@@ -11,9 +11,10 @@ check-plugin-mcp:
 
 check-admin-api:
 	uv run python scripts/export_openapi.py admin/openapi/admin.json --check
+	uv run python scripts/export_source_type_forms.py admin/src/test/fixtures/sourceTypeForms.json --check
 
 lint: check-plugin-mcp check-admin-api
-	uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py scripts/export_openapi.py scripts/provider_smoke.py scripts/compose_smoke.py scripts/smoke_env.py
+	uv run ruff check src tests scripts/sync_plugin_mcp_proxy.py scripts/export_openapi.py scripts/export_source_type_forms.py scripts/provider_smoke.py scripts/compose_smoke.py scripts/smoke_env.py
 
 test:
 	uv run pytest -q

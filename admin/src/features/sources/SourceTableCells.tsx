@@ -9,7 +9,7 @@ export function NameCell({ row }: { row: SourceRow }) {
 }
 
 export function ActionsCell({ row }: { row: SourceRow }) {
-  const { actions, onViewDetails, onDelete, onReRead } = useSourceTable();
+  const { actions, onViewDetails, onDelete, onReRead, onFullSync, onChangeAccess } = useSourceTable();
   return (
     <SourceRowActions
       row={row}
@@ -17,6 +17,8 @@ export function ActionsCell({ row }: { row: SourceRow }) {
       onViewDetails={onViewDetails}
       onDelete={onDelete}
       onReRead={onReRead}
+      onFullSync={onFullSync}
+      onChangeAccess={onChangeAccess}
     />
   );
 }

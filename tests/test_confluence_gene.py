@@ -10,7 +10,7 @@ import pytest
 from memforge.genes import confluence_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.confluence_gene import ConfluenceGene, PREVIEW_DISCOVERY_LIMIT_CONFIG_KEY
-from memforge.models import AbsenceAnswer, ContentItem
+from memforge.models import AbsenceAnswer, ConfigCondition, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 from tests.connector_http_fixture import AnsweringClient, FakeConnectorHttp
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -29,7 +29,9 @@ def test_confluence_schema_hides_runtime_transport_fields_from_ui():
     assert fields["pat"].required is True
     assert fields["pat"].advanced is False
     assert fields["base_url"].label == "Wiki URL"
-    assert fields["spaces"].required is False
+    assert fields["spaces"].required is True
+    assert fields["spaces"].visible_when == (ConfigCondition("sync_mode", ("space",)),)
+    assert fields["sync_mode"].default == "space"
     assert fields["sync_mode"].advanced is False
     assert "api_prefix" not in fields
     assert "tls_ca_bundle" not in fields
@@ -62,7 +64,7 @@ def test_confluence_normalizes_space_url_without_page_tree_root():
     assert config["api_prefix"] == "/wiki"
     assert config["spaces"] == ["ENG"]
     assert config.get("page_tree_root") is None
-    assert "sync_mode" not in config
+    assert config["sync_mode"] == "space"
 
 
 def _space_probe_http(space_status: int = 200, *, root_space_status: int = 200) -> tuple[list[str], FakeConnectorHttp]:

@@ -7,7 +7,7 @@ from typing import Any
 
 from memforge.source_adapters import github_pages as adapter
 from memforge.source_adapters.contracts import MARKDOWN_STRUCTURAL_PROFILE
-from memforge.source_types.config import SourceConfigPolicy, secret_has_value
+from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import SourceTypeDescriptor
 
 
@@ -20,101 +20,53 @@ def _canonical_scope(scope: dict[str, object]) -> dict[str, object]:
     return scope
 
 
+_SCOPE_URL_FIELDS = {
+    "single_page": ("page_url", "Page URL"),
+    "subtree": ("root_url", "Subtree Root URL"),
+    "explicit_list": ("pages", "Explicit Page URL"),
+}
+
+
+def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Keep the stored site when none is submitted; the Gene derives one for a new Source."""
+
+    stored_base_url = str((existing_config or {}).get("base_url") or "").strip()
+    if not str(config.get("base_url") or "").strip() and stored_base_url:
+        config["base_url"] = stored_base_url
+    return config
+
+
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
-    from memforge.genes.toolkit.config import require_https_base_url
+    """Every scope URL of the configured mode stays on the site the Source reads."""
 
-    base_url = _ensure_base_url(config, existing_config)
-    require_https_base_url(base_url, "GitHub Pages")
+    from memforge.genes.github_pages_gene import scope_urls_for_config, sync_mode_for_config
 
-    auth_mode = str(config.get("auth_mode") or existing_config.get("auth_mode") or "github_pat").strip().lower()
-    if auth_mode not in {"github_pat", "none"}:
-        raise ValueError("GitHub Pages Authentication Method must be Personal access token or No authentication")
-    if auth_mode == "github_pat" and not secret_has_value("pat", config, existing_config):
-        raise ValueError("GitHub Pages Personal Access Token is required for github_pat authentication")
-
-    sync_mode = str(config.get("sync_mode") or "single_page").strip().lower()
-    if sync_mode == "single_page":
-        page_url = str(config.get("page_url") or "").strip()
-        if not page_url:
-            raise ValueError("GitHub Pages Page URL is required for single page sync")
-        _validate_scope_url(base_url, page_url, "Page URL")
-        return
-    if sync_mode == "subtree":
-        root_url = str(config.get("root_url") or "").strip()
-        if not root_url:
-            raise ValueError("GitHub Pages Subtree Root URL is required for subtree sync")
-        _validate_scope_url(base_url, root_url, "Subtree Root URL")
-        return
-    if sync_mode == "explicit_list":
-        pages = config.get("pages")
-        page_urls = [
-            str(page).strip()
-            for page in (pages if isinstance(pages, list) else str(pages or "").split(","))
-            if str(page).strip()
-        ]
-        if page_urls:
-            for page_url in page_urls:
-                _validate_scope_url(base_url, page_url, "Explicit Page URL")
-            return
-        raise ValueError("GitHub Pages Explicit Page URLs are required for explicit list sync")
-    raise ValueError("GitHub Pages Sync Mode must be Single page, Subtree, or Explicit list")
+    base_url = str(config.get("base_url") or "").strip()
+    key, label = _SCOPE_URL_FIELDS[sync_mode_for_config(config)]
+    for url in scope_urls_for_config(config):
+        _validate_scope_url(base_url, url, key, label)
 
 
-def _ensure_base_url(config: dict[str, Any], existing_config: Mapping[str, Any]) -> str:
-    base_url = str(config.get("base_url") or existing_config.get("base_url") or "").strip()
-    if not base_url:
-        base_url = _site_root_from_url(_scope_url(config, existing_config))
-    if base_url:
-        config["base_url"] = base_url
-    return base_url
-
-
-def _scope_url(config: Mapping[str, Any], existing_config: Mapping[str, Any]) -> str:
-    sync_mode = str(config.get("sync_mode") or existing_config.get("sync_mode") or "single_page").strip().lower()
-    if sync_mode == "subtree":
-        return str(config.get("root_url") or existing_config.get("root_url") or "").strip()
-    if sync_mode == "explicit_list":
-        pages = config.get("pages") or existing_config.get("pages")
-        page_urls = [
-            str(page).strip()
-            for page in (pages if isinstance(pages, list) else str(pages or "").split(","))
-            if str(page).strip()
-        ]
-        return page_urls[0] if page_urls else ""
-    return str(config.get("page_url") or existing_config.get("page_url") or "").strip()
-
-
-def _site_root_from_url(url: str) -> str:
-    from urllib.parse import urlsplit, urlunsplit
-
-    value = str(url or "").strip()
-    if not value:
-        return ""
-    parts = urlsplit(value)
-    path_parts = [part for part in parts.path.split("/") if part]
-    if len(path_parts) >= 3 and path_parts[0] == "pages":
-        root_path = "/" + "/".join(path_parts[:3])
-        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
-    if len(path_parts) >= 2 and (parts.hostname or "").lower().startswith("pages."):
-        root_path = "/" + "/".join(path_parts[:2])
-        return urlunsplit((parts.scheme, parts.netloc, root_path, "", ""))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
-
-
-def _validate_scope_url(base_url: str, candidate_url: str, label: str) -> None:
+def _validate_scope_url(base_url: str, candidate_url: str, key: str, label: str) -> None:
     from urllib.parse import urlsplit
 
-    from memforge.genes.toolkit.config import require_https_base_url
+    from memforge.genes.toolkit.config import FieldIssue, SourceConfigInvalid, require_https_base_url
 
-    require_https_base_url(candidate_url, f"GitHub Pages {label}")
+    def refuse(message: str) -> SourceConfigInvalid:
+        return SourceConfigInvalid([FieldIssue(key, message)])
+
+    try:
+        require_https_base_url(candidate_url, f"GitHub Pages {label}")
+    except ValueError as exc:
+        raise refuse(str(exc)) from None
     base = urlsplit(base_url)
     candidate = urlsplit(candidate_url)
     if candidate.netloc.lower() != base.netloc.lower():
-        raise ValueError(f"GitHub Pages {label} must stay on the configured site origin")
+        raise refuse(f"GitHub Pages {label} must stay on the configured site origin")
     base_path = base.path.rstrip("/") + "/"
     candidate_path = candidate.path.rstrip("/") + "/"
     if not candidate_path.startswith(base_path):
-        raise ValueError(f"GitHub Pages {label} must stay under the configured site path")
+        raise refuse(f"GitHub Pages {label} must stay under the configured site path")
 
 
 DESCRIPTOR = SourceTypeDescriptor(
@@ -129,5 +81,5 @@ DESCRIPTOR = SourceTypeDescriptor(
     canonical_scope=_canonical_scope,
     project_native=adapter.project_native,
     evidence_profiles={"page_content": MARKDOWN_STRUCTURAL_PROFILE},
-    config=SourceConfigPolicy(validate_input=_validate_config),
+    config=SourceConfigPolicy(complete=_complete_config, validate=_validate_config),
 )

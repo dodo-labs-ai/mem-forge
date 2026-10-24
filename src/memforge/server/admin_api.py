@@ -7,6 +7,7 @@ sources/genes, schedule, model settings, and system health/stats.
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import hmac
@@ -34,6 +35,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from memforge.api_target import CAPABILITY_PATH, Edition, capability_document
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import models_json_schema
 
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig
 from memforge.auth import browser_session
@@ -75,7 +77,12 @@ from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import release_atlassian_request_limiter
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_repo_gene import GitHubRepoGene
-from memforge.genes.toolkit.config import require_https_base_url, validate_bool_fields, validate_tls_ca_bundle
+from memforge.genes.toolkit.config import (
+    FieldIssue,
+    SourceConfigInvalid,
+    require_https_base_url,
+    validate_tls_ca_bundle,
+)
 from memforge.genes.toolkit.github_api import BROWSE_TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
@@ -155,7 +162,8 @@ from memforge.vector_index_errors import (
 from memforge.memory.store import MemoryStore
 from memforge.models import (
     AbsenceCheckSkippedReason,
-    ConfigField,
+    ConfigCondition,
+    ConfigGroupPurpose,
     ScopeListingKind,
     ConfigFieldType,
     Entity,
@@ -175,6 +183,7 @@ from memforge.models import (
     VIRTUAL_DOCUMENT_SOURCE_IDS,
     Visibility,
     canonicalize_entity_name,
+    comparison_string,
 )
 from memforge.sync_progress import (
     SyncProgressPhase,
@@ -244,6 +253,7 @@ from memforge.source_types import (
     load_reference,
     source_type_descriptor,
 )
+from memforge.source_types.form import check_config, effective_value
 from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
 from memforge.storage.document_store import LocalDocumentStore
@@ -277,6 +287,7 @@ from memforge.local_agent.readiness import (
     SourceConnectionState,
     connection_status_from_browser_session,
 )
+from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     SNAPSHOT_MANIFEST_MAX_ITEMS,
@@ -830,6 +841,32 @@ def _operation_id(route: APIRoute) -> str:
     """
     operation_id = re.sub(r"\W", "_", f"{route.name}{route.path_format}")
     return f"{operation_id}_{sorted(route.methods)[0].lower()}"
+
+
+def _publish_setup_result_models(app: FastAPI) -> None:
+    """List each local setup job's result model in the app's OpenAPI document.
+
+    The host job route serves every operation, so its ``result`` stays a
+    free-form object and FastAPI publishes no setup model of its own. Adding
+    the models of ``SETUP_RESULT_MODELS`` as components lets the admin UI
+    generate one result type per setup operation from the same document.
+    """
+    generate = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            document = generate()
+            _, definitions = models_json_schema(
+                [(model, "serialization") for model in SETUP_RESULT_MODELS.values()],
+                ref_template="#/components/schemas/{model}",
+            )
+            schemas = document.setdefault("components", {}).setdefault("schemas", {})
+            for name, schema in definitions["$defs"].items():
+                if schemas.setdefault(name, schema) != schema:
+                    raise RuntimeError(f"setup result model {name} collides with another OpenAPI component")
+        return app.openapi_schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _request_audit_context(request: Request) -> AuditContext:
@@ -1705,6 +1742,38 @@ class AddAliasRequest(BaseModel):
     alias: str
 
 
+class MergedEntitiesResponse(BaseModel):
+    """The two Entities a merge joined: the source is gone, the target holds its references."""
+
+    source_id: int
+    source_name: str
+    target_id: int
+    target_name: str
+
+
+class EntityMergeResponse(BaseModel):
+    ok: bool
+    merged: MergedEntitiesResponse
+
+
+class EntityAliasListResponse(BaseModel):
+    data: list[EntityAliasResponse]
+
+
+class EntityAliasAddedResponse(BaseModel):
+    """The manual alias as given and the normalised form that matching reads."""
+
+    ok: bool
+    alias: str
+    alias_normalized: str
+
+
+class OkResponse(BaseModel):
+    """A change that reports only that it was made."""
+
+    ok: bool
+
+
 # -- Sources / Genes --
 
 
@@ -1716,31 +1785,82 @@ class GeneMetadataResponse(BaseModel):
     auth_method: str
     data_shape: str
     execution_kinds: list[SourceExecutionKind]
+    managed: bool = Field(description="Managed capture, created by the service; the type picker leaves it out.")
+
+
+class ConfigConditionResponse(BaseModel):
+    field: str
+    values: list[str]
+
+
+class ConfigOptionResponse(BaseModel):
+    value: str
+    label: str
+    help_text: str = ""
+    visible_when: list[ConfigConditionResponse] = []
+
+
+class ConfigPanelResponse(BaseModel):
+    name: str
+    visible_when: list[ConfigConditionResponse] = []
 
 
 class ConfigFieldResponse(BaseModel):
     key: str
     label: str
     field_type: str
-    required: bool = True
+    required: bool = Field(default=True, description="Required while the field is visible.")
     placeholder: str = ""
     help_text: str = ""
     group: str = "general"
     order: int = 0
     default: str = ""
-    options: list[str] = []
+    choices: list[ConfigOptionResponse] = []
+    visible_when: list[ConfigConditionResponse] = []
+    widget: str | None = None
     advanced: bool = False
+    scope: bool = Field(default=False, description="Changing it changes which items the Source holds.")
+    fixed_after_create: bool = Field(default=False, description="Chooses the executor; a stored Source keeps it.")
+    # Deprecated (admin-ui-v1): V1 setup reads bare option values; removed with V1.
+    options: list[str] = Field(default=[], deprecated=True, description="The values of `choices`.")
 
 
 class ConfigGroupResponse(BaseModel):
     key: str
     label: str
     order: int = 0
+    description: str = ""
+    purpose: ConfigGroupPurpose = "content"
+    panels: list[ConfigPanelResponse] = []
 
 
 class GeneConfigSchemaResponse(BaseModel):
     groups: list[ConfigGroupResponse] = []
     fields: list[ConfigFieldResponse] = []
+    project_field: str | None = None
+
+
+class ConfigCheckRequest(BaseModel):
+    config: dict[str, Any]
+    source_id: str | None = None
+
+
+class ConfigFactResponse(BaseModel):
+    label: str
+    value: str
+
+
+class FieldIssueResponse(BaseModel):
+    key: str | None
+    message: str
+
+
+class ConfigCheckResponse(BaseModel):
+    derived: dict[str, Any] = Field(
+        description="Declared non-secret fields whose effective value the save would change, as it would store them."
+    )
+    facts: list[ConfigFactResponse]
+    issues: list[FieldIssueResponse]
 
 
 class DiscoveryPreviewRequest(BaseModel):
@@ -1946,6 +2066,16 @@ class SourceSyncStatusResponse(BaseModel):
 
 
 class SourceAccessTransitionResponse(BaseModel):
+    """One durable change of a Source's access policy across its whole history.
+
+    The operation is ``queued`` until its worker starts, ``running`` while it
+    re-projects the Source's Memories, and ends ``completed``. A ``failed``
+    operation leaves the Source paused until its owner retries it or reverts
+    it to ``previous_policy``, which ends it ``reverted``.
+    ``processed_memories`` counts the Memories re-projected so far, out of
+    ``total_memories``.
+    """
+
     operation_id: str
     source_id: str
     previous_policy: SourceAccessPolicyValue
@@ -2161,6 +2291,57 @@ class LocalCollectionReceiptResponse(BaseModel):
     job_id: str
     status: Literal["queued"]
     coalesced: bool
+
+
+class SourceSyncRunStateResponse(BaseModel):
+    """Where one admitted sync run stands, read without advancing it."""
+
+    run_id: str
+    status: SourceSyncRunStatus
+
+
+class SourceCreatedResponse(BaseModel):
+    id: str
+    name: str
+    type: str
+    access_policy: SourceAccessPolicyValue
+
+
+class SourceUpdatedResponse(BaseModel):
+    ok: bool
+    id: str
+
+
+class SourcePinResponse(BaseModel):
+    """Whether the Source is now pinned in the caller's Source List."""
+
+    source_id: str
+    pinned: bool
+
+
+class SourceSubscriptionChangeResponse(BaseModel):
+    """The caller's subscription to the Source after the change."""
+
+    ok: bool
+    source_id: str
+    subscription: SourceSubscriptionResponse
+
+
+class SourceCurrentAccessTransitionResponse(BaseModel):
+    """The Source's unfinished access operation, or ``null`` when there is none."""
+
+    transition: SourceAccessTransitionResponse | None
+
+
+class SourceAccessTransitionOperationResponse(BaseModel):
+    transition: SourceAccessTransitionResponse
+
+
+class SourceAccessTransitionQueuedResponse(BaseModel):
+    """A retry or revert admitted for the operation's worker."""
+
+    operation_id: str
+    status: Literal["queued"]
 
 
 class SourceProjectResponse(BaseModel):
@@ -3118,6 +3299,8 @@ async def _plan_config_change(
             secret_fields=_source_secret_fields(source_type),
         )
         config = _store_source_config(source_type, config, source_id, app_config, create_inbox=not preview)
+    except SourceConfigInvalid as exc:
+        raise _config_invalid_response(exc) from exc
     except (SecretConfigurationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
@@ -3229,6 +3412,42 @@ async def _require_complete_collection(intake: CollectionIntake, source_id: str,
         raise HTTPException(status_code=409, detail="conversation_manifest_required") from exc
     if missing:
         raise HTTPException(status_code=409, detail="conversation_bodies_incomplete")
+
+
+class AgentSessionOutcomeCountsResponse(BaseModel):
+    """How many processed windows kept a knowledge patch, kept nothing, or failed."""
+
+    knowledge_patched: int
+    no_output: int
+    failed: int
+
+
+class AgentSessionLatestFailureResponse(BaseModel):
+    """The failed windows, with the reason and time of the latest one."""
+
+    count: int
+    reason: str | None
+    last_seen_at: str | None
+
+
+class AgentSessionCompletenessResponse(BaseModel):
+    """Knowledge completeness of agent-session windows, computed on demand.
+
+    ``processed_total`` counts the windows that were processed, patched or
+    not, and ``no_output_fraction`` is the share of them that kept nothing
+    (0 when none was processed). ``total`` also counts failed windows.
+    ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
+    the Source read, and ``session_id`` echoes the session filter when the
+    request named one.
+    """
+
+    session_id: str | None
+    source_id: str
+    total: int
+    processed_total: int
+    counts: AgentSessionOutcomeCountsResponse
+    no_output_fraction: float
+    latest_failure: AgentSessionLatestFailureResponse | None
 
 
 class AgentSessionWindowRequest(BaseModel):
@@ -3656,10 +3875,20 @@ def _complete_source_config(
     source_id: str,
     existing_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fill the values a source type derives from the Source or its stored configuration."""
+    """Fill the values a source type derives from the Source or its stored configuration.
+
+    A refusal raises ``SourceConfigInvalid``, which the routes answer as 400 ``config_invalid``.
+    """
 
     policy = _config_policy(source_type)
-    return policy.complete(dict(config), source_id, existing_config) if policy.complete else config
+    if policy.complete is None:
+        return config
+    try:
+        return policy.complete(dict(config), source_id, existing_config)
+    except SourceConfigInvalid:
+        raise
+    except ValueError as exc:
+        raise _unkeyed_refusal(exc) from exc
 
 
 def _store_source_config(
@@ -3728,46 +3957,81 @@ def _validate_source_config(
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
 ) -> None:
-    """Raise ``ValueError``, which the routes answer with 400, for a configuration the source type cannot use.
+    """Check a configuration the way a save does, normalizing it in place.
 
-    Besides the source type's own checks, every required field the Gene
-    declares must have a value, and every field it declares as
-    ``ConfigFieldType.BOOLEAN`` must hold a boolean value
-    (:func:`~memforge.genes.toolkit.config.bool_config`).
+    The steps run in this order (``SourceConfigPolicy``): the type's
+    ``validate_input`` on the configuration as given, the TLS CA bundle check,
+    the Gene's ``normalize_config``, the shared form check
+    (:func:`~memforge.source_types.form.check_config`), the secret-origin
+    guard, and the type's ``validate``. Any refusal raises
+    ``SourceConfigInvalid``, a ``ValueError`` the routes answer as 400
+    ``config_invalid``; a plain ``ValueError`` from a hook becomes one issue
+    with no field.
     """
+    existing_config = existing_config or {}
     policy = _config_policy(source_type)
-    if policy.validate_input is not None:
-        policy.validate_input(config, existing_config or {})
-    validate_tls_ca_bundle(config)
+    gene_cls = GENE_REGISTRY.get(source_type)
+    try:
+        if policy.validate_input is not None:
+            policy.validate_input(config, existing_config)
+        validate_tls_ca_bundle(config)
+        if gene_cls:
+            normalizer = getattr(gene_cls, "normalize_config", None)
+            if callable(normalizer):
+                normalizer(config)
+            descriptor = source_type_descriptor(source_type)
+            issues = check_config(gene_cls.config_schema(), config, existing_config, descriptor)
+            if issues:
+                raise SourceConfigInvalid(issues)
+        _require_secret_origin(source_type, config)
+        if policy.validate is not None:
+            policy.validate(config, existing_config)
+    except SourceConfigInvalid:
+        raise
+    except ValueError as exc:
+        raise _unkeyed_refusal(exc) from exc
+
+
+def _require_secret_origin(source_type: str, config: dict[str, Any]) -> None:
+    """A type that stores a secret sends it only to an HTTPS ``base_url``.
+
+    The refusal names ``base_url`` when the Gene declares that field, and no
+    field when the Gene derives it.
+    """
     secret_fields = _source_secret_fields(source_type)
     gene_cls = GENE_REGISTRY.get(source_type)
-    if gene_cls:
-        normalizer = getattr(gene_cls, "normalize_config", None)
-        if callable(normalizer):
-            normalizer(config)
     has_secret_contract = bool(secret_fields) if gene_cls else _config_contains_secret(config, secret_fields)
-    if has_secret_contract:
-        product_name = gene_cls.metadata().display_name if gene_cls else source_type
-        base_url = str(config.get("base_url") or "").strip()
-        if not base_url:
-            raise ValueError(f"{product_name} base_url is required before storing source secrets")
+    if not has_secret_contract:
+        return
+    product_name = gene_cls.metadata().display_name if gene_cls else source_type
+    declares_base_url = gene_cls is not None and any(f.key == "base_url" for f in gene_cls.config_schema().fields)
+    key = "base_url" if declares_base_url else None
+    base_url = str(config.get("base_url") or "").strip()
+    if not base_url:
+        raise SourceConfigInvalid([FieldIssue(key, f"{product_name} base_url is required before storing source secrets")])
+    try:
         require_https_base_url(base_url, product_name)
+    except ValueError as exc:
+        raise SourceConfigInvalid([FieldIssue(key, str(exc))]) from None
 
-    if gene_cls:
-        product_name = gene_cls.metadata().display_name
-        fields = gene_cls.config_schema().fields
-        _validate_required_source_fields(
-            product_name,
-            fields,
-            config,
-            existing_config=existing_config,
-        )
-        try:
-            validate_bool_fields(config, fields)
-        except SourceConfigurationError as exc:
-            raise ValueError(f"{product_name} {exc}") from exc
-    if policy.validate is not None:
-        policy.validate(config, existing_config or {})
+
+def _unkeyed_refusal(exc: ValueError) -> SourceConfigInvalid:
+    """A plain ``ValueError`` from a configuration hook, as a refusal that names no field."""
+
+    return SourceConfigInvalid([FieldIssue(None, str(exc))])
+
+
+def _config_invalid_response(exc: SourceConfigInvalid) -> HTTPException:
+    """The 400 every configuration refusal answers, keyed by field where the check knows it."""
+
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": "config_invalid",
+            "message": str(exc),
+            "fields": [{"key": issue.key, "message": issue.message} for issue in exc.issues],
+        },
+    )
 
 
 async def _cancel_running_jira_browser_sources_for_origin(
@@ -3823,45 +4087,6 @@ def _require_secure_or_loopback(request: Request) -> None:
             "(for example a server reached through Docker's localhost port mapping)."
         ),
     )
-
-
-def _validate_required_source_fields(
-    product_name: str,
-    fields: list[ConfigField],
-    config: dict[str, Any],
-    existing_config: dict[str, Any] | None = None,
-) -> None:
-    existing_config = existing_config or {}
-    for field in fields:
-        if not field.required:
-            continue
-        if _source_field_has_value(field, config, existing_config):
-            continue
-        raise ValueError(f"{product_name} {field.label} is required")
-
-
-def _source_field_has_value(
-    field: ConfigField,
-    config: dict[str, Any],
-    existing_config: dict[str, Any],
-) -> bool:
-    value = config.get(field.key)
-    if field.field_type == ConfigFieldType.SECRET:
-        if isinstance(value, str) and value.strip():
-            return True
-        return bool(
-            existing_config.get(f"{field.key}_encrypted")
-            or (isinstance(existing_config.get(field.key), str) and existing_config[field.key].strip())
-        )
-    if field.field_type in {ConfigFieldType.TAG_LIST, ConfigFieldType.MULTI_SELECT}:
-        if isinstance(value, list):
-            return any(str(item).strip() for item in value)
-        if isinstance(value, str):
-            return any(item.strip() for item in value.split(","))
-        return bool(field.default)
-    if field.field_type == ConfigFieldType.BOOLEAN:
-        return field.key in config or field.default != ""
-    return str(value if value is not None else field.default).strip() != ""
 
 
 def _config_contains_secret(config: dict[str, Any], secret_fields: tuple[str, ...]) -> bool:
@@ -5078,6 +5303,7 @@ def create_admin_app(
         lifespan=lifespan,
         generate_unique_id_function=_operation_id,
     )
+    _publish_setup_result_models(app)
     if db is not None:
         app.state.db = db
         app.state.sync_service = SyncService(
@@ -6648,7 +6874,7 @@ def create_admin_app(
             can_curate=can_manage_workspace(resolve_request_workspace_role(request)),
         )
 
-    @entity_router.post("/merge")
+    @entity_router.post("/merge", response_model=EntityMergeResponse)
     async def merge_entities(
         req: MergeEntitiesRequest,
         request: Request,
@@ -6685,7 +6911,7 @@ def create_admin_app(
             "merged": merged,
         }
 
-    @entity_router.get("/{entity_id}/aliases")
+    @entity_router.get("/{entity_id}/aliases", response_model=EntityAliasListResponse)
     async def list_entity_aliases(
         entity_id: int,
         request: Request,
@@ -6695,19 +6921,19 @@ def create_admin_app(
         await _require_visible_entity(request, db, entity_id)
 
         aliases = await db.get_aliases_for_entity(entity_id)
-        return {
-            "data": [
+        return EntityAliasListResponse(
+            data=[
                 EntityAliasResponse(
                     alias=a.alias,
                     alias_normalized=a.alias_normalized,
                     source=a.source,
                     created_at=_dt_iso(a.created_at),
-                ).model_dump()
+                )
                 for a in aliases
             ]
-        }
+        )
 
-    @entity_router.post("/{entity_id}/aliases")
+    @entity_router.post("/{entity_id}/aliases", response_model=EntityAliasAddedResponse)
     async def add_entity_alias(
         entity_id: int,
         req: AddAliasRequest,
@@ -6727,7 +6953,7 @@ def create_admin_app(
         )
         return {"ok": True, "alias": req.alias, "alias_normalized": normalized}
 
-    @entity_router.delete("/{entity_id}/aliases/{alias}")
+    @entity_router.delete("/{entity_id}/aliases/{alias}", response_model=OkResponse)
     async def remove_entity_alias(
         entity_id: int,
         alias: str,
@@ -6765,21 +6991,41 @@ def create_admin_app(
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
+                managed=source_type_descriptor(g.name).family is None,
             )
             for g in genes
         ]
 
     @gene_router.get("/{name}/config-schema", response_model=GeneConfigSchemaResponse)
     async def get_gene_config_schema(name: str):
-        """Get the configuration schema for a gene type (for dynamic UI rendering)."""
+        """The form description of a source type, which the admin UI draws without per-type code.
+
+        Besides what the Gene declares, each field says whether it is a scope
+        field and whether it is fixed after create, from the type's descriptor.
+        """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
 
-        cls = GENE_REGISTRY[name]
-        schema = cls.config_schema()
+        schema = GENE_REGISTRY[name].config_schema()
+        descriptor = source_type_descriptor(name)
+        scope_fields = set(descriptor.scope_fields)
+        fixed_fields = set(descriptor.local_agent.immutable_execution_fields) if descriptor.local_agent else set()
+
+        def conditions(items: Iterable[ConfigCondition]) -> list[ConfigConditionResponse]:
+            return [ConfigConditionResponse(field=c.field, values=list(c.values)) for c in items]
 
         return GeneConfigSchemaResponse(
-            groups=[ConfigGroupResponse(key=g.key, label=g.label, order=g.order) for g in schema.groups],
+            groups=[
+                ConfigGroupResponse(
+                    key=g.key,
+                    label=g.label,
+                    order=g.order,
+                    description=g.description,
+                    purpose=g.purpose,
+                    panels=[ConfigPanelResponse(name=p.name, visible_when=conditions(p.visible_when)) for p in g.panels],
+                )
+                for g in schema.groups
+            ],
             fields=[
                 ConfigFieldResponse(
                     key=f.key,
@@ -6791,11 +7037,84 @@ def create_admin_app(
                     group=f.group,
                     order=f.order,
                     default=f.default,
-                    options=f.options,
+                    choices=[
+                        ConfigOptionResponse(
+                            value=o.value,
+                            label=o.label,
+                            help_text=o.help_text,
+                            visible_when=conditions(o.visible_when),
+                        )
+                        for o in f.choices
+                    ],
+                    visible_when=conditions(f.visible_when),
+                    widget=f.widget,
                     advanced=f.advanced,
+                    scope=f.key in scope_fields,
+                    fixed_after_create=f.key in fixed_fields,
+                    options=[o.value for o in f.choices],
                 )
                 for f in schema.fields
             ],
+            project_field=schema.project_field,
+        )
+
+    @gene_router.post("/{name}/config-check", response_model=ConfigCheckResponse)
+    async def check_gene_config(
+        name: str,
+        req: ConfigCheckRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """What saving this configuration would store and refuse, without saving it.
+
+        It runs save's own steps (``complete`` and every configuration check)
+        on a copy, and writes nothing: no Source, no inbox, no encrypted
+        secret. ``derived`` holds the declared non-secret fields whose
+        effective value the steps change, such as the page tree a pasted
+        Confluence page URL names; ``facts`` states what the type can tell
+        about the configuration; ``issues`` holds every refusal. With
+        ``source_id``, the stored configuration completes the copy as it does
+        on update, and the caller needs the access that update needs.
+        """
+        if name not in GENE_REGISTRY:
+            raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
+        existing_config: dict[str, Any] | None = None
+        if req.source_id:
+            existing = await db.get_source(req.source_id)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Source not found")
+            _require_source_management(request, existing)
+            _require_local_agent_connection_management(request, existing)
+            if existing["type"] != name:
+                raise HTTPException(status_code=400, detail="Config-check source type does not match the existing source")
+            existing_config = existing["config"]
+
+        submitted = copy.deepcopy(req.config)
+        config = copy.deepcopy(req.config)
+        issues: tuple[FieldIssue, ...] = ()
+        try:
+            config = _complete_source_config(name, config, req.source_id or "config-check", existing_config)
+            _validate_source_config(name, config, existing_config=existing_config)
+        except SourceConfigInvalid as exc:
+            issues = exc.issues
+
+        descriptor = source_type_descriptor(name)
+        derived: dict[str, Any] = {}
+        for field in GENE_REGISTRY[name].config_schema().fields:
+            if field.field_type == ConfigFieldType.SECRET:
+                continue
+            before = comparison_string(effective_value(field, submitted, descriptor), field.field_type)
+            after = comparison_string(effective_value(field, config, descriptor), field.field_type)
+            if before != after:
+                derived[field.key] = config.get(field.key)
+
+        facts: list[tuple[str, str]] = []
+        if descriptor.config.facts is not None:
+            facts = descriptor.config.facts(config)
+        return ConfigCheckResponse(
+            derived=derived,
+            facts=[ConfigFactResponse(label=label, value=value) for label, value in facts],
+            issues=[FieldIssueResponse(key=issue.key, message=issue.message) for issue in issues],
         )
 
     @gene_router.post("/{name}/preview-discovery", response_model=DiscoveryPreviewResponse)
@@ -6849,6 +7168,8 @@ def create_admin_app(
                     )
                 if count > req.limit:
                     break
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except browser_session.BrowserSessionError as exc:
@@ -6913,6 +7234,8 @@ def create_admin_app(
             )
         except HTTPException:
             raise
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except GitHubTreeBudgetExceeded as exc:
@@ -7221,7 +7544,11 @@ def create_admin_app(
             "assessments": view["assessments"],
         }
 
-    @source_router.get("/{source_id}/agent-evaluation")
+    # Deprecated (admin-ui-v1): only the V1 per-source evaluation dialog calls
+    # this route, and V1 never renders that dialog. The admin UI reads
+    # GET /agent-evaluations/online-overview, scoped by source_id; this route
+    # is removed with the V1 admin UI.
+    @source_router.get("/{source_id}/agent-evaluation", deprecated=True)
     async def get_source_agent_evaluation(
         source_id: str,
         request: Request,
@@ -8105,7 +8432,7 @@ def create_admin_app(
         projects = [ResolvedProjectResponse(project_key=key, memory_count=count) for key, count in rows]
         return ResolvedProjectsResponse(source_id=source_id, projects=projects)
 
-    @source_router.put("/{source_id}/subscription")
+    @source_router.put("/{source_id}/subscription", response_model=SourceSubscriptionChangeResponse)
     async def set_source_subscription(
         request: Request,
         source_id: str,
@@ -8128,7 +8455,7 @@ def create_admin_app(
             "subscription": {"enabled": req.enabled},
         }
 
-    @source_router.put("/{source_id}/pin")
+    @source_router.put("/{source_id}/pin", response_model=SourcePinResponse)
     async def pin_source_for_viewer(
         request: Request,
         source_id: str,
@@ -8146,7 +8473,7 @@ def create_admin_app(
         )
         return {"source_id": source_id, "pinned": True}
 
-    @source_router.delete("/{source_id}/pin")
+    @source_router.delete("/{source_id}/pin", response_model=SourcePinResponse)
     async def unpin_source_for_viewer(
         request: Request,
         source_id: str,
@@ -8176,7 +8503,11 @@ def create_admin_app(
             sync_service=sync_service,
         )
 
-    @source_router.post("/{source_id}/access-transitions", status_code=202)
+    @source_router.post(
+        "/{source_id}/access-transitions",
+        status_code=202,
+        response_model=SourceAccessTransitionResponse,
+    )
     async def start_source_access_transition(
         request: Request,
         source_id: str,
@@ -8217,7 +8548,7 @@ def create_admin_app(
         )
         return transition
 
-    @source_router.get("/{source_id}/access-transition")
+    @source_router.get("/{source_id}/access-transition", response_model=SourceCurrentAccessTransitionResponse)
     async def get_source_access_transition(
         request: Request,
         source_id: str,
@@ -8230,7 +8561,10 @@ def create_admin_app(
         _require_source_discoverability(request, source)
         return {"transition": await db.get_active_source_access_transition(source_id)}
 
-    @source_router.get("/{source_id}/access-transitions/{operation_id}")
+    @source_router.get(
+        "/{source_id}/access-transitions/{operation_id}",
+        response_model=SourceAccessTransitionOperationResponse,
+    )
     async def get_source_access_transition_operation(
         request: Request,
         source_id: str,
@@ -8247,7 +8581,10 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="Access transition not found")
         return {"transition": transition}
 
-    @source_router.post("/{source_id}/access-transitions/{operation_id}/retry")
+    @source_router.post(
+        "/{source_id}/access-transitions/{operation_id}/retry",
+        response_model=SourceAccessTransitionQueuedResponse,
+    )
     async def retry_source_access_transition(
         request: Request,
         source_id: str,
@@ -8286,7 +8623,10 @@ def create_admin_app(
         )
         return {"operation_id": operation_id, "status": "queued"}
 
-    @source_router.post("/{source_id}/access-transitions/{operation_id}/revert")
+    @source_router.post(
+        "/{source_id}/access-transitions/{operation_id}/revert",
+        response_model=SourceAccessTransitionQueuedResponse,
+    )
     async def revert_source_access_transition(
         request: Request,
         source_id: str,
@@ -8438,7 +8778,7 @@ def create_admin_app(
             result["total_memories"] = len(recent_memories)
         return result
 
-    @source_router.post("")
+    @source_router.post("", response_model=SourceCreatedResponse)
     async def create_source(
         request: Request,
         req: CreateSourceRequest,
@@ -8463,6 +8803,8 @@ def create_admin_app(
             )
             _validate_source_project_binding(req.project_binding)
             source_config = _store_source_config(req.type, source_config, source_id, config)
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
         except (SecretConfigurationError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         creator_user_id = resolve_request_principal(request)
@@ -8533,7 +8875,7 @@ def create_admin_app(
             }
         return {"outcome": _scope_change_outcome(change), "open_transition": open_transition, "removes": removes}
 
-    @source_router.put("/{source_id}")
+    @source_router.put("/{source_id}", response_model=SourceUpdatedResponse)
     async def update_source(
         request: Request,
         source_id: str,
@@ -8748,7 +9090,7 @@ def create_admin_app(
             "coalesced": not created,
         }
 
-    @source_router.get("/{source_id}/sync-runs/{run_id}")
+    @source_router.get("/{source_id}/sync-runs/{run_id}", response_model=SourceSyncRunStateResponse)
     async def read_source_sync_run(
         request: Request,
         source_id: str,
@@ -8941,7 +9283,11 @@ def create_admin_app(
             "coalesced": run.coalesced,
         }
 
-    @source_router.post("/{source_id}/force-resync", status_code=202)
+    @source_router.post(
+        "/{source_id}/force-resync",
+        status_code=202,
+        response_model=SourceSyncRunReceiptResponse | LocalCollectionReceiptResponse,
+    )
     async def trigger_force_resync(
         request: Request,
         source_id: str,
@@ -9693,13 +10039,23 @@ def create_admin_app(
     # 4b. Agent Session Windows
     # ===================================================================
 
-    @agent_session_router.get("/completeness")
+    @agent_session_router.get("/completeness", response_model=AgentSessionCompletenessResponse)
     async def agent_session_completeness(
+        source_id: str,
+        request: Request,
         session_id: str | None = None,
-        source_id: str | None = None,
         db: Database = Depends(get_db),
     ):
-        """Return window outcome counts and the no_output fraction on demand."""
+        """Return one Source's window outcome counts and no_output fraction on demand.
+
+        ``session_id`` narrows the read to one session of that Source. The
+        receipts carry failure reasons, so a Source the caller cannot discover
+        answers 404 like an unknown one.
+        """
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_discoverability(request, source)
         return await db.summarize_agent_session_outcomes(session_id=session_id, source_id=source_id)
 
     @agent_session_router.post("/windows")

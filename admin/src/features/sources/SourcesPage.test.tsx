@@ -1,11 +1,14 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useLocation } from "react-router-dom";
 import { afterEach, expect, test, vi } from "vitest";
 import { toast } from "sonner";
 import { STANDALONE_TARGET, type WorkspaceTarget } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
+import { makeOverview, makeSourceHealth } from "@/test/evaluationFixtures";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeFailedItem, makeLocalAgentJob, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
+import { sourceTypeSchema } from "@/test/sourceTypeForms";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -16,6 +19,11 @@ afterEach(() => {
 });
 
 const RETRY_DELAY_MS = 60 * 60_000;
+
+function CurrentLocation() {
+  const location = useLocation();
+  return <output aria-label="Location">{`${location.pathname}${location.search}`}</output>;
+}
 
 function renderPage(
   sources = [makeSource(), makeSource({ id: "src-jira", type: "jira", name: "Payroll Jira", project_binding: null })],
@@ -32,10 +40,11 @@ function renderPage(
     "GET /api/v1/source-list/preferences": () => ({ sort_mode: "name" }),
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
     "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/agent-evaluations/online-overview": () => makeOverview({ sources: [] }),
     "POST /api/v1/sources/src-wiki/sync": () => ({ status: "pending", run_id: "run-2" }),
     ...routes,
   };
-  return renderRoutes([{ path: "/sources", element: <SourcesPage /> }, { path: "*", element: null }], {
+  return renderRoutes([{ path: "/sources", element: <SourcesPage /> }, { path: "*", element: <CurrentLocation /> }], {
     path: "/sources",
     api,
     workspace,
@@ -89,7 +98,18 @@ test.each([
     name: "Claude Code Session",
     unrecognized_session_lines: lines,
   });
-  renderPage([source]);
+  renderPage([source], {
+    "GET /api/v1/agent-sessions/completeness": () => ({
+      session_id: null,
+      source_id: "src-claude",
+      total: 0,
+      processed_total: 0,
+      counts: { knowledge_patched: 0, no_output: 0, failed: 0 },
+      no_output_fraction: 0,
+      latest_failure: null,
+    }),
+    "GET /api/v1/sources/src-claude/projects": () => ({ source_id: "src-claude", projects: [] }),
+  });
 
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByText("Claude Code Session"));
@@ -102,6 +122,46 @@ test.each([
     expect(warning).not.toBeInTheDocument();
     expect(within(drawer).queryByText(/not recognized/)).not.toBeInTheDocument();
   }
+});
+
+test("Add source opens the type picker in the app", async () => {
+  renderPage();
+  await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(screen.getByRole("button", { name: "Add source" }));
+  expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(/^\/sources\/new$/);
+});
+
+const REPO_OVER_LIMIT = makeSource({
+  id: "src-repo",
+  type: "github_repo",
+  name: "Payroll repo",
+  sync: {
+    status: "failed",
+    run_id: "run-9",
+    started_at: "2026-09-29T10:58:00Z",
+    finished_at: "2026-09-29T11:00:00Z",
+    error_message: "GitHub Repository discovery matched 600 files, exceeding max_files=500",
+    progress: null,
+  },
+});
+
+test.each([
+  ["Configure in the menu", undefined, "/sources/src-wiki/settings"],
+  ["Choose a project", undefined, "/sources/src-jira/settings?step=project"],
+  ["Configure", [makeSource({ connection_status: { state: "action_required", reason: "configuration" } })], "/sources/src-wiki/settings?step=connection"],
+  ["Configure file scope", [REPO_OVER_LIMIT], "/sources/src-repo/settings?step=scope"],
+])("%s opens the source's settings in the app", async (entry, sources, target) => {
+  renderPage(sources, { "GET /api/v1/genes/github_repo/config-schema": () => sourceTypeSchema("github_repo") });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  if (entry === "Configure in the menu") {
+    await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /^Configure$/ }));
+  } else {
+    await userEvent.click(within(await screen.findByRole("region", { name: "Needs you" })).getByRole("button", { name: entry }));
+  }
+
+  expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(target);
 });
 
 test("Sync now starts a sync for that source", async () => {
@@ -680,4 +740,47 @@ test("a viewer who cannot read the configuration sees the progress, but neither 
   expect(within(section).queryByText("ENG")).not.toBeInTheDocument();
   expect(within(section).queryByText("ENG, OPS")).not.toBeInTheDocument();
   expect(within(section).queryByRole("button", { name: "Restore the previous scope" })).not.toBeInTheDocument();
+});
+
+test("a source with issues links to its evaluation", async () => {
+  const { calls, router } = renderPage(undefined, {
+    "GET /api/v1/agent-evaluations/online-overview": () =>
+      makeOverview({
+        sources: [
+          makeSourceHealth({ source_id: "src-wiki", name: "Payroll wiki", evaluation_status: "attention", action_issue_group_count: 2 }),
+          makeSourceHealth({ source_id: "src-jira", name: "Payroll Jira", evaluation_status: "healthy", action_issue_group_count: 0 }),
+        ],
+      }),
+  });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const chip = await within(table).findByRole("link", { name: "Open the pipeline checks of Payroll wiki: 2 issues" });
+  expect(within(table).queryByRole("link", { name: /pipeline checks of Payroll Jira/ })).not.toBeInTheDocument();
+  const overview = new URL(calls.find((request) => request.url.includes("/online-overview"))!.url);
+  expect(overview.searchParams.get("days")).toBe("1");
+
+  await userEvent.click(chip);
+
+  expect(router.state.location.pathname + router.state.location.search).toBe("/evaluation?source_id=src-wiki");
+});
+
+test("the drawer shows the evaluation chip and offers Full sync", async () => {
+  renderPage([makeSource()], {
+    "GET /api/v1/agent-evaluations/online-overview": () =>
+      makeOverview({
+        sources: [makeSourceHealth({ source_id: "src-wiki", evaluation_status: "review", action_issue_group_count: 0, review_issue_group_count: 1 })],
+      }),
+  });
+
+  await userEvent.click(await within(await screen.findByRole("table", { name: "Sources" })).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(await within(drawer).findByRole("link", { name: "Open the pipeline checks of Payroll wiki: 1 review pattern" })).toHaveAttribute(
+    "href",
+    "/evaluation?source_id=src-wiki",
+  );
+
+  await userEvent.click(within(drawer).getByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: /Full sync/ }));
+
+  expect(await screen.findByRole("dialog", { name: "Run a full sync of Payroll wiki?" })).toBeInTheDocument();
 });

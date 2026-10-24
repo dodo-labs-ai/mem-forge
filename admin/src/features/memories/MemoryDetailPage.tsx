@@ -4,7 +4,7 @@ import { HTTP_STATUS, isApiErrorStatus, useProjects, useSharedWorkspace, useWork
 import { useSourceTypeLabels } from "@/features/sources";
 import { errorMessage } from "@/lib/errors";
 import { formatDate, formatDateTime } from "@/lib/format";
-import { MEMORIES_PATH } from "@/lib/paths";
+import { MEMORIES_PATH, entitySearchPath } from "@/lib/paths";
 import { BackLink, EmptyState, PropertyList, type Property } from "@/patterns";
 import { Button, buttonVariants } from "@/ui/button";
 import { Skeleton } from "@/ui/skeleton";
@@ -66,14 +66,20 @@ function MemoryDetailsCard({ memory, projects, typeLabels }: MemoryDetailsCardPr
   );
 }
 
+/** The entities the memory names, each opening the Entities list searched for that name. */
 function EntitiesCard({ entities }: { entities: readonly string[] }) {
   if (entities.length === 0) return null;
   return (
     <DetailCard title="Entities">
       <ul className="flex flex-wrap gap-1.5">
         {entities.map((entity) => (
-          <li key={entity} className="rounded-md bg-muted px-2 py-0.5 text-xs text-subtle-foreground">
-            {entity}
+          <li key={entity}>
+            <Link
+              to={entitySearchPath(entity)}
+              className="block rounded-md bg-muted px-2 py-0.5 text-xs text-subtle-foreground hover:bg-muted/70 hover:text-foreground"
+            >
+              {entity}
+            </Link>
           </li>
         ))}
       </ul>

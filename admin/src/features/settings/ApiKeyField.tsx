@@ -4,7 +4,7 @@ import { useFormContext } from "react-hook-form";
 import { cn } from "@/lib/cn";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
-import { describedBy } from "./describedBy";
+import { describedBy } from "@/patterns";
 import type { ModelFormValues } from "./model/modelForm";
 import { apiKeyStatus, type SavedKey } from "./model/savedKey";
 

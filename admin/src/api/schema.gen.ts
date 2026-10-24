@@ -422,7 +422,11 @@ export interface paths {
         };
         /**
          * Agent Session Completeness
-         * @description Return window outcome counts and the no_output fraction on demand.
+         * @description Return one Source's window outcome counts and no_output fraction on demand.
+         *
+         *     ``session_id`` narrows the read to one session of that Source. The
+         *     receipts carry failure reasons, so a Source the caller cannot discover
+         *     answers 404 like an unknown one.
          */
         get: operations["agent_session_completeness_api_v1_agent_sessions_completeness_get"];
         put?: never;
@@ -775,6 +779,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/genes/{name}/config-check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Gene Config
+         * @description What saving this configuration would store and refuse, without saving it.
+         *
+         *     It runs save's own steps (``complete`` and every configuration check)
+         *     on a copy, and writes nothing: no Source, no inbox, no encrypted
+         *     secret. ``derived`` holds the declared non-secret fields whose
+         *     effective value the steps change, such as the page tree a pasted
+         *     Confluence page URL names; ``facts`` states what the type can tell
+         *     about the configuration; ``issues`` holds every refusal. With
+         *     ``source_id``, the stored configuration completes the copy as it does
+         *     on update, and the caller needs the access that update needs.
+         */
+        post: operations["check_gene_config_api_v1_genes__name__config_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/genes/{name}/config-schema": {
         parameters: {
             query?: never;
@@ -784,7 +817,10 @@ export interface paths {
         };
         /**
          * Get Gene Config Schema
-         * @description Get the configuration schema for a gene type (for dynamic UI rendering).
+         * @description The form description of a source type, which the admin UI draws without per-type code.
+         *
+         *     Besides what the Gene declares, each field says whether it is a scope
+         *     field and whether it is fixed after create, from the type's descriptor.
          */
         get: operations["get_gene_config_schema_api_v1_genes__name__config_schema_get"];
         put?: never;
@@ -2108,6 +2144,7 @@ export interface paths {
         };
         /**
          * Get Source Agent Evaluation
+         * @deprecated
          * @description Return a bounded, authorized online-assessment view for one Source.
          */
         get: operations["get_source_agent_evaluation_api_v1_sources__source_id__agent_evaluation_get"];
@@ -3026,6 +3063,55 @@ export interface components {
             /** Workspace */
             workspace: string;
         };
+        /**
+         * AgentSessionCompletenessResponse
+         * @description Knowledge completeness of agent-session windows, computed on demand.
+         *
+         *     ``processed_total`` counts the windows that were processed, patched or
+         *     not, and ``no_output_fraction`` is the share of them that kept nothing
+         *     (0 when none was processed). ``total`` also counts failed windows.
+         *     ``latest_failure`` is ``null`` when no window failed. ``source_id`` names
+         *     the Source read, and ``session_id`` echoes the session filter when the
+         *     request named one.
+         */
+        AgentSessionCompletenessResponse: {
+            counts: components["schemas"]["AgentSessionOutcomeCountsResponse"];
+            latest_failure: components["schemas"]["AgentSessionLatestFailureResponse"] | null;
+            /** No Output Fraction */
+            no_output_fraction: number;
+            /** Processed Total */
+            processed_total: number;
+            /** Session Id */
+            session_id: string | null;
+            /** Source Id */
+            source_id: string;
+            /** Total */
+            total: number;
+        };
+        /**
+         * AgentSessionLatestFailureResponse
+         * @description The failed windows, with the reason and time of the latest one.
+         */
+        AgentSessionLatestFailureResponse: {
+            /** Count */
+            count: number;
+            /** Last Seen At */
+            last_seen_at: string | null;
+            /** Reason */
+            reason: string | null;
+        };
+        /**
+         * AgentSessionOutcomeCountsResponse
+         * @description How many processed windows kept a knowledge patch, kept nothing, or failed.
+         */
+        AgentSessionOutcomeCountsResponse: {
+            /** Failed */
+            failed: number;
+            /** Knowledge Patched */
+            knowledge_patched: number;
+            /** No Output */
+            no_output: number;
+        };
         /** AgentSessionWindowRequest */
         AgentSessionWindowRequest: {
             /** Branch */
@@ -3089,6 +3175,43 @@ export interface components {
             /** Status */
             status: string;
         };
+        /** ConfigCheckRequest */
+        ConfigCheckRequest: {
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Source Id */
+            source_id?: string | null;
+        };
+        /** ConfigCheckResponse */
+        ConfigCheckResponse: {
+            /**
+             * Derived
+             * @description Declared non-secret fields whose effective value the save would change, as it would store them.
+             */
+            derived: {
+                [key: string]: unknown;
+            };
+            /** Facts */
+            facts: components["schemas"]["ConfigFactResponse"][];
+            /** Issues */
+            issues: components["schemas"]["FieldIssueResponse"][];
+        };
+        /** ConfigConditionResponse */
+        ConfigConditionResponse: {
+            /** Field */
+            field: string;
+            /** Values */
+            values: string[];
+        };
+        /** ConfigFactResponse */
+        ConfigFactResponse: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+        };
         /** ConfigFieldResponse */
         ConfigFieldResponse: {
             /**
@@ -3097,12 +3220,23 @@ export interface components {
              */
             advanced: boolean;
             /**
+             * Choices
+             * @default []
+             */
+            choices: components["schemas"]["ConfigOptionResponse"][];
+            /**
              * Default
              * @default
              */
             default: string;
             /** Field Type */
             field_type: string;
+            /**
+             * Fixed After Create
+             * @description Chooses the executor; a stored Source keeps it.
+             * @default false
+             */
+            fixed_after_create: boolean;
             /**
              * Group
              * @default general
@@ -3119,6 +3253,8 @@ export interface components {
             label: string;
             /**
              * Options
+             * @deprecated
+             * @description The values of `choices`.
              * @default []
              */
             options: string[];
@@ -3134,12 +3270,31 @@ export interface components {
             placeholder: string;
             /**
              * Required
+             * @description Required while the field is visible.
              * @default true
              */
             required: boolean;
+            /**
+             * Scope
+             * @description Changing it changes which items the Source holds.
+             * @default false
+             */
+            scope: boolean;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
+            /** Widget */
+            widget?: string | null;
         };
         /** ConfigGroupResponse */
         ConfigGroupResponse: {
+            /**
+             * Description
+             * @default
+             */
+            description: string;
             /** Key */
             key: string;
             /** Label */
@@ -3149,6 +3304,44 @@ export interface components {
              * @default 0
              */
             order: number;
+            /**
+             * Panels
+             * @default []
+             */
+            panels: components["schemas"]["ConfigPanelResponse"][];
+            /**
+             * Purpose
+             * @default content
+             * @enum {string}
+             */
+            purpose: "connection" | "content" | "options";
+        };
+        /** ConfigOptionResponse */
+        ConfigOptionResponse: {
+            /**
+             * Help Text
+             * @default
+             */
+            help_text: string;
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
+        };
+        /** ConfigPanelResponse */
+        ConfigPanelResponse: {
+            /** Name */
+            name: string;
+            /**
+             * Visible When
+             * @default []
+             */
+            visible_when: components["schemas"]["ConfigConditionResponse"][];
         };
         /** ConversationArtifactLinkRequest */
         ConversationArtifactLinkRequest: {
@@ -3464,6 +3657,23 @@ export interface components {
              */
             thresholds_calibrated: boolean;
         };
+        /**
+         * EntityAliasAddedResponse
+         * @description The manual alias as given and the normalised form that matching reads.
+         */
+        EntityAliasAddedResponse: {
+            /** Alias */
+            alias: string;
+            /** Alias Normalized */
+            alias_normalized: string;
+            /** Ok */
+            ok: boolean;
+        };
+        /** EntityAliasListResponse */
+        EntityAliasListResponse: {
+            /** Data */
+            data: components["schemas"]["EntityAliasResponse"][];
+        };
         /** EntityAliasResponse */
         EntityAliasResponse: {
             /** Alias */
@@ -3508,6 +3718,12 @@ export interface components {
             /** Total */
             total: number;
         };
+        /** EntityMergeResponse */
+        EntityMergeResponse: {
+            merged: components["schemas"]["MergedEntitiesResponse"];
+            /** Ok */
+            ok: boolean;
+        };
         /** EntityResponse */
         EntityResponse: {
             /** Canonical Name */
@@ -3518,6 +3734,13 @@ export interface components {
             display_name: string;
             /** Id */
             id: number;
+        };
+        /** FieldIssueResponse */
+        FieldIssueResponse: {
+            /** Key */
+            key: string | null;
+            /** Message */
+            message: string;
         };
         /** GeneConfigSchemaResponse */
         GeneConfigSchemaResponse: {
@@ -3531,6 +3754,8 @@ export interface components {
              * @default []
              */
             groups: components["schemas"]["ConfigGroupResponse"][];
+            /** Project Field */
+            project_field?: string | null;
         };
         /** GeneMetadataResponse */
         GeneMetadataResponse: {
@@ -3546,8 +3771,103 @@ export interface components {
             display_name: string;
             /** Execution Kinds */
             execution_kinds: ("server" | "local_agent")[];
+            /**
+             * Managed
+             * @description Managed capture, created by the service; the type picker leaves it out.
+             */
+            managed: boolean;
             /** Name */
             name: string;
+        };
+        /**
+         * GitHubRepoPreviewCounts
+         * @description Files the configured paths and extensions include, and files they leave out.
+         */
+        GitHubRepoPreviewCounts: {
+            /** Ignored */
+            ignored: number;
+            /** Included */
+            included: number;
+        };
+        /**
+         * GitHubRepoPreviewItem
+         * @description One repository file the Source would read.
+         *
+         *     ``relative_path`` is the path the Source names the file by. When it is a
+         *     symbolic link, ``symlink_chain`` lists the links followed and
+         *     ``resolved_relative_path`` is the file whose content is read.
+         */
+        GitHubRepoPreviewItem: {
+            /** Blob Sha */
+            blob_sha: string;
+            /** Bytes */
+            bytes: number;
+            /** Content Type */
+            content_type: string;
+            /** File Mode */
+            file_mode: string;
+            /** Logical File Mode */
+            logical_file_mode: string;
+            /** Relative Path */
+            relative_path: string;
+            /** Resolved Relative Path */
+            resolved_relative_path: string | null;
+            /** Symlink Chain */
+            symlink_chain: components["schemas"]["GitHubSymlinkHop"][];
+        };
+        /**
+         * GitHubRepoPreviewTreeResult
+         * @description A remote repository's tree as the daemon's Git access reads it.
+         *
+         *     The daemon lists the whole tree at ``commit_sha`` of ``ref`` with the
+         *     configured include and exclude paths cleared, so the folder picker can
+         *     offer every folder. ``items`` holds at most the requested number of files,
+         *     and ``counts`` counts all of them. ``extension_counts`` counts the
+         *     included files by extension.
+         */
+        GitHubRepoPreviewTreeResult: {
+            /** Commit Sha */
+            commit_sha: string;
+            counts: components["schemas"]["GitHubRepoPreviewCounts"];
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /** Exclude Paths */
+            exclude_paths: string[];
+            /** Extension Counts */
+            extension_counts: {
+                [key: string]: number;
+            };
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /** Include Extensions */
+            include_extensions: string[];
+            /** Include Paths */
+            include_paths: string[];
+            /** Items */
+            items: components["schemas"]["GitHubRepoPreviewItem"][];
+            /** Operation */
+            operation: string;
+            /** Profile */
+            profile: string;
+            /** Ref */
+            ref: string;
+            /** Repo Url */
+            repo_url: string;
+            /** Root Tree Sha */
+            root_tree_sha: string;
+            /** Source Id */
+            source_id: string;
         };
         /** GitHubRepoTreeItemResponse */
         GitHubRepoTreeItemResponse: {
@@ -3591,6 +3911,18 @@ export interface components {
             source_type: "github_repo";
             /** Truncated */
             truncated: boolean;
+        };
+        /**
+         * GitHubSymlinkHop
+         * @description One symbolic link followed on the way to a file's content.
+         */
+        GitHubSymlinkHop: {
+            /** Blob Sha */
+            blob_sha: string;
+            /** Path */
+            path: string;
+            /** Target Path */
+            target_path: string;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -3644,6 +3976,66 @@ export interface components {
             document_count: number;
             /** Source Count */
             source_count: number;
+        };
+        /**
+         * JiraAuthResult
+         * @description A Jira browser session captured on the user's computer and stored for the Source.
+         *
+         *     On success ``authenticated`` is true and ``origin`` is the Jira site the
+         *     session belongs to. ``error`` is ``principal_changed`` when the user signed
+         *     in as a different Jira account than the one the stored session names;
+         *     ``old_principal_id`` and ``new_principal_id`` then name both accounts.
+         *     ``retryable`` is false for every failure, because renewing again needs the
+         *     user at the browser.
+         */
+        JiraAuthResult: {
+            /**
+             * Authenticated
+             * @default null
+             */
+            authenticated: boolean | null;
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /**
+             * New Principal Id
+             * @default null
+             */
+            new_principal_id: string | null;
+            /**
+             * Old Principal Id
+             * @default null
+             */
+            old_principal_id: string | null;
+            /** Operation */
+            operation: string;
+            /**
+             * Origin
+             * @default null
+             */
+            origin: string | null;
+            /**
+             * Retryable
+             * @default null
+             */
+            retryable: boolean | null;
+            /**
+             * Source Id
+             * @default null
+             */
+            source_id: string | null;
         };
         /** JiraSessionExpireRequest */
         JiraSessionExpireRequest: {
@@ -3874,6 +4266,113 @@ export interface components {
              * @constant
              */
             status: "queued";
+        };
+        /**
+         * LocalMarkdownPickRootResult
+         * @description The folder the user chose in the daemon's native folder picker.
+         *
+         *     ``root`` is the chosen absolute path. ``cancelled`` is true when the user
+         *     closed the picker without choosing, which is not a failure. A daemon with
+         *     no native picker fails the job and asks for the path to be typed instead.
+         */
+        LocalMarkdownPickRootResult: {
+            /**
+             * Cancelled
+             * @default null
+             */
+            cancelled: boolean | null;
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /** Operation */
+            operation: string;
+            /**
+             * Root
+             * @default null
+             */
+            root: string | null;
+        };
+        /**
+         * LocalMarkdownPreviewCounts
+         * @description Files the scan read, and files it left out by reason.
+         */
+        LocalMarkdownPreviewCounts: {
+            /** Ignored */
+            ignored: number;
+            /** Included */
+            included: number;
+            /** Invalid Utf8 */
+            invalid_utf8: number;
+            /** Too Large */
+            too_large: number;
+            /** Unreadable */
+            unreadable: number;
+        };
+        /**
+         * LocalMarkdownPreviewItem
+         * @description One file under the folder that the Source would read.
+         */
+        LocalMarkdownPreviewItem: {
+            /** Bytes */
+            bytes: number;
+            /** Content Type */
+            content_type: string;
+            /** Raw Hash */
+            raw_hash: string;
+            /** Relative Path */
+            relative_path: string;
+            /** Title */
+            title: string;
+        };
+        /**
+         * LocalMarkdownPreviewTreeResult
+         * @description The files under a local folder that the configured patterns select.
+         *
+         *     ``root`` is the resolved folder and ``vault_id`` the identity its
+         *     Documents are stored under. ``items`` holds at most the requested number
+         *     of files, and ``counts`` counts all of them.
+         */
+        LocalMarkdownPreviewTreeResult: {
+            counts: components["schemas"]["LocalMarkdownPreviewCounts"];
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /** Items */
+            items: components["schemas"]["LocalMarkdownPreviewItem"][];
+            /** Operation */
+            operation: string;
+            /** Profile */
+            profile: string;
+            /** Root */
+            root: string;
+            /** Source Id */
+            source_id: string;
+            /** Vault Id */
+            vault_id: string;
         };
         /**
          * LocalSourceConfirmationAnswerRequest
@@ -4946,6 +5445,20 @@ export interface components {
             /** Target Id */
             target_id: number;
         };
+        /**
+         * MergedEntitiesResponse
+         * @description The two Entities a merge joined: the source is gone, the target holds its references.
+         */
+        MergedEntitiesResponse: {
+            /** Source Id */
+            source_id: number;
+            /** Source Name */
+            source_name: string;
+            /** Target Id */
+            target_id: number;
+            /** Target Name */
+            target_name: string;
+        };
         /** ModelApiKeyStatus */
         ModelApiKeyStatus: {
             /**
@@ -5309,6 +5822,14 @@ export interface components {
             };
             /** Passed */
             passed: boolean;
+        };
+        /**
+         * OkResponse
+         * @description A change that reports only that it was made.
+         */
+        OkResponse: {
+            /** Ok */
+            ok: boolean;
         };
         /** ProjectCreateRequest */
         ProjectCreateRequest: {
@@ -5783,6 +6304,23 @@ export interface components {
             /** Why Human */
             why_human: string;
         };
+        /** SourceAccessTransitionOperationResponse */
+        SourceAccessTransitionOperationResponse: {
+            transition: components["schemas"]["SourceAccessTransitionResponse"];
+        };
+        /**
+         * SourceAccessTransitionQueuedResponse
+         * @description A retry or revert admitted for the operation's worker.
+         */
+        SourceAccessTransitionQueuedResponse: {
+            /** Operation Id */
+            operation_id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "queued";
+        };
         /** SourceAccessTransitionRequest */
         SourceAccessTransitionRequest: {
             /**
@@ -5791,7 +6329,17 @@ export interface components {
              */
             target_policy: "private" | "workspace";
         };
-        /** SourceAccessTransitionResponse */
+        /**
+         * SourceAccessTransitionResponse
+         * @description One durable change of a Source's access policy across its whole history.
+         *
+         *     The operation is ``queued`` until its worker starts, ``running`` while it
+         *     re-projects the Source's Memories, and ends ``completed``. A ``failed``
+         *     operation leaves the Source paused until its owner retries it or reverts
+         *     it to ``previous_policy``, which ends it ``reverted``.
+         *     ``processed_memories`` counts the Memories re-projected so far, out of
+         *     ``total_memories``.
+         */
         SourceAccessTransitionResponse: {
             /** Completed At */
             completed_at?: string | null;
@@ -5856,6 +6404,27 @@ export interface components {
              * @enum {string}
              */
             state: "ready" | "action_required";
+        };
+        /** SourceCreatedResponse */
+        SourceCreatedResponse: {
+            /**
+             * Access Policy
+             * @enum {string}
+             */
+            access_policy: "private" | "workspace";
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+        };
+        /**
+         * SourceCurrentAccessTransitionResponse
+         * @description The Source's unfinished access operation, or ``null`` when there is none.
+         */
+        SourceCurrentAccessTransitionResponse: {
+            transition: components["schemas"]["SourceAccessTransitionResponse"] | null;
         };
         /** SourceExecutionResponse */
         SourceExecutionResponse: {
@@ -5972,6 +6541,16 @@ export interface components {
              * @enum {string}
              */
             viewer_role: "owner" | "workspace_admin" | "member" | "viewer";
+        };
+        /**
+         * SourcePinResponse
+         * @description Whether the Source is now pinned in the caller's Source List.
+         */
+        SourcePinResponse: {
+            /** Pinned */
+            pinned: boolean;
+            /** Source Id */
+            source_id: string;
         };
         /** SourceProjectResponse */
         SourceProjectResponse: {
@@ -6253,6 +6832,17 @@ export interface components {
             /** Updated At */
             updated_at: string;
         };
+        /**
+         * SourceSubscriptionChangeResponse
+         * @description The caller's subscription to the Source after the change.
+         */
+        SourceSubscriptionChangeResponse: {
+            /** Ok */
+            ok: boolean;
+            /** Source Id */
+            source_id: string;
+            subscription: components["schemas"]["SourceSubscriptionResponse"];
+        };
         /** SourceSubscriptionRequest */
         SourceSubscriptionRequest: {
             /** Enabled */
@@ -6367,6 +6957,19 @@ export interface components {
             run_id: string;
             /** Source Id */
             source_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "running" | "success" | "failed";
+        };
+        /**
+         * SourceSyncRunStateResponse
+         * @description Where one admitted sync run stands, read without advancing it.
+         */
+        SourceSyncRunStateResponse: {
+            /** Run Id */
+            run_id: string;
             /**
              * Status
              * @enum {string}
@@ -6505,6 +7108,13 @@ export interface components {
             /** Source Id */
             source_id: string;
         };
+        /** SourceUpdatedResponse */
+        SourceUpdatedResponse: {
+            /** Id */
+            id: string;
+            /** Ok */
+            ok: boolean;
+        };
         /** StatsResponse */
         StatsResponse: {
             /** Memories By Status */
@@ -6560,6 +7170,161 @@ export interface components {
             role: "sentinel" | "development" | "release_holdout";
             /** Selection Policy Version */
             selection_policy_version: string;
+        };
+        /**
+         * TeamsAuthCheckResult
+         * @description Whether the daemon holds a usable Teams session, without opening a browser.
+         *
+         *     ``expires_in_minutes`` is the time left on the session's soonest-expiring
+         *     token, or ``null`` when there is no usable session. A missing or expired
+         *     session is reported through ``authenticated: false`` and ``error``.
+         */
+        TeamsAuthCheckResult: {
+            /** Authenticated */
+            authenticated: boolean;
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /** Expires In Minutes */
+            expires_in_minutes: number | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /** Operation */
+            operation: string;
+            /** Region */
+            region: string;
+        };
+        /**
+         * TeamsAuthResult
+         * @description A Teams sign-in through a browser window on the user's computer.
+         *
+         *     On success ``authenticated`` is true and ``token_count`` counts the
+         *     tokens the session holds.
+         */
+        TeamsAuthResult: {
+            /** Authenticated */
+            authenticated: boolean;
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /** Operation */
+            operation: string;
+            /** Region */
+            region: string;
+            /**
+             * Token Count
+             * @default null
+             */
+            token_count: number | null;
+        };
+        /**
+         * TeamsBrowseResult
+         * @description The Teams conversations a Source can read, for the conversation picker.
+         *
+         *     Names follow Teams' own fields (``displayName``, ``lastActivity``).
+         *     Group and individual chats are listed by latest activity first. An
+         *     expired session is renewed once through a browser sign-in before the job
+         *     fails; the four lists are absent from a failed job.
+         */
+        TeamsBrowseResult: {
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Favorites
+             * @default null
+             */
+            favorites: components["schemas"]["TeamsConversationOption"][] | null;
+            /**
+             * Group Chats
+             * @default null
+             */
+            group_chats: components["schemas"]["TeamsConversationOption"][] | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /**
+             * Individual Chats
+             * @default null
+             */
+            individual_chats: components["schemas"]["TeamsConversationOption"][] | null;
+            /** Operation */
+            operation: string;
+            /** Region */
+            region: string;
+            /**
+             * Teams
+             * @default null
+             */
+            teams: components["schemas"]["TeamsTeamOption"][] | null;
+        };
+        /** TeamsChannelOption */
+        TeamsChannelOption: {
+            /** Displayname */
+            displayName: string;
+            /** Id */
+            id: string;
+        };
+        /**
+         * TeamsConversationOption
+         * @description A chat or a favourite channel, named by its topic.
+         *
+         *     ``lastActivity`` is the time of the latest message as ISO 8601, when
+         *     Teams reports one; a favourite carries no time.
+         */
+        TeamsConversationOption: {
+            /** Id */
+            id: string;
+            /**
+             * Lastactivity
+             * @default null
+             */
+            lastActivity: string | null;
+            /** Topic */
+            topic: string;
+        };
+        /**
+         * TeamsTeamOption
+         * @description A team the user belongs to, with the channels a Source can read.
+         */
+        TeamsTeamOption: {
+            /** Channels */
+            channels: components["schemas"]["TeamsChannelOption"][];
+            /** Displayname */
+            displayName: string;
+            /** Id */
+            id: string;
         };
         /** UnqueuedSource */
         UnqueuedSource: {
@@ -7406,9 +8171,9 @@ export interface operations {
     };
     agent_session_completeness_api_v1_agent_sessions_completeness_get: {
         parameters: {
-            query?: {
+            query: {
+                source_id: string;
                 session_id?: string | null;
-                source_id?: string | null;
             };
             header?: never;
             path?: never;
@@ -7422,7 +8187,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["AgentSessionCompletenessResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7827,7 +8592,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["EntityMergeResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7889,7 +8654,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["EntityAliasListResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7924,7 +8689,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["EntityAliasAddedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -7956,7 +8721,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["OkResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8010,6 +8775,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GitHubRepoTreeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_gene_config_api_v1_genes__name__config_check_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConfigCheckRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfigCheckResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9814,7 +10614,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceCreatedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9909,7 +10709,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceUpdatedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -9971,7 +10771,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceCurrentAccessTransitionResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10008,7 +10808,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceAccessTransitionResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10040,7 +10840,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceAccessTransitionOperationResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10072,7 +10872,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceAccessTransitionQueuedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10104,7 +10904,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceAccessTransitionQueuedResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10454,7 +11254,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceSyncRunReceiptResponse"] | components["schemas"]["LocalCollectionReceiptResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10619,7 +11419,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourcePinResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10650,7 +11450,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourcePinResponse"];
                 };
             };
             /** @description Validation Error */
@@ -10958,7 +11758,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceSubscriptionChangeResponse"];
                 };
             };
             /** @description Validation Error */
@@ -11025,7 +11825,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["SourceSyncRunStateResponse"];
                 };
             };
             /** @description Validation Error */

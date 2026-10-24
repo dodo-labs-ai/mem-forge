@@ -31,6 +31,24 @@ export interface LocalAgentJobResult {
 export type LocalAgentJob = Omit<Schemas["LocalAgentJobResponse"], "result"> & { result: LocalAgentJobResult };
 
 /**
+ * The result each local setup job reports once it has succeeded, keyed by
+ * operation. Every field its model declares is present, as null when unset.
+ * On failure, read `result.error` when it is present, otherwise the job's
+ * `last_error`.
+ */
+export interface SetupJobResults {
+  github_repo_preview_tree: Schemas["GitHubRepoPreviewTreeResult"];
+  jira_auth: Schemas["JiraAuthResult"];
+  local_markdown_pick_root: Schemas["LocalMarkdownPickRootResult"];
+  local_markdown_preview_tree: Schemas["LocalMarkdownPreviewTreeResult"];
+  teams_auth: Schemas["TeamsAuthResult"];
+  teams_auth_check: Schemas["TeamsAuthCheckResult"];
+  teams_browse: Schemas["TeamsBrowseResult"];
+}
+
+export type SetupJobOperation = keyof SetupJobResults;
+
+/**
  * What a model validation observed. The server sends these as a free-form
  * object, and a failed validation is only certain to carry `latency_ms`.
  */

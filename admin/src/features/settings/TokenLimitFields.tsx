@@ -1,7 +1,6 @@
 import { useFormContext } from "react-hook-form";
 import { Input } from "@/ui/input";
-import { describedBy } from "./describedBy";
-import { FormField } from "./FormField";
+import { describedBy, FormField } from "@/patterns";
 import type { ModelFormValues } from "./model/modelForm";
 import { tokenLimitField } from "./model/providerFields";
 

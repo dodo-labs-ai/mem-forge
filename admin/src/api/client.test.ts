@@ -108,8 +108,17 @@ describe("unwrap", () => {
     const response = new Response(null, { status: 403 });
     const error = { detail: { error: "project_management_forbidden", message: "Only a workspace admin can change projects." } };
     await expect(unwrap(Promise.resolve({ error, response }))).rejects.toEqual(
-      new ApiError(403, "Only a workspace admin can change projects.", "project_management_forbidden"),
+      new ApiError(403, "Only a workspace admin can change projects.", "project_management_forbidden", error.detail),
     );
+  });
+
+  test("keeps what a coded refusal carries beyond its code and message", async () => {
+    const response = new Response(null, { status: 400 });
+    const detail = { code: "config_invalid", message: "Wiki URL is required.", fields: [{ key: "base_url", message: "Wiki URL is required." }] };
+    const refused = await unwrap(Promise.resolve({ error: { detail }, response })).catch((caught: unknown) => caught);
+
+    expect(refused).toEqual(new ApiError(400, "Wiki URL is required.", "config_invalid", detail));
+    expect((refused as ApiError).detail.fields).toEqual(detail.fields);
   });
 
   test("explains a change refused while the search index is rebuilt, and keeps its code", async () => {
@@ -127,6 +136,7 @@ describe("unwrap", () => {
         409,
         "The search index is being rebuilt, so this change has to wait. Try again when the rebuild has finished. Settings shows its progress.",
         "reindex_in_progress",
+        error.detail,
       ),
     );
     expect(isReindexInProgress(refused)).toBe(true);
@@ -142,7 +152,7 @@ describe("unwrap", () => {
         (caught: unknown) => caught,
       );
 
-      expect(refused).toEqual(new ApiError(409, message, code));
+      expect(refused).toEqual(new ApiError(409, message, code, { error: code, message }));
       expect(isSearchIndexRefusal(refused)).toBe(true);
       expect(isReindexInProgress(refused)).toBe(false);
     }

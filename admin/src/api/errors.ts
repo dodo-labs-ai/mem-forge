@@ -3,12 +3,19 @@ export class ApiError extends Error {
   readonly status: number;
   /** The code of a coded refusal, such as `reindex_in_progress`; `null` when the server named none. */
   readonly code: string | null;
+  /**
+   * A coded refusal's whole `detail`, which can carry more than its code and
+   * message, such as the field issues of `config_invalid` or the `run_id` of
+   * `source_sync_running`; empty when the body's `detail` is not an object.
+   */
+  readonly detail: Readonly<Record<string, unknown>>;
 
-  constructor(status: number, message: string, code: string | null = null) {
+  constructor(status: number, message: string, code: string | null = null, detail: Readonly<Record<string, unknown>> = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -78,6 +85,13 @@ export function errorCodeOf(body: unknown): string | null {
   if (!detail || typeof detail !== "object") return null;
   const code = "error" in detail ? (detail as { error: unknown }).error : (detail as { code?: unknown }).code;
   return typeof code === "string" && code !== "" ? code : null;
+}
+
+/** A coded refusal's `detail` object; empty when the body has none. */
+export function errorDetailOf(body: unknown): Readonly<Record<string, unknown>> {
+  if (!body || typeof body !== "object" || !("detail" in body)) return {};
+  const detail = (body as { detail: unknown }).detail;
+  return detail && typeof detail === "object" && !Array.isArray(detail) ? (detail as Record<string, unknown>) : {};
 }
 
 /** Turns a FastAPI error body into one readable sentence. */

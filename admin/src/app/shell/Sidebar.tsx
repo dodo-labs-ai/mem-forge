@@ -11,6 +11,18 @@ import { APP_NAME } from "./pageTitle";
 const itemClass =
   "flex h-8 items-center gap-2.5 rounded-md px-2.5 text-sm text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0 [&_svg]:text-muted-foreground";
 const activeClass = "bg-sidebar-accent font-medium text-sidebar-accent-foreground [&_svg]:text-sidebar-accent-foreground";
+/** The largest count a badge spells out; anything above it reads as "99+". */
+const BADGE_CAP = 99;
+
+function NavBadge({ useCount }: { useCount: () => number | null }) {
+  const count = useCount();
+  if (count === null || count <= 0) return null;
+  return (
+    <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-muted px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+      {count > BADGE_CAP ? `${BADGE_CAP}+` : count}
+    </span>
+  );
+}
 
 function ProductNavLink({ item }: { item: NavItem }) {
   const extension = useExtension();
@@ -21,6 +33,7 @@ function ProductNavLink({ item }: { item: NavItem }) {
     <NavLink to={redirect?.to ?? `/${item.segment}`} className={({ isActive }) => cn(itemClass, isActive && activeClass)}>
       <Icon />
       <span className="flex-1 truncate">{item.label}</span>
+      {item.useBadge ? <NavBadge useCount={item.useBadge} /> : null}
     </NavLink>
   );
 }

@@ -1,12 +1,13 @@
 import { useMemo } from "react";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { unwrap, useApi, type Source, type SourceListSortMode } from "@/api";
+import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { unwrap, useApi, type ApiClient, type Source, type SourceListSortMode } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { ACTIVE_POLL_MS } from "./constants";
+import type { AccessPolicy } from "./model/sourceAccess";
 import type { SourceSyncRetryTarget } from "./model/sourceSyncActivity";
 import { sourceProjectBinding } from "./model/projectBinding";
 import { sourcesByProjectKey, type ResolvedBySource } from "./model/projectGrouping";
-import type { LocalAgentJob } from "./model/types";
+import type { LocalAgentJob, SourceEvaluationHealth } from "./model/types";
 
 export const sourceKeys = {
   all: ["sources"] as const,
@@ -14,7 +15,14 @@ export const sourceKeys = {
   imageDocuments: ["sources", "image-documents"] as const,
   preferences: ["sources", "preferences"] as const,
   types: ["genes"] as const,
+  configSchema: (sourceType: string) => ["genes", sourceType, "config-schema"] as const,
 };
+
+/** The days of online evaluation the rows and the drawer summarize. */
+const EVALUATION_HEALTH_DAYS = 1;
+/** How long that evaluation is reused before it is read again. */
+const EVALUATION_HEALTH_STALE_MS = 60_000;
+const EMPTY_HEALTH: ReadonlyMap<string, SourceEvaluationHealth> = new Map();
 
 const EMPTY_SOURCES: Source[] = [];
 const EMPTY_JOBS: LocalAgentJob[] = [];
@@ -54,25 +62,34 @@ export function useLocalSyncJobs() {
   return { ...query, jobs: query.data ?? EMPTY_JOBS };
 }
 
+/** The registered source types, with their display names, where they run and whether the service manages them. */
+export function useSourceTypes() {
+  const api = useApi();
+  return useQuery({ queryKey: sourceKeys.types, queryFn: () => unwrap(api.GET("/api/v1/genes")) });
+}
+
 /** Display names of source types, such as "Confluence" for `confluence`. */
 export function useSourceTypeLabels(): Record<string, string> {
-  const api = useApi();
-  const genes = useQuery({ queryKey: sourceKeys.types, queryFn: () => unwrap(api.GET("/api/v1/genes")) });
+  const genes = useSourceTypes();
   return useMemo(
     () => Object.fromEntries((genes.data ?? []).map((gene) => [gene.name, gene.display_name])),
     [genes.data],
   );
 }
 
+/** A source type's form description, which does not change while the app runs. */
+export function configSchemaQuery(api: ApiClient, sourceType: string) {
+  return queryOptions({
+    queryKey: sourceKeys.configSchema(sourceType),
+    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType } } })),
+    staleTime: Infinity,
+  });
+}
+
 /** The labels a source type's configuration gives its fields, keyed by field, such as "Spaces" for `spaces`. */
 export function useSourceConfigLabels(sourceType: string | null): Record<string, string> {
   const api = useApi();
-  const schema = useQuery({
-    queryKey: [...sourceKeys.types, sourceType, "config-schema"],
-    queryFn: () => unwrap(api.GET("/api/v1/genes/{name}/config-schema", { params: { path: { name: sourceType! } } })),
-    enabled: sourceType !== null,
-    staleTime: Infinity,
-  });
+  const schema = useQuery({ ...configSchemaQuery(api, sourceType ?? ""), enabled: sourceType !== null });
   return useMemo(
     () => Object.fromEntries((schema.data?.fields ?? []).map((field) => [field.key, field.label])),
     [schema.data],
@@ -98,11 +115,52 @@ export function useResolvedProjects(sources: Source[]): ResolvedBySource {
   return resolved;
 }
 
+/** How an agent-session Source's windows turned out: kept as memory, skipped as low-signal, or failed. */
+export function useAgentSessionCompleteness(sourceId: string) {
+  const api = useApi();
+  return useQuery({
+    queryKey: [...sourceKeys.all, "agent-session-completeness", sourceId],
+    queryFn: () => unwrap(api.GET("/api/v1/agent-sessions/completeness", { params: { query: { source_id: sourceId } } })),
+  });
+}
+
+/** The projects a Source's documents were filed under, each with its document and memory counts. */
+export function useSourceProjects(sourceId: string) {
+  const api = useApi();
+  return useQuery({
+    queryKey: [...sourceKeys.all, "projects", sourceId],
+    queryFn: () => unwrap(api.GET("/api/v1/sources/{source_id}/projects", { params: { path: { source_id: sourceId } } })),
+    select: (response) => response.projects,
+  });
+}
+
 /** The sources that send memories to each project, keyed by project key. */
 export function useProjectSources() {
   const sourcesQuery = useSources();
   const resolved = useResolvedProjects(sourcesQuery.sources);
   return { ...sourcesQuery, byProject: sourcesByProjectKey(sourcesQuery.sources, resolved) };
+}
+
+// One reference for every caller, so the map is built once per response.
+const healthBySource = (overview: { sources: readonly SourceEvaluationHealth[] }) =>
+  new Map(overview.sources.map((health) => [health.source_id, health]));
+
+/**
+ * The online evaluation of each source the viewer can discover over the last
+ * day, by source id. A source without an entry, or one the evaluation cannot
+ * be read for, shows nothing.
+ */
+export function useSourceEvaluationHealth(): ReadonlyMap<string, SourceEvaluationHealth> {
+  const api = useApi();
+  const query = useQuery({
+    // Kept apart from the source keys, which every source write refreshes.
+    queryKey: ["source-evaluation-health", EVALUATION_HEALTH_DAYS] as const,
+    queryFn: () =>
+      unwrap(api.GET("/api/v1/agent-evaluations/online-overview", { params: { query: { days: EVALUATION_HEALTH_DAYS } } })),
+    select: healthBySource,
+    staleTime: EVALUATION_HEALTH_STALE_MS,
+  });
+  return query.data ?? EMPTY_HEALTH;
 }
 
 export function useSourceListPreferences() {
@@ -306,6 +364,18 @@ export function useSyncSource() {
 }
 
 /**
+ * Starts a full sync: the server, or the device of a source that runs on
+ * one, lists the whole source again and processes every document, unchanged
+ * ones included.
+ */
+export function useFullSync() {
+  const api = useApi();
+  return useSourceMutation((sourceId: string) =>
+    unwrap(api.POST("/api/v1/sources/{source_id}/force-resync", { params: { path: { source_id: sourceId } } })),
+  );
+}
+
+/**
  * Stops the source's sync in progress: a server run, or the local sync job of
  * its device. The source stays active, and its next sync runs as usual.
  */
@@ -326,5 +396,58 @@ export function useDeleteSource() {
   const api = useApi();
   return useSourceMutation((sourceId: string) =>
     unwrap(api.DELETE("/api/v1/sources/{source_id}", { params: { path: { source_id: sourceId } } })),
+  );
+}
+
+/**
+ * Starts changing who can use a source, across its whole history. The
+ * server answers at once and re-shares the source's memories in the
+ * background; the source list follows it while it runs. `requestId` makes a
+ * repeated request start the same change, not a second one.
+ */
+export function useChangeSourceAccess() {
+  const api = useApi();
+  return useSourceMutation(
+    ({ sourceId, targetPolicy, requestId }: { sourceId: string; targetPolicy: AccessPolicy; requestId: string }) =>
+      unwrap(
+        api.POST("/api/v1/sources/{source_id}/access-transitions", {
+          params: { path: { source_id: sourceId }, header: { "Idempotency-Key": requestId } },
+          body: { target_policy: targetPolicy },
+        }),
+      ),
+  );
+}
+
+/** How long a retry or revert is followed until the server's worker picks it up. */
+const SETTLE_PICKUP_MS = 30_000;
+
+/**
+ * Settles a failed access change: `retry` runs it again, and `revert`
+ * returns every memory to the policy the source had before it. The server
+ * queues either one, so this follows the source's current access change
+ * until the worker has picked it up; the refreshed source list then follows
+ * it while it runs.
+ */
+export function useSettleSourceAccess() {
+  const api = useApi();
+  return useSourceMutation(
+    async ({ source, settle }: { source: Source; settle: "retry" | "revert" }) => {
+      const failed = source.access_transition;
+      if (!failed) throw new Error("This source has no access change to settle.");
+      const path = { source_id: source.id, operation_id: failed.operation_id };
+      await unwrap(
+        settle === "retry"
+          ? api.POST("/api/v1/sources/{source_id}/access-transitions/{operation_id}/retry", { params: { path } })
+          : api.POST("/api/v1/sources/{source_id}/access-transitions/{operation_id}/revert", { params: { path } }),
+      );
+      const deadline = Date.now() + SETTLE_PICKUP_MS;
+      while (Date.now() < deadline) {
+        const { transition } = await unwrap(
+          api.GET("/api/v1/sources/{source_id}/access-transition", { params: { path: { source_id: source.id } } }),
+        );
+        if (transition?.status !== "failed" || transition.updated_at !== failed.updated_at) return;
+        await new Promise((resolve) => window.setTimeout(resolve, ACTIVE_POLL_MS));
+      }
+    },
   );
 }

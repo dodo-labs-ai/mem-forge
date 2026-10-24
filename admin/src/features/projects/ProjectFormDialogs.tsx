@@ -19,7 +19,7 @@ import {
   type EditProjectInput,
   type EditProjectValues,
 } from "./model/projectForm";
-import type { Project } from "./model/types";
+import type { Project, ProjectResponse } from "./model/types";
 
 const DIALOG_WIDTH = "sm:max-w-lg";
 
@@ -58,17 +58,26 @@ function Field({
   );
 }
 
-export function CreateProjectDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
+export function CreateProjectDialog({
+  open,
+  onOpenChange,
+  onCreated,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** Called with the new project once it is created, such as to select it in the form that opened the dialog. */
+  onCreated?: (project: ProjectResponse) => void;
+}) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className={DIALOG_WIDTH}>
-        {open ? <CreateProjectForm onClose={() => onOpenChange(false)} /> : null}
+        {open ? <CreateProjectForm onClose={() => onOpenChange(false)} onCreated={onCreated} /> : null}
       </DialogContent>
     </Dialog>
   );
 }
 
-function CreateProjectForm({ onClose }: { onClose: () => void }) {
+function CreateProjectForm({ onClose, onCreated }: { onClose: () => void; onCreated?: (project: ProjectResponse) => void }) {
   const ids = useId();
   const nameId = `${ids}-name`;
   const codeId = `${ids}-code`;
@@ -89,6 +98,7 @@ function CreateProjectForm({ onClose }: { onClose: () => void }) {
     try {
       const created = await createProject.mutateAsync(createProjectBody(values));
       toast.success(`Project “${created.name}” created`);
+      onCreated?.(created);
       onClose();
     } catch (error) {
       setServerError(errorMessage(error));

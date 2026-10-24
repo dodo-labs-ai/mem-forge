@@ -41,9 +41,12 @@ from memforge.local_agent.jira_contract import validate_jira_observation_identit
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, source_time_iso
 from memforge.models import (
     AbsenceAnswer,
+    ConfigCondition,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
+    ConfigOption,
+    ConfigPanel,
     ContentItem,
     GeneConfigSchema,
     GeneMetadata,
@@ -477,8 +480,19 @@ class JiraGene(DocumentGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="scope", label="What to Sync", order=1),
+                ConfigGroup(
+                    key="connection",
+                    label="Jira access",
+                    order=0,
+                    purpose="connection",
+                    panels=[
+                        ConfigPanel(
+                            "jira_session",
+                            (ConfigCondition("auth_mode", (JIRA_AUTH_MODE_COOKIE,)),),
+                        ),
+                    ],
+                ),
+                ConfigGroup(key="scope", label="Issues to sync", order=1, purpose="content"),
             ],
             fields=[
                 ConfigField(
@@ -488,9 +502,30 @@ class JiraGene(DocumentGene):
                     group="connection", order=0,
                 ),
                 ConfigField(
+                    key="sync_mode", label="Sync Location",
+                    field_type=ConfigFieldType.SELECT, required=False,
+                    choices=[
+                        ConfigOption("cloud", "Cloud"),
+                        ConfigOption("local_agent", "Local sync"),
+                    ],
+                    default="cloud",
+                    help_text=(
+                        "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync "
+                        "from the machine where the daemon is running, useful for VPN-only Jira."
+                    ),
+                    group="connection", order=1,
+                ),
+                ConfigField(
                     key="auth_mode", label="Authentication Method",
                     field_type=ConfigFieldType.SELECT, required=True,
-                    options=[JIRA_AUTH_MODE_COOKIE, JIRA_AUTH_MODE_PAT],
+                    choices=[
+                        ConfigOption(JIRA_AUTH_MODE_COOKIE, "Browser session"),
+                        ConfigOption(
+                            JIRA_AUTH_MODE_PAT,
+                            "Personal access token",
+                            visible_when=(ConfigCondition("sync_mode", ("cloud",)),),
+                        ),
+                    ],
                     default=JIRA_AUTH_MODE_COOKIE,
                     help_text=(
                         "Browser session uses the local CLI adapter "
@@ -500,23 +535,15 @@ class JiraGene(DocumentGene):
                         "mode is only for Jira deployments that grant the user REST API "
                         "quota."
                     ),
-                    group="connection", order=1,
-                ),
-                ConfigField(
-                    key="sync_mode", label="Sync Location",
-                    field_type=ConfigFieldType.SELECT, required=False,
-                    options=["cloud", "local_agent"],
-                    default="cloud",
-                    help_text=(
-                        "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync "
-                        "from the machine where the daemon is running, useful for VPN-only Jira."
-                    ),
                     group="connection", order=2,
                 ),
                 ConfigField(
                     key="query_mode", label="Query mode",
                     field_type=ConfigFieldType.SELECT, required=False,
-                    options=[JIRA_QUERY_MODE_SIMPLE, JIRA_QUERY_MODE_ADVANCED],
+                    choices=[
+                        ConfigOption(JIRA_QUERY_MODE_SIMPLE, "Simple (projects and issue types)"),
+                        ConfigOption(JIRA_QUERY_MODE_ADVANCED, "Advanced (JQL)"),
+                    ],
                     default=JIRA_QUERY_MODE_SIMPLE,
                     help_text=(
                         "Simple builds the query from projects and issue types. "
@@ -526,20 +553,22 @@ class JiraGene(DocumentGene):
                 ),
                 ConfigField(
                     key="projects", label="Projects to Sync",
-                    field_type=ConfigFieldType.TAG_LIST, required=False,
+                    field_type=ConfigFieldType.TAG_LIST, required=True,
                     placeholder="PAY, ARCH",
                     help_text="Comma-separated Jira project keys (simple mode)",
                     group="scope", order=1,
+                    visible_when=(ConfigCondition("query_mode", (JIRA_QUERY_MODE_SIMPLE,)),),
                 ),
                 ConfigField(
                     key="jql", label="JQL",
-                    field_type=ConfigFieldType.STRING, required=False,
+                    field_type=ConfigFieldType.STRING, required=True,
                     placeholder='project = PROJ AND type != "Test" ORDER BY Rank ASC',
                     help_text=(
                         "Full JQL used as-is in advanced mode. MemForge adds an "
                         "incremental updated-since filter before your ORDER BY."
                     ),
                     group="scope", order=2,
+                    visible_when=(ConfigCondition("query_mode", (JIRA_QUERY_MODE_ADVANCED,)),),
                 ),
                 ConfigField(
                     key="jql_filter", label="JQL Filter (optional)",
@@ -547,13 +576,18 @@ class JiraGene(DocumentGene):
                     placeholder="labels = 'important'",
                     help_text="Additional JQL filter to refine results (simple mode)",
                     group="scope", order=3,
+                    visible_when=(ConfigCondition("query_mode", (JIRA_QUERY_MODE_SIMPLE,)),),
                 ),
                 ConfigField(
                     key="issue_types", label="Issue Types",
                     field_type=ConfigFieldType.MULTI_SELECT, required=False,
-                    options=["Epic", "Story", "Bug", "Task", "Sub-task", "Defect"],
+                    choices=[
+                        ConfigOption(issue_type, issue_type)
+                        for issue_type in ("Epic", "Story", "Bug", "Task", "Sub-task", "Defect")
+                    ],
                     default="Epic,Story,Bug,Task",
                     group="scope", order=4,
+                    visible_when=(ConfigCondition("query_mode", (JIRA_QUERY_MODE_SIMPLE,)),),
                 ),
                 ConfigField(
                     key="include_comments", label="Include Comments",
@@ -563,9 +597,10 @@ class JiraGene(DocumentGene):
                 ),
                 ConfigField(
                     key="pat", label="Personal Access Token",
-                    field_type=ConfigFieldType.SECRET, required=False,
+                    field_type=ConfigFieldType.SECRET, required=True,
                     help_text="Stored encrypted and sent as a bearer token when PAT mode is selected",
                     group="connection", order=3,
+                    visible_when=(ConfigCondition("auth_mode", (JIRA_AUTH_MODE_PAT,)),),
                 ),
             ],
         )

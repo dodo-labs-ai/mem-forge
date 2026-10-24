@@ -21,12 +21,15 @@ from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.conversations.units import Member
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.teams_provider import teams_conversation_label
+from memforge.genes.toolkit.config import FieldIssue, SourceConfigInvalid
 from memforge.local_agent.source_contract import TEAMS_ROLLING_RETENTION_PRESETS
 from memforge.local_agent.teams_contract import validate_teams_canonical_messages
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
+    ConfigOption,
+    ConfigPanel,
     GeneConfigSchema,
     GeneMetadata,
 )
@@ -34,9 +37,14 @@ from memforge.source_adapters.teams import MESSAGE_SCHEMA, message_record, teams
 
 __all__ = ["TeamsGene"]
 
+
 # A Teams Unit's stored input in window-package form: one window's messages
 # with its conversation's framing, as a local agent uploaded it.
 TEAMS_WINDOW_PACKAGE_KIND = "teams_window_document"
+
+
+def _refused(key: str, message: str) -> SourceConfigInvalid:
+    return SourceConfigInvalid([FieldIssue(key, message)])
 
 
 class TeamsGene(ConversationGene):
@@ -60,9 +68,15 @@ class TeamsGene(ConversationGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="scope", label="What to Sync", order=1),
-                ConfigGroup(key="sync", label="Sync Settings", order=2),
+                ConfigGroup(
+                    key="connection",
+                    label="Teams session",
+                    order=0,
+                    purpose="connection",
+                    panels=[ConfigPanel("teams_session")],
+                ),
+                ConfigGroup(key="scope", label="Conversations to sync", order=1, purpose="content"),
+                ConfigGroup(key="sync", label="Sync settings", order=2, purpose="options"),
             ],
             fields=[
                 ConfigField(
@@ -71,7 +85,11 @@ class TeamsGene(ConversationGene):
                     field_type=ConfigFieldType.SELECT,
                     required=False,
                     default="emea",
-                    options=["emea", "amer", "apac"],
+                    choices=[
+                        ConfigOption("emea", "EMEA"),
+                        ConfigOption("amer", "Americas"),
+                        ConfigOption("apac", "Asia Pacific"),
+                    ],
                     help_text="Teams API regional endpoint",
                     group="connection",
                     order=0,
@@ -80,11 +98,12 @@ class TeamsGene(ConversationGene):
                     key="conversation_ids",
                     label="Teams Conversations",
                     field_type=ConfigFieldType.TAG_LIST,
-                    required=False,
+                    required=True,
                     placeholder="Conversation IDs selected through Browse Teams",
                     help_text="Direct Teams conversation IDs selected through Browse Teams",
                     group="scope",
                     order=0,
+                    widget="teams_conversations",
                 ),
                 ConfigField(
                     key="initial_history_days",
@@ -102,7 +121,13 @@ class TeamsGene(ConversationGene):
                     field_type=ConfigFieldType.SELECT,
                     required=False,
                     default="forever",
-                    options=["forever", *(str(days) for days in TEAMS_ROLLING_RETENTION_PRESETS)],
+                    choices=[
+                        ConfigOption("forever", "Forever"),
+                        *(
+                            ConfigOption(str(days), f"{days // 365} year{'s' if days > 365 else ''}")
+                            for days in TEAMS_ROLLING_RETENTION_PRESETS
+                        ),
+                    ],
                     help_text="Explicitly remove MemForge support older than the selected period",
                     group="sync",
                     order=1,
@@ -119,10 +144,10 @@ class TeamsGene(ConversationGene):
             canonical_teams_conversation_ids,
         )
 
-        conversation_ids = canonical_teams_conversation_ids(
-            config,
-            require_nonempty=True,
-        )
+        try:
+            conversation_ids = canonical_teams_conversation_ids(config, require_nonempty=True)
+        except ValueError as exc:
+            raise _refused("conversation_ids", str(exc)) from None
         for field in TEAMS_CONVERSATION_SELECTOR_FIELDS:
             config.pop(field, None)
         config["conversation_ids"] = list(conversation_ids)
@@ -131,21 +156,22 @@ class TeamsGene(ConversationGene):
         history_rule = f"Teams initial history must be between 1 and {MAX_INITIAL_HISTORY_DAYS} days"
         try:
             initial_history_days = int(config["initial_history_days"])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(history_rule) from exc
+        except (TypeError, ValueError):
+            raise _refused("initial_history_days", history_rule) from None
         if not 1 <= initial_history_days <= MAX_INITIAL_HISTORY_DAYS:
-            raise ValueError(history_rule)
+            raise _refused("initial_history_days", history_rule)
         config["initial_history_days"] = initial_history_days
         retention = config.get("rolling_retention_days")
         if retention in (None, "", "forever", "none"):
             config["rolling_retention_days"] = None
         else:
+            retention_rule = "Teams rolling retention must be Forever, 1 year, 2 years, or 3 years"
             try:
                 retention_days = int(retention)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Teams rolling retention must be Forever, 1 year, 2 years, or 3 years") from exc
+            except (TypeError, ValueError):
+                raise _refused("rolling_retention_days", retention_rule) from None
             if retention_days not in TEAMS_ROLLING_RETENTION_PRESETS:
-                raise ValueError("Teams rolling retention must be Forever, 1 year, 2 years, or 3 years")
+                raise _refused("rolling_retention_days", retention_rule)
             config["rolling_retention_days"] = retention_days
         config.pop("max_age_days", None)
         config.pop("conversation_gap_minutes", None)

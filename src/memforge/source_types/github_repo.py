@@ -15,31 +15,31 @@ def _pushed_by_local_agent(config: Mapping[str, Any]) -> bool:
     return str(config.get("connection_mode") or "").strip().lower() == "local_push"
 
 
-def validate_config(config: dict[str, Any], existing_config: Mapping[str, Any] | None = None) -> None:
-    from urllib.parse import urlsplit
-
-    from memforge.genes.toolkit.config import require_https_base_url
-
-    existing_config = existing_config or {}
+def _validate_input(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
     if "repo_path" in config:
         raise ValueError("GitHub Repository reads the configured remote repository; repo_path is not a supported field")
-    repo_url = str(config.get("repo_url") or existing_config.get("repo_url") or "").strip()
-    require_https_base_url(repo_url, "GitHub Repository")
-    parts = urlsplit(repo_url)
-    path_parts = [part for part in parts.path.split("/") if part]
-    if len(path_parts) < 2:
-        raise ValueError("GitHub Repository URL must include owner and repository")
-    connection_mode = (
-        str(config.get("connection_mode") or existing_config.get("connection_mode") or "cloud_pull").strip().lower()
-    )
-    if connection_mode not in {"cloud_pull", "local_push"}:
-        raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
-    max_files = config.get("max_files", existing_config.get("max_files", 500))
+
+
+def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
+    from memforge.genes.toolkit.config import FieldIssue, SourceConfigInvalid
+
     try:
-        if int(max_files) < 1:
+        if int(config.get("max_files", 500)) < 1:
             raise ValueError
     except (TypeError, ValueError):
-        raise ValueError("GitHub Repository Max Files must be a positive integer") from None
+        raise SourceConfigInvalid(
+            [FieldIssue("max_files", "GitHub Repository Max Files must be a positive integer")]
+        ) from None
+
+
+def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
+    from memforge.github_repo_utils import parse_github_repo_url
+
+    try:
+        repo = parse_github_repo_url(str(config.get("repo_url") or ""))
+    except ValueError:
+        return []
+    return [("Host", repo["host"]), ("Repository", f"{repo['owner']}/{repo['repo']}")]
 
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
@@ -65,5 +65,10 @@ DESCRIPTOR = SourceTypeDescriptor(
         replay_adapter="memforge.local_agent.replay_adapter:GitHubRepoReplayAdapter",
         accepts_artifact_inputs=True,
     ),
-    config=SourceConfigPolicy(validate_input=validate_config, store=_store_config),
+    config=SourceConfigPolicy(
+        validate_input=_validate_input,
+        validate=_validate_config,
+        store=_store_config,
+        facts=_facts,
+    ),
 )
