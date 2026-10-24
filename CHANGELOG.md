@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0b2 - 2026-10-24
+
 - Automatic agent-session capture is removed. The Claude Code and Codex
   plugins (`0.2.0-beta.2`) no longer register `Stop`, `PreCompact` or
   `SubagentStop` hooks. `SessionStart` only adds MemForge usage guidance and
