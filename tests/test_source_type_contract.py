@@ -552,6 +552,7 @@ MINIMAL_CONFIGS = {
     "github_repo": {"repo_url": "https://github.example.test/org/repo"},
     "jira": {"base_url": "https://jira.example.test"},
     "local_markdown": {"root": "/notes"},
+    "notion": {"token": "notion-token", "root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"]},
     "teams": {"conversation_ids": ["19:conversation-a@example.test"]},
 }
 

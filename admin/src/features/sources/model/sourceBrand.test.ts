@@ -16,7 +16,7 @@ test("maps source types and clients to brand marks", () => {
   }
 
   // Source-type-keyed marks. agent_session resolves per-client; see below.
-  const SOURCE_TYPES = ["confluence", "jira", "github_pages", "github_repo", "teams", "local_markdown"];
+  const SOURCE_TYPES = ["confluence", "jira", "github_pages", "github_repo", "teams", "local_markdown", "notion"];
   for (const type of SOURCE_TYPES) {
     const keys = SOURCE_TYPE_MARKS[type];
     assert.ok(keys && keys.length > 0, `${type} should have at least one brand mark`);
@@ -41,6 +41,7 @@ test("maps source types and clients to brand marks", () => {
   assert.deepEqual(SOURCE_TYPE_MARKS.local_markdown, ["obsidian"], "local markdown should show the Obsidian mark");
   assert.deepEqual(SOURCE_TYPE_MARKS.github_pages, ["github"], "GitHub Pages should show the GitHub mark");
   assert.deepEqual(SOURCE_TYPE_MARKS.github_repo, ["github"], "GitHub repositories should show the GitHub mark");
+  assert.deepEqual(SOURCE_TYPE_MARKS.notion, ["notion"], "Notion sources should show the Notion mark");
 
   // Brand colors are pinned so they can't silently drift. These four match the
   // exact hexes the README uses for the same logos.
@@ -50,9 +51,10 @@ test("maps source types and clients to brand marks", () => {
   assert.equal(BRAND_MARKS.claude.color, "#D97757");
   assert.equal(BRAND_MARKS.obsidian.color, "#7C3AED");
 
-  // GitHub and Codex (OpenAI mark) are near-black in the README; we pin them to
+  // GitHub, Codex (OpenAI mark) and Notion are near-black in the README; we pin them to
   // null so they inherit the theme foreground and stay visible in dark mode.
   assert.equal(BRAND_MARKS.github.color, null, "GitHub mark should inherit the theme foreground");
   assert.equal(BRAND_MARKS.codex.color, null, "Codex mark should inherit the theme foreground");
+  assert.equal(BRAND_MARKS.notion.color, null, "Notion mark should inherit the theme foreground");
 
 });

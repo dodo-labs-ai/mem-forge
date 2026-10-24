@@ -39,6 +39,7 @@ _BUILTIN_SOURCE_TYPES = (
     "github_repo",
     "jira",
     "local_markdown",
+    "notion",
     "teams",
 )
 
