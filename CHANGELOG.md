@@ -14,17 +14,18 @@
   `unrecognized_session_lines` on `GET /api/v1/sources`. The MCP `search`
   tool no longer offers `source_filter.clients`; the API still accepts it for
   this release. An agent-session Source can now be deleted by its owner in
-  the admin UI (`can_delete` follows `can_manage`), while configure and sync
-  stay unavailable. The admin UI's coding-agent page now installs the plugin
-  for its memory tools.
+  the admin UI, while configure and sync stay unavailable. The admin UI's
+  coding-agent page now shows the commands that install the plugin for its
+  memory tools.
   **Upgrade:** if your coding agent shows
   `MemForge hook skipped: /hooks/receipts returned HTTP 410` at the end of
   a turn, update the MemForge memory plugin and restart the client. Claude
   Code: `claude plugin marketplace update memforge`, then
   `claude plugin update memory@memforge`. Codex:
   `codex plugin marketplace upgrade memforge`, then
-  `codex plugin add memory@memforge`. You can delete
-  `~/.memforge-agent/queue.sqlite` and its lock files; keep
+  `codex plugin add memory@memforge`. You can delete `queue.sqlite`,
+  `queue.sqlite-wal`, `queue.sqlite-shm` and `worker.lock` in
+  `~/.memforge-agent`; keep
   `~/.memforge-agent/artifacts` if you use `get_resource(mode="file")`. A
   `hook_workspace_id` entry in `~/.memforge/workspace-bindings.json` is
   ignored, and `memforge-setup` can remove it. To remove your existing

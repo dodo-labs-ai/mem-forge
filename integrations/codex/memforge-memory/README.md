@@ -109,7 +109,7 @@ private Memory with the MCP `create_memory` tool.
 
 ## Upgrading from 0.2.0-beta.1 or earlier
 
-Earlier plugin releases uploaded session transcripts automatically. That
+Earlier plugin releases uploaded redacted session windows automatically. That
 capture is removed, and MemForge refuses those uploads. Update the plugin and
 restart Codex:
 
@@ -120,8 +120,8 @@ codex plugin add memory@memforge
 
 After the update:
 
-- You can delete `~/.memforge-agent/queue.sqlite` and its lock files; nothing
-  reads them. Keep `~/.memforge-agent/artifacts` if you use
+- You can delete `queue.sqlite`, `queue.sqlite-wal`, `queue.sqlite-shm` and
+  `worker.lock` in `~/.memforge-agent`; nothing reads them. Keep `~/.memforge-agent/artifacts` if you use
   `get_resource(mode="file")`.
 - A `hook_workspace_id` entry in `~/.memforge/workspace-bindings.json` is
   ignored. The `memforge-setup` skill reports it and can remove it.
