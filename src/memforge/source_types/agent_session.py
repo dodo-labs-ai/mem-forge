@@ -1,4 +1,4 @@
-"""Agent sessions: knowledge a coding agent captures through the managed entrypoint."""
+"""Agent sessions: private Agent Knowledge kept for one coding client and owner."""
 
 from __future__ import annotations
 

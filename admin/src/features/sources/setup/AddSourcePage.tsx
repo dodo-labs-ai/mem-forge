@@ -19,7 +19,7 @@ const LOCAL_SYNC_LABELS: Record<LocalSyncState, string> = {
 
 /**
  * `/sources/new`: the source types a person can add, each opening its setup
- * page, and the coding agents whose plugin creates its own Source.
+ * page, and the coding agents whose plugin adds MemForge memory tools.
  */
 export function AddSourcePage() {
   const types = useSourceTypes();

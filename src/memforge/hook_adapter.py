@@ -27,6 +27,7 @@ from typing import Any
 
 CONTEXT_MODE = "context"
 SESSION_START_EVENT = "SessionStart"
+# The plugin release this script ships in, so an installed copy names its version.
 PLUGIN_VERSION = "0.2.0-beta.2"
 SESSION_START_USAGE_GUIDANCE = (
     "## MemForge Usage Guidance\n\n"

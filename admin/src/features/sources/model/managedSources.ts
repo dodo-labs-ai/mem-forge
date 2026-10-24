@@ -2,8 +2,9 @@ type NamedSourceType = {
   name: string;
 };
 
-// Both the legacy singleton type and the per-client split ids are managed:
-// they are populated automatically by plugins and cannot be user-configured.
+// Agent-session Sources, by type or by their per-client id prefix, are managed:
+// they hold what earlier plugin releases captured and nothing writes to them
+// now, so they have no sync runs, schedule or configuration.
 const MANAGED_SOURCE_TYPES = new Set(["agent_session"]);
 const MANAGED_SOURCE_ID_PREFIX = "src-agent-sessions-";
 
