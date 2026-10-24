@@ -1243,6 +1243,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                                 outcome=PollOutcome.HISTORY_EXHAUSTED,
                                 started_at=sent_at + timedelta(hours=1),
                                 earliest_returned_at=sent_at,
+                                earliest_complete_page_time=sent_at,
                             )
                             for interval in requested_conversation.intervals
                         ),
@@ -1298,6 +1299,9 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                     ],
                 },
             )
+            planned = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/plan", headers=headers, json=context
+            )
             accepted_process = client.post(
                 f"/api/v1/sources/{source_id}/process",
                 headers=headers,
@@ -1351,6 +1355,8 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         assert missing_process.status_code == 409, missing_process.text
         assert missing_process.json()["detail"] == "conversation_bodies_incomplete"
         assert uploaded_bodies.status_code == 200, uploaded_bodies.text
+        assert planned.status_code == 200, planned.text
+        assert planned.json()["summary"]["new_units"] == 1
         assert accepted_process.status_code == 202, accepted_process.text
         process_run = asyncio.run(database.get_source_sync_run(accepted_process.json()["run_id"]))
         assert process_run is not None
