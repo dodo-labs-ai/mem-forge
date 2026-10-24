@@ -1148,6 +1148,9 @@ class SourceUnitReconciliationReplayExecutor:
                 "relation_pair_count": metrics.relation_pair_count,
                 "revision_proof_count": metrics.revision_proof_count,
                 "revision_proof_failure_count": metrics.revision_proof_failure_count,
+                "refinement_verification_count": metrics.refinement_verification_count,
+                "refinement_verification_dropped_count": metrics.refinement_verification_dropped_count,
+                "refinement_verification_unjudged_count": metrics.refinement_verification_unjudged_count,
             },
         }
 

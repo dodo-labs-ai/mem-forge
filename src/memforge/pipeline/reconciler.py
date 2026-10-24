@@ -31,6 +31,7 @@ from memforge.memory.relation_classifier import (
     MemoryRelationType,
     StructuredMemoryPairClassifier,
 )
+from memforge.memory.refinement_verification import verify_refinements
 from memforge.models import (
     Memory,
     RawMemory,
@@ -47,6 +48,7 @@ from memforge.pipeline.support_relation_coordinator import (
     SupportRecheckRequest,
     coordinate,
     plan_rechecks,
+    revisions_to_verify,
     supported_refiners,
 )
 
@@ -96,6 +98,10 @@ class ReconciliationMetrics:
     relation_prompt_chars: int = 0
     revision_proof_count: int = 0
     revision_proof_failure_count: int = 0
+    # Revisions Refinement verification was asked about, and those it found dropping a fact or could not judge.
+    refinement_verification_count: int = 0
+    refinement_verification_dropped_count: int = 0
+    refinement_verification_unjudged_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,8 +235,10 @@ async def join_support_and_relation(
 
     Each conflicting claim's single re-check runs first; a re-check execution
     failure raises like any Support failure. Several refinements of one kept old
-    Memory are then compared pairwise, because only one of them may revise it.
-    Without ``recheck`` the re-checks are reported and the claims keep their results.
+    Memory are then compared pairwise, because only one of them may revise it,
+    and the one refinement that would still revise a kept old Memory is verified
+    alone before the table runs. Without ``recheck`` the re-checks are reported
+    and the claims keep their results.
     The result carries the final Memory-level Support results the table used.
     """
     if relation.failure is not None:
@@ -271,8 +279,35 @@ async def join_support_and_relation(
                     relation_prompt_chars=metrics.relation_prompt_chars + conditional.prompt_chars,
                 )
                 entries = _without_conflicting_refinements(entries, conditional, transient_candidates)
+            operation = "verify_refinements"
+            unverified: frozenset[tuple[int, str]] = frozenset()
+            # An incomplete Relation line withholds every revision, so none is worth verifying.
+            revisions = revisions_to_verify(relations=entries, supports=supports, **ledger) if relation.covers(
+                len(new_extractions), frozenset(memory.id for memory in existing_memories),
+            ) else ()
+            if revisions:
+                by_id = {memory.id: memory for memory in existing_memories}
+                verification = await verify_refinements(tuple(
+                    (index, MemoryPair(challenger=transient_candidates[index], candidate=by_id[memory_id]))
+                    for index, memory_id in revisions
+                ), client=structured_llm_client, model=llm_model)
+                metrics = replace(
+                    metrics,
+                    refinement_verification_count=len(revisions),
+                    refinement_verification_dropped_count=len(verification.dropped),
+                    refinement_verification_unjudged_count=len(verification.unjudged),
+                )
+                unverified = verification.dropped
+                # A revision that cannot be judged even alone leaves its refinement uncertain.
+                entries = [
+                    replace(entry, relation_type=None, reason="The revision could not be verified")
+                    if (entry.candidate_index, entry.incumbent_id) in verification.unjudged else entry
+                    for entry in entries
+                ]
             operation = "coordinate_support_and_relation"
-            coordination = coordinate(relations=entries, supports=supports, **ledger)
+            coordination = coordinate(
+                relations=entries, supports=supports, unverified_revisions=unverified, **ledger,
+            )
         except Exception as error:  # noqa: BLE001 - classified by _failure
             failure = _failure(error, operation)
     return ReconciliationResult(
