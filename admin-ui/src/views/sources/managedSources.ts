@@ -22,10 +22,6 @@ export function canConfigureSourceType(sourceType: string): boolean {
   return !isManagedSourceType(sourceType);
 }
 
-export function canDeleteSourceType(sourceType: string): boolean {
-  return !isManagedSourceType(sourceType);
-}
-
 /** Whether this UI has a setup form for the source type. */
 export function hasSetupForm(sourceType: string): boolean {
   return sourceType === "teams" || isSchemaSourceType(sourceType);

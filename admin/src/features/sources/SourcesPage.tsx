@@ -128,7 +128,7 @@ export function SourcesPage() {
     <div className="space-y-6">
       <PageHeader
         title="Sources"
-        description="Sources are the places MemForge reads from, such as wikis, issue trackers, repositories and coding-agent sessions. Each sync turns new and changed content into memories your agents can search."
+        description="Sources are the places MemForge reads from, such as wikis, issue trackers, chat and repositories. Each sync turns new and changed content into memories your agents can search."
         actions={
           <Button nativeButton={false} render={<Link to={newSourcePath()} />}>
             <Plus />
