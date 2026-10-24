@@ -513,6 +513,8 @@ def wait_for_sync(api: str, state: State, *, timeout: float, new_run: bool = Fal
     """
     source_id = state.get("source_id")
     earlier_run = state.get("sync_run_id") if new_run else None
+    if new_run and earlier_run is None:
+        raise CheckFailed("no earlier sync run is recorded to wait past")
 
     def synced() -> str | None:
         source = _source(api, source_id)

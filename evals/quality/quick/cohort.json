@@ -103,8 +103,7 @@
       "title": "Runbook: rotating the Kestrel signing key",
       "rubric": {
         "expected_support_terms": {
-          "kestrel-admin status": "supported",
-          "retire-key": "supported"
+          "kestrel-admin status": "supported"
         }
       }
     },
