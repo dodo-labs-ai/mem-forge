@@ -29,6 +29,11 @@ SUBMITTED = {
     "github_repo": {"repo_url": "https://github.example.test/platform/cookbook.git", "connection_mode": "cloud_pull"},
     "jira": {"base_url": "https://jira.example.test", "projects": "PAY, OPS", "pat": "jira-pat-secret"},
     "local_markdown": {"root": "/Users/me/notes"},
+    "notion": {
+        "token": "notion-token-secret",
+        "root_pages": ["https://www.notion.so/team/Payroll-Runbook-1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"],
+        "databases": "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f",
+    },
     "teams": {
         "region": "emea",
         "conversation_ids": "19:conversation-a@example.test",

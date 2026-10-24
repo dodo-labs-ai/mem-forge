@@ -178,8 +178,27 @@ class NotionGene(DocumentGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="content", label="Content", order=1),
+                ConfigGroup(
+                    key="connection",
+                    label="Connection",
+                    order=0,
+                    purpose="connection",
+                    description=(
+                        "Create an internal connection at notion.so/profile/integrations and give it Read content, "
+                        "and Read user information without email addresses so people show by name. "
+                        "Then copy its token."
+                    ),
+                ),
+                ConfigGroup(
+                    key="content",
+                    label="Content",
+                    order=1,
+                    purpose="content",
+                    description=(
+                        "Share each root page or database with the connection (••• → Connections), "
+                        "then paste its URL or ID."
+                    ),
+                ),
             ],
             fields=[
                 ConfigField(
