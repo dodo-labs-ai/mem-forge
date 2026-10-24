@@ -56,3 +56,13 @@ test("clicking a step opens it", async () => {
 
   expect(onSelect).toHaveBeenCalledWith("scope");
 });
+
+test("a long summary stays on one line within the rail and is whole in its tooltip", () => {
+  const jql = "Advanced (JQL) · project = SFPAY AND type not in (Epic, Sub-task, Test Execution) ORDER BY updated DESC";
+  render(<StepRail aria-label="Setup steps" steps={[{ key: "scope", label: "Issues to sync", complete: true, summary: jql }]} current="scope" onSelect={vi.fn()} />);
+
+  const summary = screen.getByText(jql);
+  expect(summary).toHaveAttribute("title", jql);
+  expect(summary).toHaveClass("truncate");
+  expect(screen.getByRole("navigation", { name: "Setup steps" })).toHaveClass("min-w-0");
+});

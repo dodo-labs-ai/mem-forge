@@ -78,3 +78,24 @@ test("a coverage read that fails can be retried", async () => {
   await userEvent.click(screen.getByRole("button", { name: /Retry|Try again/ }));
   expect(await screen.findByText("Windows processed")).toBeInTheDocument();
 });
+
+test("a project's name is cut short beside its counts instead of running into them", async () => {
+  renderWithApi(<AgentSessionCoverage source={SOURCE} />, {
+    "GET /api/v1/agent-sessions/completeness": () => completeness({ latest_failure: null }),
+    "GET /api/v1/sources/src-codex/projects": () => ({
+      source_id: "src-codex",
+      projects: [{ project: "UNSORTED", document_count: 182, memory_count: 40, last_observed_at: "2026-10-23T08:00:00Z" }],
+    }),
+    "GET /api/v1/projects": () => PROJECTS,
+  });
+
+  const projects = await screen.findByRole("list", { name: "Projects with memories from sessions" });
+  const name = within(projects).getByText("UNSORTED");
+  expect(name).toHaveAttribute("title", "UNSORTED");
+  // A minimum width keeps the name from shrinking under its text; a row too narrow wraps the counts instead.
+  expect(name).toHaveClass("min-w-24", "truncate");
+  expect(name).not.toHaveClass("min-w-0");
+  for (const count of ["182 summaries", "40 memories"]) {
+    expect(within(projects).getByText(count)).toHaveClass("whitespace-nowrap");
+  }
+});

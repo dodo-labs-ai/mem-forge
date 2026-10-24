@@ -249,3 +249,20 @@ test("a GitHub repository source syncs the folder chosen from its tree", async (
   ]);
   await expect(page).toHaveURL(appUrl("sources"));
 });
+
+test("a long step summary stays inside the setup page at a narrow window", async ({ page }) => {
+  const pageUrl =
+    "https://wiki.example.com/pages/viewpage.action?pageId=4815162342&spaceKey=PAYROLL&title=Payroll+processing+runbook+for+quarter+end+close";
+  const pageTree = { ...SOURCE, config: { ...CONFLUENCE_CONFIG, sync_mode: "page_tree", spaces: [], page_tree_root: pageUrl } };
+  await stubApi(page, { "GET /api/v1/sources": (route) => route.fulfill({ json: { data: [pageTree] } }) });
+  await page.setViewportSize({ width: 800, height: 900 });
+
+  await page.goto(appPath("sources/src-wiki/settings?step=scope"));
+  const summary = page.getByRole("navigation", { name: "Setup steps" }).getByText(`This page tree · ${pageUrl}`);
+  await expect(summary).toBeVisible();
+
+  // How far the main column scrolls sideways; the e2e project has no DOM types, so the page evaluates a string.
+  const overflow = await page.evaluate<number>("(main => main.scrollWidth - main.clientWidth)(document.querySelector('main'))");
+  expect(overflow).toBe(0);
+  await expect(summary).toHaveAttribute("title", `This page tree · ${pageUrl}`);
+});
