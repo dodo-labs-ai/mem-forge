@@ -163,14 +163,19 @@ const SCOPE_CHANGE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
 };
 
 /**
- * The message for a refused scope change. A refusal for a mode that cannot
- * list keeps the server's words, which name the mode and what to choose
- * instead.
+ * The message for a refused scope change, by its code. A refusal the table
+ * does not word, such as one for a mode that cannot list, keeps the server's
+ * words, which name the mode and what to choose instead.
  */
+export function scopeChangeRefusalMessage(code: string, serverMessage?: string | null): string {
+  return SCOPE_CHANGE_ERROR_MESSAGES[code] ?? serverMessage ?? code;
+}
+
+/** The message for a scope change the server refused. */
 export function scopeChangeErrorMessage(error: unknown): string {
   const message = errorMessage(error);
   const code = error instanceof ApiError ? (error.code ?? message) : message;
-  return SCOPE_CHANGE_ERROR_MESSAGES[code] ?? message;
+  return scopeChangeRefusalMessage(code, message);
 }
 
 export type ScopeChangePreview = components["schemas"]["SourceScopeChangePreviewResponse"];

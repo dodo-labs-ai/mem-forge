@@ -20,7 +20,7 @@ those links.
 | `npm test` | Vitest unit and component tests |
 | `npm run test:e2e` | Playwright smoke tests against the production build, API stubbed; `ADMIN_E2E_PORT` moves the preview server off port 4175 |
 | `npm run storybook` | The catalogue of `ui` and `patterns` |
-| `npm run gen:api` | Regenerate API types after a backend change |
+| `npm run gen:api` | Regenerate API types and the source type form fixture after a backend change |
 
 ## Layers
 

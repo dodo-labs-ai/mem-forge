@@ -1,11 +1,10 @@
 import { Lock } from "lucide-react";
 import { useCallback, useState } from "react";
 import { MODEL_KINDS } from "@/api";
-import { Notice } from "@/patterns";
+import { Notice, useUnsavedChangesGuard } from "@/patterns";
 import { LeaveDialog } from "./LeaveDialog";
 import type { ModelKind, ModelProvider, ModelSettings } from "./model/types";
 import { ModelCard } from "./ModelCard";
-import { useUnsavedChangesGuard } from "./useUnsavedChangesGuard";
 
 interface ModelSettingsViewProps {
   settings: ModelSettings;

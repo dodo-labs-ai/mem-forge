@@ -1,6 +1,6 @@
 import { MoreHorizontal } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { sourceEvaluationPath } from "@/lib/paths";
+import { sourceEvaluationPath, sourceSettingsPath } from "@/lib/paths";
 import { Button } from "@/ui/button";
 import {
   DropdownMenu,
@@ -118,7 +118,7 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
                   </span>
                 )}
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => actions.openInV1()}>
+              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => navigate(sourceSettingsPath(source.id))}>
                 Configure
               </DropdownMenuItem>
             </>

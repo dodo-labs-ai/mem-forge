@@ -1,5 +1,5 @@
 import createClient, { type Client, type Middleware } from "openapi-fetch";
-import { ApiError, NoWorkspaceError, describeErrorBody, errorCodeOf } from "./errors";
+import { ApiError, NoWorkspaceError, describeErrorBody, errorCodeOf, errorDetailOf } from "./errors";
 import type { AdminPaths } from "./paths";
 import { LOCAL_AGENT_PREFIX, RESOURCE_PREFIX, type WorkspaceController, type WorkspaceTarget } from "./workspace";
 
@@ -67,9 +67,14 @@ interface FetchResult<T> {
   response: Response;
 }
 
-/** Returns the response data, or throws an `ApiError` carrying the server's message and, for a coded refusal, its code. */
+/**
+ * Returns the response data, or throws an `ApiError` carrying the server's
+ * message and, for a coded refusal, its code and the rest of its detail.
+ */
 export async function unwrap<T>(call: Promise<FetchResult<T>>): Promise<T> {
   const { data, error, response } = await call;
-  if (!response.ok) throw new ApiError(response.status, describeErrorBody(error, response.status), errorCodeOf(error));
+  if (!response.ok) {
+    throw new ApiError(response.status, describeErrorBody(error, response.status), errorCodeOf(error), errorDetailOf(error));
+  }
   return data as T;
 }

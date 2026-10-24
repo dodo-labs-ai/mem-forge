@@ -312,9 +312,9 @@ class GitHubPagesGene(DocumentGene):
         sitemap the site does not declare complete may leave pages out, so
         neither lists.
         """
-        if _sync_mode(config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+        if sync_mode_for_config(config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
             return True
-        if _sync_mode(config) != SYNC_MODE_SUBTREE:
+        if sync_mode_for_config(config) != SYNC_MODE_SUBTREE:
             return False
         return _auth_mode(config) == AUTH_MODE_GITHUB_PAT or bool_config(config, "sitemap_authoritative", default=False)
 
@@ -343,7 +343,7 @@ class GitHubPagesGene(DocumentGene):
             raise ValueError("This GitHub Pages configuration does not list its scope")
         if self._discovered_scope is not None:
             return self._discovered_scope
-        if _sync_mode(self.config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
+        if sync_mode_for_config(self.config) in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
             return ScopeListing(
                 kind=ScopeListingKind.EXISTENCE,
                 doc_ids=frozenset(
@@ -362,12 +362,12 @@ class GitHubPagesGene(DocumentGene):
 
     def _configured_page_urls(self) -> list[str]:
         """The page of a single-page Source, or the pages of an explicit list."""
-        if _sync_mode(self.config) == SYNC_MODE_SINGLE_PAGE:
+        if sync_mode_for_config(self.config) == SYNC_MODE_SINGLE_PAGE:
             return [str(self.config.get("page_url") or "").strip()]
         return list_config(self.config.get("pages"))
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        mode = _sync_mode(self.config)
+        mode = sync_mode_for_config(self.config)
         if mode in {SYNC_MODE_SINGLE_PAGE, SYNC_MODE_EXPLICIT_LIST}:
             listed: set[str] = set()
             for url in self._configured_page_urls():
@@ -762,7 +762,7 @@ class GitHubPagesGene(DocumentGene):
             canonical_url = self._require_in_site(url)
         except ValueError:
             return False
-        mode = _sync_mode(self.config)
+        mode = sync_mode_for_config(self.config)
         root = _canonicalize_url(
             str(self.config.get("root_url") or self.config.get("page_url") or self._base_url)
         )
@@ -782,7 +782,7 @@ def scope_urls_for_config(config: Mapping[str, Any]) -> list[str]:
     A single page or a subtree root is one URL, read whole because it may
     itself hold a comma; only an explicit list names several.
     """
-    mode = _sync_mode(config)
+    mode = sync_mode_for_config(config)
     if mode == SYNC_MODE_EXPLICIT_LIST:
         return list_config(config.get("pages"))
     url = str(config.get("root_url" if mode == SYNC_MODE_SUBTREE else "page_url") or "").strip()
@@ -794,7 +794,8 @@ def _scope_url_for_config(config: dict) -> str:
     return urls[0] if urls else ""
 
 
-def _sync_mode(config: Mapping[str, Any]) -> str:
+def sync_mode_for_config(config: Mapping[str, Any]) -> str:
+    """The configured sync mode, a single page when none is set."""
     return str(config.get("sync_mode") or SYNC_MODE_SINGLE_PAGE).strip().lower()
 
 
