@@ -1,0 +1,19 @@
+{
+  "situation": "A record that one rotation skipped a step does not change the rule that the step is required.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "On 2026-10-01 the old Kestrel signing key was retired before two workers reported the new key id, and their jobs failed for ten minutes.",
+        "memory_type": "fact",
+        "evidence": [
+          {"role": "primary", "excerpt": "Rotation log: on 2026-10-01 the on-call engineer retired the old key before two workers reported the new key id, and their jobs failed for ten minutes.", "observation": "signing-key-rotation", "revision": "v2"}
+        ]
+      }
+    ],
+    "incumbents": [
+      {"id": "wait-for-workers", "claim": "Before retiring the old Kestrel signing key, wait until every worker reports the new key id in kestrel-admin status.", "memory_type": "procedure"}
+    ],
+    "support": {"wait-for-workers": "supported"}
+  },
+  "rubric": {"expected_incumbents": {"wait-for-workers": "kept"}}
+}

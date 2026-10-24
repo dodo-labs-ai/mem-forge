@@ -6,7 +6,9 @@ model-accuracy evidence.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -186,3 +188,19 @@ async def test_the_seed_route_is_for_a_maintenance_operator_and_reports_skips(db
     assert responses[False].status_code == 403
     assert responses[True].status_code == 200, responses[True].text
     assert responses[True].json()["skipped"]["document_not_found"] == ["doc-unsynced"]
+
+
+PUBLIC_SITUATIONS = sorted(
+    (Path(__file__).resolve().parents[1] / "evals" / "quality" / "quick" / "reconciliation").glob("*.json")
+)
+
+
+@pytest.mark.parametrize("path", PUBLIC_SITUATIONS, ids=lambda path: path.stem)
+async def test_each_public_situation_imports(db, path: Path) -> None:
+    situation_file = json.loads(path.read_text(encoding="utf-8"))
+
+    report = await _import(db, ReconciliationCaseRequest(
+        input=situation_file["input"], rubric=situation_file["rubric"], doc_id=DOCUMENT.doc_id,
+    ))
+
+    assert len(report.cases) == 1 and situation_file["situation"]

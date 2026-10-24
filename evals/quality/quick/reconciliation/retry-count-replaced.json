@@ -1,0 +1,19 @@
+{
+  "situation": "The document now states five retries where it stated three; the old claim lost its Support.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "A failed Kestrel job is retried five times, waiting 10, 60, 300, 900 and 3600 seconds between attempts.",
+        "memory_type": "decision",
+        "evidence": [
+          {"role": "primary", "excerpt": "A Kestrel job that raises an error is retried five times, waiting 10, 60, 300, 900 and 3600 seconds between attempts.", "observation": "job-retries", "revision": "v2"}
+        ]
+      }
+    ],
+    "incumbents": [
+      {"id": "three-retries", "claim": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts.", "memory_type": "decision"}
+    ],
+    "support": {"three-retries": "unsupported"}
+  },
+  "rubric": {"expected_incumbents": {"three-retries": "retired"}}
+}
