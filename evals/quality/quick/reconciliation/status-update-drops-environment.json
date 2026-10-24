@@ -1,0 +1,34 @@
+{
+  "situation": "A status update on a ticket restates its failure in more detail but leaves out the environment and tenant the old claim named, which the ticket still states.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "KES-412 is Blocked: dispatch fails in JobRouter.assign() because two queued jobs share the id 7f3c and the router builds a map keyed by job id, raising DuplicateKeyError.",
+        "memory_type": "fact",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "Status: Blocked. Dispatch fails in JobRouter.assign(): two queued jobs share the id 7f3c, and the router builds a map keyed by job id, so it raises DuplicateKeyError.",
+            "observation": "ticket-KES-412",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "In KES-412 (production EU1, tenant acme-prod), duplicate job ids make dispatch fail with a DuplicateKeyError.",
+        "memory_type": "fact"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "kept"
+    }
+  }
+}
