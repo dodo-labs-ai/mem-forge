@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from enum import Enum
 
 from memforge.derivation_work import payload_hash
@@ -44,7 +45,7 @@ from memforge.evals.source_unit_derivation_cases import (
     find_case_document,
 )
 from memforge.memory.evidence import EvidencePartKind, EvidenceRole, ResolvedEvidencePart, ResolvedEvidenceSelection
-from memforge.models import MemoryExtractionResult, RawMemory
+from memforge.models import MemoryExtractionResult, MemoryType, RawMemory
 from memforge.pipeline.evidence_fragments import COMPILER_CONTRACT_VERSION
 from memforge.source_derivation import memory_extraction_output_payload
 from memforge.source_projection import AnchorKind, SourceAnchor
@@ -187,9 +188,9 @@ def reconciliation_manifest(
             {
                 "id": _text(incumbent, "id"),
                 "content": _text(incumbent, "claim"),
-                "memory_type": _text(incumbent, "memory_type"),
-                "valid_from": incumbent.get("valid_from"),
-                "valid_until": incumbent.get("valid_until"),
+                "memory_type": _memory_type(incumbent),
+                "valid_from": _date(incumbent, "valid_from"),
+                "valid_until": _date(incumbent, "valid_until"),
             }
             for incumbent in incumbents
         ],
@@ -221,9 +222,9 @@ def _candidate(candidate: Mapping[str, object], *, source_id: str, source_unit_i
         ))
     return RawMemory(
         content=_text(candidate, "claim"),
-        memory_type=_text(candidate, "memory_type"),
-        valid_from=candidate.get("valid_from"),
-        valid_until=candidate.get("valid_until"),
+        memory_type=_memory_type(candidate),
+        valid_from=_date(candidate, "valid_from"),
+        valid_until=_date(candidate, "valid_until"),
         resolved_evidence_selection=ResolvedEvidenceSelection(
             source_id=source_id,
             source_unit_id=source_unit_id,
@@ -241,6 +242,25 @@ def _list(payload: Mapping[str, object], key: str) -> list[Mapping[str, object]]
     if not isinstance(value, list) or not all(isinstance(item, Mapping) for item in value):
         raise ValueError(f"{key} must be a list of objects")
     return value
+
+
+def _memory_type(payload: Mapping[str, object]) -> str:
+    value = _text(payload, "memory_type")
+    if value not in {memory_type.value for memory_type in MemoryType}:
+        raise ValueError("memory_type must be one of " + ", ".join(memory_type.value for memory_type in MemoryType))
+    return value
+
+
+def _date(payload: Mapping[str, object], key: str) -> str | None:
+    """An optional ISO date, checked so that a typo cannot pass as an open validity."""
+
+    value = payload.get(key)
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value)).isoformat()
+    except ValueError:
+        raise ValueError(f"{key} must be an ISO date") from None
 
 
 def _text(payload: Mapping[str, object], key: str) -> str:

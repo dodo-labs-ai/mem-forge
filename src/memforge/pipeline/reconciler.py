@@ -337,7 +337,9 @@ async def reconcile_memories(
     """Run the Relation line against Support results that are already known, then join them.
 
     Production runs the two lines concurrently; this sequential form serves
-    callers whose Support results are pinned, such as offline replay.
+    callers whose Support results are already final. It stops at the join:
+    the caller applies DestructiveValidation, as production and offline replay
+    do.
     """
     relation = await assess_relations(
         new_extractions, existing_memories, structured_llm_client=structured_llm_client, llm_model=llm_model,
