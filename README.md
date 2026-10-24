@@ -68,11 +68,11 @@ more than one workspace, local folders, the host CLI and network details.
 
 ## Why MemForge
 
-**One memory for your docs and your sessions.** Confluence, Jira, GitHub, Teams
-and your Claude Code and Codex sessions land in one store and come back from
-one `search` call. From sessions it keeps what you decided or corrected, not
-everything the agent said. A decision you made in Claude Code is there when you
-open Codex.
+**One memory for your docs and your sessions.** Confluence, Jira, Notion,
+GitHub, Teams and your Claude Code and Codex sessions land in one store and come
+back from one `search` call. From sessions it keeps what you decided or
+corrected, not everything the agent said. A decision you made in Claude Code is
+there when you open Codex.
 
 **It follows the source.** When a page or ticket changes, the next sync
 rechecks the memories built on it. Each one is kept, replaced or retired, or it
@@ -107,7 +107,7 @@ flowchart LR
     CC["Claude Code / Codex"]
     Plugin["MemForge plugin<br/>hooks + MCP proxy"]
   end
-  Docs["Confluence, Jira, GitHub,<br/>Teams, local Markdown"]
+  Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local Markdown"]
   API["MemForge API"]
   Extract["Extract memories<br/>with source Evidence"]
   Recheck["Plan updates and Reviews<br/>relate across documents"]
@@ -150,6 +150,7 @@ agents that do the work.
     <td>Docs and wikis</td>
     <td nowrap>
       <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/confluence.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Confluence&nbsp;&nbsp;&nbsp;
+      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/notion-dark.svg"><img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/notion-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Notion&nbsp;&nbsp;&nbsp;
       <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;Pages&nbsp;&nbsp;&nbsp;
       <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/github-dark.svg"><img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/github-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;GitHub&nbsp;repo&nbsp;docs&nbsp;&nbsp;&nbsp;
       <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/folder.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Local&nbsp;folders
