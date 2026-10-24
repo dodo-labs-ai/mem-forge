@@ -169,8 +169,11 @@ class RequestLimiter(Protocol):
     ``run`` sends one attempt through ``operation`` when the pace allows,
     waiting with ``sleep`` until then. After the attempt, a non-``None``
     ``delay_for_response(response)`` holds the limiter's next request back by
-    that many seconds. ``memforge.genes.atlassian_auth.AtlassianRequestLimiter``
-    is the built-in one.
+    that many seconds. Two are built in:
+    :class:`memforge.genes.toolkit.pacing.RateLimiter` holds a provider's
+    requests-per-minute budget, and
+    ``memforge.genes.atlassian_auth.AtlassianRequestLimiter`` keeps a gap
+    between requests to one Atlassian origin.
     """
 
     async def run(

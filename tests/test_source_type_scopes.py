@@ -90,6 +90,19 @@ _CONFIGS = {
         {"sync_mode": "subtree", "root_url": "https://pages.example/x/", "branch": " gh-pages "},
     ],
     "local_markdown": [{"vault_id": "v", "include": "docs/**, *.md", "exclude": []}],
+    "notion": [
+        # A pasted link and a dashed id read as the id they name; the token and the API origin are not scope.
+        {
+            "token": "ntn_secret",
+            "base_url": "https://api.notion.com",
+            "root_pages": [
+                "2a3b4c5d6e7f40818293a4b5c6d7e8f9",
+                "https://www.notion.so/team/Runbook-1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b",
+            ],
+            "databases": "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f",
+        },
+        {"token": "other", "root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"], "databases": []},
+    ],
     "teams": [{"conversation_ids": ["b", "a"], "rolling_retention_days": 365, "channels": "c1"}],
     "agent_session": [{"client": "codex"}],
 }
@@ -166,6 +179,21 @@ _EXPECTED = {
             "5a9239481ecca3317f1a37017ed5dfb0eea05cedee0b4cf2cc446e52ae9c6988",
         ]
     ],
+    "notion": [
+        [
+            {},
+            {
+                "databases": ["9c0d1e2f3a4b4c5d8e6f7a8b9c0d1e2f"],
+                "root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b", "2a3b4c5d6e7f40818293a4b5c6d7e8f9"],
+            },
+            "2902d288a411e0738feceee479d1920b2a34935b662e949046618dcce8ce5385",
+        ],
+        [
+            {},
+            {"root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"]},
+            "f04560355f4b26f91f193722cef287a2bb37bf0e29f8c1f3eeec530b59f324ed",
+        ],
+    ],
     "teams": [
         [
             {},
@@ -198,6 +226,7 @@ def test_progress_nouns_and_available_genes() -> None:
         "github_repo": "file",
         "jira": "issue",
         "local_markdown": "file",
+        "notion": "page",
         "teams": "message",
     }
     assert source_progress_unit("outlook") == "item"

@@ -73,6 +73,18 @@
       "name": "local_markdown"
     },
     {
+      "auth_method": "api_key",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 1440,
+      "description": "Pages and database rows shared with an internal connection",
+      "display_name": "Notion",
+      "execution_kinds": [
+        "server"
+      ],
+      "managed": false,
+      "name": "notion"
+    },
+    {
       "auth_method": "browser_cookie",
       "data_shape": "message",
       "default_sync_interval_minutes": 60,
@@ -1225,6 +1237,83 @@
           "description": "",
           "key": "scope",
           "label": "Files to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "notion": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "",
+          "key": "token",
+          "label": "Internal connection token",
+          "options": [],
+          "order": 0,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "content",
+          "help_text": "",
+          "key": "root_pages",
+          "label": "Root pages",
+          "options": [],
+          "order": 0,
+          "placeholder": "Page URL or ID",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "content",
+          "help_text": "",
+          "key": "databases",
+          "label": "Databases",
+          "options": [],
+          "order": 1,
+          "placeholder": "Database URL or ID",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "Create an internal connection at notion.so/profile/integrations and give it Read content, and Read user information without email addresses so people show by name. Then copy its token.",
+          "key": "connection",
+          "label": "Connection",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "Share each root page or database with the connection (\u2022\u2022\u2022 \u2192 Connections), then paste its URL or ID.",
+          "key": "content",
+          "label": "Content",
           "order": 1,
           "panels": [],
           "purpose": "content"
