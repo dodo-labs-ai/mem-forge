@@ -26,7 +26,7 @@ const CANNOT_LIST =
   + "so the change could never complete. Use a personal access token. Or create a new Source for this scope.";
 
 function preview(overrides: Partial<SourceScopeChangePreview>): SourceScopeChangePreview {
-  return { outcome: "unchanged", open_transition: false, refusal: null, ...overrides };
+  return { outcome: "unchanged", open_transition: false, removes: "at_completion", refusal: null, ...overrides };
 }
 
 function transition(overrides: Partial<SourceScopeTransition> = {}): SourceScopeTransition {
@@ -79,6 +79,32 @@ it("says that saving replaces the scope change in progress", () => {
     message:
       "The source returns to its previous scope. Nothing the previous scope synced is removed. Once a sync lists the previous scope in full, items only the replaced change added are removed.",
   });
+});
+
+it("says that a conversation source's next sync removes the deselected conversations, never that nothing is removed", () => {
+  const removal =
+    "The next sync removes the conversations the new selection leaves out; the change completes once every selected conversation is synced.";
+
+  expect(
+    scopeChangeWarning(preview({ outcome: "supersedes_transition", open_transition: true, removes: "next_sync" })),
+  ).toEqual({
+    tone: "info",
+    title: "This replaces the scope change in progress",
+    message: `The source changes from the scope it had before that change to this one. ${removal}`,
+  });
+  expect(
+    scopeChangeWarning(preview({ outcome: "returns_to_previous_scope", open_transition: true, removes: "next_sync" })),
+  ).toEqual({
+    tone: "info",
+    title: "This replaces the scope change in progress",
+    message: `The source returns to its previous scope. ${removal}`,
+  });
+});
+
+it("keeps the document wording for a document source that replaces its scope change", () => {
+  expect(scopeChangeWarning(preview({ outcome: "supersedes_transition", open_transition: true }))?.message).toBe(
+    "The source changes from the scope it had before that change to this one. Nothing is removed until every item of the new scope is synced.",
+  );
 });
 
 it("says nothing when the change keeps or simply opens a scope change", () => {

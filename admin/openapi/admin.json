@@ -9226,7 +9226,7 @@
         "type": "object"
       },
       "SourceScopeChangePreviewResponse": {
-        "description": "What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.\n\n- ``unchanged``: the scope stays as it is.\n- ``opens_transition``: a scope change opens; nothing is removed until it completes.\n- ``supersedes_transition``: the change replaces the scope change in progress.\n- ``restores_previous_scope``: the change returns to the last applied scope, which the\n  configuration cannot list. The change in progress closes, none opens, and nothing is removed.\n- ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the\n  change in progress with a change back to it. Nothing that scope synced is removed; once a\n  sync lists it in full, what only the replaced change added is removed.\n- ``refused``: saving answers 409, as ``refusal`` says.\n\n``open_transition`` says whether a scope change is in progress now.",
+        "description": "What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.\n\n- ``unchanged``: the scope stays as it is.\n- ``opens_transition``: a scope change opens.\n- ``supersedes_transition``: the change replaces the scope change in progress with a change\n  from the last applied scope to the new one.\n- ``restores_previous_scope``: the change returns to the last applied scope, which the\n  configuration cannot list. The change in progress closes, none opens, and nothing is removed.\n- ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the\n  change in progress with a change back to it. Nothing that scope synced is removed; what only\n  the replaced change added is removed as ``removes`` says.\n- ``refused``: saving answers 409, as ``refusal`` says.\n\n``removes`` says when a change that opens removes what its new scope leaves out:\n``at_completion`` for a document Source, where nothing is removed until a sync lists the new\nscope in full and every listed item has committed; ``next_sync`` for a conversation Source,\nwhose next sync removes the conversations the new selection leaves out.\n\n``open_transition`` says whether a scope change is in progress now.",
         "properties": {
           "open_transition": {
             "title": "Open Transition",
@@ -9253,11 +9253,21 @@
                 "type": "null"
               }
             ]
+          },
+          "removes": {
+            "description": "When a change that opens removes what the new scope leaves out: at_completion (a document Source) or next_sync (a conversation Source).",
+            "enum": [
+              "at_completion",
+              "next_sync"
+            ],
+            "title": "Removes",
+            "type": "string"
           }
         },
         "required": [
           "outcome",
-          "open_transition"
+          "open_transition",
+          "removes"
         ],
         "title": "SourceScopeChangePreviewResponse",
         "type": "object"
@@ -9266,7 +9276,7 @@
         "description": "Why saving the configuration would be refused (409).",
         "properties": {
           "code": {
-            "description": "scope_change_requires_listing, transition_requires_listing, projection_scope_transition_active, source_provider_namespace_immutable or source_execution_mode_immutable.",
+            "description": "scope_change_requires_listing, transition_requires_listing, source_provider_namespace_immutable or source_execution_mode_immutable.",
             "title": "Code",
             "type": "string"
           },
@@ -9301,7 +9311,7 @@
         "type": "object"
       },
       "SourceScopeTransitionResponse": {
-        "description": "The scope change a Source is applying.\n\nA change of what a Source syncs opens a transition from the last applied\nscope to the new one. Its syncs commit the items the new scope lists,\nand once every listed item has committed, the change completes and what\nthe new scope leaves out is removed. Until then nothing is removed.\n``members_committed`` of ``listed_count`` items have committed; the\ncount is ``null`` until a sync lists the new scope in full.\n``failing_items`` are the failed items not yet committed under the\nchange; one the new scope lists keeps it open until a sync commits it,\nand one only the previous scope held is settled when the change\ncompletes.\n\nSaving ``restore_config`` with ``PUT /sources/{id}``, with this\ntransition's ``id`` as ``expected_scope_transition_id``, returns to the\nprevious scope: it replaces the change in progress, and nothing the\nprevious scope synced is removed. It is ``null`` when the viewer cannot\nchange the configuration, the Source cannot replace a change in progress\nand waits for it to complete, or the change already returns to the\nprevious scope.",
+        "description": "The scope change a Source is applying.\n\nA change of what a Source syncs opens a transition from the last applied\nscope to the new one. ``removes`` says when what the new scope leaves\nout is removed:\n\n- ``at_completion`` (a document Source): its syncs commit the items the\n  new scope lists, and once every listed item has committed, the change\n  completes and what the new scope leaves out is removed. Until then\n  nothing is removed. ``members_committed`` of ``listed_count`` items\n  have committed; the count is ``null`` until a sync lists the new scope\n  in full. ``failing_items`` are the failed items not yet committed under\n  the change; one the new scope lists keeps it open until a sync commits\n  it, and one only the previous scope held is settled when the change\n  completes.\n- ``next_sync`` (a conversation Source): the next sync removes the\n  conversations the new selection leaves out, and the change completes\n  once every selected conversation is synced. Nothing is listed, so\n  ``listed_count`` stays ``null``.\n\nSaving ``restore_config`` with ``PUT /sources/{id}``, with this\ntransition's ``id`` as ``expected_scope_transition_id``, returns to the\nprevious scope: it replaces the change in progress, and nothing the\nprevious scope synced is removed. It is ``null`` when the viewer cannot\nchange the configuration, or the change already returns to the previous\nscope.",
         "properties": {
           "created_at": {
             "title": "Created At",
@@ -9359,6 +9369,15 @@
             "description": "The canonical scope fields of the last applied scope; null when the viewer cannot read the configuration.",
             "title": "Previous Scope"
           },
+          "removes": {
+            "description": "When the change removes what the new scope leaves out: at_completion, once every listed item has committed (a document Source); next_sync, the deselected conversations in the next sync (a conversation Source).",
+            "enum": [
+              "at_completion",
+              "next_sync"
+            ],
+            "title": "Removes",
+            "type": "string"
+          },
           "restore_config": {
             "anyOf": [
               {
@@ -9411,7 +9430,8 @@
           "excluded_scopes_due",
           "error",
           "failing_items",
-          "restore_config"
+          "restore_config",
+          "removes"
         ],
         "title": "SourceScopeTransitionResponse",
         "type": "object"
@@ -16116,7 +16136,7 @@
     },
     "/api/v1/sources/{source_id}/conversation-collection/plan": {
       "post": {
-        "description": "What one uploaded device collection attempt would change, without processing it.\n\nThe plan is the one a sync run would make now, including the removals\nof an open Projection Scope transition.",
+        "description": "What one uploaded device collection attempt would change, without processing it.\n\nThe plan is the one a sync run would make now: the run's collection\nfamily binds the attempt and starts the open Projection Scope\ntransition, with its removals, as the run does.",
         "operationId": "plan_conversation_collection_api_v1_sources__source_id__conversation_collection_plan_post",
         "parameters": [
           {
@@ -16881,7 +16901,7 @@
     },
     "/api/v1/sources/{source_id}/scope-change-preview": {
       "post": {
-        "description": "What saving this configuration would do to the Source's scope, without saving it.\n\nThe configuration form reads it before saving, to warn about a mode\nthat cannot list a scope change and about replacing the change in\nprogress. It decides as ``PUT /sources/{id}`` does, from the same\nstored facts; a configuration the source type rejects answers 400.",
+        "description": "What saving this configuration would do to the Source's scope, without saving it.\n\nThe configuration form reads it before saving, to warn about a mode\nthat cannot list a scope change, about replacing the change in\nprogress, and about when removal happens. It decides as\n``PUT /sources/{id}`` does, from the same stored facts; a\nconfiguration the source type rejects answers 400.",
         "operationId": "preview_source_scope_change_api_v1_sources__source_id__scope_change_preview_post",
         "parameters": [
           {
