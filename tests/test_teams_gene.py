@@ -170,7 +170,6 @@ def test_the_selection_is_the_configured_conversations_and_time_scope():
     assert selection.conversation_ids == ("19:a@thread.v2", "19:b@thread.v2")
     assert selection.initial_history_days == 14
     assert selection.rolling_retention_days == 365
-    assert gene.selected_conversation_ids({"conversation_ids": ["19:a@thread.v2"]}) == ("19:a@thread.v2",)
 
 
 def _window_package(window_id: str, messages: list[dict]) -> bytes:

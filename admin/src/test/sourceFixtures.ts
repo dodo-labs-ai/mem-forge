@@ -74,6 +74,7 @@ export function makeScopeTransition(overrides: Partial<ScopeTransition> = {}): S
     error: "3 listed Documents have not committed under the transition",
     failing_items: { count: 0, retrying_after_upgrade: 0, items: [] },
     restore_config: { base_url: "https://wiki.example", sync_mode: "spaces", spaces: ["ENG"] },
+    removes: "at_completion",
     ...overrides,
   };
 }

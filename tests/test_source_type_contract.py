@@ -102,9 +102,6 @@ def test_a_gene_of_both_families_is_refused() -> None:
         def conversation_selection(self):
             raise NotImplementedError
 
-        def selected_conversation_ids(self, projection_scope):
-            raise NotImplementedError
-
     _refused(Both, "both DocumentGene and ConversationGene")
 
 
