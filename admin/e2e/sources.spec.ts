@@ -62,6 +62,7 @@ test("a source's scope change in progress shows in its drawer and restores the p
       error: null,
       failing_items: { count: 0, retrying_after_upgrade: 0, items: [] },
       restore_config: restoreConfig,
+      removes: "at_completion",
     },
   };
   const saved: unknown[] = [];
@@ -69,7 +70,9 @@ test("a source's scope change in progress shows in its drawer and restores the p
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (request.method() === "POST" && path === "/api/v1/sources/src-wiki/scope-change-preview") {
-      return route.fulfill({ json: { outcome: "returns_to_previous_scope", open_transition: true, refusal: null } });
+      return route.fulfill({
+        json: { outcome: "returns_to_previous_scope", open_transition: true, removes: "at_completion", refusal: null },
+      });
     }
     if (request.method() === "PUT" && path === "/api/v1/sources/src-wiki") {
       saved.push(request.postDataJSON());

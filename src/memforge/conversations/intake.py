@@ -199,20 +199,45 @@ def _require_answer(manifest: CollectionManifest, request: CollectionRequest) ->
 def _require_consistent_poll(conversation_id: str, poll: PollEvidence, returned: Set[datetime]) -> None:
     """Refuse poll evidence that does not support what it claims.
 
-    A poll that reached the requested start names the time its read is
-    complete from, earlier than that start, as the provider certified it; an
-    agent that names none predates that evidence and must be upgraded. The
-    earliest returned time is the creation time of a message the manifest
-    lists for the conversation, inside the poll's requested interval.
+    A poll names the time its read is complete from, as the provider
+    certified it (:class:`~memforge.conversations.port.PollOutcome`): before
+    the requested start when it reached that start; at or after it when
+    history ran out or paging stopped early, and before the requested end
+    when it stopped early. A poll that returned a message names one whatever
+    its outcome; only a poll that returned nothing may name none. An agent
+    that names none predates that evidence and must be upgraded. The check
+    does not change what a poll proves (:func:`~memforge.conversations.coverage.proven_interval`):
+    a poll that ran out of history read every page, so its earliest returned
+    message is a sound bound. The earliest returned time is the creation time
+    of a message the manifest lists for the conversation, inside the poll's
+    requested interval.
     """
 
-    if poll.outcome is PollOutcome.REACHED_START and (
-        poll.earliest_complete_page_time is None or poll.earliest_complete_page_time >= poll.requested.start
-    ):
+    complete = poll.earliest_complete_page_time
+    if poll.outcome is PollOutcome.REACHED_START and (complete is None or complete >= poll.requested.start):
         raise CollectionRejected(
             f"a poll of conversation {conversation_id} reached its start without a complete time before it; "
             "upgrade the MemForge agent that collected it"
         )
+    if complete is None and poll.earliest_returned_at is not None:
+        raise CollectionRejected(
+            f"a poll of conversation {conversation_id} returned messages without the time its read is complete "
+            "from; upgrade the MemForge agent that collected it"
+        )
+    if complete is not None and poll.outcome is not PollOutcome.REACHED_START:
+        if complete < poll.requested.start:
+            ended = "stopped early" if poll.outcome is PollOutcome.STOPPED_EARLY else "ran out of history"
+            raise CollectionRejected(
+                f"a poll of conversation {conversation_id} that {ended} is complete from before its requested start; "
+                "upgrade the MemForge agent that collected it"
+            )
+        if poll.outcome is PollOutcome.STOPPED_EARLY and poll.requested.end is not None and (
+            complete >= poll.requested.end
+        ):
+            raise CollectionRejected(
+                f"a poll of conversation {conversation_id} that stopped early is complete from at or after its "
+                "requested end; upgrade the MemForge agent that collected it"
+            )
     earliest = poll.earliest_returned_at
     if earliest is not None and (
         earliest not in returned
