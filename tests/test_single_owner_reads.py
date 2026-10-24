@@ -25,7 +25,7 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from memforge import plugin_mcp_proxy, tool_client
-from memforge.agent_sessions import ensure_agent_session_source
+from tests.agent_session_fixture import seed_agent_session_source
 from memforge.api_target import build_target
 from memforge.config import AppConfig, RetrievalConfig
 from memforge.main import cli
@@ -254,10 +254,10 @@ async def owner_deployment(tmp_path, monkeypatch):
     await database.connect()
     collection = _VectorCollection()
     try:
-        owner_sessions = await ensure_agent_session_source(
+        owner_sessions = await seed_agent_session_source(
             database, client="claude-code", owner_user_id=LOCAL_DEV_USER_ID
         )
-        other_sessions = await ensure_agent_session_source(
+        other_sessions = await seed_agent_session_source(
             database, client="claude-code", owner_user_id=OTHER_USER_ID
         )
         await database.upsert_source(
