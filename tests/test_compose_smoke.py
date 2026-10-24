@@ -116,6 +116,14 @@ def test_every_revised_document_has_its_support_case() -> None:
     assert all((QUICK / "docs" / path.name).exists() for path in (QUICK / "revisions").glob("*.md"))
 
 
+def test_every_hand_written_situation_is_in_the_cohort() -> None:
+    import json
+
+    listed = {case["file"] for case in json.loads(COHORT.read_text(encoding="utf-8"))["reconciliation_cases"]}
+
+    assert listed == {f"reconciliation/{path.name}" for path in (QUICK / "reconciliation").glob("*.json")}
+
+
 @pytest.mark.parametrize("kind", tuple(smoke.QUALITY_CASE_KINDS))
 def test_the_seed_request_names_each_document_within_the_smoke_source(tmp_path: Path, kind: str) -> None:
     import json
