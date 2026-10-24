@@ -34,7 +34,7 @@
       }
     },
     {
-      "title": "Decision: Kestrel retries a failed job three times",
+      "title": "Decision: Kestrel retries a failed job five times",
       "rubric": {
         "expected_memory_count": {
           "min": 1
@@ -77,6 +77,58 @@
           "kestrel-oncall"
         ]
       }
+    }
+  ],
+  "support_cases": [
+    {
+      "title": "Decision: Kestrel retries a failed job five times",
+      "rubric": {
+        "expected_support_terms": {
+          "kestrel-dlq": "supported",
+          "300": "unsupported",
+          "backoff": "unsupported"
+        }
+      }
+    },
+    {
+      "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
+      "rubric": {
+        "expected_support_terms": {
+          "startup check": "supported",
+          "on-call": "unsupported"
+        }
+      }
+    },
+    {
+      "title": "Runbook: rotating the Kestrel signing key",
+      "rubric": {
+        "expected_support_terms": {
+          "kestrel-admin status": "supported"
+        }
+      }
+    },
+    {
+      "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
+      "rubric": {
+        "expected_support_terms": {
+          "Slack": "supported",
+          "15": "unsupported"
+        }
+      }
+    }
+  ],
+  "reconciliation_cases": [
+    {
+      "title": "Decision: Kestrel retries a failed job five times",
+      "file": "reconciliation/retry-count-replaced.json"
+    },
+    {
+      "title": "Runbook: rotating the Kestrel signing key",
+      "file": "reconciliation/rule-outlives-a-broken-rotation.json"
+    },
+    {
+      "title": "Convention: Kestrel release tags",
+      "file": "reconciliation/test-environment-is-not-production.json"
     }
   ]
 }

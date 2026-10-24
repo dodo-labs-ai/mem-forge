@@ -45,12 +45,26 @@ A change that fits several rows needs every check they name. When you are not
 sure whether a change belongs to the prompts and extraction row, treat it as
 if it does. Releases run all of them.
 
-`--quality` adds the quick offline quality evaluation to the Compose smoke: it
-syncs the synthetic documents in `evals/quality/quick`, pins each as a case
-with the rubric in `cohort.json` (how many memories its extraction should give
-and terms they must hold), replays extraction with the configured model and
-prints a summary with a verdict below the smoke table. A `fail` names the case
-and the check; run it again before you conclude, since a model's answers vary.
+`--quality` adds the quick offline quality evaluation to the Compose smoke. It
+syncs the synthetic documents in `evals/quality/quick/docs`, then replaces the
+ones in `revisions/` with their second version and syncs again, and evaluates
+three kinds of cases with the rubrics in `cohort.json`:
+
+- extraction: how many memories each document should give and terms they must
+  hold;
+- Support after an update: whether each old memory still has support in the
+  second version, naming memories by a term their claims hold;
+- reconciliation: the hand-written situations in `reconciliation/`, each an old
+  memory, a new candidate with its evidence and the expected outcome for the
+  old memory (`kept`, `review`, `revised` or `retired`).
+
+Each kind replays with the configured model and prints a summary with a verdict
+below the smoke table. A `fail` names the case and the check; run it again
+before you conclude, since a model's answers vary. When pinning fails because
+a memory is "labelled both" ways, the model merged two labelled facts into one
+claim: choose a more specific term rather than treating it as a regression. To
+test a new situation, add a document pair or a reconciliation file and list it
+in `cohort.json`.
 Maintainers also run the same evaluation over cases pinned from a real
 workspace, which stay in that workspace.
 
