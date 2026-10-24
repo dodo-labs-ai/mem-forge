@@ -858,6 +858,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "CandidateAdmissionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
+        "RefinementVerificationResponse": '{"decisions":[]}',
         "CrossDocumentRelationResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "RerankResponse": '{"ranking":[]}',
