@@ -151,31 +151,32 @@ def test_specific_directory_binding_overrides_repository_binding(
     assert result.repo_identifier == "github.com/acme/payroll-service"
 
 
-def test_hook_workspace_is_never_used_by_interactive_resolution(
+@pytest.mark.parametrize("value", ["capture_workspace", "", None, 7])
+def test_obsolete_hook_workspace_key_parses_and_selects_no_workspace(
     tmp_path: Path,
+    value: object,
 ) -> None:
     working_directory = tmp_path / "ordinary"
     working_directory.mkdir()
     config = tmp_path / "bindings.json"
-    _write_config(config, {"hook_workspace_id": "capture_workspace"})
-
-    interactive = resolve_workspace_binding(
-        origin=ORIGIN,
-        working_directory=str(working_directory),
-        allow_hook_default=False,
-        config_path=config,
-    )
-    hook = resolve_workspace_binding(
-        origin=ORIGIN,
-        working_directory=str(working_directory),
-        allow_hook_default=True,
-        config_path=config,
+    _write_config(
+        config,
+        {
+            "hook_workspace_id": value,
+            "repository_bindings": {"github.com/acme/payroll": "payroll_workspace"},
+        },
     )
 
-    assert interactive.workspace_id is None
-    assert interactive.source == "none"
-    assert hook.workspace_id == "capture_workspace"
-    assert hook.source == "hook_default"
+    bindings = load_workspace_bindings(config)
+    result = resolve_workspace_binding(
+        origin=ORIGIN,
+        working_directory=str(working_directory),
+        config_path=config,
+    )
+
+    assert bindings.targets[ORIGIN].repository_bindings == {"github.com/acme/payroll": "payroll_workspace"}
+    assert result.workspace_id is None
+    assert result.source == "none"
 
 
 def test_bindings_are_scoped_to_the_exact_memforge_origin(tmp_path: Path) -> None:
@@ -233,6 +234,10 @@ def test_multiple_roots_with_different_bindings_fail_closed(tmp_path: Path) -> N
         {
             "version": 1,
             "targets": {ORIGIN: {"repository_bindings": {"github.com/acme/repo": ""}}},
+        },
+        {
+            "version": 1,
+            "targets": {ORIGIN: {"capture_workspace_id": "workspace"}},
         },
     ],
 )
@@ -310,3 +315,96 @@ def test_setup_helper_uses_normalized_origin_for_git_repository(
 
     assert preview["binding_kind"] == "repository"
     assert preview["binding_key"] == "github.com/acme/payroll"
+
+
+def test_setup_helper_inspect_reports_obsolete_keys(monkeypatch, tmp_path: Path) -> None:
+    helper = _load_setup_helper()
+    bindings = tmp_path / "workspace-bindings.json"
+    ordinary = tmp_path / "notes"
+    ordinary.mkdir()
+    bindings.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "targets": {
+                    "https://cloud.example": {
+                        "hook_workspace_id": "capture_workspace",
+                        "directory_bindings": {str(ordinary): "notes_workspace"},
+                    },
+                    "http://127.0.0.1:8765": {"hook_workspace_id": "default"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = SimpleNamespace(origin="https://cloud.example")
+    monkeypatch.setattr(helper, "workspace_bindings_path", lambda: bindings)
+    monkeypatch.setattr(helper, "configured_target", lambda: target)
+    monkeypatch.setattr(
+        helper,
+        "resolve_workspace_binding",
+        lambda **kwargs: resolve_workspace_binding(config_path=bindings, **kwargs),
+    )
+
+    report = helper._inspect(SimpleNamespace(operation="inspect", client="codex", path=str(ordinary)))
+
+    assert report["effective_workspace_id"] == "notes_workspace"
+    assert report["effective_source"] == "directory"
+    assert report["obsolete_keys"] == [
+        {"origin": "https://cloud.example", "key": "hook_workspace_id", "value": "capture_workspace"},
+        {"origin": "http://127.0.0.1:8765", "key": "hook_workspace_id", "value": "default"},
+    ]
+
+
+def test_setup_helper_removes_obsolete_keys_only_after_confirmed_preview(monkeypatch, tmp_path: Path) -> None:
+    helper = _load_setup_helper()
+    bindings = tmp_path / "workspace-bindings.json"
+    ordinary = tmp_path / "notes"
+    ordinary.mkdir()
+    original = {
+        "version": 1,
+        "targets": {
+            "https://cloud.example": {
+                "hook_workspace_id": "capture_workspace",
+                "directory_bindings": {str(ordinary): "notes_workspace"},
+            },
+            "http://127.0.0.1:8765": {"hook_workspace_id": "default"},
+        },
+    }
+    bindings.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(helper, "workspace_bindings_path", lambda: bindings)
+    monkeypatch.setattr(helper, "configured_target", lambda: SimpleNamespace(origin="https://cloud.example"))
+    args = SimpleNamespace(operation="remove-obsolete-keys", client="codex", apply=False, expect_digest=None)
+
+    preview = helper._mutate(args)
+
+    assert [entry["origin"] for entry in preview["removed_obsolete_keys"]] == [
+        "https://cloud.example",
+        "http://127.0.0.1:8765",
+    ]
+    assert preview["planned_document"] == {
+        "version": 1,
+        "targets": {"https://cloud.example": {"directory_bindings": {str(ordinary): "notes_workspace"}}},
+    }
+    assert json.loads(bindings.read_text(encoding="utf-8")) == original
+
+    args.apply = True
+    args.expect_digest = "stale-digest"
+    with pytest.raises(helper.SetupError, match="changed after preview"):
+        helper._mutate(args)
+    assert json.loads(bindings.read_text(encoding="utf-8")) == original
+
+    args.expect_digest = preview["document_digest"]
+    helper._mutate(args)
+
+    assert json.loads(bindings.read_text(encoding="utf-8")) == preview["planned_document"]
+    args.apply = False
+    with pytest.raises(helper.SetupError, match="no obsolete keys"):
+        helper._mutate(args)
+
+
+def test_setup_helper_no_longer_offers_a_hook_workspace() -> None:
+    helper = _load_setup_helper()
+
+    with pytest.raises(SystemExit):
+        helper._parser().parse_args(["--client", "codex", "set-hook-workspace", "--workspace", "w"])

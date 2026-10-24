@@ -87,7 +87,7 @@ except ImportError:  # pragma: no cover - copied plugin package or direct file l
 
 DEFAULT_TIMEOUT_SECONDS = 60.0
 SERVER_NAME = "memforge"
-SERVER_VERSION = "0.2.0-beta.1"
+SERVER_VERSION = "0.2.0-beta.2"
 CODEX_SANDBOX_STATE_META_CAPABILITY = "codex/sandbox-state-meta"
 SERVER_INSTRUCTIONS = (
     "Local project context is optional. MemForge uses negotiated request-scoped host context when "
@@ -96,8 +96,7 @@ SERVER_INSTRUCTIONS = (
     "Omit it when unavailable; the operation must continue. Explicit repository_context takes "
     "precedence. MemForge derives repository attribution locally and never sends the local path "
     "to the service. Workspace selection is request-scoped through the optional workspace_id "
-    "tool parameter or a user-confirmed local project binding. The hook fallback is never used "
-    "for interactive tool calls."
+    "tool parameter or a user-confirmed local project binding."
 )
 AGENT_CLIENT_VALUES = ["claude-code", "codex"]
 RANKED_RETRIEVAL_INTENTS = ["general_hybrid", "known_item", "relationship"]
@@ -119,7 +118,6 @@ SEARCH_ALLOWED_KEYS = frozenset(
 SOURCE_FILTER_ALLOWED_KEYS = frozenset(
     {
         "source_ids",
-        "clients",
         "current_repo_only",
     }
 )
@@ -171,8 +169,7 @@ WORKSPACE_ID_SCHEMA = {
     "minLength": 1,
     "description": (
         "Optional workspace selected for this call. It overrides any local project binding. "
-        "When omitted, MemForge uses a local binding or the caller's only accessible workspace; "
-        "it never uses the hook fallback for interactive calls."
+        "When omitted, MemForge uses a local binding or the caller's only accessible workspace."
     ),
 }
 
@@ -262,7 +259,7 @@ TOOLS: list[dict[str, Any]] = [
             "List workspaces accessible to the current principal. Discovery is optional; other tools resolve omitted "
             "workspace_id from a user-confirmed local project binding or a singleton workspace. "
             "If multiple workspaces exist and the project is unbound, ask which workspace to use. "
-            "Never change a binding or hook fallback silently."
+            "Never change a binding silently."
         ),
         "inputSchema": {
             "type": "object",
@@ -320,14 +317,6 @@ TOOLS: list[dict[str, Any]] = [
                             "description": (
                                 "Exact source IDs returned by list_sources. Use source_ids when "
                                 "the user names a configured source; do not guess IDs."
-                            ),
-                        },
-                        "clients": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": AGENT_CLIENT_VALUES},
-                            "description": (
-                                "Restrict agent-session memories by producer. Use only when "
-                                "the user explicitly names Codex or Claude Code."
                             ),
                         },
                     },
@@ -1576,7 +1565,6 @@ def _tool_call_context(value: Any, *, request_meta: Any = None) -> ToolCallConte
         resolution = resolve_workspace_binding(
             origin=target.origin,
             root_paths=_CLIENT_ROOT_PATHS,
-            allow_hook_default=False,
         )
         return ToolCallContext(
             target=target,
@@ -1618,7 +1606,6 @@ def _tool_call_context_from_working_directory(
         resolution = resolve_workspace_binding(
             origin=target.origin,
             working_directory=working_directory,
-            allow_hook_default=False,
         )
     except ValueError as exc:
         raise ValueError(f"{field_name} must resolve to one existing local directory") from exc

@@ -1,4 +1,4 @@
-"""Agent sessions: knowledge a coding agent captures through the managed entrypoint."""
+"""Agent sessions: private memories kept from earlier Codex or Claude Code sessions."""
 
 from __future__ import annotations
 

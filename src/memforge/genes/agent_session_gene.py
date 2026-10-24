@@ -21,18 +21,22 @@ __all__ = ["AgentSessionGene"]
 
 
 _NO_PROVIDER_CONTENT = (
-    "Agent Session Sources receive knowledge through agent-session windows; "
-    "they have no provider content to fetch"
+    "Agent Session Sources hold memories kept from earlier Codex or Claude Code "
+    "sessions; they have no provider content to fetch"
 )
 
 
 class AgentSessionGene(Gene):
-    """Private per-client, per-user Sources written by agent-session windows.
+    """Private per-client, per-user Sources that hold existing Agent Knowledge.
 
-    Codex and Claude Code upload transcript windows to the agent-session API,
-    which patches the owner's Agent Knowledge directly under the Source activity
-    lease. The Source declares no execution kinds, so it is never synced and
-    discovery finds nothing.
+    Each one keeps the private claims recorded for one coding client and owner.
+    MemForge creates no new agent-session Sources and coding sessions add no new
+    claims: coding agents save memory only through the confirmed MCP
+    ``create_memory`` tool. The owner can still correct or retire a claim
+    Memory, and that change goes through the claim lifecycle in
+    ``memforge.agent_knowledge``, which updates the claim and its concept. The
+    owner retires the whole Source by deleting it. The Source declares no
+    execution kinds, so it is never synced and discovery finds nothing.
     """
 
     @classmethod
@@ -40,7 +44,7 @@ class AgentSessionGene(Gene):
         return GeneMetadata(
             name="agent_session",
             display_name="Agent Session",
-            description="Private coding-agent knowledge from Codex and Claude Code session windows",
+            description="Private memories kept from earlier Codex or Claude Code sessions",
             default_sync_interval_minutes=0,
             auth_method="local_file",
             data_shape="message",
@@ -58,7 +62,7 @@ class AgentSessionGene(Gene):
                     field_type=ConfigFieldType.STRING,
                     required=False,
                     placeholder="codex",
-                    help_text="Coding client whose session windows this Source receives (e.g. 'codex', 'claude-code').",
+                    help_text="Coding client whose memories this Source holds (e.g. 'codex', 'claude-code').",
                     group="client",
                     order=0,
                 ),

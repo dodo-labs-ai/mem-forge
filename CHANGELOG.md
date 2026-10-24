@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Automatic agent-session capture is removed. The Claude Code and Codex
+  plugins (`0.2.0-beta.2`) no longer register `Stop`, `PreCompact` or
+  `SubagentStop` hooks. `SessionStart` only adds MemForge usage guidance and
+  makes no network call; a hook mode it does not know prints
+  `{"continue": true}` and exits 0. Agents write memory only through the
+  confirmed `create_memory` tool. `POST /api/v1/agent-sessions/windows` and
+  `POST /api/v1/hooks/receipts` answer `410` with code
+  `agent_session_capture_removed` for this release and are removed in the
+  next one. `GET /api/v1/agent-sessions/completeness` is removed, and so is
+  `unrecognized_session_lines` on `GET /api/v1/sources`. The MCP `search`
+  tool no longer offers `source_filter.clients`; the API still accepts it for
+  this release. An agent-session Source can now be deleted by its owner in
+  the admin UI, while configure and sync stay unavailable. The admin UI's
+  coding-agent page now shows the commands that install the plugin for its
+  memory tools.
+  **Upgrade:** if your coding agent shows
+  `MemForge hook skipped: /hooks/receipts returned HTTP 410` at the end of
+  a turn, update the MemForge memory plugin and restart the client. Claude
+  Code: `claude plugin marketplace update memforge`, then
+  `claude plugin update memory@memforge`. Codex:
+  `codex plugin marketplace upgrade memforge`, then
+  `codex plugin add memory@memforge`. You can delete `queue.sqlite`,
+  `queue.sqlite-wal`, `queue.sqlite-shm` and `worker.lock` in
+  `~/.memforge-agent`; keep
+  `~/.memforge-agent/artifacts` if you use `get_resource(mode="file")`. A
+  `hook_workspace_id` entry in `~/.memforge/workspace-bindings.json` is
+  ignored, and `memforge-setup` can remove it. To remove your existing
+  agent-session memories now, delete the Codex Session and Claude Code
+  Session Sources in the admin UI. Otherwise the next release retires them
+  on upgrade.
+
 - The quick quality evaluation covers document updates. `compose_smoke.sh
   --quality` syncs second versions of the synthetic documents and evaluates
   Support cases of those updates and hand-written reconciliation cases next to

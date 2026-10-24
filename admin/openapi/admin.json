@@ -1015,337 +1015,37 @@
         "title": "AgentHookContextRequest",
         "type": "object"
       },
-      "AgentHookReceiptRequest": {
+      "AgentSessionCaptureRemovedDetail": {
+        "description": "Why an automatic agent-session upload is refused, and what the user does next.",
         "properties": {
-          "branch": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Branch"
-          },
-          "client": {
-            "title": "Client",
+          "code": {
+            "const": "agent_session_capture_removed",
+            "title": "Code",
             "type": "string"
           },
-          "commit_sha": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Commit Sha"
-          },
-          "hook": {
-            "title": "Hook",
-            "type": "string"
-          },
-          "metadata": {
-            "additionalProperties": true,
-            "title": "Metadata",
-            "type": "object"
-          },
-          "repo": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repo"
-          },
-          "session_id": {
-            "title": "Session Id",
-            "type": "string"
-          },
-          "submitted_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Submitted At"
-          },
-          "workspace": {
-            "title": "Workspace",
+          "message": {
+            "title": "Message",
             "type": "string"
           }
         },
         "required": [
-          "client",
-          "session_id",
-          "hook",
-          "workspace"
+          "code",
+          "message"
         ],
-        "title": "AgentHookReceiptRequest",
+        "title": "AgentSessionCaptureRemovedDetail",
         "type": "object"
       },
-      "AgentSessionCompletenessResponse": {
-        "description": "Knowledge completeness of agent-session windows, computed on demand.\n\n``processed_total`` counts the windows that were processed, patched or\nnot, and ``no_output_fraction`` is the share of them that kept nothing\n(0 when none was processed). ``total`` also counts failed windows.\n``latest_failure`` is ``null`` when no window failed. ``source_id`` names\nthe Source read, and ``session_id`` echoes the session filter when the\nrequest named one.",
+      "AgentSessionCaptureRemovedResponse": {
+        "description": "The ``410 Gone`` body of the removed agent-session capture routes.\n\nExample::\n\n    {\"detail\": {\"code\": \"agent_session_capture_removed\",\n                \"message\": \"MemForge no longer captures agent sessions automatically. \"\n                           \"Update the MemForge memory plugin.\"}}",
         "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/AgentSessionOutcomeCountsResponse"
-          },
-          "latest_failure": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AgentSessionLatestFailureResponse"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "no_output_fraction": {
-            "title": "No Output Fraction",
-            "type": "number"
-          },
-          "processed_total": {
-            "title": "Processed Total",
-            "type": "integer"
-          },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Session Id"
-          },
-          "source_id": {
-            "title": "Source Id",
-            "type": "string"
-          },
-          "total": {
-            "title": "Total",
-            "type": "integer"
+          "detail": {
+            "$ref": "#/components/schemas/AgentSessionCaptureRemovedDetail"
           }
         },
         "required": [
-          "session_id",
-          "source_id",
-          "total",
-          "processed_total",
-          "counts",
-          "no_output_fraction",
-          "latest_failure"
+          "detail"
         ],
-        "title": "AgentSessionCompletenessResponse",
-        "type": "object"
-      },
-      "AgentSessionLatestFailureResponse": {
-        "description": "The failed windows, with the reason and time of the latest one.",
-        "properties": {
-          "count": {
-            "title": "Count",
-            "type": "integer"
-          },
-          "last_seen_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Seen At"
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          }
-        },
-        "required": [
-          "count",
-          "reason",
-          "last_seen_at"
-        ],
-        "title": "AgentSessionLatestFailureResponse",
-        "type": "object"
-      },
-      "AgentSessionOutcomeCountsResponse": {
-        "description": "How many processed windows kept a knowledge patch, kept nothing, or failed.",
-        "properties": {
-          "failed": {
-            "title": "Failed",
-            "type": "integer"
-          },
-          "knowledge_patched": {
-            "title": "Knowledge Patched",
-            "type": "integer"
-          },
-          "no_output": {
-            "title": "No Output",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "knowledge_patched",
-          "no_output",
-          "failed"
-        ],
-        "title": "AgentSessionOutcomeCountsResponse",
-        "type": "object"
-      },
-      "AgentSessionWindowRequest": {
-        "properties": {
-          "branch": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Branch"
-          },
-          "client": {
-            "title": "Client",
-            "type": "string"
-          },
-          "commit_sha": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Commit Sha"
-          },
-          "events": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Events",
-            "type": "array"
-          },
-          "history_window": {
-            "additionalProperties": true,
-            "title": "History Window",
-            "type": "object"
-          },
-          "plugin_version": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Plugin Version"
-          },
-          "process_now": {
-            "default": false,
-            "title": "Process Now",
-            "type": "boolean"
-          },
-          "receipt": {
-            "additionalProperties": true,
-            "title": "Receipt",
-            "type": "object"
-          },
-          "repo": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repo"
-          },
-          "retention": {
-            "default": "none",
-            "title": "Retention",
-            "type": "string"
-          },
-          "schema_version": {
-            "default": "agent-session-window/v1",
-            "title": "Schema Version",
-            "type": "string"
-          },
-          "session_id": {
-            "title": "Session Id",
-            "type": "string"
-          },
-          "source_updated_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Updated At"
-          },
-          "submitted_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Submitted At"
-          },
-          "transcript_markdown": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Transcript Markdown"
-          },
-          "trigger": {
-            "title": "Trigger",
-            "type": "string"
-          },
-          "workspace": {
-            "title": "Workspace",
-            "type": "string"
-          }
-        },
-        "required": [
-          "client",
-          "session_id",
-          "trigger",
-          "workspace"
-        ],
-        "title": "AgentSessionWindowRequest",
+        "title": "AgentSessionCaptureRemovedResponse",
         "type": "object"
       },
       "ComponentHealth": {
@@ -10444,17 +10144,6 @@
           "type": {
             "title": "Type",
             "type": "string"
-          },
-          "unrecognized_session_lines": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/UnrecognizedSessionLinesResponse"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Transcript lines the current plugin version could not recognize in recent uploads; present only for agent-session Sources, null when every line was recognized."
           }
         },
         "required": [
@@ -12064,44 +11753,6 @@
         "title": "UnqueuedSource",
         "type": "object"
       },
-      "UnrecognizedSessionLinesResponse": {
-        "description": "Transcript lines the agent client's plugin could not recognize in recent uploads.",
-        "properties": {
-          "count": {
-            "title": "Count",
-            "type": "integer"
-          },
-          "last_seen_at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Last Seen At"
-          },
-          "plugin_version": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Plugin Version"
-          }
-        },
-        "required": [
-          "count",
-          "plugin_version",
-          "last_seen_at"
-        ],
-        "title": "UnrecognizedSessionLinesResponse",
-        "type": "object"
-      },
       "UpdateSourceRequest": {
         "properties": {
           "config": {
@@ -13380,100 +13031,24 @@
         ]
       }
     },
-    "/api/v1/agent-sessions/completeness": {
-      "get": {
-        "description": "Return one Source's window outcome counts and no_output fraction on demand.\n\n``session_id`` narrows the read to one session of that Source. The\nreceipts carry failure reasons, so a Source the caller cannot discover\nanswers 404 like an unknown one.",
-        "operationId": "agent_session_completeness_api_v1_agent_sessions_completeness_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "source_id",
-            "required": true,
-            "schema": {
-              "title": "Source Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "session_id",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Session Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentSessionCompletenessResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Agent Session Completeness",
-        "tags": [
-          "agent-sessions"
-        ]
-      }
-    },
     "/api/v1/agent-sessions/windows": {
       "post": {
-        "description": "Submit a client transcript window for private agent-knowledge patching.",
-        "operationId": "submit_agent_session_window_summary_api_v1_agent_sessions_windows_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentSessionWindowRequest"
-              }
-            }
-          },
-          "required": true
-        },
+        "deprecated": true,
+        "description": "Refuse an automatic session-window upload from an earlier memory plugin.\n\nMemForge no longer captures agent sessions. The route reads no body,\ncreates no Source, calls no model and takes no Source activity; it\nanswers ``410`` with ``agent_session_capture_removed`` so the upload\nstops at the plugin. It is removed in the next release.",
+        "operationId": "refuse_agent_session_window_api_v1_agent_sessions_windows_post",
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
+          "410": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/AgentSessionCaptureRemovedResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Successful Response"
           }
         },
-        "summary": "Submit Agent Session Window Summary",
+        "summary": "Refuse Agent Session Window",
         "tags": [
           "agent-sessions"
         ]
@@ -14458,39 +14033,22 @@
     },
     "/api/v1/hooks/receipts": {
       "post": {
-        "description": "Record a coding-agent lifecycle hook without creating a source document.",
-        "operationId": "record_agent_hook_receipt_api_v1_hooks_receipts_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentHookReceiptRequest"
-              }
-            }
-          },
-          "required": true
-        },
+        "deprecated": true,
+        "description": "Refuse a turn-end hook receipt from an earlier memory plugin.\n\nSame contract as ``POST /api/v1/agent-sessions/windows``: no body is\nread and nothing is recorded. It is removed in the next release.",
+        "operationId": "refuse_agent_hook_receipt_api_v1_hooks_receipts_post",
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
+          "410": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/AgentSessionCaptureRemovedResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Successful Response"
           }
         },
-        "summary": "Record Agent Hook Receipt",
+        "summary": "Refuse Agent Hook Receipt",
         "tags": [
           "hooks"
         ]

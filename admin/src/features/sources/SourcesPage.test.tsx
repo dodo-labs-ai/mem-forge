@@ -87,74 +87,58 @@ test("a shared workspace shows who can use each source", async () => {
   expect(within(drawer).getByText("Only me")).toBeInTheDocument();
 });
 
-test.each([
-  [{ count: 3, plugin_version: "0.2.0", last_seen_at: "2026-09-29T11:00:00Z" }, true],
-  [null, false],
-])("an agent-session source warns about session lines its plugin did not recognize (%o)", async (lines, warns) => {
-  const source = makeSource({
+function agentSessionSource(canDelete: boolean) {
+  const base = makeSource();
+  return makeSource({
     id: "src-claude",
     type: "agent_session",
     client: "claude-code",
     name: "Claude Code Session",
-    unrecognized_session_lines: lines,
-  });
-  renderPage([source], {
-    "GET /api/v1/agent-sessions/completeness": () => ({
-      session_id: null,
-      source_id: "src-claude",
-      total: 0,
-      processed_total: 0,
-      counts: { knowledge_patched: 0, no_output: 0, failed: 0 },
-      no_output_fraction: 0,
-      latest_failure: null,
-    }),
-    "GET /api/v1/sources/src-claude/projects": () => ({ source_id: "src-claude", projects: [] }),
-  });
-
-  const table = await screen.findByRole("table", { name: "Sources" });
-  await userEvent.click(await within(table).findByText("Claude Code Session"));
-  const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
-  const warning = within(drawer).queryByText("3 session lines from Claude Code were not recognized");
-  if (warns) {
-    expect(warning).toBeInTheDocument();
-    expect(within(drawer).getByText("Update the MemForge plugin so new sessions are read in full.")).toBeInTheDocument();
-  } else {
-    expect(warning).not.toBeInTheDocument();
-    expect(within(drawer).queryByText(/not recognized/)).not.toBeInTheDocument();
-  }
-});
-
-test("an agent-session source's drawer shows when a session window was last processed, not a sync status it cannot have", async () => {
-  const source = makeSource({
-    id: "src-claude",
-    type: "agent_session",
-    client: "claude-code",
-    name: "Claude Code Session",
+    access_policy: "private",
     sync: null,
     sync_schedule: null,
     last_sync: "2026-10-24T05:00:00Z",
+    capabilities: {
+      ...base.capabilities!,
+      can_configure: false,
+      can_configure_connection: false,
+      can_sync: false,
+      can_force_resync: false,
+      can_delete: canDelete,
+    },
   });
-  renderPage([source], {
-    "GET /api/v1/agent-sessions/completeness": () => ({
-      session_id: null,
-      source_id: "src-claude",
-      total: 0,
-      processed_total: 0,
-      counts: { knowledge_patched: 0, no_output: 0, failed: 0 },
-      no_output_fraction: 0,
-      latest_failure: null,
-    }),
-    "GET /api/v1/sources/src-claude/projects": () => ({ source_id: "src-claude", projects: [] }),
-  });
+}
+
+test("an agent-session source's drawer shows its content without coverage or a sync status it cannot have", async () => {
+  const { calls } = renderPage([agentSessionSource(true)]);
 
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByText("Claude Code Session"));
   const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
-  expect(await within(drawer).findByText("Last window processed")).toBeInTheDocument();
+  expect(within(drawer).getByRole("heading", { name: "Content" })).toBeInTheDocument();
   expect(within(drawer).queryByRole("heading", { name: "Sync" })).not.toBeInTheDocument();
-  for (const text of ["Not synced yet", "Status", "Last sync", "Schedule", "Manual only"]) {
+  for (const text of ["Session coverage", "Last window processed", "Not synced yet", "Last sync", "Schedule"]) {
     expect(within(drawer).queryByText(text)).not.toBeInTheDocument();
   }
+  expect(calls.some((request) => new URL(request.url).pathname.startsWith("/api/v1/agent-sessions"))).toBe(false);
+});
+
+test.each([
+  [true, "enabled"],
+  [false, "disabled"],
+])("an agent-session source offers Delete from the server's can_delete (%s)", async (canDelete, state) => {
+  renderPage([agentSessionSource(canDelete)]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Claude Code Session");
+  await userEvent.click(within(table).getByRole("button", { name: "More actions for Claude Code Session" }));
+  const remove = await screen.findByRole("menuitem", { name: "Delete source" });
+  if (state === "enabled") {
+    expect(remove).not.toHaveAttribute("aria-disabled", "true");
+  } else {
+    expect(remove).toHaveAttribute("aria-disabled", "true");
+  }
+  expect(screen.queryByRole("menuitem", { name: "Configure" })).not.toBeInTheDocument();
 });
 
 test("a synced source's drawer keeps its sync status, last sync and schedule", async () => {
@@ -167,7 +151,6 @@ test("a synced source's drawer keeps its sync status, last sync and schedule", a
   for (const text of ["Status", "Last sync", "Schedule"]) {
     expect(within(drawer).getByText(text)).toBeInTheDocument();
   }
-  expect(within(drawer).queryByText("Last window processed")).not.toBeInTheDocument();
 });
 
 test("Add source opens the type picker in the app", async () => {

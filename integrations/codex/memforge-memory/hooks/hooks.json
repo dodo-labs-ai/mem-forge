@@ -8,31 +8,7 @@
             "type": "command",
             "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" context --client codex'",
             "timeout": 10,
-            "statusMessage": "Loading MemForge context"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client codex'",
-            "timeout": 15,
-            "statusMessage": "Submitting MemForge compaction receipt"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh -lc 'root=\"${CODEX_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; script=\"$root/scripts/memforge_hook.py\"; if [ ! -f \"$script\" ]; then echo \"MemForge hook script not found\" >&2; exit 0; fi; exec python3 \"$script\" submit-session --client codex'",
-            "timeout": 15,
-            "statusMessage": "Submitting MemForge session receipt"
+            "statusMessage": "Loading MemForge usage guidance"
           }
         ]
       }
