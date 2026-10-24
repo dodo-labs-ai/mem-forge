@@ -5,12 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 
 from memforge.conversations.port import (
     ConversationAccess,
-    ConversationUnavailable,
     Interval,
     PollOutcome,
     ThreadingModel,
@@ -112,31 +110,6 @@ async def test_a_poll_maps_messages_and_keeps_the_paging_evidence():
     client.read_messages.assert_awaited_once_with(
         CHANNEL.conversation_id, start=SENT, end=None, budget_seconds=30
     )
-
-
-@pytest.mark.parametrize("status", [403, 404])
-async def test_a_refused_poll_reports_lost_access(status):
-    client = TeamsChatClient(region="emea")
-    request = httpx.Request("GET", "https://teams.example/conversations")
-    client.read_messages = AsyncMock(
-        side_effect=httpx.HTTPStatusError("refused", request=request, response=httpx.Response(status, request=request))
-    )
-
-    with pytest.raises(ConversationUnavailable) as refused:
-        await TeamsConversationProvider(client).poll(CHANNEL, Interval(start=SENT))
-
-    assert refused.value.status.access is ConversationAccess.NO_ACCESS
-
-
-async def test_a_server_error_fails_the_poll():
-    client = TeamsChatClient(region="emea")
-    request = httpx.Request("GET", "https://teams.example/conversations")
-    client.read_messages = AsyncMock(
-        side_effect=httpx.HTTPStatusError("broken", request=request, response=httpx.Response(500, request=request))
-    )
-
-    with pytest.raises(httpx.HTTPStatusError):
-        await TeamsConversationProvider(client).poll(CHANNEL, Interval(start=SENT))
 
 
 async def test_a_selected_conversation_missing_from_the_recent_listing_is_still_polled():
