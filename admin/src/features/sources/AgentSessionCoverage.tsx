@@ -60,18 +60,23 @@ export function AgentSessionCoverage({ source }: { source: Source }) {
         <p className="text-sm text-muted-foreground">No session has been kept yet.</p>
       ) : (
         <ul aria-label="Projects with memories from sessions" className="divide-y rounded-lg border">
-          {projects.data.map((project) => (
-            <li key={project.project} className="flex flex-wrap items-baseline gap-x-4 gap-y-0.5 p-3 text-sm">
-              <span className="min-w-0 flex-1 font-medium text-foreground">{projectNames.get(project.project) ?? project.project}</span>
-              <span className="text-muted-foreground">{pluralize(project.document_count, "summary", "summaries")}</span>
-              <span className="text-muted-foreground">{pluralize(project.memory_count, "memory", "memories")}</span>
-              {project.last_observed_at ? (
-                <span className="text-xs text-muted-foreground" title={formatDateTime(project.last_observed_at)}>
-                  {formatRelative(project.last_observed_at)}
+          {projects.data.map((project) => {
+            const name = projectNames.get(project.project) ?? project.project;
+            return (
+              <li key={project.project} className="flex flex-wrap items-baseline gap-x-4 gap-y-0.5 p-3 text-sm">
+                <span className="min-w-24 flex-1 truncate font-medium text-foreground" title={name}>
+                  {name}
                 </span>
-              ) : null}
-            </li>
-          ))}
+                <span className="whitespace-nowrap text-muted-foreground">{pluralize(project.document_count, "summary", "summaries")}</span>
+                <span className="whitespace-nowrap text-muted-foreground">{pluralize(project.memory_count, "memory", "memories")}</span>
+                {project.last_observed_at ? (
+                  <span className="whitespace-nowrap text-xs text-muted-foreground" title={formatDateTime(project.last_observed_at)}>
+                    {formatRelative(project.last_observed_at)}
+                  </span>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
     </DrawerSection>

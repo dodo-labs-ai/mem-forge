@@ -6,6 +6,7 @@ import { Button } from "@/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { AgentSessionCoverage } from "./AgentSessionCoverage";
 import { AGENT_SESSION_SOURCE_TYPE } from "./model/agentSessions";
+import { isManagedSourceType } from "./model/managedSources";
 import { canChangeSourceAccess } from "./model/sourceAccess";
 import { BRAND_MARKS, sourceBrandKeysFor } from "./model/sourceBrand";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
@@ -144,48 +145,63 @@ export function SourceDetailDrawer({
 
       <SourceScopeTransitionSection source={source} activity={activity} />
 
-      <DrawerSection title="Sync">
-        <PropertyList
-          items={[
-            {
-              label: "Status",
-              value: presentation ? (
-                <StatusBadge
-                  tone={
-                    activity?.state === "failed"
-                      ? "danger"
-                      : activity?.state === "success"
-                        ? "ok"
-                        : activity?.state === "stopped"
-                          ? "idle"
-                          : "live"
-                  }
-                >
-                  {presentation.message}
-                </StatusBadge>
-              ) : (
-                "Not synced yet"
-              ),
-              // The attention card above already explains a problem in full.
-              hint: attention ? undefined : presentation?.detail,
-            },
-            {
-              label: "Last sync",
-              value: source.last_sync ? formatRelative(source.last_sync) : "Never",
-              hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
-            },
-            {
-              label: "Schedule",
-              value: schedule?.enabled ? formatInterval(schedule.interval_minutes) : "Manual only",
-              hint:
-                schedule?.enabled && schedule.next_run_at && source.status === "active"
-                  ? `Next run ${formatUntil(schedule.next_run_at)}`
-                  : undefined,
-            },
-          ]}
-        />
-        {presentation?.notice ? <Notice tone="idle" icon={Info}>{presentation.notice}</Notice> : null}
-      </DrawerSection>
+      {isManagedSourceType(source.type) ? (
+        // Its plugin delivers the sessions, so the source has no sync runs or schedule.
+        <DrawerSection title="Sessions">
+          <PropertyList
+            items={[
+              {
+                label: "Last session",
+                value: source.last_sync ? formatRelative(source.last_sync) : "None yet",
+                hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
+              },
+            ]}
+          />
+        </DrawerSection>
+      ) : (
+        <DrawerSection title="Sync">
+          <PropertyList
+            items={[
+              {
+                label: "Status",
+                value: presentation ? (
+                  <StatusBadge
+                    tone={
+                      activity?.state === "failed"
+                        ? "danger"
+                        : activity?.state === "success"
+                          ? "ok"
+                          : activity?.state === "stopped"
+                            ? "idle"
+                            : "live"
+                    }
+                  >
+                    {presentation.message}
+                  </StatusBadge>
+                ) : (
+                  "Not synced yet"
+                ),
+                // The attention card above already explains a problem in full.
+                hint: attention ? undefined : presentation?.detail,
+              },
+              {
+                label: "Last sync",
+                value: source.last_sync ? formatRelative(source.last_sync) : "Never",
+                hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
+              },
+              {
+                label: "Schedule",
+                value: schedule?.enabled ? formatInterval(schedule.interval_minutes) : "Manual only",
+                hint:
+                  schedule?.enabled && schedule.next_run_at && source.status === "active"
+                    ? `Next run ${formatUntil(schedule.next_run_at)}`
+                    : undefined,
+              },
+            ]}
+          />
+          {presentation?.notice ? <Notice tone="idle" icon={Info}>{presentation.notice}</Notice> : null}
+        </DrawerSection>
+      )}
 
       <DrawerSection title="Content">
         <PropertyList
