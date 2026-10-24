@@ -16,7 +16,8 @@ interface FullSyncDialogProps {
  * unchanged ones included, so it repairs content a sync left stale at the
  * cost of a first sync's model calls. Re-reading all documents is the
  * cheaper way to apply an adapter or model change, and the dialog says so
- * and where to find it, since the drawer's menu offers only Full sync.
+ * and where to find it, since Re-read all documents is offered only in the
+ * row menu, not the drawer's.
  */
 export function FullSyncDialog({ source, onOpenChange }: FullSyncDialogProps) {
   const fullSync = useFullSync();
