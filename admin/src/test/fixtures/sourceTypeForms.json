@@ -1,0 +1,1486 @@
+{
+  "genes": [
+    {
+      "auth_method": "local_file",
+      "data_shape": "message",
+      "default_sync_interval_minutes": 0,
+      "description": "Private coding-agent knowledge from Codex and Claude Code session windows",
+      "display_name": "Agent Session",
+      "execution_kinds": [],
+      "managed": true,
+      "name": "agent_session"
+    },
+    {
+      "auth_method": "pat",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 1440,
+      "description": "Wiki pages and documentation",
+      "display_name": "Confluence",
+      "execution_kinds": [
+        "server"
+      ],
+      "managed": false,
+      "name": "confluence"
+    },
+    {
+      "auth_method": "pat",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 1440,
+      "description": "Rendered documentation pages from GitHub Pages sites",
+      "display_name": "GitHub Pages",
+      "execution_kinds": [
+        "server"
+      ],
+      "managed": false,
+      "name": "github_pages"
+    },
+    {
+      "auth_method": "github_repo",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 1440,
+      "description": "Repository files from GitHub or GitHub Enterprise, scoped by folders and file types",
+      "display_name": "GitHub Repository",
+      "execution_kinds": [
+        "server",
+        "local_agent"
+      ],
+      "managed": false,
+      "name": "github_repo"
+    },
+    {
+      "auth_method": "browser_cookie",
+      "data_shape": "ticket",
+      "default_sync_interval_minutes": 360,
+      "description": "Tickets, decisions, and work items",
+      "display_name": "Jira",
+      "execution_kinds": [
+        "server",
+        "local_agent"
+      ],
+      "managed": false,
+      "name": "jira"
+    },
+    {
+      "auth_method": "local_adapter",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 0,
+      "description": "Files from a UI-configured local folder or repo uploaded by the local daemon",
+      "display_name": "Local Repository",
+      "execution_kinds": [
+        "local_agent"
+      ],
+      "managed": false,
+      "name": "local_markdown"
+    },
+    {
+      "auth_method": "api_key",
+      "data_shape": "document",
+      "default_sync_interval_minutes": 1440,
+      "description": "Pages and database rows shared with an internal connection",
+      "display_name": "Notion",
+      "execution_kinds": [
+        "server"
+      ],
+      "managed": false,
+      "name": "notion"
+    },
+    {
+      "auth_method": "browser_cookie",
+      "data_shape": "message",
+      "default_sync_interval_minutes": 60,
+      "description": "Channel messages, group chats, and direct messages",
+      "display_name": "Microsoft Teams",
+      "execution_kinds": [
+        "local_agent"
+      ],
+      "managed": false,
+      "name": "teams"
+    }
+  ],
+  "schemas": {
+    "agent_session": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "client",
+          "help_text": "Coding client whose session windows this Source receives (e.g. 'codex', 'claude-code').",
+          "key": "client",
+          "label": "Client",
+          "options": [],
+          "order": 0,
+          "placeholder": "codex",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "client",
+          "label": "Client",
+          "order": 0,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": "repo"
+    },
+    "confluence": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "url",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Paste a Confluence root, space, or page URL",
+          "key": "base_url",
+          "label": "Wiki URL",
+          "options": [],
+          "order": 0,
+          "placeholder": "https://wiki.example.com or a Confluence page URL",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "This page tree",
+              "value": "page_tree",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Whole space",
+              "value": "space",
+              "visible_when": []
+            }
+          ],
+          "default": "space",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Sync one page tree or a whole space",
+          "key": "sync_mode",
+          "label": "Sync Scope",
+          "options": [
+            "page_tree",
+            "space"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Space keys to sync",
+          "key": "spaces",
+          "label": "Spaces to Sync",
+          "options": [],
+          "order": 1,
+          "placeholder": "PAY, ARCH, DevOps",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "space"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Only sync pages under this root page",
+          "key": "page_tree_root",
+          "label": "Page Tree Root",
+          "options": [],
+          "order": 2,
+          "placeholder": "Page ID or URL",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "page_tree"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Pages with these labels will be skipped",
+          "key": "exclude_labels",
+          "label": "Exclude Labels",
+          "options": [],
+          "order": 3,
+          "placeholder": "draft, archived, obsolete",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "true",
+          "field_type": "boolean",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "",
+          "key": "include_children",
+          "label": "Include Child Pages",
+          "options": [],
+          "order": 4,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "page_tree"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Stored encrypted in MemForge and sent as a bearer token",
+          "key": "pat",
+          "label": "Personal Access Token",
+          "options": [],
+          "order": 1,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Confluence site",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Pages to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "github_pages": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Personal access token",
+              "value": "github_pat",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "No authentication",
+              "value": "none",
+              "visible_when": []
+            }
+          ],
+          "default": "github_pat",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Use a GitHub personal access token for Enterprise GitHub Pages, or no auth for public pages.",
+          "key": "auth_mode",
+          "label": "Authentication Method",
+          "options": [
+            "github_pat",
+            "none"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Stored encrypted and sent as a bearer token when PAT mode is selected.",
+          "key": "pat",
+          "label": "Personal Access Token",
+          "options": [],
+          "order": 1,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [
+            {
+              "field": "auth_mode",
+              "values": [
+                "github_pat"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Single page",
+              "value": "single_page",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Subtree",
+              "value": "subtree",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Selected pages",
+              "value": "explicit_list",
+              "visible_when": []
+            }
+          ],
+          "default": "single_page",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Choose one page, all pages under a path, or an explicit URL list.",
+          "key": "sync_mode",
+          "label": "Sync Mode",
+          "options": [
+            "single_page",
+            "subtree",
+            "explicit_list"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": true,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "url",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Published GitHub Pages URL for one documentation page.",
+          "key": "page_url",
+          "label": "Page URL",
+          "options": [],
+          "order": 1,
+          "placeholder": "https://pages.github.example.com/org/repo/path/to/page/",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "single_page"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "url",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Only published pages under this URL path are discovered.",
+          "key": "root_url",
+          "label": "Subtree Root URL",
+          "options": [],
+          "order": 2,
+          "placeholder": "https://pages.github.example.com/org/repo/cloud-native-platform/",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "subtree"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Comma-separated documentation page URLs.",
+          "key": "pages",
+          "label": "Explicit Page URLs",
+          "options": [],
+          "order": 3,
+          "placeholder": "https://.../page-a/, https://.../page-b/",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "explicit_list"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "5",
+          "field_type": "integer",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Maximum same-site link depth when sitemap discovery is unavailable.",
+          "key": "max_depth",
+          "label": "Max Crawl Depth",
+          "options": [],
+          "order": 4,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "subtree"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "200",
+          "field_type": "integer",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Stop with an error if discovery reaches this many pages.",
+          "key": "max_pages",
+          "label": "Max Pages",
+          "options": [],
+          "order": 5,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "subtree",
+                "explicit_list"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Regex patterns for page URLs to exclude.",
+          "key": "exclude_url_patterns",
+          "label": "Exclude URL Patterns",
+          "options": [],
+          "order": 6,
+          "placeholder": "/blog/, /archive/",
+          "required": false,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "sync_mode",
+              "values": [
+                "subtree",
+                "explicit_list"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "false",
+          "field_type": "boolean",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Allow a validated sitemap urlset to retire pages that are no longer listed. Leave disabled unless the site guarantees that its sitemap is exhaustive.",
+          "key": "sitemap_authoritative",
+          "label": "Treat Sitemap as Complete Inventory",
+          "options": [],
+          "order": 7,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Documentation site",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Pages to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "github_repo": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Cloud access",
+              "value": "cloud_pull",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Local sync",
+              "value": "local_push",
+              "visible_when": []
+            }
+          ],
+          "default": "cloud_pull",
+          "field_type": "select",
+          "fixed_after_create": true,
+          "group": "connection",
+          "help_text": "Use Public internet when MemForge Cloud can reach the repo. Use Internal network / VPN when only your machine can reach it.",
+          "key": "connection_mode",
+          "label": "Repository Access",
+          "options": [
+            "cloud_pull",
+            "local_push"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "url",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "GitHub or GitHub Enterprise repository URL.",
+          "key": "repo_url",
+          "label": "Repository URL",
+          "options": [],
+          "order": 1,
+          "placeholder": "https://github.com/org/repo",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Optional token for private repositories when using cloud pull. Leave blank for public repositories or local push.",
+          "key": "pat",
+          "label": "Personal Access Token",
+          "options": [],
+          "order": 2,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [
+            {
+              "field": "connection_mode",
+              "values": [
+                "cloud_pull"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "main",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Git ref to sync. Leave as main unless the repository uses another branch.",
+          "key": "ref",
+          "label": "Branch, Tag, or Commit",
+          "options": [],
+          "order": 0,
+          "placeholder": "main",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Repo-relative folders or files to sync. Empty means the whole repository, filtered by extension.",
+          "key": "include_paths",
+          "label": "Folders or Files",
+          "options": [],
+          "order": 1,
+          "placeholder": "Payroll Processing/, Flexible Payroll/README.md",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": "github_repo_paths"
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Repository-relative folders or files to leave out. Exclusions override selected paths.",
+          "key": "exclude_paths",
+          "label": "Folders or Files to Exclude",
+          "options": [],
+          "order": 2,
+          "placeholder": "docs/archived/, docs/outdated.md",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": "github_repo_paths"
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "md, markdown, txt, adoc, rst",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Text-like extensions to sync. Binary assets are skipped unless explicitly allowed.",
+          "key": "include_extensions",
+          "label": "File Extensions",
+          "options": [],
+          "order": 3,
+          "placeholder": "md, markdown, txt, adoc, rst",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "500",
+          "field_type": "integer",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Stop with an error if the selected scope contains more files.",
+          "key": "max_files",
+          "label": "Max Files",
+          "options": [],
+          "order": 4,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Repository access",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Files to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "jira": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "url",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "",
+          "key": "base_url",
+          "label": "Jira Base URL",
+          "options": [],
+          "order": 0,
+          "placeholder": "https://jira.example.com",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Cloud",
+              "value": "cloud",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Local sync",
+              "value": "local_agent",
+              "visible_when": []
+            }
+          ],
+          "default": "cloud",
+          "field_type": "select",
+          "fixed_after_create": true,
+          "group": "connection",
+          "help_text": "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync from the machine where the daemon is running, useful for VPN-only Jira.",
+          "key": "sync_mode",
+          "label": "Sync Location",
+          "options": [
+            "cloud",
+            "local_agent"
+          ],
+          "order": 1,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Browser session",
+              "value": "browser_cookie",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Personal access token",
+              "value": "pat",
+              "visible_when": [
+                {
+                  "field": "sync_mode",
+                  "values": [
+                    "cloud"
+                  ]
+                }
+              ]
+            }
+          ],
+          "default": "browser_cookie",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Browser session uses the local CLI adapter (`memforge adapter auth jira refresh --base-url ...`) to capture cookies from your signed-in browser. Use this for Enterprise Jira where REST API quota is not available. PAT mode is only for Jira deployments that grant the user REST API quota.",
+          "key": "auth_mode",
+          "label": "Authentication Method",
+          "options": [
+            "browser_cookie",
+            "pat"
+          ],
+          "order": 2,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Simple (projects and issue types)",
+              "value": "simple",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Advanced (JQL)",
+              "value": "advanced",
+              "visible_when": []
+            }
+          ],
+          "default": "simple",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Simple builds the query from projects and issue types. Advanced uses a full JQL you provide (authoritative).",
+          "key": "query_mode",
+          "label": "Query mode",
+          "options": [
+            "simple",
+            "advanced"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Comma-separated Jira project keys (simple mode)",
+          "key": "projects",
+          "label": "Projects to Sync",
+          "options": [],
+          "order": 1,
+          "placeholder": "PAY, ARCH",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "query_mode",
+              "values": [
+                "simple"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Full JQL used as-is in advanced mode. MemForge adds an incremental updated-since filter before your ORDER BY.",
+          "key": "jql",
+          "label": "JQL",
+          "options": [],
+          "order": 2,
+          "placeholder": "project = PROJ AND type != \"Test\" ORDER BY Rank ASC",
+          "required": true,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "query_mode",
+              "values": [
+                "advanced"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Additional JQL filter to refine results (simple mode)",
+          "key": "jql_filter",
+          "label": "JQL Filter (optional)",
+          "options": [],
+          "order": 3,
+          "placeholder": "labels = 'important'",
+          "required": false,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "query_mode",
+              "values": [
+                "simple"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Epic",
+              "value": "Epic",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Story",
+              "value": "Story",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Bug",
+              "value": "Bug",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Task",
+              "value": "Task",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Sub-task",
+              "value": "Sub-task",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Defect",
+              "value": "Defect",
+              "visible_when": []
+            }
+          ],
+          "default": "Epic,Story,Bug,Task",
+          "field_type": "multi_select",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "",
+          "key": "issue_types",
+          "label": "Issue Types",
+          "options": [
+            "Epic",
+            "Story",
+            "Bug",
+            "Task",
+            "Sub-task",
+            "Defect"
+          ],
+          "order": 4,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [
+            {
+              "field": "query_mode",
+              "values": [
+                "simple"
+              ]
+            }
+          ],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "true",
+          "field_type": "boolean",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "",
+          "key": "include_comments",
+          "label": "Include Comments",
+          "options": [],
+          "order": 5,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Stored encrypted and sent as a bearer token when PAT mode is selected",
+          "key": "pat",
+          "label": "Personal Access Token",
+          "options": [],
+          "order": 3,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [
+            {
+              "field": "auth_mode",
+              "values": [
+                "pat"
+              ]
+            }
+          ],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Jira access",
+          "order": 0,
+          "panels": [
+            {
+              "name": "jira_session",
+              "visible_when": [
+                {
+                  "field": "auth_mode",
+                  "values": [
+                    "browser_cookie"
+                  ]
+                }
+              ]
+            }
+          ],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Issues to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "local_markdown": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Folder path on the machine running the local daemon.",
+          "key": "root",
+          "label": "Folder Path",
+          "options": [],
+          "order": 0,
+          "placeholder": "/Users/me/notes",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": "local_folder"
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "string",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Optional human-readable label shown in source metadata.",
+          "key": "display_label",
+          "label": "Display Label",
+          "options": [],
+          "order": 0,
+          "placeholder": "Engineering notes",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": "*.md,**/*.md,*.markdown,**/*.markdown,*.txt,**/*.txt,*.json,**/*.json,*.html,**/*.html,*.htm,**/*.htm",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Glob patterns relative to the folder path.",
+          "key": "include",
+          "label": "Include Patterns",
+          "options": [],
+          "order": 1,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": true,
+          "choices": [],
+          "default": ".obsidian/**,.trash/**,.git/**,**/.git/**",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Glob patterns to skip.",
+          "key": "exclude",
+          "label": "Exclude Patterns",
+          "options": [],
+          "order": 2,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Folder",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Files to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "notion": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "secret",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "",
+          "key": "token",
+          "label": "Internal connection token",
+          "options": [],
+          "order": 0,
+          "placeholder": "",
+          "required": true,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "content",
+          "help_text": "",
+          "key": "root_pages",
+          "label": "Root pages",
+          "options": [],
+          "order": 0,
+          "placeholder": "Page URL or ID",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "content",
+          "help_text": "",
+          "key": "databases",
+          "label": "Databases",
+          "options": [],
+          "order": 1,
+          "placeholder": "Database URL or ID",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "Create an internal connection at notion.so/profile/integrations and give it Read content, and Read user information without email addresses so people show by name. Then copy its token.",
+          "key": "connection",
+          "label": "Connection",
+          "order": 0,
+          "panels": [],
+          "purpose": "connection"
+        },
+        {
+          "description": "Share each root page or database with the connection (\u2022\u2022\u2022 \u2192 Connections), then paste its URL or ID.",
+          "key": "content",
+          "label": "Content",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        }
+      ],
+      "project_field": null
+    },
+    "teams": {
+      "fields": [
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "EMEA",
+              "value": "emea",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Americas",
+              "value": "amer",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "Asia Pacific",
+              "value": "apac",
+              "visible_when": []
+            }
+          ],
+          "default": "emea",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "connection",
+          "help_text": "Teams API regional endpoint",
+          "key": "region",
+          "label": "Teams Region",
+          "options": [
+            "emea",
+            "amer",
+            "apac"
+          ],
+          "order": 0,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "",
+          "field_type": "tag_list",
+          "fixed_after_create": false,
+          "group": "scope",
+          "help_text": "Direct Teams conversation IDs selected through Browse Teams",
+          "key": "conversation_ids",
+          "label": "Teams Conversations",
+          "options": [],
+          "order": 0,
+          "placeholder": "Conversation IDs selected through Browse Teams",
+          "required": true,
+          "scope": true,
+          "visible_when": [],
+          "widget": "teams_conversations"
+        },
+        {
+          "advanced": false,
+          "choices": [],
+          "default": "14",
+          "field_type": "integer",
+          "fixed_after_create": false,
+          "group": "sync",
+          "help_text": "How far back to collect, and to follow edits, deletions and replies",
+          "key": "initial_history_days",
+          "label": "Initial History (days)",
+          "options": [],
+          "order": 0,
+          "placeholder": "",
+          "required": false,
+          "scope": false,
+          "visible_when": [],
+          "widget": null
+        },
+        {
+          "advanced": false,
+          "choices": [
+            {
+              "help_text": "",
+              "label": "Forever",
+              "value": "forever",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "1 year",
+              "value": "365",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "2 years",
+              "value": "730",
+              "visible_when": []
+            },
+            {
+              "help_text": "",
+              "label": "3 years",
+              "value": "1095",
+              "visible_when": []
+            }
+          ],
+          "default": "forever",
+          "field_type": "select",
+          "fixed_after_create": false,
+          "group": "sync",
+          "help_text": "Explicitly remove MemForge support older than the selected period",
+          "key": "rolling_retention_days",
+          "label": "Rolling Retention",
+          "options": [
+            "forever",
+            "365",
+            "730",
+            "1095"
+          ],
+          "order": 1,
+          "placeholder": "",
+          "required": false,
+          "scope": true,
+          "visible_when": [],
+          "widget": null
+        }
+      ],
+      "groups": [
+        {
+          "description": "",
+          "key": "connection",
+          "label": "Teams session",
+          "order": 0,
+          "panels": [
+            {
+              "name": "teams_session",
+              "visible_when": []
+            }
+          ],
+          "purpose": "connection"
+        },
+        {
+          "description": "",
+          "key": "scope",
+          "label": "Conversations to sync",
+          "order": 1,
+          "panels": [],
+          "purpose": "content"
+        },
+        {
+          "description": "",
+          "key": "sync",
+          "label": "Sync settings",
+          "order": 2,
+          "panels": [],
+          "purpose": "options"
+        }
+      ],
+      "project_field": null
+    }
+  }
+}
