@@ -27,6 +27,6 @@ Include:
 - Do not commit `.env`, local databases, transcript exports, Chroma data, or
   browser-cookie artifacts.
 - Prefer `MEMFORGE_*` environment variables for local secrets.
-- Agent adapters redact obvious bearer tokens, API keys, passwords, and nested
-  JSON secret fields before upload, but the service also validates and redacts
-  incoming windows because client-side redaction is not a security boundary.
+- The memory plugins send no session content. A coding agent saves memory only
+  through a `create_memory` call the user confirms, so review what it proposes
+  to save before confirming.

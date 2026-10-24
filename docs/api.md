@@ -28,7 +28,7 @@ Default base URL: `http://127.0.0.1:8765`.
 | Source Units | `GET /api/source-units/{source_unit_id}/pdf` | Fetch the Unit's stored PDF rendition when available |
 | Documents | `GET /api/documents/{doc_id}/artifacts`, `.../artifacts/{kind}`, `.../content`, `.../pdf` | The same reads for the newest copy of the Document stored by a Source the caller can read |
 | Review | `GET /api/review` | List review queue items |
-| Agent sessions | `POST /api/v1/agent-sessions/windows`, `POST /api/v1/hooks/receipts` | Removed capture routes: answer `410` with `agent_session_capture_removed` for this release, then are removed |
+| Agent sessions | `POST /api/v1/agent-sessions/windows`, `POST /api/v1/hooks/receipts` | Retired capture routes. They answer `410` with `agent_session_capture_removed` in this release and are deleted in the next |
 | Model settings | `GET /api/v1/model-settings` | The generation and embedding models in use and being edited; never a key |
 | Model settings | `PUT /api/v1/model-settings/{kind}/candidate` | Save an edit to a model without putting it to use |
 | Model settings | `POST /api/v1/model-settings/{kind}/candidate/validate` | Check the edit with one real request and put it to use when it passes; an embedding model of another vector space waits for a reindex |

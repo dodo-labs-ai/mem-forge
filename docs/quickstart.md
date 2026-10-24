@@ -439,7 +439,6 @@ and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 
 | Source | What is synced |
 | --- | --- |
-| Claude Code, Codex | Decisions, conventions and corrections from your sessions |
 | Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
 | Jira | Tickets, decisions and work items |
 | GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
@@ -524,8 +523,7 @@ Evidence where available. Full source inspection
 retains the underlying excerpt; readable text need not be verbatim. Artifact
 evidence uses `evidence[].items[].artifact.url`. The Document `content_url` and
 `pdf_url` describe current stored content, which may differ from the cited
-revision. Managed-session citations point to generated concept documents,
-not retained raw dialogue.
+revision.
 
 To fetch backing evidence:
 
