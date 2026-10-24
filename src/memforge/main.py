@@ -167,7 +167,12 @@ def setup_logging(verbose: bool = False) -> None:
 
     A container or service manager collects stderr as text without a terminal
     width, where boxed tracebacks wrap into unreadable columns.
+
+    httpx logs only warnings: its INFO line names each request's full URL,
+    query included, and a provider's signed download URL carries a live
+    signature there. MemForge's own request logs name the address alone.
     """
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     level = logging.DEBUG if verbose else logging.INFO
     if log_console.is_terminal:
         logging.basicConfig(

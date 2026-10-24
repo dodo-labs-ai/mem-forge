@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import SimpleNamespace
+from weakref import WeakValueDictionary
 
 import httpx
 import pytest
@@ -103,8 +104,12 @@ QUERY_TYPES = [
 
 @pytest.fixture(autouse=True)
 def own_origin_limiters(monkeypatch):
-    """Give each test its own Atlassian origin limiters; the fakes' stub sleep skips their gaps."""
+    """Give each test its own Atlassian origin limiters and shared rate limiters.
+
+    The fakes' stub sleep skips the limiters' gaps.
+    """
     monkeypatch.setattr("memforge.genes.atlassian_auth._ATLASSIAN_REQUEST_LIMITERS", {})
+    monkeypatch.setattr("memforge.genes.toolkit.pacing._SHARED_LIMITERS", WeakValueDictionary())
 
 
 # ---------------------------------------------------------------------------

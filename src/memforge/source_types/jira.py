@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import jira as adapter
-from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_has_value
+from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_has_value, secret_replaced
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
 _SOURCE_OWNED_COOKIE_FIELDS = (
@@ -110,25 +110,7 @@ def _credentials_changed(config: dict[str, Any], existing_config: Mapping[str, A
         return True
     if auth_mode == "browser_cookie":
         return False
-    incoming = config.get("pat")
-    if not isinstance(incoming, str) or not incoming.strip():
-        return False
-    return _stored_secret_value("pat", existing_config) != incoming.strip()
-
-
-def _stored_secret_value(field: str, config: Mapping[str, Any]) -> str | None:
-    from memforge.source_secrets import SecretConfigurationError, decrypt_secret
-
-    encrypted = config.get(f"{field}_encrypted")
-    if encrypted:
-        try:
-            return decrypt_secret(str(encrypted))
-        except SecretConfigurationError:
-            return None
-    plaintext = config.get(field)
-    if isinstance(plaintext, str) and plaintext.strip():
-        return plaintext.strip()
-    return None
+    return secret_replaced("pat", config, existing_config)
 
 
 DESCRIPTOR = SourceTypeDescriptor(

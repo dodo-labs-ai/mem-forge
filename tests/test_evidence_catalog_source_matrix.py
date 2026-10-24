@@ -29,6 +29,7 @@ TEXTUAL_BUILTIN_SOURCE_TYPES = (
     "github_repo",
     "github_pages",
     "local_markdown",
+    "notion",
     "teams",
     "agent_session",
 )
@@ -186,6 +187,28 @@ def _projection_inputs(
         }
         content_type = "application/json"
         target_observation_type = "file_content"
+    elif source_type == "notion":
+        # A database row: its body, and its properties as their own Observation.
+        item_id = "notion-1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"
+        source_url = "https://app.notion.com/p/1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"
+        extra = {
+            "page_id": "1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b",
+            "parent_page_id": "9c0d1e2f3a4b4c5d8e6f7a8b9c0d1e2f",
+            "parent_kind": "database",
+        }
+        raw_value = {
+            "notion_raw": 1,
+            "markdown": "Runbook for the diagnostic steps.",
+            "properties": [
+                {"name": "Status", "type": "status", "value": "Active"},
+                {"name": "Rule", "type": "rich_text", "value": rule},
+            ],
+            "truncated": False,
+            "unknown_not_found": 0,
+        }
+        content_type = "application/json"
+        markdown = "Runbook for the diagnostic steps."
+        target_observation_type = "properties"
     elif source_type == "teams":
         item_id = "teams-window-1"
         source_url = "https://teams.example.test/conversations/conversation-1"
