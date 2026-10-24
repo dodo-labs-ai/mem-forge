@@ -155,7 +155,7 @@
       "file": "reconciliation/repro-steps-do-not-replace-the-summary.json"
     },
     {
-      "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
+      "title": "Decision: the Kestrel job queue is stored in SQLite",
       "file": "reconciliation/status-update-drops-environment.json"
     }
   ]

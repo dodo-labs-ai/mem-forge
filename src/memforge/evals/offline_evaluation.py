@@ -1116,20 +1116,18 @@ class SourceUnitReconciliationReplayExecutor:
         failure, metrics = relation.failure, relation.metrics
         operations: tuple[ReconcileOperation, ...] = ()
         rechecks = ()
+        relation_complete = relation.covers(len(new_extractions), frozenset(memory.id for memory in incumbents))
         if failure is None:
             result = await join_support_and_relation(
                 relation, new_extractions=new_extractions, existing_memories=incumbents,
                 supports=_pinned_supports(manifest), structured_llm_client=self._structured_llm_client,
-                llm_model=model,
+                llm_model=model, relation_complete=relation_complete,
             )
             # Production applies nothing when the join fails.
             failure, metrics = result.failure, result.metrics
             if failure is None:
                 operations = validate_destructive_operations(
-                    result.operations, supports=result.supports,
-                    relation_complete=relation.covers(
-                        len(new_extractions), frozenset(memory.id for memory in incumbents),
-                    ),
+                    result.operations, supports=result.supports, relation_complete=relation_complete,
                 ).operations
                 rechecks = result.rechecks
         return {

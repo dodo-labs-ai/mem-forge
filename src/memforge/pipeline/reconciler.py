@@ -228,6 +228,7 @@ async def join_support_and_relation(
     supports: Mapping[str, MemorySupport],
     structured_llm_client,
     llm_model: str,
+    relation_complete: bool,
     recheck: RecheckSupports | None = None,
     rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
 ) -> ReconciliationResult:
@@ -237,8 +238,10 @@ async def join_support_and_relation(
     failure raises like any Support failure. Several refinements of one kept old
     Memory are then compared pairwise, because only one of them may revise it,
     and the one refinement that would still revise a kept old Memory is verified
-    alone before the table runs. Without ``recheck`` the re-checks are reported
-    and the claims keep their results.
+    alone before the table runs. ``relation_complete`` is the caller's verdict
+    on the Relation line's coverage, the same one DestructiveValidation reads:
+    an incomplete line withholds every revision, so none is verified. Without
+    ``recheck`` the re-checks are reported and the claims keep their results.
     The result carries the final Memory-level Support results the table used.
     """
     if relation.failure is not None:
@@ -281,10 +284,7 @@ async def join_support_and_relation(
                 entries = _without_conflicting_refinements(entries, conditional, transient_candidates)
             operation = "verify_refinements"
             unverified: frozenset[tuple[int, str]] = frozenset()
-            # An incomplete Relation line withholds every revision, so none is worth verifying.
-            revisions = revisions_to_verify(relations=entries, supports=supports, **ledger) if relation.covers(
-                len(new_extractions), frozenset(memory.id for memory in existing_memories),
-            ) else ()
+            revisions = revisions_to_verify(relations=entries, supports=supports, **ledger) if relation_complete else ()
             if revisions:
                 by_id = {memory.id: memory for memory in existing_memories}
                 verification = await verify_refinements(tuple(
@@ -293,6 +293,7 @@ async def join_support_and_relation(
                 ), client=structured_llm_client, model=llm_model)
                 metrics = replace(
                     metrics,
+                    relation_prompt_chars=metrics.relation_prompt_chars + verification.prompt_chars,
                     refinement_verification_count=len(revisions),
                     refinement_verification_dropped_count=len(verification.dropped),
                     refinement_verification_unjudged_count=len(verification.unjudged),
@@ -386,6 +387,9 @@ async def reconcile_memories(
     return await join_support_and_relation(
         relation, new_extractions=new_extractions, existing_memories=existing_memories, supports=supports,
         structured_llm_client=structured_llm_client, llm_model=llm_model, recheck=recheck,
+        relation_complete=relation.covers(
+            len(new_extractions), frozenset(memory.id for memory in existing_memories),
+        ),
     )
 
 

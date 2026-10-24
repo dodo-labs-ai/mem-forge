@@ -26,9 +26,8 @@ from memforge.models import Memory
 REFINEMENT_VERIFICATION_CONTRACT = "refinement-verification-v1"
 REFINEMENT_VERIFICATION_TASK = DecisionTask("refinement_verification", REFINEMENT_VERIFICATION_CONTRACT)
 
-REFINEMENT_VERIFICATION_PROMPT = """A stored claim (old_claim) is about to be replaced by a new claim (new_claim) that was \
-judged a more specific statement of the same knowledge. The current source still states old_claim, so the \
-replacement must not lose any of it.
+REFINEMENT_VERIFICATION_PROMPT = """A stored claim (old_claim) may be replaced by a new claim (new_claim). The current \
+source still states old_claim, so a replacement must not lose any of it.
 
 Answer "preserves" only when new_claim states every fact old_claim states: the same subject and population, \
 every condition and exception, the same scope and environment, the same modality (a requirement stays a \
@@ -54,7 +53,6 @@ class RefinementVerification:
     preserved: frozenset[tuple[int, str]]
     dropped: frozenset[tuple[int, str]]
     unjudged: frozenset[tuple[int, str]]
-    llm_calls: int
     prompt_chars: int
 
 
@@ -102,7 +100,15 @@ async def verify_refinements(
         ), (pair,), label="refinement verification")
         return answers, unjudged, runner.stats
 
-    outcomes = await asyncio.gather(*(verify(pair) for _, pair in pairs))
+    tasks = [asyncio.create_task(verify(pair)) for _, pair in pairs]
+    try:
+        outcomes = await asyncio.gather(*tasks)
+    except BaseException:
+        # A failed pair fails the revision: stop the pairs still asking, then raise its own error.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     preserved, dropped, unjudged = set(), set(), set()
     for (candidate_index, pair), (answers, pair_unjudged, _stats) in zip(pairs, outcomes, strict=True):
         key = (candidate_index, pair.candidate.id)
@@ -116,6 +122,5 @@ async def verify_refinements(
         preserved=frozenset(preserved),
         dropped=frozenset(dropped),
         unjudged=frozenset(unjudged),
-        llm_calls=sum(stats.calls for _, _, stats in outcomes),
         prompt_chars=sum(stats.prompt_chars for _, _, stats in outcomes),
     )
