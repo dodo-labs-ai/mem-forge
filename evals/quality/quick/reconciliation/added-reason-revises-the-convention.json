@@ -1,0 +1,34 @@
+{
+  "situation": "The document adds the reason for a convention it already stated; the fuller claim keeps every fact and revises the old one.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "Kestrel release tags are always cut from the main branch, never from a feature branch, so that every release contains all reviewed changes.",
+        "memory_type": "convention",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "A release tag is always cut from the main branch, never from a feature branch, so that every release contains all reviewed changes.",
+            "observation": "release-tags",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "Kestrel release tags are always cut from the main branch.",
+        "memory_type": "convention"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "revised"
+    }
+  }
+}

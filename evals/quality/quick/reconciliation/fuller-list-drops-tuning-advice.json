@@ -1,0 +1,34 @@
+{
+  "situation": "A new parameter table lists the setting the old claim named but leaves out the tuning advice the document still gives.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "Kestrel's `WorkerConfig` takes `poll_interval` (default 5 seconds), `lease_timeout` (default 60 seconds) and `max_workers` (maximum concurrent workers, default 8).",
+        "memory_type": "fact",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "| Option | Meaning | Default |\n| poll_interval | Seconds between queue polls | 5 |\n| lease_timeout | Seconds a worker holds a job before it is released | 60 |\n| max_workers | Maximum concurrent workers | 8 |",
+            "observation": "worker-configuration",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "The number of concurrent Kestrel workers is set by `max_workers` (default 8). Lower it to reduce lock contention on the queue database; raise it for throughput when many short jobs are queued.",
+        "memory_type": "fact"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "kept"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "situation": "An example added to a meeting agenda item is taken for a replacement of the item, losing what the item belongs to.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "Kestrel and the SRE team need to align on alert routing: alerts should be raised per queue, not per job.",
+        "memory_type": "decision",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "Alert routing: a sub-task of the observability epic. We need to align with SRE on how alerts are routed. For example, SRE asked that alerts be raised per queue, not per job.",
+            "observation": "meeting-2026-10-02",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "Alert routing for the retry dashboard is a sub-task of the observability epic; Kestrel needs to align with the SRE team on how alerts are routed.",
+        "memory_type": "decision"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "kept"
+    }
+  }
+}

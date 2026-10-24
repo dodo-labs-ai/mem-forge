@@ -1,0 +1,34 @@
+{
+  "situation": "Reproduction steps of a bug describe one instance; the ticket's summary of the bug still stands.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "KES-501 reproduces when a job is cut off on run 6, its queue is changed on Sep 10 and its retry profile on Sep 8, and run 7 then starts: the job is dispatched without an owner.",
+        "memory_type": "fact",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "Steps: 1. Start run 6. 2. Cut off. 3. Change the job's queue, effective Sep 10. 4. Change its retry profile, effective Sep 8. 5. Start run 7. Result: the job is dispatched without an owner.",
+            "observation": "ticket-KES-501",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "old",
+        "claim": "Bug KES-501: changing a job's queue between cut-off and the next run loses the job's owner.",
+        "memory_type": "fact"
+      }
+    ],
+    "support": {
+      "old": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "old": "kept"
+    }
+  }
+}

@@ -661,7 +661,7 @@ async def test_refinements_whose_comparison_stays_invalid_leave_their_edges_unce
     result = await join_support_and_relation(
         relation, new_extractions=refinements, existing_memories=[incumbent],
         supports=dict([pinned(incumbent.id, True)]), structured_llm_client=InvalidComparisonClient(),
-        llm_model="test-model",
+        llm_model="test-model", relation_complete=True,
     )
 
     # Which refinement may revise the old Memory cannot be judged: nothing revises it and nothing is added.
