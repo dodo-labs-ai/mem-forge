@@ -1,10 +1,10 @@
 """A scope change saved through the Source route: supersession, refusal and the return to the last applied scope.
 
-A document Source's change while a transition is open supersedes it, and the
-new transition runs from the last applied scope. A change into a
-configuration that cannot list is refused, except a return to exactly the
-last applied scope. A conversation Source still waits for its transition, and
-every Source waits for a running sync.
+A change while a transition is open supersedes it, for a document Source and a
+conversation Source alike, and the new transition runs from the last applied
+scope. A document change into a configuration that cannot list is refused,
+except a return to exactly the last applied scope; a conversation selection
+always lists. Every Source waits for a running sync.
 """
 
 from __future__ import annotations
@@ -266,18 +266,103 @@ async def test_github_pages_branch_is_a_scope_field_and_how_pages_are_listed_is_
     assert transition.target_scope["branch"] == "gh-pages"
 
 
+def _teams(*conversation_ids: str) -> dict[str, object]:
+    return {"conversation_ids": [f"19:{conversation_id}@thread.v2" for conversation_id in conversation_ids]}
+
+
 @pytest.mark.asyncio
-async def test_a_conversation_source_still_waits_for_its_open_transition(db, tmp_path):
-    await _source(db, "teams", {"conversation_ids": ["19:a@thread.v2"]}, execution_owner_user_id="dev")
-    first = _save(tmp_path, db, {"conversation_ids": ["19:b@thread.v2"]})
+async def test_a_conversation_change_during_an_open_transition_supersedes_it_from_the_last_applied_scope(db, tmp_path):
+    await _source(db, "teams", _teams("a"), execution_owner_user_id="dev")
+    assert _save(tmp_path, db, _teams("a", "b")).status_code == 200
     to_b = await _open(db)
 
-    response = _save(tmp_path, db, {"conversation_ids": ["19:c@thread.v2"]})
+    to_c = _save(tmp_path, db, _teams("a", "c"))
+    superseding = await _open(db)
+    back_to_a = _save(tmp_path, db, _teams("a"))
+    returning = await _open(db)
 
-    assert first.status_code == 200, first.text
+    assert to_c.status_code == 200, to_c.text
+    assert back_to_a.status_code == 200, back_to_a.text
+    assert superseding.previous_scope == canonical_projection_scope("teams", _teams("a"))
+    assert superseding.target_scope == canonical_projection_scope("teams", _teams("a", "c"))
+    assert superseding.predecessor_transition_id == to_b.id
+    assert returning.previous_scope == returning.target_scope == canonical_projection_scope("teams", _teams("a"))
+    assert returning.predecessor_transition_id == superseding.id
+    assert await _statuses(db) == {
+        to_b.id: ProjectionScopeTransitionStatus.SUPERSEDED,
+        superseding.id: ProjectionScopeTransitionStatus.SUPERSEDED,
+        returning.id: ProjectionScopeTransitionStatus.PENDING,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_stale_conversation_change_answers_409_and_writes_nothing(db, tmp_path, monkeypatch):
+    await _source(db, "teams", _teams("a"), execution_owner_user_id="dev")
+    _save(tmp_path, db, _teams("a", "b"))
+    to_b = await _open(db)
+    upsert_source = db.upsert_source
+
+    async def completed_meanwhile(**kwargs):
+        # A run completes the transition after the change read it.
+        await db.start_projection_scope_transition(to_b.id, run_id="run-1")
+        await db.complete_projection_scope_transition(to_b.id, run_id="run-1")
+        return await upsert_source(**kwargs)
+
+    monkeypatch.setattr(db, "upsert_source", completed_meanwhile)
+    response = _save(tmp_path, db, _teams("a", "c"))
+
     assert response.status_code == 409
-    assert response.json()["detail"] == "projection_scope_transition_active"
-    assert await _statuses(db) == {to_b.id: ProjectionScopeTransitionStatus.PENDING}
+    assert response.json()["detail"] == "projection_scope_transition_stale"
+    assert (await db.get_source(SOURCE_ID))["config"]["conversation_ids"] == _teams("a", "b")["conversation_ids"]
+    assert await _statuses(db) == {to_b.id: ProjectionScopeTransitionStatus.APPLIED}
+
+
+def _preview(tmp_path: Path, db: Database, config: dict[str, object]) -> dict[str, object]:
+    with TestClient(create_admin_app(db=db, config=_config(tmp_path))) as client:
+        response = client.post(f"/api/v1/sources/{SOURCE_ID}/scope-change-preview", json={"config": config})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_type", "configs", "removes"),
+    [
+        ("teams", (_teams("a"), _teams("a", "b"), _teams("a", "c")), "next_sync"),
+        ("confluence", (_confluence("root-a"), _confluence("root-b"), _confluence("root-c")), "at_completion"),
+    ],
+    ids=["conversation", "document"],
+)
+async def test_the_preview_says_a_conversation_source_removes_at_the_next_sync_and_a_document_source_at_completion(
+    db, tmp_path, source_type, configs, removes
+):
+    current, opened, superseding = configs
+    await _source(db, source_type, {**current, "pat": "secret"}, execution_owner_user_id="dev")
+
+    opening = _preview(tmp_path, db, opened)
+    _save(tmp_path, db, opened)
+    replacing = _preview(tmp_path, db, superseding)
+    returning = _preview(tmp_path, db, current)
+
+    assert (opening["outcome"], opening["removes"]) == ("opens_transition", removes)
+    assert (replacing["outcome"], replacing["removes"]) == ("supersedes_transition", removes)
+    assert (returning["outcome"], returning["removes"]) == ("returns_to_previous_scope", removes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_before", [False, True], ids=["no-transition", "open-transition"])
+async def test_a_conversation_scope_change_is_never_refused_as_unable_to_list(db, tmp_path, open_before):
+    await _source(db, "teams", _teams("a"), execution_owner_user_id="dev")
+    if open_before:
+        _save(tmp_path, db, _teams("a", "b"))
+
+    preview = _preview(tmp_path, db, _teams("c"))
+    response = _save(tmp_path, db, _teams("c"))
+
+    assert preview["outcome"] == ("supersedes_transition" if open_before else "opens_transition")
+    assert preview["refusal"] is None
+    assert response.status_code == 200, response.text
+    assert (await _open(db)).target_scope == canonical_projection_scope("teams", _teams("c"))
 
 
 @pytest.mark.asyncio

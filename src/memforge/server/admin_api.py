@@ -70,7 +70,7 @@ from memforge.genes import (
     source_rediscovers_documents,
     source_type_supports_sync,
 )
-from memforge.genes.conversation_gene import ConversationGene
+from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import release_atlassian_request_limiter
 from memforge.genes.base import SourceConfigurationError
@@ -210,6 +210,7 @@ from memforge.runtime import (
     SyncService,
     SourcePausedError,
 )
+from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
 from memforge.pipeline.stored_document import reprocess_preview
 from memforge.scheduler import SyncScheduler
@@ -258,11 +259,13 @@ from memforge.server.memory_admin_service import (
     pick_origin_source_type,
 )
 from memforge.server.source_admin_service import (
+    ScopeChangeRemoval,
     can_manage_source,
     can_manage_workspace,
     image_documents_by_source,
     list_source_admin_rows,
     normalize_workspace_role,
+    scope_change_removes,
 )
 from memforge.source_access import source_is_discoverable
 from memforge.source_access_transition import (
@@ -1978,23 +1981,29 @@ class SourceScopeTransitionResponse(BaseModel):
     """The scope change a Source is applying.
 
     A change of what a Source syncs opens a transition from the last applied
-    scope to the new one. Its syncs commit the items the new scope lists,
-    and once every listed item has committed, the change completes and what
-    the new scope leaves out is removed. Until then nothing is removed.
-    ``members_committed`` of ``listed_count`` items have committed; the
-    count is ``null`` until a sync lists the new scope in full.
-    ``failing_items`` are the failed items not yet committed under the
-    change; one the new scope lists keeps it open until a sync commits it,
-    and one only the previous scope held is settled when the change
-    completes.
+    scope to the new one. ``removes`` says when what the new scope leaves
+    out is removed:
+
+    - ``at_completion`` (a document Source): its syncs commit the items the
+      new scope lists, and once every listed item has committed, the change
+      completes and what the new scope leaves out is removed. Until then
+      nothing is removed. ``members_committed`` of ``listed_count`` items
+      have committed; the count is ``null`` until a sync lists the new scope
+      in full. ``failing_items`` are the failed items not yet committed under
+      the change; one the new scope lists keeps it open until a sync commits
+      it, and one only the previous scope held is settled when the change
+      completes.
+    - ``next_sync`` (a conversation Source): the next sync removes the
+      conversations the new selection leaves out, and the change completes
+      once every selected conversation is synced. Nothing is listed, so
+      ``listed_count`` stays ``null``.
 
     Saving ``restore_config`` with ``PUT /sources/{id}``, with this
     transition's ``id`` as ``expected_scope_transition_id``, returns to the
     previous scope: it replaces the change in progress, and nothing the
     previous scope synced is removed. It is ``null`` when the viewer cannot
-    change the configuration, the Source cannot replace a change in progress
-    and waits for it to complete, or the change already returns to the
-    previous scope.
+    change the configuration, or the change already returns to the previous
+    scope.
     """
 
     id: str
@@ -2023,6 +2032,13 @@ class SourceScopeTransitionResponse(BaseModel):
     error: str | None = Field(description="Why the latest sync left the change open; null before one did.")
     failing_items: SourceFailedItemsResponse
     restore_config: dict[str, Any] | None
+    removes: ScopeChangeRemoval = Field(
+        description=(
+            "When the change removes what the new scope leaves out: at_completion, once every listed item "
+            "has committed (a document Source); next_sync, the deselected conversations in the next sync "
+            "(a conversation Source)."
+        ),
+    )
 
 
 class SourceResponse(BaseModel):
@@ -2443,8 +2459,7 @@ class SourceScopeChangeRefusalResponse(BaseModel):
     code: str = Field(
         description=(
             "scope_change_requires_listing, transition_requires_listing, "
-            "projection_scope_transition_active, source_provider_namespace_immutable or "
-            "source_execution_mode_immutable."
+            "source_provider_namespace_immutable or source_execution_mode_immutable."
         ),
     )
     mode: str | None = Field(default=None, description="The configured mode that cannot list its scope.")
@@ -2455,14 +2470,20 @@ class SourceScopeChangePreviewResponse(BaseModel):
     """What saving a configuration would do to the Source's scope, decided as ``PUT /sources/{id}`` decides it.
 
     - ``unchanged``: the scope stays as it is.
-    - ``opens_transition``: a scope change opens; nothing is removed until it completes.
-    - ``supersedes_transition``: the change replaces the scope change in progress.
+    - ``opens_transition``: a scope change opens.
+    - ``supersedes_transition``: the change replaces the scope change in progress with a change
+      from the last applied scope to the new one.
     - ``restores_previous_scope``: the change returns to the last applied scope, which the
       configuration cannot list. The change in progress closes, none opens, and nothing is removed.
     - ``returns_to_previous_scope``: the change returns to the last applied scope and replaces the
-      change in progress with a change back to it. Nothing that scope synced is removed; once a
-      sync lists it in full, what only the replaced change added is removed.
+      change in progress with a change back to it. Nothing that scope synced is removed; what only
+      the replaced change added is removed as ``removes`` says.
     - ``refused``: saving answers 409, as ``refusal`` says.
+
+    ``removes`` says when a change that opens removes what its new scope leaves out:
+    ``at_completion`` for a document Source, where nothing is removed until a sync lists the new
+    scope in full and every listed item has committed; ``next_sync`` for a conversation Source,
+    whose next sync removes the conversations the new selection leaves out.
 
     ``open_transition`` says whether a scope change is in progress now.
     """
@@ -2476,6 +2497,12 @@ class SourceScopeChangePreviewResponse(BaseModel):
         "refused",
     ]
     open_transition: bool
+    removes: ScopeChangeRemoval = Field(
+        description=(
+            "When a change that opens removes what the new scope leaves out: at_completion (a document Source) "
+            "or next_sync (a conversation Source)."
+        ),
+    )
     refusal: SourceScopeChangeRefusalResponse | None = None
 
 
@@ -2927,17 +2954,19 @@ async def _plan_scope_change(
 
     The last applied scope is the open transition's previous scope, or the
     current scope when no transition is open. The new transition runs from
-    it to the target, and supersedes the open transition of a document
-    Source, which becomes its predecessor. For example, A→B open and a change
-    to C opens A→C after A→B; a change back to A opens A→A, which removes
-    what B added when it completes. A conversation Source cannot supersede
-    its open transition (409 ``projection_scope_transition_active``).
+    it to the target and supersedes the open transition, which becomes its
+    predecessor. For example, A→B open and a change to C opens A→C after
+    A→B; a change back to A opens A→A. What only B added is removed when a
+    document transition completes, and by the next sync of a conversation
+    transition, which deselects every held conversation its target leaves
+    out.
 
     A document change into a configuration that cannot list is refused (409
     ``scope_change_requires_listing``), because its transition could never
     complete. Returning to exactly the last applied scope is the exception:
     the open transition is superseded and none opens, since that scope has no
-    listing to remove anything by.
+    listing to remove anything by. A conversation configuration always lists
+    its selection, so neither applies to it.
     """
 
     source_id = str(source["id"])
@@ -2945,12 +2974,9 @@ async def _plan_scope_change(
     open_transition = await db.get_open_projection_scope_transition(source_id)
     if open_transition is not None:
         open_transition = canonical_scope_transition(source_type, open_transition, current_scope)
-    document = _is_document_source_type(source_type)
-    if open_transition is not None and not document:
-        raise HTTPException(status_code=409, detail="projection_scope_transition_active")
     last_applied_scope = dict(open_transition.previous_scope) if open_transition is not None else current_scope
     superseded_transition_id = open_transition.id if open_transition is not None else None
-    if document and not source_lists_scope(source_type, config):
+    if _is_document_source_type(source_type) and not source_lists_scope(source_type, config):
         if open_transition is not None and target_scope == last_applied_scope:
             return _ScopeChange(transition=None, superseded_transition_id=superseded_transition_id)
         raise _scope_change_requires_listing_http_error(source_type, config)
@@ -3114,18 +3140,13 @@ def _restore_previous_scope_config(source: Mapping[str, Any], previous_scope: Ma
     It is the configuration the viewer reads, with its scope fields replaced
     by the previous scope's (:func:`excluded_scope_config`); secrets stay
     redacted and are kept when it is saved. Saving it replaces the change in
-    progress. ``None`` when the viewer cannot change the configuration, or
-    the Source is not a document Source: a conversation Source's open change
-    cannot be replaced.
+    progress. ``None`` when the viewer cannot change the configuration.
     """
 
     capabilities = source.get("capabilities") or {}
-    source_type = str(source.get("type") or "")
     if not (capabilities.get("can_configure") and capabilities.get("can_configure_connection")):
         return None
-    if not _is_document_source_type(source_type):
-        return None
-    return excluded_scope_config(source_type, source.get("config") or {}, previous_scope)
+    return excluded_scope_config(str(source.get("type") or ""), source.get("config") or {}, previous_scope)
 
 
 def _viewed_scope_transition(source: Mapping[str, Any], transition: dict[str, Any]) -> dict[str, Any]:
@@ -8404,9 +8425,10 @@ def create_admin_app(
         """What saving this configuration would do to the Source's scope, without saving it.
 
         The configuration form reads it before saving, to warn about a mode
-        that cannot list a scope change and about replacing the change in
-        progress. It decides as ``PUT /sources/{id}`` does, from the same
-        stored facts; a configuration the source type rejects answers 400.
+        that cannot list a scope change, about replacing the change in
+        progress, and about when removal happens. It decides as
+        ``PUT /sources/{id}`` does, from the same stored facts; a
+        configuration the source type rejects answers 400.
         """
 
         existing = await db.get_source(source_id)
@@ -8415,13 +8437,19 @@ def create_admin_app(
         _require_source_management(request, existing)
         _require_local_agent_connection_management(request, existing)
         open_transition = await db.get_open_projection_scope_transition(source_id) is not None
+        removes = scope_change_removes(str(existing["type"]))
         try:
             change = await _plan_config_change(db, existing, req.config, config, preview=True)
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
-            return {"outcome": "refused", "open_transition": open_transition, "refusal": _scope_change_refusal(exc.detail)}
-        return {"outcome": _scope_change_outcome(change), "open_transition": open_transition}
+            return {
+                "outcome": "refused",
+                "open_transition": open_transition,
+                "removes": removes,
+                "refusal": _scope_change_refusal(exc.detail),
+            }
+        return {"outcome": _scope_change_outcome(change), "open_transition": open_transition, "removes": removes}
 
     @source_router.put("/{source_id}")
     async def update_source(
@@ -9317,30 +9345,26 @@ def create_admin_app(
         req: ConversationCollectionAttemptRequest,
         request: Request,
         db: Database = Depends(get_db),
+        document_store: DocumentArtifactStore = Depends(get_document_store),
         workspace_id: str = Depends(get_workspace_id),
     ):
         """What one uploaded device collection attempt would change, without processing it.
 
-        The plan is the one a sync run would make now, including the removals
-        of an open Projection Scope transition.
+        The plan is the one a sync run would make now: the run's collection
+        family binds the attempt and starts the open Projection Scope
+        transition, with its removals, as the run does.
         """
 
         upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
         await _require_complete_collection(upload.intake, source_id, upload.collection_attempt_id)
-        upload.gene.bind_conversation_run(
-            projection_store=db,
-            collections=upload.collections,
-            collection_attempt_id=upload.collection_attempt_id,
+        family = collection_family(upload.gene, db=db, doc_store=document_store, source_id=source_id)
+        family.prepare(
+            collection_attempt=CollectionAttempt(workspace_id, upload.collection_attempt_id),
+            input_snapshot=None,
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
-            source_type = upload.gene.metadata().name
-            transition = canonical_scope_transition(
-                source_type, transition, _sync_scope_config(source_type, upload.gene.config)
-            )
-            upload.gene.begin_scope_transition(
-                previous_scope=transition.previous_scope, target_scope=transition.target_scope
-            )
+            family.begin_scope_transition(transition)
         return {
             "collection_attempt_id": upload.collection_attempt_id,
             **plan_report(await upload.gene.preview(), source_id=source_id),
