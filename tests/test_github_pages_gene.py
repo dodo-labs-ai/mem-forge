@@ -12,7 +12,7 @@ from memforge.genes import GENE_REGISTRY, github_pages_gene
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_pages_gene import GitHubPagesGene
 from memforge.genes.toolkit.github_api import TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
-from memforge.models import ContentItem, RawContent
+from memforge.models import ConfigCondition, ContentItem, RawContent
 from tests.connector_http_fixture import FakeConnectorHttp
 from tests.github_api_fixture import FakeGitHub, git_blob_sha
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -121,12 +121,14 @@ def test_github_pages_gene_is_registered_and_schema_is_practical():
     fields = {field.key: field for field in GitHubPagesGene.config_schema().fields}
 
     assert "base_url" not in fields
-    assert fields["auth_mode"].options == ["github_pat", "none"]
-    assert fields["sync_mode"].options == ["single_page", "subtree", "explicit_list"]
-    assert fields["pat"].required is False
-    assert fields["page_url"].required is False
-    assert fields["root_url"].required is False
-    assert fields["pages"].required is False
+    assert [option.value for option in fields["auth_mode"].choices] == ["github_pat", "none"]
+    assert [option.value for option in fields["sync_mode"].choices] == ["single_page", "subtree", "explicit_list"]
+    # Each is required only while its mode shows it.
+    assert fields["pat"].visible_when == (ConfigCondition("auth_mode", ("github_pat",)),)
+    assert fields["page_url"].visible_when == (ConfigCondition("sync_mode", ("single_page",)),)
+    assert fields["root_url"].visible_when == (ConfigCondition("sync_mode", ("subtree",)),)
+    assert fields["pages"].visible_when == (ConfigCondition("sync_mode", ("explicit_list",)),)
+    assert all(fields[key].required for key in ("pat", "page_url", "root_url", "pages"))
     assert fields["max_pages"].default == "200"
     assert fields["max_depth"].advanced is True
     assert fields["max_pages"].advanced is True

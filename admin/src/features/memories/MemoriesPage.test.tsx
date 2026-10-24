@@ -91,7 +91,7 @@ test("the list shows active memories until a status filter asks for another stat
 
   await user.click(screen.getByRole("button", { name: "Filters" }));
   await user.click(screen.getByRole("combobox", { name: "Status" }));
-  expect(screen.getByRole("option", { name: "Active" })).toHaveAttribute("aria-selected", "true");
+  expect(await screen.findByRole("option", { name: "Active" })).toHaveAttribute("aria-selected", "true");
   expect(screen.queryByRole("option", { name: "All statuses" })).not.toBeInTheDocument();
   await user.click(screen.getByRole("option", { name: "Retired" }));
 

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { appPath, appUrl } from "./support/appPath";
 
 const HANDBOOK = { source_id: "src-handbook", source_type: "confluence", name: "Payroll handbook" };
 const BOARD = { source_id: "src-board", source_type: "jira", name: "PAYR board" };
@@ -101,7 +102,7 @@ async function stubApi(page: Page) {
 
 test("the Memories list opens a memory's detail", async ({ page }) => {
   await stubApi(page);
-  await page.goto("/v2/memories");
+  await page.goto(appPath("memories"));
 
   await expect(page.getByRole("heading", { name: "Memories", level: 1 })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Main" }).getByRole("link", { name: "Memories" })).toHaveAttribute(
@@ -113,7 +114,7 @@ test("the Memories list opens a memory's detail", async ({ page }) => {
   await expect(table.getByRole("link", { name: "1 conflict" })).toBeVisible();
 
   await table.getByRole("link", { name: /Cut-off runs the same way/ }).click();
-  await expect(page).toHaveURL(/\/v2\/memories\/mem-cutoff$/);
+  await expect(page).toHaveURL(appUrl("memories/mem-cutoff"));
   await expect(page.getByRole("heading", { level: 1, name: /Cut-off runs the same way/ })).toBeVisible();
   await expect(page.getByRole("region", { name: "Evidence" }).getByText("Payroll Handbook")).toBeVisible();
   await expect(page).toHaveTitle(/^Memories/);
@@ -121,9 +122,9 @@ test("the Memories list opens a memory's detail", async ({ page }) => {
 
 test("the conflicts card opens the Relations view on conflicts", async ({ page }) => {
   await stubApi(page);
-  await page.goto("/v2/memories");
+  await page.goto(appPath("memories"));
 
   await page.getByRole("link", { name: "Show conflict", exact: true }).click();
-  await expect(page).toHaveURL(/\/v2\/memories\?view=relations&relation=contradicts$/);
+  await expect(page).toHaveURL(appUrl("memories?view=relations&relation=contradicts"));
   await expect(page.getByRole("table", { name: "Relations" }).getByText("Conflict", { exact: true })).toBeVisible();
 });

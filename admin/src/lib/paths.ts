@@ -8,11 +8,16 @@ export const REVIEW_PATH = "/review";
 export const EVALUATION_PATH = "/evaluation";
 export const SOURCES_PATH = "/sources";
 export const PROJECTS_PATH = "/projects";
+export const ENTITIES_PATH = "/entities";
 
 /** The Memories parameter that narrows the list to one project, by its key. */
 export const MEMORIES_PROJECT_PARAM = "project";
 /** The Evaluation parameter that scopes the page to one source, by its id. */
 export const EVALUATION_SOURCE_PARAM = "source_id";
+/** The Entities parameter that narrows the list to names matching a search. */
+export const ENTITIES_SEARCH_PARAM = "search";
+/** The Source settings parameter that opens one step, by its key, such as `connection` or `project`. */
+export const SOURCE_SETTINGS_STEP_PARAM = "step";
 
 export function memoryPath(memoryId: string): string {
   return `${MEMORIES_PATH}/${encodeURIComponent(memoryId)}`;
@@ -26,6 +31,15 @@ export function projectPath(projectKey: string): string {
   return `${PROJECTS_PATH}/${encodeURIComponent(projectKey)}`;
 }
 
+export function entityPath(entityId: number): string {
+  return `${ENTITIES_PATH}/${entityId}`;
+}
+
+/** The Entities list narrowed to names matching `name`, such as an entity a memory mentions. */
+export function entitySearchPath(name: string): string {
+  return `${ENTITIES_PATH}?${new URLSearchParams({ [ENTITIES_SEARCH_PARAM]: name })}`;
+}
+
 /** The Memories list narrowed to one project. */
 export function projectMemoriesPath(projectKey: string): string {
   return `${MEMORIES_PATH}?${new URLSearchParams({ [MEMORIES_PROJECT_PARAM]: projectKey })}`;
@@ -34,4 +48,15 @@ export function projectMemoriesPath(projectKey: string): string {
 /** The Evaluation page scoped to one source. */
 export function sourceEvaluationPath(sourceId: string): string {
   return `${EVALUATION_PATH}?${new URLSearchParams({ [EVALUATION_SOURCE_PARAM]: sourceId })}`;
+}
+
+/** The Add source type picker, or with a type, the page that creates a Source of that type. */
+export function newSourcePath(sourceType?: string): string {
+  return sourceType === undefined ? `${SOURCES_PATH}/new` : `${SOURCES_PATH}/new/${encodeURIComponent(sourceType)}`;
+}
+
+/** One Source's settings, opened at a step when one is named. */
+export function sourceSettingsPath(sourceId: string, step?: string): string {
+  const path = `${SOURCES_PATH}/${encodeURIComponent(sourceId)}/settings`;
+  return step === undefined ? path : `${path}?${new URLSearchParams({ [SOURCE_SETTINGS_STEP_PARAM]: step })}`;
 }

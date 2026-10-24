@@ -11,7 +11,7 @@ import pytest
 from memforge.genes import atlassian_auth, jira_gene
 from memforge.genes.jira_gene import JiraGene, JiraQueryRejected
 from memforge.genes.toolkit.http import ConnectorHttpClient
-from memforge.models import AbsenceAnswer, ContentItem
+from memforge.models import AbsenceAnswer, ConfigCondition, ContentItem
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactContractError
 from tests.connector_http_fixture import AnsweringClient, FakeConnectorHttp
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -87,7 +87,8 @@ def test_jira_schema_hides_runtime_transport_fields_from_ui():
     assert fields["auth_mode"].required is True
     assert fields["auth_mode"].default == "browser_cookie"
     assert "jira_cookie" not in fields
-    assert fields["pat"].required is False
+    assert fields["pat"].required is True
+    assert fields["pat"].visible_when == (ConfigCondition("auth_mode", ("pat",)),)
     assert fields["pat"].advanced is False
     assert "tls_ca_bundle" not in fields
     assert "request_interval_ms" not in fields

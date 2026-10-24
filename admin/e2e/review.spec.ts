@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { appPath, appUrl } from "./support/appPath";
 
 const ACTIONS = [
   {
@@ -93,7 +94,7 @@ async function stubApi(page: Page, detail: Record<string, unknown>) {
 test("the Review queue opens a review from the sidebar", async ({ page }) => {
   await stubApi(page, { ...REVIEW, related_challengers: [RELATED], can_decide: true });
 
-  await page.goto("/v2/review");
+  await page.goto(appPath("review"));
 
   const nav = page.getByRole("navigation", { name: "Main" });
   await expect(nav.getByRole("link", { name: "Review" })).toHaveAttribute("aria-current", "page");
@@ -102,22 +103,22 @@ test("the Review queue opens a review from the sidebar", async ({ page }) => {
 
   await page.getByRole("link", { name: REVIEW.presentation.summary }).click();
 
-  await expect(page).toHaveURL(/\/v2\/review\/review-1$/);
+  await expect(page).toHaveURL(appUrl("review/review-1"));
   await expect(page.getByRole("heading", { level: 1, name: REVIEW.presentation.summary })).toBeVisible();
   await expect(page.getByRole("button", { name: "Keep current state" })).toBeDisabled();
   await expect(page.getByRole("region", { name: "Also affected" }).getByRole("link")).toHaveAttribute(
     "href",
-    "/v2/memories/mem-related",
+    appPath("memories/mem-related"),
   );
 
   await page.getByRole("link", { name: "Review queue" }).click();
-  await expect(page).toHaveURL(/\/v2\/review$/);
+  await expect(page).toHaveURL(appUrl("review"));
 });
 
 test("a review the caller cannot decide is view only", async ({ page }) => {
   await stubApi(page, { ...REVIEW, related_challengers: [], can_decide: false });
 
-  await page.goto("/v2/review/review-1");
+  await page.goto(appPath("review/review-1"));
 
   await expect(page.getByText("View only.", { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Use latest state" })).toBeDisabled();
@@ -126,7 +127,7 @@ test("a review the caller cannot decide is view only", async ({ page }) => {
 test("a review the caller cannot decide cannot be picked for a bulk decision", async ({ page }) => {
   await stubApi(page, { ...REVIEW, related_challengers: [], can_decide: false });
 
-  await page.goto("/v2/review");
+  await page.goto(appPath("review"));
 
   const row = page.getByRole("list", { name: "Reviews" }).getByRole("listitem");
   await expect(row.getByRole("checkbox")).toHaveAttribute("aria-disabled", "true");

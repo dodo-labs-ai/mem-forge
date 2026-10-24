@@ -926,7 +926,7 @@ def test_admin_source_save_rejects_missing_tls_ca_bundle(tmp_path, monkeypatch):
         )
 
     assert response.status_code == 400
-    assert "TLS CA bundle" in response.json()["detail"]
+    assert "TLS CA bundle" in response.json()["detail"]["message"]
 
 
 def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeypatch):
@@ -952,7 +952,7 @@ def test_admin_source_save_rejects_insecure_atlassian_base_url(tmp_path, monkeyp
         )
 
     assert response.status_code == 400
-    assert "HTTPS" in response.json()["detail"]
+    assert "HTTPS" in response.json()["detail"]["message"]
 
 
 def test_admin_source_save_rejects_pat_without_base_url(tmp_path, monkeypatch):
@@ -977,7 +977,8 @@ def test_admin_source_save_rejects_pat_without_base_url(tmp_path, monkeypatch):
         )
 
     assert response.status_code == 400
-    assert "base_url is required" in response.json()["detail"]
+    # The form check names the missing site before the secret-origin guard runs.
+    assert response.json()["detail"]["fields"] == [{"key": "base_url", "message": "Confluence Wiki URL is required"}]
 
 
 @pytest.mark.parametrize(
@@ -1019,7 +1020,7 @@ def test_admin_source_create_rejects_missing_atlassian_pat(
         )
 
     assert response.status_code == 400
-    assert expected_detail in response.json()["detail"]
+    assert expected_detail in response.json()["detail"]["message"]
 
 
 def test_admin_source_create_accepts_confluence_page_url_without_spaces(tmp_path, monkeypatch):
@@ -1084,7 +1085,7 @@ def test_admin_source_create_requires_spaces_for_confluence_space_scope(tmp_path
         )
 
     assert response.status_code == 400
-    assert "Spaces to Sync is required" in response.json()["detail"]
+    assert "Spaces to Sync is required" in response.json()["detail"]["message"]
 
 
 def test_admin_source_create_allows_jira_browser_session_without_source_cookie(tmp_path, monkeypatch):
@@ -1141,7 +1142,7 @@ def test_admin_source_create_rejects_missing_required_source_scope(tmp_path, mon
         )
 
     assert response.status_code == 400
-    assert "Projects to Sync is required" in response.json()["detail"]
+    assert "Projects to Sync is required" in response.json()["detail"]["message"]
 
 
 def test_admin_source_create_ignores_forged_jira_cookie_configured_flag(tmp_path, monkeypatch):
@@ -1197,7 +1198,7 @@ def test_admin_source_create_rejects_forged_jira_pat_configured_flag(tmp_path, m
         )
 
     assert response.status_code == 400
-    assert "Personal Access Token is required" in response.json()["detail"]
+    assert "Personal Access Token is required" in response.json()["detail"]["message"]
 
 
 @pytest.mark.asyncio
@@ -1622,7 +1623,8 @@ async def test_pat_source_noop_update_preserves_sync_cursor(db, tmp_path, monkey
     assert await db.get_sync_state(source_id) is not None
     assert len(await db.get_sync_history(source_id)) == 1
     updated = await db.get_source(source_id)
-    assert updated["config"] == source_config
+    # The save names the mode the stored configuration implied.
+    assert updated["config"] == {**source_config, "sync_mode": "space"}
 
 
 @pytest.mark.asyncio
@@ -2475,7 +2477,7 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
         )
 
     assert missing_page.status_code == 400
-    assert "Page URL is required" in missing_page.json()["detail"]
+    assert "Page URL is required" in missing_page.json()["detail"]["message"]
     assert valid.status_code == 200
     assert valid_subdomain_isolation.status_code == 200
     subdomain_source = next(
@@ -2485,9 +2487,9 @@ async def test_github_pages_source_config_requires_scope_url_for_selected_mode(d
     )
     assert subdomain_source["config"]["base_url"] == "https://pages.github.example.test/org/repo"
     assert wrong_site_path.status_code == 400
-    assert "configured site path" in wrong_site_path.json()["detail"]
+    assert "configured site path" in wrong_site_path.json()["detail"]["message"]
     assert missing_pat.status_code == 400
-    assert "Personal Access Token is required" in missing_pat.json()["detail"]
+    assert "Personal Access Token is required" in missing_pat.json()["detail"]["message"]
 
 
 @pytest.mark.asyncio

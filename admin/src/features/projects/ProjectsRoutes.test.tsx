@@ -5,6 +5,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { Route as FakeRoute } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
 import { makeSource } from "@/test/sourceFixtures";
+import { CreateProjectDialog } from "./ProjectFormDialogs";
 import { ProjectsRoutes } from "./ProjectsRoutes";
 
 const PROJECTS = [
@@ -199,6 +200,23 @@ test("a new project refuses a built-in code and sends no kind", async () => {
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const create = calls.find((request) => request.method === "POST")!;
   expect(await create.clone().json()).toEqual({ name: "Payments" });
+});
+
+test("onCreated receives the created project", async () => {
+  const created = { id: "p-new", key: "PAYMENTS", name: "Payments", kind: "normal", created_at: null };
+  const onCreated = vi.fn();
+  const onOpenChange = vi.fn();
+  renderRoutes([{ path: "*", element: <CreateProjectDialog open onOpenChange={onOpenChange} onCreated={onCreated} /> }], {
+    path: "/sources/new/confluence",
+    api: { "POST /api/v1/projects": () => created },
+  });
+
+  const dialog = await screen.findByRole("dialog", { name: "New project" });
+  await userEvent.type(within(dialog).getByLabelText(/Name/), "Payments");
+  await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+  await vi.waitFor(() => expect(onCreated).toHaveBeenCalledWith(created));
+  expect(onOpenChange).toHaveBeenCalledWith(false);
 });
 
 test("the detail page links to the project's memories and lists the sources sending them", async () => {

@@ -12,7 +12,16 @@ const DEV_API_TARGET = "http://localhost:8765";
 const V1_DEV_TARGET = "http://localhost:5174";
 const V1_DEV_PATHS = "^/(?!v2(/|$)|api/)";
 
-export default defineConfig({
+/**
+ * `--mode e2e` builds what the Playwright suite runs against: the app as
+ * production builds it, plus the harness pages under `e2e/harness/`, into a
+ * directory of its own so `dist` never holds a harness.
+ */
+const E2E_MODE = "e2e";
+const E2E_OUT_DIR = "node_modules/.tmp/e2e-dist";
+const E2E_HARNESS_PAGES = ["e2e/harness/shared-workspace.html"];
+
+export default defineConfig(({ mode }) => ({
   base: APP_BASE_PATH,
   plugins: [react(), tailwindcss()],
   resolve: {
@@ -27,11 +36,20 @@ export default defineConfig({
     },
   },
   preview: { port: DEV_PORT },
-  build: { outDir: "dist", emptyOutDir: true },
+  build:
+    mode === E2E_MODE
+      ? {
+          outDir: E2E_OUT_DIR,
+          emptyOutDir: true,
+          rolldownOptions: {
+            input: ["index.html", ...E2E_HARNESS_PAGES].map((page) => path.resolve(import.meta.dirname, page)),
+          },
+        }
+      : { outDir: "dist", emptyOutDir: true },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
     css: false,
   },
-});
+}));

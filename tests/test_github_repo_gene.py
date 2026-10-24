@@ -13,7 +13,7 @@ from memforge.genes import GENE_REGISTRY, github_repo_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.genes.toolkit.github_api import GitHubRateLimitError
 from memforge.github_repo_utils import build_github_repo_doc_id
-from memforge.models import ContentItem, RawContent, require_attested_content
+from memforge.models import ConfigCondition, ContentItem, RawContent, require_attested_content
 from memforge.source_artifacts import SourceArtifactContractError
 from tests.github_api_fixture import FakeGitHub, git_blob_sha
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -52,7 +52,7 @@ def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
     assert meta.data_shape == "document"
 
     fields = {field.key: field for field in GitHubRepoGene.config_schema().fields}
-    assert fields["connection_mode"].options == ["cloud_pull", "local_push"]
+    assert [option.value for option in fields["connection_mode"].choices] == ["cloud_pull", "local_push"]
     assert fields["repo_url"].required is True
     assert fields["ref"].default == "main"
     assert fields["include_paths"].required is False
@@ -61,6 +61,7 @@ def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
     assert fields["include_extensions"].default == "md, markdown, txt, adoc, rst"
     assert fields["max_files"].default == "500"
     assert fields["pat"].required is False
+    assert fields["pat"].visible_when == (ConfigCondition("connection_mode", ("cloud_pull",)),)
 
 
 @pytest.mark.asyncio

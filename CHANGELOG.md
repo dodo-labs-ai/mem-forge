@@ -15,6 +15,81 @@
   situations are imported with `memforge eval seed-reconciliation-cases` or
   `POST /api/v1/agent-evaluations/reconciliation-cases/seed`.
 
+- Source setup is described by the server and checked by it in one place.
+  `GET /api/v1/genes/{type}/config-schema` adds each field's labelled
+  `choices`, the `visible_when` conditions that show a field or a choice,
+  an interactive `widget`, `scope` and `fixed_after_create`, each group's
+  `description`, `purpose` and `panels`, and the schema's `project_field`;
+  `GET /api/v1/genes` marks `managed` types. `options` stays, derived from
+  `choices` and deprecated, until the V1 admin UI is removed. The new
+  `POST /api/v1/genes/{type}/config-check` runs save's own steps on a copy
+  and returns the values save would derive (a pasted Confluence page URL
+  names its page tree), facts such as the effective Jira query, and field
+  issues; with `source_id` it needs the access an update needs. Every
+  refused source configuration, on create, update, scope-change preview,
+  discovery preview and repository browse, answers 400 with `detail`
+  `{"code": "config_invalid", "message", "fields": [{"key", "message"}]}`
+  instead of a string. A field is required only while it is visible, so a
+  partial update that omits a required field, and a value its mode hides,
+  are now refused. A save writes the mode the server infers: Confluence
+  `sync_mode` (`page_tree` with a root, else `space`) and Jira `auth_mode`
+  (`pat` when a token is supplied or stored); `GET /sources` shows the
+  effective Jira `auth_mode` of a Source stored without one.
+  For source type authors: `ConfigField.options` is replaced by `choices`
+  (`ConfigOption`), with `ConfigCondition`, `ConfigPanel`, `widget` and
+  group `purpose`, which registration checks; `validate_input` checks only
+  the input as given and may no longer derive a value; hooks refuse a field
+  with `SourceConfigInvalid` and `FieldIssue`
+  (`memforge.genes.toolkit.config`); and `SourceConfigPolicy` gains `facts`.
+
+- The admin UI V2 adds and configures Sources on its own pages instead of
+  linking to V1. Add source opens a type picker (`/sources/new`) that
+  leaves out managed types and says where each type runs; each type's
+  setup page (`/sources/new/{type}`, `/sources/{id}/settings?step=…`) is
+  drawn from the server's form description, with steps for the name, the
+  type's groups, access, project (with inline project creation) and the
+  automatic sync schedule. It checks the form with config-check as fields
+  are left and before save, fills values the server derives without
+  overwriting what was typed, previews a scope change and sends the
+  change in progress it saw, offers to stop a running sync before saving,
+  and asks before leaving with unsaved changes. Configure, Choose a
+  project and Configure file scope open the matching step. The interactive
+  parts run on the same pages: the GitHub repository folder tree, the local
+  folder picker, the Teams session check and connect and the Teams
+  conversation picker, and the Jira browser session with renewal and the
+  copyable refresh command; a local folder's Check setup lists the files
+  local sync finds. Sign in renews a Teams or Jira browser session in place
+  and opens the connection step for a token, so V2 no longer links to V1.
+
+- The admin UI V2 changes who can use a Source in a shared workspace. The
+  row and drawer menus offer "Change who can use this source" to someone
+  who manages it; the change runs through
+  `POST /api/v1/sources/{id}/access-transitions`, and the row and drawer
+  follow it while it runs, with how many memories are updated. A failed
+  change shows its reason, and its owner can retry it or revert it to the
+  previous policy.
+
+- The admin UI V2 shows how many reviews wait for a decision beside Review
+  in the navigation (read every 30 seconds, `99+` above 99), and a chip on a
+  Source's row and drawer when its pipeline checks over the last day found
+  issues, left evaluations pending or want a review, which opens Evaluation
+  scoped to that Source. The row and drawer menus offer "Full sync" beside
+  "Re-read all documents" to someone who can force a resync: after a
+  confirmation that names its model cost, it calls
+  `POST /api/v1/sources/{id}/force-resync`, which lists the whole Source
+  again from its provider or device and processes every document, unchanged
+  ones included. `GET /api/v1/sources/{id}/agent-evaluation` is deprecated
+  and is removed with the V1 admin UI.
+
+- The admin UI V2 has an Entities page under Knowledge (`/entities`): a
+  searchable, paged list of the entities the caller can discover, and a
+  detail page with the entity's aliases and how many memories it is linked
+  to. A workspace admin adds and removes aliases there, and merges the
+  entity into another chosen by name, after a confirmation that shows each
+  entity's current linked memory count; the merge then opens the target.
+  The entity chips on a memory's detail open the Entities list searched for
+  that name.
+
 - A Notion document Source: the server collects every page under configured
   root pages and databases, database rows included, with an internal
   connection token. Each page is a `notion_page` Unit with a `page_body`

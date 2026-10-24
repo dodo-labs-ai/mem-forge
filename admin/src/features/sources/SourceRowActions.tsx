@@ -1,6 +1,7 @@
 import { MoreHorizontal } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { sourceEvaluationPath } from "@/lib/paths";
+import { useSharedWorkspace } from "@/api";
+import { sourceEvaluationPath, sourceSettingsPath } from "@/lib/paths";
 import { Button } from "@/ui/button";
 import {
   DropdownMenu,
@@ -11,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from "@/ui/dropdown-menu";
 import { canDeleteSourceType, canConfigureSourceType } from "./model/managedSources";
+import { canChangeSourceAccess } from "./model/sourceAccess";
 import type { SourceRow } from "./model/sourceRows";
 import type { Source } from "./model/types";
 import type { SourceActions } from "./useSourceActions";
@@ -21,11 +23,36 @@ interface SourceRowActionsProps {
   onViewDetails: (source: Source) => void;
   onDelete: (source: Source) => void;
   onReRead: (source: Source) => void;
+  onFullSync: (source: Source) => void;
+  onChangeAccess: (source: Source) => void;
+}
+
+/** The menu item that opens the Full sync confirmation, in the row and the drawer menus. */
+export function FullSyncMenuItem({ enabled, onClick }: { enabled: boolean; onClick: () => void }) {
+  return (
+    <DropdownMenuItem className="items-start" disabled={!enabled} onClick={onClick}>
+      <span className="flex flex-col gap-0.5">
+        <span>Full sync</span>
+        <span className="text-xs text-muted-foreground">
+          List the whole source again and process every document, unchanged ones included.
+        </span>
+      </span>
+    </DropdownMenuItem>
+  );
 }
 
 /** One primary button (the fix when the source needs the user) and a menu of the rest. */
-export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRead }: SourceRowActionsProps) {
+export function SourceRowActions({
+  row,
+  actions,
+  onViewDetails,
+  onDelete,
+  onReRead,
+  onFullSync,
+  onChangeAccess,
+}: SourceRowActionsProps) {
   const navigate = useNavigate();
+  const sharedWorkspace = useSharedWorkspace();
   const { source, attention, activity } = row;
   const capabilities = source.capabilities;
   const sync = actions.syncControl(source, activity);
@@ -35,6 +62,7 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
   // While a sync runs, the row's button stops it; a queued sync keeps its own button.
   const stopIsPrimary = canStop && (activity?.state === "active" || activity?.state === "recovering");
   const control = attention && actions.attentionControl(attention.action, source, attention.actionLabel);
+  const fullSync = actions.fullSyncControl(source, activity);
 
   return (
     <div className="flex items-center justify-end gap-1" onClick={(event) => event.stopPropagation()}>
@@ -80,6 +108,7 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
               <span className="text-xs text-muted-foreground">Process every document again with the current models.</span>
             </span>
           </DropdownMenuItem>
+          {fullSync.visible ? <FullSyncMenuItem enabled={fullSync.enabled} onClick={() => onFullSync(source)} /> : null}
           <DropdownMenuItem className="items-start" onClick={() => navigate(sourceEvaluationPath(source.id))}>
             <span className="flex flex-col gap-0.5">
               <span>Pipeline checks</span>
@@ -103,8 +132,11 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
             <>
               <DropdownMenuItem
                 className="items-start"
-                // Pausing stops a sync, so it stays available during one; resuming waits for the sync to end.
-                disabled={!capabilities?.can_configure || (source.status === "paused" && syncIsLive)}
+                // Pausing stops a sync, so it stays available during one; resuming waits for a sync or an access change to end.
+                disabled={
+                  !capabilities?.can_configure ||
+                  (source.status === "paused" && (syncIsLive || source.access_state === "changing"))
+                }
                 onClick={() => actions.togglePaused(source)}
               >
                 {source.status === "paused" ? (
@@ -118,10 +150,13 @@ export function SourceRowActions({ row, actions, onViewDetails, onDelete, onReRe
                   </span>
                 )}
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => actions.openInV1()}>
+              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => navigate(sourceSettingsPath(source.id))}>
                 Configure
               </DropdownMenuItem>
             </>
+          ) : null}
+          {canChangeSourceAccess(source, sharedWorkspace) ? (
+            <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
           ) : null}
           {canDeleteSourceType(source.type) ? (
             <>

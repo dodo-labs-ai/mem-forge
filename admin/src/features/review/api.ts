@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { unwrap, useApi, type ApiClient } from "@/api";
+import { reviewQueryKeys, unwrap, useApi, type ApiClient } from "@/api";
 import { inBatches } from "./model/batchDecisions";
 import { decisionNote } from "./model/reviewDecision";
 import { queueQuery, type ReviewQueueView } from "./model/reviewQueue";
@@ -8,7 +8,7 @@ import type { DecisionManifestItem, DecisionResult, ReviewDecision, ReviewDetail
 const CHECK_ROOT = "review-decision-check";
 
 export const reviewKeys = {
-  all: ["reviews"] as const,
+  all: reviewQueryKeys.all,
   queue: (view: ReviewQueueView) => ["reviews", "queue", view.tab, view.kind, view.page] as const,
   detail: (reviewId: string) => ["reviews", "detail", reviewId] as const,
   /** Outside `all`: a check describes the moment it ran, so a decision never refetches it. */

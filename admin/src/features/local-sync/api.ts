@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
-import { unwrap, useApi } from "@/api";
+import { queryOptions, useQuery } from "@tanstack/react-query";
+import { unwrap, useApi, type ApiClient } from "@/api";
 
 const STATUS_REFETCH_MS = 30_000;
 const STATUS_STALE_MS = 15_000;
@@ -9,15 +9,19 @@ export const localSyncKeys = {
   jobs: ["local-sync", "jobs"] as const,
 };
 
+/** The local sync daemon's status, for a caller that reads it once, such as before asking the daemon for a setup step. */
+export function localSyncStatusQuery(api: ApiClient) {
+  return queryOptions({
+    queryKey: localSyncKeys.status,
+    queryFn: () => unwrap(api.GET("/api/cloud/local-agent/status")),
+    staleTime: STATUS_STALE_MS,
+  });
+}
+
 /** Whether the local sync daemon on the user's machine is reachable. */
 export function useLocalSyncStatus() {
   const api = useApi();
-  return useQuery({
-    queryKey: localSyncKeys.status,
-    queryFn: () => unwrap(api.GET("/api/cloud/local-agent/status")),
-    refetchInterval: STATUS_REFETCH_MS,
-    staleTime: STATUS_STALE_MS,
-  });
+  return useQuery({ ...localSyncStatusQuery(api), refetchInterval: STATUS_REFETCH_MS });
 }
 
 export type LocalSyncState = "checking" | "online" | "offline";

@@ -10,8 +10,15 @@ import pytest
 
 from memforge.server.admin_api import MemorySearchRequest, RecentMemoryListRequest
 
-ADMIN_UI_SEARCH_REQUEST_FIXTURE = (
-    Path(__file__).resolve().parents[1] / "admin-ui" / "tests" / "fixtures" / "memory-search-request.json"
+ADMIN_SEARCH_REQUEST_FIXTURE = (
+    Path(__file__).resolve().parents[1]
+    / "admin"
+    / "src"
+    / "features"
+    / "memories"
+    / "model"
+    / "fixtures"
+    / "memory-search-request.json"
 )
 
 
@@ -122,17 +129,19 @@ def test_search_request_rejects_legacy_top_level_sources_filter():
         MemorySearchRequest(query="jira defects", sources=["Gamma Defects"])  # type: ignore[call-arg]
 
 
-def test_search_request_accepts_admin_ui_project_query_source_body():
+def test_search_request_accepts_admin_project_query_source_body():
     """The admin UI Memories page builds this body for project + query + source;
-    admin-ui/src/views/memories/memorySearchRequest.test.ts asserts it matches."""
-    body = json.loads(ADMIN_UI_SEARCH_REQUEST_FIXTURE.read_text(encoding="utf-8"))
+    admin/src/features/memories/model/listState.test.ts asserts it matches."""
+    body = json.loads(ADMIN_SEARCH_REQUEST_FIXTURE.read_text(encoding="utf-8"))
 
     req = MemorySearchRequest.model_validate(body)
 
     assert req.active_project == "PAY"
     assert req.scope_mode == "project"
     assert req.memory_types == ["decision"]
-    assert req.status == "active"
+    assert req.status == "retired"
+    assert req.include_superseded is False
+    assert req.offset == 0
     assert req.source_filter is not None
     assert req.source_filter.source_ids == ["src-jira"]
 
