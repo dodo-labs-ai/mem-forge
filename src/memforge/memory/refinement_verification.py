@@ -57,9 +57,9 @@ class RefinementVerification:
 
 
 def _claim(memory: Memory) -> dict[str, object]:
+    """What a claim states. Its Memory type is an extraction label that varies between extractions, not a fact."""
     return {
         "text": memory.content,
-        "type": memory.memory_type,
         "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
         "valid_until": memory.valid_until.isoformat() if memory.valid_until else None,
     }
