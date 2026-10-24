@@ -8,8 +8,7 @@ each claim, its concept Markdown and its Memory consistent.
 
 ``AgentKnowledgeBundleService.apply_patch_proposal`` is the boundary that
 turns a structured patch proposal into stable concept claims and Memories. It
-creates the claims that the correction and retirement lifecycle acts on, and
-the lifecycle tests use it to seed them.
+creates the claims that the correction and retirement lifecycle acts on.
 """
 
 from __future__ import annotations
