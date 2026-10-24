@@ -124,6 +124,52 @@ test.each([
   }
 });
 
+test("an agent-session source's drawer shows when a session window was last processed, not a sync status it cannot have", async () => {
+  const source = makeSource({
+    id: "src-claude",
+    type: "agent_session",
+    client: "claude-code",
+    name: "Claude Code Session",
+    sync: null,
+    sync_schedule: null,
+    last_sync: "2026-10-24T05:00:00Z",
+  });
+  renderPage([source], {
+    "GET /api/v1/agent-sessions/completeness": () => ({
+      session_id: null,
+      source_id: "src-claude",
+      total: 0,
+      processed_total: 0,
+      counts: { knowledge_patched: 0, no_output: 0, failed: 0 },
+      no_output_fraction: 0,
+      latest_failure: null,
+    }),
+    "GET /api/v1/sources/src-claude/projects": () => ({ source_id: "src-claude", projects: [] }),
+  });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByText("Claude Code Session"));
+  const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
+  expect(await within(drawer).findByText("Last window processed")).toBeInTheDocument();
+  expect(within(drawer).queryByRole("heading", { name: "Sync" })).not.toBeInTheDocument();
+  for (const text of ["Not synced yet", "Status", "Last sync", "Schedule", "Manual only"]) {
+    expect(within(drawer).queryByText(text)).not.toBeInTheDocument();
+  }
+});
+
+test("a synced source's drawer keeps its sync status, last sync and schedule", async () => {
+  renderPage([makeSource()]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByText("Payroll wiki"));
+  const drawer = await screen.findByRole("dialog", { name: "Payroll wiki" });
+  expect(within(drawer).getByRole("heading", { name: "Sync" })).toBeInTheDocument();
+  for (const text of ["Status", "Last sync", "Schedule"]) {
+    expect(within(drawer).getByText(text)).toBeInTheDocument();
+  }
+  expect(within(drawer).queryByText("Last window processed")).not.toBeInTheDocument();
+});
+
 test("Add source opens the type picker in the app", async () => {
   renderPage();
   await screen.findByRole("table", { name: "Sources" });
