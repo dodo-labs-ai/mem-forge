@@ -409,7 +409,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   }
 
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[15rem_minmax(0,1fr)]">
+    <div className="grid gap-6 lg:grid-cols-[15rem_minmax(0,1fr)]">
       <StepRail aria-label="Setup steps" steps={railSteps} current={currentKey} onSelect={openStep} />
       <form
         noValidate

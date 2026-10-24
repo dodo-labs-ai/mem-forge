@@ -261,8 +261,8 @@ test("a long step summary stays inside the setup page at a narrow window", async
   const summary = page.getByRole("navigation", { name: "Setup steps" }).getByText(`This page tree · ${pageUrl}`);
   await expect(summary).toBeVisible();
 
-  // How far the main column scrolls sideways; the e2e project has no DOM types, so the page evaluates a string.
-  const overflow = await page.evaluate<number>("(main => main.scrollWidth - main.clientWidth)(document.querySelector('main'))");
+  // The main column does not scroll sideways.
+  const overflow = await page.locator("main").evaluate((main: { scrollWidth: number; clientWidth: number }) => main.scrollWidth - main.clientWidth);
   expect(overflow).toBe(0);
   await expect(summary).toHaveAttribute("title", `This page tree · ${pageUrl}`);
 });

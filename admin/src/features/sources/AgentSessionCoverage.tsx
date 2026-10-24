@@ -10,7 +10,8 @@ import type { Source } from "./model/types";
 /**
  * The drawer's "Session coverage" for an agent-session Source: how the
  * session windows its plugin sent turned out (kept as memory, skipped as
- * low-signal, failed), and the projects the kept ones were filed under.
+ * low-signal, failed), when one was last processed, and the projects the
+ * kept ones were filed under.
  */
 export function AgentSessionCoverage({ source }: { source: Source }) {
   const completeness = useAgentSessionCompleteness(source.id);
@@ -34,6 +35,14 @@ export function AgentSessionCoverage({ source }: { source: Source }) {
               { label: "Windows processed", value: formatCount(completeness.data.processed_total) },
               { label: "Kept as memory", value: formatCount(completeness.data.counts.knowledge_patched) },
               { label: "Skipped as low-signal", value: formatCount(completeness.data.counts.no_output) },
+              {
+                label: "Last window processed",
+                value: source.last_sync ? (
+                  <span title={formatDateTime(source.last_sync)}>{formatRelative(source.last_sync)}</span>
+                ) : (
+                  "None yet"
+                ),
+              },
             ]}
           />
           <p className="text-sm text-muted-foreground">
