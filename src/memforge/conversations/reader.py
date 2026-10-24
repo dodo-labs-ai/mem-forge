@@ -68,7 +68,12 @@ class ConversationUnitReader(Protocol):
         ...
 
     async def read(self, units: Collection[UnitRef]) -> tuple[StoredUnit, ...]:
-        """These Units with their members."""
+        """These Units with their members.
+
+        Every Unit asked for was just listed as current, so one without a
+        current revision means the projection changed under the attempt,
+        and the read fails rather than leave the Unit out.
+        """
         ...
 
     async def units_spanning(
@@ -129,7 +134,9 @@ class SourceProjectionUnitReader:
         for ref in {unit.unit_id: unit for unit in units}.values():
             revision = await self._store.get_current_source_unit_revision(ref.unit_id)
             if revision is None:
-                continue
+                raise ValueError(
+                    f"conversation Unit {ref.unit_id} was listed as current but has no current revision"
+                )
             observations = await self._store.get_source_observation_revisions(revision.observation_revision_ids)
             stored.append(StoredUnit(ref=ref, members=_members(ref, observations.values())))
         return tuple(stored)

@@ -69,6 +69,10 @@ class PollEvidence:
 
     ``started_at`` is the executor's clock when the poll began; the layer
     bounds what the poll proves by it and by the manifest's receipt time.
+    ``earliest_complete_page_time`` is the time the read is complete from, as
+    the provider's poll named it (:class:`~memforge.conversations.port.PollOutcome`):
+    a poll that returned a message names it for every outcome, and intake
+    refuses evidence where it is missing or outside what the outcome allows.
     """
 
     requested: Interval

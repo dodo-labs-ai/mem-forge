@@ -161,6 +161,7 @@ async def test_the_source_list_shows_the_open_transition_its_progress_and_the_it
     assert (summary["members_committed"], summary["listed_count"]) == (2, 3)
     assert summary["error"] == "1 listed Documents have not committed under the transition"
     assert summary["excluded_scopes_due"] is False
+    assert summary["removes"] == "at_completion"
     assert summary["failing_items"]["count"] == 1
     assert [(item["document_id"], item["message"]) for item in summary["failing_items"]["items"]] == [
         ("page-3", "403 Forbidden")
@@ -197,6 +198,7 @@ async def test_saving_the_restore_configuration_returns_a_listing_source_to_its_
     assert _preview(tmp_path, db, restore) == {
         "outcome": "returns_to_previous_scope",
         "open_transition": True,
+        "removes": "at_completion",
         "refusal": None,
     }
     response = _save(tmp_path, db, restore, expected_scope_transition_id=stuck.id)
@@ -253,17 +255,29 @@ async def test_saving_the_restore_configuration_of_a_source_that_cannot_list_clo
 
 
 @pytest.mark.asyncio
-async def test_a_conversation_source_shows_its_open_change_without_a_restore(db, tmp_path):
-    await _source(db, "teams", {"conversation_ids": ["19:a@thread.v2"]}, execution_owner_user_id="dev")
-    assert _save(tmp_path, db, {"conversation_ids": ["19:b@thread.v2"]}).status_code == 200
+async def test_a_conversation_source_offers_the_restore_of_its_previous_selection(db, tmp_path):
+    await _source(
+        db, "teams", {"conversation_ids": ["19:a@thread.v2"], "initial_history_days": 30}, execution_owner_user_id="dev"
+    )
+    assert _save(tmp_path, db, {"conversation_ids": ["19:b@thread.v2"], "initial_history_days": 30}).status_code == 200
+    stuck = await db.get_open_projection_scope_transition(SOURCE_ID)
 
     summary = _row(tmp_path, db)["scope_transition"]
+    superseding = _preview(tmp_path, db, {"conversation_ids": ["19:c@thread.v2"], "initial_history_days": 30})
+    restoring = _preview(tmp_path, db, summary["restore_config"])
+    response = _save(tmp_path, db, summary["restore_config"], expected_scope_transition_id=stuck.id)
+    back = await db.get_open_projection_scope_transition(SOURCE_ID)
 
     assert summary["target_scope"]["conversation_ids"] == ["19:b@thread.v2"]
-    assert summary["restore_config"] is None
-    refused = _preview(tmp_path, db, {"conversation_ids": ["19:c@thread.v2"]})
-    assert refused["outcome"] == "refused"
-    assert refused["refusal"]["code"] == "projection_scope_transition_active"
+    assert summary["removes"] == "next_sync"
+    assert summary["restore_config"]["conversation_ids"] == ["19:a@thread.v2"]
+    assert summary["restore_config"]["initial_history_days"] == 30
+    assert (superseding["outcome"], superseding["removes"]) == ("supersedes_transition", "next_sync")
+    assert (restoring["outcome"], restoring["removes"]) == ("returns_to_previous_scope", "next_sync")
+    assert response.status_code == 200, response.text
+    assert back.previous_scope == back.target_scope == stuck.previous_scope
+    assert back.predecessor_transition_id == stuck.id
+    assert _row(tmp_path, db)["scope_transition"]["restore_config"] is None
 
 
 @pytest.mark.asyncio
@@ -274,6 +288,7 @@ async def test_the_preview_decides_as_saving_would_and_writes_nothing(db, tmp_pa
     assert _preview(tmp_path, db, _confluence("root-b")) == {
         "outcome": "opens_transition",
         "open_transition": False,
+        "removes": "at_completion",
         "refusal": None,
     }
     assert await db.get_open_projection_scope_transition(SOURCE_ID) is None
@@ -285,6 +300,7 @@ async def test_the_preview_decides_as_saving_would_and_writes_nothing(db, tmp_pa
     assert _preview(tmp_path, db, _confluence("root-b")) == {
         "outcome": "unchanged",
         "open_transition": True,
+        "removes": "at_completion",
         "refusal": None,
     }
     assert _preview(tmp_path, db, _confluence("root-c"))["outcome"] == "supersedes_transition"

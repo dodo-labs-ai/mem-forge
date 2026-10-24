@@ -20,9 +20,9 @@ interface SourceScopeTransitionSectionProps {
 }
 
 /**
- * The scope change a source is applying: what it changes, how many of the
- * items its new scope lists are synced, the items whose failure keeps it
- * open, and the way back to the previous scope.
+ * The scope change a source is applying: what it changes, what it removes
+ * and when, how far it is, the items whose failure keeps it open, and the way
+ * back to the previous scope.
  */
 export function SourceScopeTransitionSection({ source, activity }: SourceScopeTransitionSectionProps) {
   const labels = useSourceConfigLabels(source.scope_transition ? source.type : null);
@@ -50,9 +50,7 @@ export function SourceScopeTransitionSection({ source, activity }: SourceScopeTr
           ) : null
         }
       >
-        {view.returning
-          ? "Nothing the previous scope synced is removed. Once a sync lists it in full, items only the replaced change added are removed."
-          : "Nothing is removed until every item the new scope lists is synced. Each sync retries the items that failed."}
+        {view.summary}
       </Notice>
 
       <PropertyList
