@@ -9,7 +9,6 @@ from memforge.agent_knowledge import (
     AGENT_CLAIM_CREATED_REASON,
     AgentKnowledgeBundleService,
     AgentKnowledgePatchProposal,
-    render_agent_knowledge_patch_prompt,
 )
 from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
 from memforge.memory.lifecycle_service import MemoryLifecycleService
@@ -889,26 +888,6 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
     active_claims = await db.list_agent_claims(created.concept_id)
     lineage_claim = await db.get_agent_claim(created.claim_id)
     concept = await db.get_agent_concept(created.concept_id)
-    prompt = await render_agent_knowledge_patch_prompt(
-        db=db,
-        owner_user_id="u-andrew",
-        client="codex",
-        session_id="sess-2",
-        trigger="stop",
-        workspace="/workspace/memforge-cloud",
-        repo_identifier="github.tools.sap/hcm/memforge-cloud",
-        branch=None,
-        history_window={"kind": "tail"},
-        events=[
-            {
-                "evidence_id": "event-1",
-                "kind": "user",
-                "text": "Keep future scheduler work aligned with current active memories.",
-            }
-        ],
-        transcript_markdown="user: Keep future scheduler work aligned with current active memories.",
-    )
-
     assert lineage_claim is not None
     assert lineage_claim["memory_id"] == created.memory_id
     assert active_claims == []
@@ -916,8 +895,6 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
     assert (await db.get_memory(created.memory_id)).status == "retired"
     assert concept is not None
     assert "Workspace source schedulers must start during app startup" not in concept["markdown_body"]
-    assert created.claim_id not in prompt
-    assert "Workspace source schedulers must start during app startup" not in prompt
 
 
 @pytest.mark.asyncio
@@ -1940,46 +1917,6 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
     assert concept_count[0] == 1
     assert claim_count[0] == 1
     assert memory_count[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_agent_memory_prompt_uses_primary_evidence_as_authorization_boundary(bundle_stack):
-    db, _store, _collection = bundle_stack
-
-    prompt = await render_agent_knowledge_patch_prompt(
-        db=db,
-        owner_user_id="u-andrew",
-        client="claude-code",
-        session_id="sess-1",
-        trigger="stop",
-        workspace="/workspace/memforge-cloud",
-        repo_identifier="github.tools.sap/hcm/memforge-cloud",
-        branch="codex/example-branch",
-        history_window={"kind": "transcript_window"},
-        events=[
-            {
-                "evidence_id": "E1",
-                "evidence_role": "supporting",
-                "kind": "assistant_message",
-                "text": "I verified the prompt tests and deployed the change.",
-            },
-            {
-                "evidence_id": "E2",
-                "evidence_role": "primary",
-                "kind": "user_message",
-                "text": "Yes, agent-session memories should be user-approved, not agent self-reasoning.",
-            },
-        ],
-        transcript_markdown="",
-    )
-
-    assert "<primary_evidence>" in prompt
-    assert "[E2:user_message] Yes, agent-session memories should be user-approved" in prompt
-    assert "<supporting_evidence>" in prompt
-    assert "[E1:assistant_message] I verified the prompt tests" in prompt
-    assert "<candidate_evidence>" not in prompt
-    assert "- primary_event_id never appears in required_event_ids." in prompt
-    assert "- With no_output, leave primary_event_id and required_event_ids empty." in prompt
 
 
 @pytest.mark.asyncio

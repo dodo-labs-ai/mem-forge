@@ -4,8 +4,9 @@ type NamedSourceType = {
   name: string;
 };
 
-// Both the legacy singleton type and the per-client split ids are managed:
-// they are populated automatically by plugins and cannot be user-configured.
+// Agent-session Sources, by type or by their per-client id prefix, are managed:
+// they hold memories kept from earlier Codex or Claude Code sessions and take
+// in no new content, so they have no sync runs, schedule or configuration.
 const MANAGED_SOURCE_TYPES = new Set(["agent_session"]);
 const MANAGED_SOURCE_ID_PREFIX = "src-agent-sessions-";
 
@@ -22,10 +23,6 @@ export function canConfigureSourceType(sourceType: string): boolean {
   return !isManagedSourceType(sourceType);
 }
 
-export function canDeleteSourceType(sourceType: string): boolean {
-  return !isManagedSourceType(sourceType);
-}
-
 /** Whether this UI has a setup form for the source type. */
 export function hasSetupForm(sourceType: string): boolean {
   return sourceType === "teams" || isSchemaSourceType(sourceType);
@@ -37,13 +34,4 @@ export function hasSetupForm(sourceType: string): boolean {
  */
 export function userConfigurableGenes<T extends NamedSourceType>(genes: readonly T[]): T[] {
   return genes.filter((gene) => canConfigureSourceType(gene.name) && hasSetupForm(gene.name));
-}
-
-/**
- * Returns the managed (info-only) source types from the gene list. These are
- * push-based sources where the service cannot be configured by the user; the
- * Add Source dialog shows them as read-only information cards instead.
- */
-export function infoOnlyGenes<T extends NamedSourceType>(genes: readonly T[]): T[] {
-  return genes.filter((gene) => isManagedSourceType(gene.name));
 }

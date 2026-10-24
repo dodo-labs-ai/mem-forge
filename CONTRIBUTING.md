@@ -83,10 +83,10 @@ Then fill in the keys you have. Git ignores `.env.test`, and both scripts read
 it on start; a variable exported in your shell takes precedence. Keep these
 keys out of `.env`, which configures the MemForge you run.
 
-For agent-session changes, also run the focused Python tests:
+For memory plugin changes, also run the focused Python tests:
 
 ```bash
-uv run pytest tests/test_hook_adapter.py tests/test_agent_session_api.py tests/test_agent_session_gene.py -q
+uv run pytest tests/test_hook_adapter.py tests/test_workspace_bindings.py tests/test_mcp_workspace_contract.py -q
 ```
 
 ### MCP proxy integration copies
@@ -104,8 +104,8 @@ generated copy differs from the canonical source.
 
 ## Design Principles
 
-- Keep client adapters thin. They translate hook payloads, redact obvious
-  secrets, and upload bounded windows.
+- Keep client adapters thin. The hook adds static usage guidance, and the MCP
+  proxy forwards tool calls; neither captures sessions.
 - Keep memory extraction, package generation, lifecycle, and source sync inside
   the service.
 - Prefer clear ownership boundaries over fallback paths that bypass the owning

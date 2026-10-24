@@ -1,14 +1,11 @@
-import { CircleAlert, Info, MoreHorizontal, RefreshCw } from "lucide-react";
+import { Info, MoreHorizontal, RefreshCw } from "lucide-react";
 import { useSharedWorkspace } from "@/api";
-import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil, pluralize } from "@/lib/format";
+import { formatCount, formatDateTime, formatInterval, formatRelative, formatUntil } from "@/lib/format";
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/ui/dropdown-menu";
-import { AgentSessionCoverage } from "./AgentSessionCoverage";
-import { AGENT_SESSION_SOURCE_TYPE } from "./model/agentSessions";
 import { isManagedSourceType } from "./model/managedSources";
 import { canChangeSourceAccess } from "./model/sourceAccess";
-import { BRAND_MARKS, sourceBrandKeysFor } from "./model/sourceBrand";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -31,12 +28,6 @@ interface SourceDetailDrawerProps {
   onOpenChange: (open: boolean) => void;
 }
 
-function unrecognizedSessionLinesTitle(count: number, type: string, client: string | null | undefined): string {
-  const brandKey = sourceBrandKeysFor(type, client)?.[0];
-  const clientLabel = brandKey ? BRAND_MARKS[brandKey].label : "this client";
-  return `${pluralize(count, "session line")} from ${clientLabel} ${count === 1 ? "was" : "were"} not recognized`;
-}
-
 export function SourceDetailDrawer({
   row,
   typeLabel,
@@ -52,7 +43,6 @@ export function SourceDetailDrawer({
   const presentation = activity ? presentSourceSyncActivity(activity, source.name, "items") : null;
   const schedule = source.sync_schedule;
   const { failedItems } = row;
-  const unrecognizedLines = source.unrecognized_session_lines;
   const sync = actions.syncControl(source, activity);
   const canStop = actions.canStopSync(source, activity);
   const canSync = Boolean(source.capabilities?.can_sync) && source.status === "active";
@@ -131,22 +121,12 @@ export function SourceDetailDrawer({
         />
       ) : null}
 
-      {unrecognizedLines ? (
-        <Notice
-          tone="warn"
-          icon={CircleAlert}
-          title={unrecognizedSessionLinesTitle(unrecognizedLines.count, source.type, source.client)}
-        >
-          Update the MemForge plugin so new sessions are read in full.
-        </Notice>
-      ) : null}
-
       {sharedWorkspace ? <SourceAccessTransitionSection source={source} /> : null}
 
       <SourceScopeTransitionSection source={source} activity={activity} />
 
       {isManagedSourceType(source.type) ? null : (
-        // A managed source's plugin delivers its content, so it has no sync runs or schedule.
+        // A managed source takes in no new content, so it has no sync runs or schedule.
         <DrawerSection title="Sync">
           <PropertyList
             items={[
@@ -201,8 +181,6 @@ export function SourceDetailDrawer({
           ]}
         />
       </DrawerSection>
-
-      {source.type === AGENT_SESSION_SOURCE_TYPE ? <AgentSessionCoverage source={source} /> : null}
 
       {failedItems ? (
         <DrawerSection title={failedItemsTitle(failedItems.count)}>

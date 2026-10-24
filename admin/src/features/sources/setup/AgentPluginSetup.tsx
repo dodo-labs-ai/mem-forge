@@ -3,8 +3,11 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
-import { AGENT_PLUGIN_SETUPS, AGENT_SESSION_SOURCE_TYPE, type AgentPluginSetup } from "../model/agentSessions";
+import { AGENT_PLUGIN_SETUPS, type AgentPluginSetup } from "../model/agentPlugins";
 import { SourceIcon } from "../SourceIcon";
+
+/** The origin of a Memory an agent saves on request; its brand mark is the agent's. */
+const AGENT_MEMORY_SOURCE_TYPE = "user_memory";
 
 function CopyableCommand({ command }: { command: string }) {
   function copy() {
@@ -39,9 +42,9 @@ function PluginSetupDialog({
         <DialogHeader>
           <DialogTitle>Set up {setup.name}</DialogTitle>
           <DialogDescription>
-            The MemForge plugin runs on your computer, records your coding sessions and sends redacted session windows
-            to MemForge as you work. Its source appears on the Sources page after the first upload; nothing else is set
-            up here.
+            The MemForge plugin gives {setup.name} memory tools: it searches your memories while it works, and when you
+            ask it to remember something it saves one private memory after you confirm. It records nothing on its own,
+            and nothing else is set up here.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -65,8 +68,8 @@ function PluginSetupDialog({
 
 /**
  * The type picker's "Coding agent integrations": Codex and Claude Code, each
- * opening the commands that install its MemForge plugin. Their Sources are
- * created by the plugin, so the picker offers no setup page for them.
+ * opening the commands that install its MemForge plugin. The plugin adds MCP
+ * memory tools and creates no Source, so the picker offers no setup page.
  */
 export function AgentPluginSetupSection() {
   const [selected, setSelected] = useState<AgentPluginSetup>(AGENT_PLUGIN_SETUPS[0]!);
@@ -77,7 +80,9 @@ export function AgentPluginSetupSection() {
         <h2 id="agent-integrations-heading" className="text-base font-medium">
           Coding agent integrations
         </h2>
-        <p className="text-sm text-muted-foreground">Save what your coding agent learns while it works as memories.</p>
+        <p className="text-sm text-muted-foreground">
+          Let your coding agent search MemForge and save what you ask it to remember.
+        </p>
       </div>
       <ul aria-label="Coding agents" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {AGENT_PLUGIN_SETUPS.map((setup) => (
@@ -91,10 +96,12 @@ export function AgentPluginSetupSection() {
               }}
             >
               <span className="flex items-center gap-2.5">
-                <SourceIcon type={AGENT_SESSION_SOURCE_TYPE} client={setup.client} className="size-5" />
+                <SourceIcon type={AGENT_MEMORY_SOURCE_TYPE} client={setup.client} className="size-5" />
                 <span className="font-medium text-foreground">{setup.name}</span>
               </span>
-              <span className="text-sm text-muted-foreground">Install the MemForge plugin to save {setup.name} sessions as memories.</span>
+              <span className="text-sm text-muted-foreground">
+                Install the MemForge plugin to give {setup.name} memory tools.
+              </span>
             </button>
           </li>
         ))}

@@ -59,7 +59,7 @@ test("a local-only type shows the Local sync badge", async () => {
   expect(within(within(types).getByRole("link", { name: /Jira/ })).getByText("Cloud or local sync")).toBeInTheDocument();
 });
 
-test("a coding agent shows the commands that install its plugin", async () => {
+test("a coding agent shows the commands that install its memory-tools plugin", async () => {
   const writeText = vi.fn().mockResolvedValue(undefined);
   vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
   renderPicker();
@@ -68,6 +68,8 @@ test("a coding agent shows the commands that install its plugin", async () => {
   await userEvent.click(within(agents).getByRole("button", { name: /Claude Code/ }));
 
   const dialog = await screen.findByRole("dialog", { name: "Set up Claude Code" });
+  expect(within(dialog).getByText(/records nothing on its own/)).toBeInTheDocument();
+  expect(within(dialog).queryByText(/session windows/)).not.toBeInTheDocument();
   expect(within(dialog).getByText("/plugin marketplace add dodo-labs-ai/mem-forge")).toBeInTheDocument();
   expect(within(dialog).getByText("/plugin install memory@memforge")).toBeInTheDocument();
   await userEvent.click(within(dialog).getByRole("button", { name: "Copy /plugin install memory@memforge" }));

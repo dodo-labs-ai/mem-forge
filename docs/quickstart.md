@@ -392,17 +392,18 @@ The MCP server should be named `memforge`.
 
 Each plugin does two things:
 
-- **Session capture.** Lifecycle hooks read the local session, redact obvious
-  secrets, and upload bounded evidence windows to
-  `POST /api/v1/agent-sessions/windows`. The service redacts again, decides
-  which user messages carry durable authority, and patches the user's private
-  Agent Knowledge. Raw windows are not stored. The local collection daemon is
-  not required for session capture.
+- **Usage guidance.** A `SessionStart` hook adds short MemForge usage guidance
+  to each new, resumed or compacted session. It makes no network call and
+  stores nothing.
 - **Memory tools.** A plugin-local MCP proxy speaks stdio to the agent and
   calls the MemForge API over HTTP(S). Search and provenance logic stay in the
   service, while `get_resource(mode="file")` writes a real file on the agent
   machine under `~/.memforge-agent/artifacts`. The proxy does not need the
   `memforge` CLI.
+
+The plugins capture nothing on their own. To keep a decision or a correction,
+ask the agent to remember it: it shows a preview, and after you confirm it
+saves one private memory with the `create_memory` tool.
 
 ### Plugin routing
 
@@ -416,8 +417,7 @@ export MEMFORGE_API_TOKEN=...
 ```
 
 For Claude Code, put these values in the top-level `env` object in
-`~/.claude/settings.json`. Lifecycle hooks do not inherit MCP-server-only
-environment.
+`~/.claude/settings.json`.
 
 MCP offers `list_workspaces`; every other tool accepts an optional
 `workspace_id`. Installed clients resolve a user-confirmed local project
@@ -439,7 +439,6 @@ and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 
 | Source | What is synced |
 | --- | --- |
-| Claude Code, Codex | Decisions, conventions and corrections from your sessions |
 | Confluence | Pages, including exported PDFs; accepts a root, space or page URL |
 | Jira | Tickets, decisions and work items |
 | GitHub Repository | Repository files from GitHub or GitHub Enterprise, scoped by folders and file types |
@@ -508,7 +507,7 @@ page, or one moved out of the roots, is kept as it was.
 After a source has synced, ask:
 
 ```text
-I'm about to change the agent-session capture flow.
+I'm about to change how Jira sources sync.
 Check MemForge for the decisions, conventions, and source evidence that matter.
 If a memory points to a backing page or PDF, inspect it when the original context
 could change your recommendation.
@@ -524,8 +523,7 @@ Evidence where available. Full source inspection
 retains the underlying excerpt; readable text need not be verbatim. Artifact
 evidence uses `evidence[].items[].artifact.url`. The Document `content_url` and
 `pdf_url` describe current stored content, which may differ from the cited
-revision. Managed-session citations point to generated concept documents,
-not retained raw dialogue.
+revision.
 
 To fetch backing evidence:
 

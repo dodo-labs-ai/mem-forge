@@ -279,40 +279,6 @@ class StructuredResponseModel(BaseModel):
         return decoded if decoded is not None else data
 
 
-class AgentSessionAuthorityDecision(StructuredResponseModel):
-    """One authority kind for a candidate agent-session user event.
-
-    ``not_authoritative`` is the safe answer; every other kind authorizes
-    durable memory.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    evidence_id: str = Field(min_length=1)
-    authority_kind: Literal[
-        "durable_user_intent",
-        "future_memory_intent",
-        "durable_preference",
-        "design_decision",
-        "rule_or_convention",
-        "approval_of_durable_direction",
-        "not_authoritative",
-    ]
-
-    @property
-    def is_authoritative(self) -> bool:
-        return self.authority_kind != "not_authoritative"
-
-
-class AgentSessionAuthorityResponse(StructuredResponseModel):
-    """Schema returned by agent-session authority classification."""
-
-    model_config = ConfigDict(extra="forbid")
-    direct_answer = True
-
-    decisions: list[AgentSessionAuthorityDecision]
-
-
 _PRIMARY_REF_DESCRIPTION = (
     "Exactly one authentic readable reference copied unchanged from primary_candidates, "
     "directly supporting the central conclusion; it need not alone prove every clause. "
@@ -2106,32 +2072,6 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=OfflineSemanticJudgeResponse,
-            model=model,
-        )
-
-    async def generate_agent_knowledge_patch(
-        self,
-        prompt: str,
-        *,
-        model: str | None = None,
-    ):
-        from memforge.agent_knowledge import AgentKnowledgePatchModelResponse
-
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=AgentKnowledgePatchModelResponse,
-            model=model,
-        )
-
-    async def classify_agent_session_evidence_authority(
-        self,
-        prompt: str,
-        *,
-        model: str | None = None,
-    ) -> AgentSessionAuthorityResponse:
-        return await self._call_schema(
-            prompt=prompt,
-            response_format=AgentSessionAuthorityResponse,
             model=model,
         )
 

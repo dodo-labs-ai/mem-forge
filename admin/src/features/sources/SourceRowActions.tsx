@@ -11,7 +11,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/ui/dropdown-menu";
-import { canDeleteSourceType, canConfigureSourceType } from "./model/managedSources";
+import { canConfigureSourceType } from "./model/managedSources";
 import { canChangeSourceAccess } from "./model/sourceAccess";
 import type { SourceRow } from "./model/sourceRows";
 import type { Source } from "./model/types";
@@ -158,18 +158,10 @@ export function SourceRowActions({
           {canChangeSourceAccess(source, sharedWorkspace) ? (
             <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
           ) : null}
-          {canDeleteSourceType(source.type) ? (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                variant="destructive"
-                disabled={!capabilities?.can_delete}
-                onClick={() => onDelete(source)}
-              >
-                Delete source
-              </DropdownMenuItem>
-            </>
-          ) : null}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" disabled={!capabilities?.can_delete} onClick={() => onDelete(source)}>
+            Delete source
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

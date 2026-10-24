@@ -83,37 +83,86 @@ def test_exact_sync_receipt_read_preserves_state_and_source_visibility(tmp_path)
         asyncio.run(database.close())
 
 
-def test_agent_session_completeness_answers_only_for_a_discoverable_source(tmp_path):
-    from memforge.agent_sessions import ensure_agent_session_source
-    from tests.test_agent_session_api import _make_receipt
+async def _seed_agent_claim_memory(database: Database, *, source_id: str, owner_user_id: str) -> str:
+    """Store one agent-session claim and its Memory, as earlier releases did, and return the Memory id."""
+    from memforge.agent_knowledge import AgentKnowledgeBundleService
+    from memforge.memory.store import MemoryStore
+    from memforge.storage.adapters.sqlite import build_sqlite_adapters
+    from tests.embedding_fixture import unconfigured_embedding
+    from tests.test_agent_knowledge_bundle import RecordingCollection, _proposal
 
+    adapters = build_sqlite_adapters(database, RecordingCollection())
+    store = MemoryStore(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embedding=unconfigured_embedding(),
+    )
+
+    async def embed(_text: str) -> list[float]:
+        return [0.1]
+
+    store._embed = embed
+    result = await AgentKnowledgeBundleService(db=database, memory_store=store).apply_patch_proposal(
+        proposal=_proposal(),
+        owner_user_id=owner_user_id,
+        source_id=source_id,
+        client="codex",
+        session_id="sess-1",
+        workspace="/workspace/mem-forge",
+        repo_identifier="github.example.test/platform/mem-forge",
+        project_key="UNSORTED",
+        source_updated_at=None,
+    )
+    assert result.outcome == "applied"
+    return result.memory_id
+
+
+def test_agent_session_owner_can_delete_it_but_not_configure_or_sync_it(tmp_path, monkeypatch):
+    from memforge.memory.store import MemoryStore
+    from tests.agent_session_fixture import seed_agent_session_source
+
+    cascaded_sources: list[str] = []
+    delete_source_cascade = MemoryStore.delete_source_cascade
+
+    async def record_cascade(self, source_id, **kwargs):
+        cascaded_sources.append(source_id)
+        return await delete_source_cascade(self, source_id, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "delete_source_cascade", record_cascade)
     database = _connect_database(tmp_path)
+    owner = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
+    admin = {"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"}
     try:
-        source = asyncio.run(ensure_agent_session_source(database, client="codex", owner_user_id="owner-user"))
-        receipt = _make_receipt(
-            doc_id="window-1",
-            session_id="sess-1",
-            outcome="failed",
-            reason="owner's private failure",
-            source_id=source["id"],
+        source = asyncio.run(seed_agent_session_source(database, client="codex", owner_user_id="owner-user"))
+        memory_id = asyncio.run(
+            _seed_agent_claim_memory(database, source_id=source["id"], owner_user_id="owner-user")
         )
-        asyncio.run(database.upsert_agent_session_receipt(receipt))
-        url = "/api/v1/agent-sessions/completeness"
-        other = {"x-test-user": "other"}
+        url = f"/api/v1/sources/{source['id']}"
         with TestClient(_app(tmp_path, database)) as client:
-            own = client.get(url, params={"source_id": source["id"]})
-            hidden = client.get(url, params={"source_id": source["id"]}, headers=other)
-            hidden_session = client.get(url, params={"source_id": source["id"], "session_id": "sess-1"}, headers=other)
-            unknown = client.get(url, params={"source_id": "src-missing"}, headers=other)
-            without_source = client.get(url, params={"session_id": "sess-1"}, headers=other)
+            owner_rows = client.get("/api/v1/sources", headers=owner).json()["data"]
+            admin_rows = client.get("/api/v1/sources", headers=admin).json()["data"]
+            refused = client.delete(url, headers=admin)
+            deleted = client.delete(url, headers=owner)
 
-        assert own.status_code == 200, own.text
-        assert own.json()["latest_failure"]["reason"] == "owner's private failure"
-        assert unknown.status_code == 404
-        for response in (hidden, hidden_session):
-            assert response.status_code == 404
-            assert response.json() == unknown.json()
-        assert without_source.status_code == 422
+        [row] = [row for row in owner_rows if row["id"] == source["id"]]
+        assert row["capabilities"] == {
+            "can_subscribe": True,
+            "can_configure": False,
+            "can_configure_connection": False,
+            "can_sync": False,
+            "can_force_resync": False,
+            "can_delete": True,
+            "can_change_access": True,
+        }
+        assert all(row["id"] != source["id"] for row in admin_rows)
+        assert refused.status_code == 404, refused.text
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"ok": True, "deleted_source": source["id"]}
+        assert asyncio.run(database.get_source(source["id"]))["status"] == "retired"
+        assert cascaded_sources == [source["id"]]
+        memory = asyncio.run(database.get_memory(memory_id))
+        assert (memory.status, memory.retirement_reason) == ("retired", "source_deleted")
     finally:
         asyncio.run(database.close())
 
