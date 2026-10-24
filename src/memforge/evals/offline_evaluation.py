@@ -36,8 +36,17 @@ from memforge.memory.cross_document_relation import (
 )
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.memory.text_view import TextEvidenceView
-from memforge.models import Memory, MemoryExtractionResult, RawMemory, ReconcileOperation, content_hash
-from memforge.pipeline.reconciler import reconcile_memories
+from memforge.memory.destructive_validation import validate_destructive_operations
+from memforge.models import (
+    Memory,
+    MemoryExtractionResult,
+    RawMemory,
+    ReconcileAction,
+    ReconcileOperation,
+    content_hash,
+)
+from memforge.pipeline.reconciler import assess_relations, join_support_and_relation
+from memforge.pipeline.revision_assessment import SupportAssessment
 from memforge.pipeline.revision_work import RevisionWorkExecutor
 from memforge.pipeline.support_relation_coordinator import (
     UNRESOLVED_RESULTS,
@@ -61,6 +70,7 @@ from memforge.source_derivation import (
     SourceUnitDerivationContext,
     SourceUnitDerivationRequest,
     memory_extraction_output_payload,
+    memory_extraction_result_from_output_payload,
     replay_source_unit_derivation,
     source_unit_derivation_context_from_payload,
 )
@@ -121,6 +131,8 @@ SUPPORT_LABELS = frozenset({"supported", "unsupported"})
 SUPPORT_LABEL_CRITERION = "support_label"
 UNLABELLED_UNSUPPORTED_CRITERION = "unlabelled_unsupported"
 IMAGE_READING_CRITERION = "image_reading"
+INCUMBENT_OUTCOME_CRITERION = "incumbent_outcome"
+UNLABELLED_OUTCOME_CRITERION = "unlabelled_outcome"
 _SUPPORT_RESULTS = frozenset(result.value for result in SupportResult)
 
 
@@ -1075,12 +1087,13 @@ def pinned_image_loader(
 
 
 class SourceUnitReconciliationReplayExecutor:
-    """Replay Relation and SupportRelationCoordinator against the case's pinned Support ledger.
+    """Replay the Relation line, SupportRelationCoordinator and DestructiveValidation over a pinned input.
 
-    Production joins the Support results of the same sync; a case pins them as
-    ``support_audits`` so replay judges the same inputs without applying a
+    The input pins the Candidates, the incumbents and each incumbent's Support
+    result, so replay judges the same situation every run without applying a
     lifecycle plan. Replay has no revision to read, so the coordinator's
-    re-checks are reported and the pinned results stand.
+    re-checks are reported and the pinned results stand. Each incumbent's
+    outcome is reported by the operation that names it.
     """
 
     def __init__(self, structured_llm_client: object) -> None:
@@ -1092,40 +1105,76 @@ class SourceUnitReconciliationReplayExecutor:
         candidate_manifest: Mapping[str, object],
     ) -> Mapping[str, object]:
         manifest = case.manifest
-        new_extractions = [
-            _raw_memory_from_payload(item)
-            for item in _mapping_list(manifest, "new_extractions")
-        ]
-        incumbents = [
-            _memory_from_payload(item) for item in _mapping_list(manifest, "incumbents")
-        ]
-        result = await reconcile_memories(
-            new_extractions=new_extractions,
-            existing_memories=incumbents,
-            structured_llm_client=self._structured_llm_client,
-            llm_model=str(candidate_manifest.get("model") or manifest.get("model") or ""),
-            supports=_pinned_supports(manifest),
+        new_extractions = memory_extraction_result_from_output_payload(
+            {"memories": _mapping_list(manifest, "new_extractions")},
+        ).memories
+        incumbents = [_memory_from_payload(item) for item in _mapping_list(manifest, "incumbents")]
+        model = str(candidate_manifest.get("model") or manifest.get("model") or "")
+        relation = await assess_relations(
+            new_extractions, incumbents, structured_llm_client=self._structured_llm_client, llm_model=model,
         )
+        failure = relation.failure
+        operations: tuple[ReconcileOperation, ...] = ()
+        rechecks = ()
+        if failure is None:
+            result = await join_support_and_relation(
+                relation, new_extractions=new_extractions, existing_memories=incumbents,
+                supports=_pinned_supports(manifest), structured_llm_client=self._structured_llm_client,
+                llm_model=model,
+            )
+            operations = validate_destructive_operations(
+                result.operations, supports=result.supports,
+                relation_complete=relation.covers(
+                    len(new_extractions), frozenset(memory.id for memory in incumbents),
+                ),
+            ).operations
+            rechecks = result.rechecks
         return {
             "case_kind": case.case_kind.value,
-            "operations": [_reconcile_operation_payload(operation) for operation in result.operations],
+            "operations": [_reconcile_operation_payload(operation) for operation in operations],
+            "outcomes": incumbent_outcomes(operations, [memory.id for memory in incumbents]) if failure is None else {},
             "rechecks": [
-                {"memory_id": recheck.memory_id, "reading": recheck.reading.value} for recheck in result.rechecks
+                {"memory_id": recheck.memory_id, "reading": recheck.reading.value} for recheck in rechecks
             ],
             "failure": (
-                {
-                    "error_type": result.failure.error_type,
-                    "reason_code": result.failure.reason_code,
-                }
-                if result.failure is not None
+                {"error_type": failure.error_type, "reason_code": failure.reason_code}
+                if failure is not None
                 else None
             ),
             "metrics": {
-                "relation_pair_count": result.metrics.relation_pair_count,
-                "revision_proof_count": result.metrics.revision_proof_count,
-                "revision_proof_failure_count": result.metrics.revision_proof_failure_count,
+                "relation_pair_count": relation.metrics.relation_pair_count,
+                "revision_proof_count": relation.metrics.revision_proof_count,
+                "revision_proof_failure_count": relation.metrics.revision_proof_failure_count,
             },
         }
+
+
+INCUMBENT_OUTCOMES = ("kept", "review", "revised", "retired")
+_OUTCOME_BY_ACTION = {
+    ReconcileAction.DELETE: "retired", ReconcileAction.SUPERSEDE: "retired", ReconcileAction.UPDATE: "revised",
+}
+
+
+def incumbent_outcomes(operations: Sequence[ReconcileOperation], incumbent_ids: Sequence[str]) -> dict[str, str]:
+    """What the operations do to each incumbent, the most consequential when several name it.
+
+    ``DELETE`` removes this Unit's Support, which retires a Memory whose only
+    Support it was, so it counts with ``SUPERSEDE`` as ``retired``; ``UPDATE``
+    replaces the claim (``revised``); a kept Memory whose decision a Review holds,
+    or a removal flagged for Review, is ``review``; anything else is ``kept``.
+    """
+
+    outcomes = dict.fromkeys(incumbent_ids, "kept")
+    for operation in operations:
+        if operation.memory_id not in outcomes:
+            continue
+        outcome = (
+            "review" if operation.flag_for_review or operation.reviews
+            else _OUTCOME_BY_ACTION.get(operation.action, "kept")
+        )
+        if INCUMBENT_OUTCOMES.index(outcome) > INCUMBENT_OUTCOMES.index(outcomes[operation.memory_id]):
+            outcomes[operation.memory_id] = outcome
+    return outcomes
 
 
 @dataclass(frozen=True)
@@ -3067,6 +3116,8 @@ def deterministic_checks(
                 ),
             )
         )
+        if output.get("failure") is None:
+            checks.extend(_incumbent_outcome_checks(ground_truth.rubric, output.get("outcomes")))
     required = ground_truth.rubric.get("required_deterministic_criteria", [])
     present = {check.criterion for check in checks}
     if isinstance(required, list):
@@ -3296,6 +3347,35 @@ def _support_label_checks(
     return checks
 
 
+def _incumbent_outcome_checks(rubric: Mapping[str, object], outcomes: object) -> list[DeterministicCheck]:
+    """Check each labelled incumbent's outcome; an unlabelled one the replay does not keep needs review."""
+
+    if not isinstance(outcomes, Mapping) or any(outcome not in INCUMBENT_OUTCOMES for outcome in outcomes.values()):
+        return [DeterministicCheck(
+            criterion=INCUMBENT_OUTCOME_CRITERION, label=DeterministicCheckLabel.FAIL,
+            reason_code="incumbent_outcomes_invalid",
+        )]
+    expected = rubric.get("expected_incumbents") or {}
+    checks = []
+    for incumbent_id, outcome in outcomes.items():
+        if incumbent_id in expected:
+            label = str(expected[incumbent_id])
+            checks.append(DeterministicCheck(
+                criterion=INCUMBENT_OUTCOME_CRITERION,
+                label=DeterministicCheckLabel.PASS if outcome == label else DeterministicCheckLabel.FAIL,
+                reason_code=f"{label}:{outcome}",
+                item_id=str(incumbent_id),
+            ))
+        elif outcome != "kept":
+            checks.append(DeterministicCheck(
+                criterion=UNLABELLED_OUTCOME_CRITERION,
+                label=DeterministicCheckLabel.UNKNOWN,
+                reason_code=str(outcome),
+                item_id=str(incumbent_id),
+            ))
+    return checks
+
+
 def _reading_group_coverage_check(extraction: Mapping[str, object]) -> DeterministicCheck:
     telemetry = extraction.get("evidence_telemetry")
     skipped = telemetry.get("skipped_reading_group_count", 0) if isinstance(telemetry, Mapping) else 0
@@ -3496,7 +3576,7 @@ def _validate_case_manifest(
     elif case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
         PinnedSupportInput.from_manifest(manifest)
     else:
-        _mapping_list(manifest, "new_extractions")
+        memory_extraction_result_from_output_payload({"memories": _mapping_list(manifest, "new_extractions")})
         incumbents = _mapping_list(manifest, "incumbents")
         if not incumbents:
             raise ValueError("reconciliation case requires pinned incumbents")
@@ -3513,32 +3593,52 @@ def _require_relation_input_contract(manifest: Mapping[str, object]) -> None:
 
 
 def _pinned_supports(manifest: Mapping[str, object]) -> dict[str, MemorySupport]:
-    """Read the pinned Support ledger: exactly one read result for every incumbent.
+    """Read the pinned Support results: exactly one for every incumbent.
 
-    ``supported`` pins a completed read; an optional ``unresolved`` reason pins a
-    claim that could not be judged.
+    Each result becomes the one Support assessment that production folds to it,
+    so DestructiveValidation sees what it would see in production: a supported
+    or unaffected claim holds its own claim as Evidence, and an unsupported one
+    rests on a complete read unless ``complete_read`` says otherwise.
     """
 
     if "support_audits" not in manifest:
         raise ValueError("reconciliation case requires pinned support_audits")
+    claims = {
+        str(item.get("id") or ""): _memory_from_payload(item) for item in _mapping_list(manifest, "incumbents")
+    }
     supports: dict[str, MemorySupport] = {}
     for item in _mapping_list(manifest, "support_audits"):
-        supported = item.get("supported")
-        if not isinstance(supported, bool):
-            raise ValueError("support_audits supported must be a boolean")
-        unresolved = item.get("unresolved")
-        if unresolved is not None and unresolved not in UNRESOLVED_RESULTS:
-            raise ValueError("support_audits unresolved must be one of: " + ", ".join(UNRESOLVED_RESULTS))
         incumbent_id = str(item.get("incumbent_id") or "")
-        if incumbent_id in supports:
+        if incumbent_id in supports or incumbent_id not in claims:
             raise ValueError("support_audits must cover every pinned incumbent exactly once")
-        supports[incumbent_id] = MemorySupport(
-            UNRESOLVED_RESULTS[unresolved] if unresolved is not None
-            else SupportResult.SUPPORTED if supported else SupportResult.UNSUPPORTED,
-            str(item.get("reason") or ""),
+        try:
+            result = SupportResult(str(item.get("result")))
+        except ValueError:
+            raise ValueError(
+                "support_audits result must be one of: " + ", ".join(result.value for result in SupportResult)
+            ) from None
+        complete_read = item.get("complete_read", True)
+        if not isinstance(complete_read, bool):
+            raise ValueError("support_audits complete_read must be a boolean")
+        claim = claims[incumbent_id]
+        evidence = RawMemory(
+            content=claim.content, memory_type=claim.memory_type,
+            valid_from=str(claim.valid_from) if claim.valid_from else None,
+            valid_until=str(claim.valid_until) if claim.valid_until else None,
         )
-    incumbent_ids = sorted(str(item.get("id") or "") for item in _mapping_list(manifest, "incumbents"))
-    if sorted(supports) != incumbent_ids:
+        reason = str(item.get("reason") or "")
+        unresolved = next((key for key, value in UNRESOLVED_RESULTS.items() if value is result), None)
+        supports[incumbent_id] = memory_support([
+            SupportAssessment(supported=None, reason=reason, memory=None, unresolved=unresolved)
+            if unresolved is not None
+            else SupportAssessment(supported=False, reason=reason, memory=None, complete_read=complete_read)
+            if result is SupportResult.UNSUPPORTED
+            else SupportAssessment(
+                supported=True, reason=reason, memory=evidence,
+                rebound=result is SupportResult.UNAFFECTED, complete_read=result is SupportResult.SUPPORTED,
+            )
+        ])
+    if sorted(supports) != sorted(claims):
         raise ValueError("support_audits must cover every pinned incumbent exactly once")
     return supports
 
@@ -3596,9 +3696,13 @@ def _validate_rubric(
             raise ValueError("Support labels must be one of " + ", ".join(sorted(SUPPORT_LABELS)))
         rubric_memory_labels(expected, terms, claims)
     if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
-        forbidden = rubric.get("forbidden_destructive_memory_ids", [])
-        if not isinstance(forbidden, list):
-            raise ValueError("forbidden_destructive_memory_ids must be a list")
+        expected = rubric.get("expected_incumbents", {})
+        if not isinstance(expected, Mapping):
+            raise ValueError("expected_incumbents must be a mapping of incumbent id to outcome")
+        if not set(expected) <= {str(item.get("id")) for item in _mapping_list(case.manifest, "incumbents")}:
+            raise ValueError("expected_incumbents names only pinned incumbents")
+        if any(label not in INCUMBENT_OUTCOMES for label in expected.values()):
+            raise ValueError("expected_incumbents outcomes must be one of " + ", ".join(INCUMBENT_OUTCOMES))
 
 
 def _validate_derivation_rubric(rubric: Mapping[str, object]) -> None:
@@ -3620,24 +3724,6 @@ def _validate_derivation_rubric(rubric: Mapping[str, object]) -> None:
         raise ValueError("required_terms must be a list of non-empty strings")
 
 
-def _raw_memory_from_payload(payload: Mapping[str, object]) -> RawMemory:
-    return RawMemory(
-        content=str(payload.get("content") or ""),
-        memory_type=str(payload.get("memory_type") or "fact"),
-        entity_refs=[str(value) for value in payload.get("entity_refs", [])],
-        valid_from=_optional_str(payload.get("valid_from")),
-        valid_until=_optional_str(payload.get("valid_until")),
-        evidence_quote=_optional_str(payload.get("evidence_quote")),
-        evidence_range_start=_optional_int(payload.get("evidence_range_start")),
-        evidence_range_end=_optional_int(payload.get("evidence_range_end")),
-        evidence_anchor=_optional_str(payload.get("evidence_anchor")),
-        source_observation_id=_optional_str(payload.get("source_observation_id")),
-        required_source_observation_ids=[
-            str(value) for value in payload.get("required_source_observation_ids", [])
-        ],
-    )
-
-
 def _memory_from_payload(payload: Mapping[str, object]) -> Memory:
     content = str(payload.get("content") or "")
     return Memory(
@@ -3645,6 +3731,8 @@ def _memory_from_payload(payload: Mapping[str, object]) -> Memory:
         memory_type=str(payload.get("memory_type") or "fact"),
         content=content,
         content_hash=str(payload.get("content_hash") or _hash_text(content)),
+        valid_from=date.fromisoformat(str(payload["valid_from"])) if payload.get("valid_from") else None,
+        valid_until=date.fromisoformat(str(payload["valid_until"])) if payload.get("valid_until") else None,
         visibility=str(payload.get("visibility") or "workspace"),
         owner_user_id=_optional_str(payload.get("owner_user_id")),
         project_key=_optional_str(payload.get("project_key")),

@@ -7526,6 +7526,110 @@
         "title": "RecentMemoryTimeRangeRequest",
         "type": "object"
       },
+      "ReconciliationCaseRequest": {
+        "additionalProperties": false,
+        "description": "One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by\n``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the\n``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels\nincumbents ``kept``, ``review``, ``revised`` or ``retired``.",
+        "properties": {
+          "doc_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Id"
+          },
+          "input": {
+            "additionalProperties": true,
+            "minProperties": 1,
+            "title": "Input",
+            "type": "object"
+          },
+          "population": {
+            "default": "representative_control",
+            "enum": [
+              "representative_control",
+              "failure_regression"
+            ],
+            "title": "Population",
+            "type": "string"
+          },
+          "rubric": {
+            "additionalProperties": true,
+            "minProperties": 1,
+            "title": "Rubric",
+            "type": "object"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "input",
+          "rubric"
+        ],
+        "title": "ReconciliationCaseRequest",
+        "type": "object"
+      },
+      "ReconciliationCasesSeedRequest": {
+        "additionalProperties": false,
+        "description": "Hand-written situations to import into the request's workspace, and the cohort they form.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/ReconciliationCaseRequest"
+            },
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "role": {
+            "default": "sentinel",
+            "enum": [
+              "sentinel",
+              "development",
+              "release_holdout"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "selection_policy_version": {
+            "minLength": 1,
+            "title": "Selection Policy Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cases",
+          "selection_policy_version"
+        ],
+        "title": "ReconciliationCasesSeedRequest",
+        "type": "object"
+      },
       "RelatedMemoryDetail": {
         "properties": {
           "content_hash": {
@@ -10241,7 +10345,7 @@
       },
       "SupportCaseRequest": {
         "additionalProperties": false,
-        "description": "One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``\nwithin ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied\nupdate whose Support the model judged is pinned. The rubric's ``expected_support`` maps Memory ids to\n``supported`` or ``unsupported``.",
+        "description": "One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``\nwithin ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied\nupdate whose Support the model judged is pinned. The rubric labels Memories ``supported`` or\n``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold.",
         "properties": {
           "derivation_id": {
             "anyOf": [
@@ -11404,6 +11508,46 @@
           }
         },
         "summary": "Get Workspace Agent Evaluation",
+        "tags": [
+          "agent-evaluations"
+        ]
+      }
+    },
+    "/api/v1/agent-evaluations/reconciliation-cases/seed": {
+      "post": {
+        "description": "Import each hand-written situation as a reconciliation case and freeze their cohort.",
+        "operationId": "seed_reconciliation_evaluation_cases_api_v1_agent_evaluations_reconciliation_cases_seed_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReconciliationCasesSeedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seed Reconciliation Evaluation Cases",
         "tags": [
           "agent-evaluations"
         ]

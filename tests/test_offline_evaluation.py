@@ -25,10 +25,8 @@ from memforge.evals.offline_evaluation import (
     SemanticJudgeRequest,
     SemanticJudgeSpec,
     SourceUnitDerivationReplayExecutor,
-    SourceUnitReconciliationReplayExecutor,
     StructuredOfflineSemanticJudge,
 )
-from memforge.evals import offline_evaluation
 from memforge.models import (
     ContentItem,
     DocumentRecord,
@@ -37,8 +35,6 @@ from memforge.models import (
     RawContent,
     RawMemory,
 )
-from memforge.pipeline.reconciler import ReconciliationResult
-from memforge.pipeline.support_relation_coordinator import MemorySupport, SupportResult
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -69,6 +65,7 @@ class _FixedExecutor:
                     "flag_for_review": False,
                 }
             ],
+            "outcomes": {incumbent_id: "kept"},
             "failure": None,
         }
 
@@ -166,7 +163,7 @@ async def test_real_candidate_can_be_annotated_before_ground_truth_exists(db) ->
                     "memory_type": "procedure",
                 }
             ],
-            "support_audits": [{"incumbent_id": "mem-real", "supported": True}],
+            "support_audits": [{"incumbent_id": "mem-real", "result": "supported"}],
             "doc_type": "teams",
             "updated_document": "Tracing starts with traceId.",
         },
@@ -186,6 +183,7 @@ async def test_real_candidate_can_be_annotated_before_ground_truth_exists(db) ->
                     "flag_for_review": False,
                 }
             ],
+            "outcomes": {"mem-real": "kept"},
             "failure": None,
         },
         provenance={
@@ -299,7 +297,7 @@ async def test_offline_evaluation_records_frozen_lineage_and_result_assessments(
                     "memory_type": "procedure",
                 }
             ],
-            "support_audits": [{"incumbent_id": "mem-1", "supported": True}],
+            "support_audits": [{"incumbent_id": "mem-1", "result": "supported"}],
             "doc_type": "teams",
             "updated_document": "Tracing starts with traceId.",
         },
@@ -463,7 +461,7 @@ async def test_human_calibration_is_policy_gated_and_adjudication_preserves_labe
                     "memory_type": "procedure",
                 }
             ],
-            "support_audits": [{"incumbent_id": "mem-calibration", "supported": True}],
+            "support_audits": [{"incumbent_id": "mem-calibration", "result": "supported"}],
             "updated_document": "Tracing starts with traceId.",
         },
         promotion_policy_version="manual-v1",
@@ -783,7 +781,7 @@ async def test_semantic_judge_is_shadowed_and_exact_assessment_is_reused(db) -> 
                     "memory_type": "procedure",
                 }
             ],
-            "support_audits": [{"incumbent_id": "mem-semantic-shadow", "supported": True}],
+            "support_audits": [{"incumbent_id": "mem-semantic-shadow", "result": "supported"}],
             "updated_document": "Tracing starts with traceId.",
         },
         promotion_policy_version="manual-v1",
@@ -1174,14 +1172,14 @@ async def test_cohort_rejects_operation_family_leakage_across_roles(db) -> None:
 
 def _reconciliation_manifest(**overrides: object) -> dict[str, object]:
     return {
-        "new_extractions": [{"content": "Tracing starts with traceId and spanId."}],
+        "new_extractions": [{"content": "Tracing starts with traceId and spanId.", "memory_type": "procedure"}],
         "incumbents": [
             {"id": "mem-a", "content": "Tracing starts with traceId.", "memory_type": "procedure"},
             {"id": "mem-b", "content": "Logs live in Kibana.", "memory_type": "fact"},
         ],
         "support_audits": [
-            {"incumbent_id": "mem-a", "supported": True, "reason": "still stated"},
-            {"incumbent_id": "mem-b", "supported": False},
+            {"incumbent_id": "mem-a", "result": "supported", "reason": "still stated"},
+            {"incumbent_id": "mem-b", "result": "unsupported"},
         ],
         "doc_type": "teams",
         **overrides,
@@ -1205,18 +1203,25 @@ async def _curate_reconciliation_case(db, manifest: dict[str, object]) -> AgentE
     ("support_audits", "message"),
     [
         (None, "requires pinned support_audits"),
-        ([{"incumbent_id": "mem-a", "supported": True}], "cover every pinned incumbent exactly once"),
+        ([{"incumbent_id": "mem-a", "result": "supported"}], "cover every pinned incumbent exactly once"),
         (
             [
-                {"incumbent_id": "mem-a", "supported": True},
-                {"incumbent_id": "mem-a", "supported": False},
+                {"incumbent_id": "mem-a", "result": "supported"},
+                {"incumbent_id": "mem-a", "result": "unsupported"},
             ],
             "cover every pinned incumbent exactly once",
         ),
         (
             [
-                {"incumbent_id": "mem-a", "supported": "yes"},
-                {"incumbent_id": "mem-b", "supported": False},
+                {"incumbent_id": "mem-a", "result": "yes"},
+                {"incumbent_id": "mem-b", "result": "unsupported"},
+            ],
+            "result must be one of",
+        ),
+        (
+            [
+                {"incumbent_id": "mem-a", "result": "supported"},
+                {"incumbent_id": "mem-b", "result": "unsupported", "complete_read": "no"},
             ],
             "must be a boolean",
         ),
@@ -1229,30 +1234,6 @@ async def test_reconciliation_case_requires_complete_pinned_support(db, support_
 
     with pytest.raises(ValueError, match=message):
         await _curate_reconciliation_case(db, manifest)
-
-
-@pytest.mark.asyncio
-async def test_reconciliation_replay_judges_against_pinned_support(db, monkeypatch) -> None:
-    case = await _curate_reconciliation_case(db, _reconciliation_manifest())
-    captured: dict[str, object] = {}
-
-    async def reconcile(**kwargs):
-        captured.update(kwargs)
-        return ReconciliationResult(operations=[])
-
-    monkeypatch.setattr(offline_evaluation, "reconcile_memories", reconcile)
-    client = object()
-
-    output = await SourceUnitReconciliationReplayExecutor(client).execute(case, {"model": "candidate-model"})
-
-    assert output["operations"] == []
-    assert captured["structured_llm_client"] is client
-    assert captured["llm_model"] == "candidate-model"
-    assert captured["supports"] == {
-        "mem-a": MemorySupport(SupportResult.SUPPORTED, "still stated"),
-        "mem-b": MemorySupport(SupportResult.UNSUPPORTED, ""),
-    }
-    assert [memory.id for memory in captured["existing_memories"]] == ["mem-a", "mem-b"]
 
 
 @pytest.mark.asyncio
@@ -1281,7 +1262,7 @@ async def test_offline_case_curation_enforces_private_source_owner(db) -> None:
                         "memory_type": "fact",
                     }
                 ],
-                "support_audits": [{"incumbent_id": "mem-private", "supported": True}],
+                "support_audits": [{"incumbent_id": "mem-private", "result": "supported"}],
             },
             promotion_policy_version="manual-v1",
             created_by="not-owner",
