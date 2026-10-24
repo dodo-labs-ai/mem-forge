@@ -1,7 +1,7 @@
 # Security Policy
 
-MemForge handles source-system credentials, generated agent-session
-evidence, and memory derived from private workspaces. Treat all of those as
+MemForge handles source-system credentials, memories agents save on a user's
+request, and memory derived from private workspaces. Treat all of those as
 sensitive.
 
 ## Supported Versions
