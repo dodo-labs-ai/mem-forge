@@ -34,8 +34,10 @@
 #   --sync-timeout SECONDS  How long the source sync may take (default 900).
 #   --report FILE           Also write the Markdown report to FILE.
 #   --quality               Also sync the synthetic documents of
-#                           evals/quality/quick and run the quick offline quality
-#                           evaluation over them; its summary follows the table.
+#                           evals/quality/quick, replace the ones it revises with
+#                           their second version and sync again, then run the
+#                           quick offline quality evaluation of each case kind;
+#                           the summaries follow the table.
 #   -h, --help              Show this help.
 #
 # Models: with --ollama the smoke uses a local Ollama that has both models
@@ -334,8 +336,22 @@ sync_source() {
     say "the local daemon pass failed; its report is above"
     return 1
   fi
-  helper wait-sync --timeout "$sync_timeout" >"$detail_file" || return 1
+  helper wait-sync --timeout "$sync_timeout" "$@" >"$detail_file" || return 1
   say "$requested, collected by one daemon pass; $(tail -n 1 "$detail_file")"
+}
+
+# The quality cohort's revision pairs: replace each revised document with its
+# second version and sync again, so each is an applied update with recorded
+# Support work for the Support cases to pin.
+revise_source() {
+  if [ "$model_provider" = none ]; then
+    say "needs a synced source"
+    return "$SKIPPED"
+  fi
+  cp "$REPO_ROOT"/evals/quality/quick/revisions/*.md "$docs_dir"/
+  chmod 644 "$docs_dir"/*.md
+  sync_source --new-run || return 1
+  say "$(ls "$REPO_ROOT"/evals/quality/quick/revisions/*.md | wc -l | tr -d ' ') documents revised; $(cat "$detail_file")"
 }
 
 retrieve_memories() {
@@ -349,36 +365,42 @@ retrieve_memories() {
   say "API: $searched; MCP: $(tail -n 1 "$detail_file")"
 }
 
-# The quick quality evaluation runs through the CLI in the API image: it pins
-# the cohort's documents as cases, then submits the run and waits for the
-# worker's verdict.
+# The quick quality evaluation runs through the CLI in the API image: for each
+# case kind it pins the cohort's cases, then submits the run and waits for the
+# worker's verdict. The step passes only when every kind's verdict is pass.
 quality_checks() {
-  local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" seeded run_spec summary status
+  local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" kind command seeded run_spec summary status
+  local verdicts=() failed=0
   if [ "$model_provider" = none ]; then
     say "needs a synced source"
     return "$SKIPPED"
   fi
-  run_spec="$work_dir/quality-run.json"
-  if ! seeded=$(helper quality-seed-spec --cohort "$cohort" |
-      compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
-        memforge eval seed-derivation-cases --spec /dev/stdin); then
-    say "pinning the quality cohort failed: $(echo "$seeded" | tr '\n' ' ')"
-    return 1
-  fi
-  if ! printf '%s' "$seeded" | helper quality-run-spec --cohort "$cohort" >"$run_spec"; then
-    say "$(cat "$run_spec")"
-    return 1
-  fi
-  summary=$(compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
-    memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
-  status=$?
-  quality_summary=$summary
-  case $status in
-    0) say "verdict pass over $(grep -c '"title"' "$cohort") cases; summary below the table" ;;
-    2) say "the evaluation run did not finish within ${sync_timeout}s" ;;
-    *) say "verdict $(echo "$summary" | sed -n 's/^- Verdict: \*\*\(.*\)\*\*$/\1/p' | head -n 1) ; summary below the table" ;;
-  esac
-  return "$status"
+  quality_summary=
+  for kind in derivation support reconciliation; do
+    command=seed-$kind-cases
+    run_spec="$work_dir/quality-run-$kind.json"
+    if ! seeded=$(helper quality-seed-spec --cohort "$cohort" --kind "$kind" |
+        compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
+          memforge eval "$command" --spec /dev/stdin); then
+      say "pinning the $kind cases failed: $(echo "$seeded" | tr '\n' ' ')"
+      return 1
+    fi
+    if ! printf '%s' "$seeded" | helper quality-run-spec --cohort "$cohort" >"$run_spec"; then
+      say "$kind: $(cat "$run_spec")"
+      return 1
+    fi
+    summary=$(compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
+      memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
+    status=$?
+    quality_summary+="### $kind cases"$'\n\n'"$summary"$'\n\n'
+    case $status in
+      0) verdicts+=("$kind pass") ;;
+      2) verdicts+=("$kind timed out"); failed=1 ;;
+      *) verdicts+=("$kind $(echo "$summary" | sed -n 's/^- Verdict: \*\*\(.*\)\*\*$/\1/p' | head -n 1)"); failed=1 ;;
+    esac
+  done
+  say "verdicts: $(IFS=,; echo "${verdicts[*]}" | sed 's/,/, /g'); summaries below the table"
+  return "$failed"
 }
 
 restart_stack() {
@@ -521,6 +543,7 @@ run_step "Add local source" add_source
 run_step "Local source sync" sync_source
 run_step "Memory retrieval" retrieve_memories
 if (( run_quality )); then
+  run_step "Revised source sync" revise_source
   run_step "Quick quality evaluation" quality_checks
 fi
 run_step "Restart on the same volume" restart_stack

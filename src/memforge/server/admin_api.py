@@ -1196,8 +1196,8 @@ class DerivationCasesSeedRequest(BaseModel):
 class SupportCaseRequest(BaseModel):
     """One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
     within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
-    update whose Support the model judged is pinned. The rubric's ``expected_support`` maps Memory ids to
-    ``supported`` or ``unsupported``."""
+    update whose Support the model judged is pinned. The rubric labels Memories ``supported`` or
+    ``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1215,6 +1215,32 @@ class SupportCasesSeedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cases: list[SupportCaseRequest] = Field(min_length=1)
+    role: Literal["sentinel", "development", "release_holdout"] = "sentinel"
+    selection_policy_version: str = Field(min_length=1)
+
+
+class ReconciliationCaseRequest(BaseModel):
+    """One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by
+    ``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the
+    ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels
+    incumbents ``kept``, ``review``, ``revised`` or ``retired``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    doc_id: str | None = Field(default=None, min_length=1)
+    source_id: str | None = Field(default=None, min_length=1)
+    title: str | None = Field(default=None, min_length=1)
+    input: dict[str, object] = Field(min_length=1)
+    rubric: dict[str, object] = Field(min_length=1)
+    population: Literal["representative_control", "failure_regression"] = "representative_control"
+
+
+class ReconciliationCasesSeedRequest(BaseModel):
+    """Hand-written situations to import into the request's workspace, and the cohort they form."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cases: list[ReconciliationCaseRequest] = Field(min_length=1)
     role: Literal["sentinel", "development", "release_holdout"] = "sentinel"
     selection_policy_version: str = Field(min_length=1)
 
@@ -7900,6 +7926,62 @@ def create_admin_app(
                 {
                     "doc_id": case.doc_id,
                     "derivation_id": case.derivation_id,
+                    "case_id": case.case_id,
+                    "ground_truth_revision_id": case.ground_truth_revision_id,
+                    "population": case.population.value,
+                }
+                for case in report.cases
+            ],
+            "skipped": {reason: list(labels) for reason, labels in report.skipped.items()},
+        }
+
+    @evaluation_router.post("/reconciliation-cases/seed")
+    async def seed_reconciliation_evaluation_cases(
+        body: ReconciliationCasesSeedRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Import each hand-written situation as a reconciliation case and freeze their cohort."""
+
+        from memforge.evals.offline_evaluation import (
+            AgentEvaluationPopulation,
+            AgentEvaluationRole,
+            OfflineAgentEvaluation,
+        )
+        from memforge.evals.reconciliation_cases import (
+            ReconciliationCaseRequest as ImportRequest,
+            seed_reconciliation_cases,
+        )
+
+        actor = _require_maintenance_operator(request)
+        try:
+            report = await seed_reconciliation_cases(
+                db,
+                OfflineAgentEvaluation(db, executors={}),
+                requests=[
+                    ImportRequest(
+                        doc_id=case.doc_id,
+                        source_id=case.source_id,
+                        title=case.title,
+                        input=case.input,
+                        rubric=case.rubric,
+                        population=AgentEvaluationPopulation(case.population),
+                    )
+                    for case in body.cases
+                ],
+                role=AgentEvaluationRole(body.role),
+                selection_policy_version=body.selection_policy_version,
+                actor=actor,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "cohort_id": report.cohort_id,
+            "cases": [
+                {
+                    "doc_id": case.doc_id,
                     "case_id": case.case_id,
                     "ground_truth_revision_id": case.ground_truth_revision_id,
                     "population": case.population.value,

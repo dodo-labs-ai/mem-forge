@@ -1,0 +1,19 @@
+{
+  "situation": "A new claim about the test environment sits next to an old claim about production releases; they are about different things.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "The Kestrel test environment is redeployed every Thursday.",
+        "memory_type": "fact",
+        "evidence": [
+          {"role": "primary", "excerpt": "The test environment is redeployed every Thursday so that QA starts each week on a clean install.", "observation": "release-process", "revision": "v2"}
+        ]
+      }
+    ],
+    "incumbents": [
+      {"id": "friday-release", "claim": "Kestrel production releases ship every Friday.", "memory_type": "convention"}
+    ],
+    "support": {"friday-release": "supported"}
+  },
+  "rubric": {"expected_incumbents": {"friday-release": "kept"}}
+}

@@ -45,6 +45,7 @@ class _Executor:
                     "flag_for_review": False,
                 }
             ],
+            "outcomes": {"mem-1": "kept"},
             "failure": None,
         }
 
@@ -133,7 +134,7 @@ async def _admit_run(
                     "memory_type": "procedure",
                 }
             ],
-            "support_audits": [{"incumbent_id": "mem-1", "supported": True}],
+            "support_audits": [{"incumbent_id": "mem-1", "result": "supported"}],
             "updated_document": "Tracing starts with traceId.",
         },
         promotion_policy_version="manual-v1",

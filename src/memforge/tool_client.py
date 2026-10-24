@@ -593,6 +593,11 @@ class ToolClient:
 
         return self._resource_json("POST", "/agent-evaluations/support-cases/seed", spec)
 
+    def seed_reconciliation_evaluation_cases(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Import hand-written reconciliation situations against synced Documents and freeze their cohort."""
+
+        return self._resource_json("POST", "/agent-evaluations/reconciliation-cases/seed", spec)
+
     def get_agent_evaluation_run(self, run_id: str) -> dict[str, Any]:
         """Read one authorized content-free evaluation report."""
 
