@@ -1,3 +1,5 @@
+import { isSchemaSourceType } from "./sourceSetupAdapters.js";
+
 type NamedSourceType = {
   name: string;
 };
@@ -24,8 +26,17 @@ export function canDeleteSourceType(sourceType: string): boolean {
   return !isManagedSourceType(sourceType);
 }
 
+/** Whether this UI has a setup form for the source type. */
+export function hasSetupForm(sourceType: string): boolean {
+  return sourceType === "teams" || isSchemaSourceType(sourceType);
+}
+
+/**
+ * The source types the Add Source dialog offers: configurable ones this UI
+ * has a setup form for. A type set up only in the newer admin UI is left out.
+ */
 export function userConfigurableGenes<T extends NamedSourceType>(genes: readonly T[]): T[] {
-  return genes.filter((gene) => canConfigureSourceType(gene.name));
+  return genes.filter((gene) => canConfigureSourceType(gene.name) && hasSetupForm(gene.name));
 }
 
 /**

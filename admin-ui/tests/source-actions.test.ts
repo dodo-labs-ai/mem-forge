@@ -138,6 +138,11 @@ assert.doesNotMatch(
 );
 assert.match(
   sourceRowSource,
+  /const canConfigure = capabilities\.can_configure && hasSetupForm\(source\.type\);[\s\S]*\{canConfigure && \([\s\S]*onConfigureScope=\{canConfigure && /,
+  "SourceRow should offer Configure and Configure scope only for a source type with a setup form, so a Notion row gets neither",
+);
+assert.match(
+  sourceRowSource,
   /syncActivity/,
   "SourceRow should render the normalized sync activity for the matching source row",
 );
