@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A Notion document Source: the server collects every page under configured
+  root pages and databases, database rows included, with an internal
+  connection token. Each page is a `notion_page` Unit with a `page_body`
+  Observation, a row also has a `properties` Observation, and each image or
+  PDF Notion hosts is stored as an artifact. A pasted page or database link
+  is saved as its ID.
+
 - A scope change of a conversation Source during an open change supersedes
   it, as for documents, instead of answering 409
   `projection_scope_transition_active`, a code no longer produced: the open

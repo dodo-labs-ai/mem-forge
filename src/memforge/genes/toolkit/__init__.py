@@ -8,6 +8,8 @@ you need from its module::
 
 - :mod:`memforge.genes.toolkit.http` sends a connector's HTTP requests,
   retrying and pacing them by one policy.
+- :mod:`memforge.genes.toolkit.pacing` holds a connector to the request rate
+  its provider allows, shared by every client reading with one credential.
 - :mod:`memforge.genes.toolkit.config` reads configuration values: booleans,
   integers, lists, personal access tokens, TLS trust and HTTPS base URLs.
 - :mod:`memforge.genes.toolkit.local_packages` reads the packages a device

@@ -48,6 +48,39 @@ def secret_has_value(field: str, config: Mapping[str, Any], existing_config: Map
     )
 
 
+def secret_replaced(field: str, config: Mapping[str, Any], existing_config: Mapping[str, Any]) -> bool:
+    """Whether an update supplies a write-only secret other than the one stored.
+
+    A blank or absent incoming value keeps the stored secret, so it replaces
+    nothing; a stored secret that cannot be read counts as replaced::
+
+        secret_replaced("token", {"token": "new"}, {"token_encrypted": "<old, encrypted>"})  # True
+        secret_replaced("token", {"token": ""}, {"token_encrypted": "<old, encrypted>"})     # False
+    """
+
+    incoming = config.get(field)
+    if not isinstance(incoming, str) or not incoming.strip():
+        return False
+    return stored_secret_value(field, existing_config) != incoming.strip()
+
+
+def stored_secret_value(field: str, config: Mapping[str, Any]) -> str | None:
+    """The stored value of a write-only secret, decrypted; ``None`` when none is stored or it cannot be read."""
+
+    from memforge.source_secrets import SecretConfigurationError, decrypt_secret
+
+    encrypted = config.get(f"{field}_encrypted")
+    if encrypted:
+        try:
+            return decrypt_secret(str(encrypted))
+        except SecretConfigurationError:
+            return None
+    plaintext = config.get(field)
+    if isinstance(plaintext, str) and plaintext.strip():
+        return plaintext.strip()
+    return None
+
+
 def list_has_value(value: Any) -> bool:
     """Whether a list field, given as a list or a comma-separated string, names anything."""
 

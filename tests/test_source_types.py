@@ -23,6 +23,7 @@ BUILTIN_SOURCE_TYPES = {
     "github_repo",
     "jira",
     "local_markdown",
+    "notion",
     "teams",
 }
 
@@ -84,6 +85,7 @@ BUILTIN_FAMILIES = {
     "github_repo": CollectionFamilyKind.DOCUMENT,
     "jira": CollectionFamilyKind.DOCUMENT,
     "local_markdown": CollectionFamilyKind.DOCUMENT,
+    "notion": CollectionFamilyKind.DOCUMENT,
     "teams": CollectionFamilyKind.CONVERSATION,
 }
 
@@ -93,6 +95,7 @@ BUILTIN_LISTING_KINDS = {
     "github_repo": {ScopeListingKind.EXISTENCE},
     "jira": {ScopeListingKind.QUERY},
     "local_markdown": {ScopeListingKind.EXISTENCE},
+    "notion": {ScopeListingKind.QUERY},
 }
 
 

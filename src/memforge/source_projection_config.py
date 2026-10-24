@@ -29,6 +29,8 @@ _SET_LIKE_FIELDS = frozenset(
         "channels",
         "group_chats",
         "individual_chats",
+        "root_pages",
+        "databases",
     }
 )
 _URL_FIELDS = frozenset({"base_url", "repo_url", "page_url", "root_url"})
