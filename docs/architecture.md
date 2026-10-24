@@ -1,7 +1,8 @@
 # Architecture overview
 
-MemForge is a self-hosted service that turns a team's documents and coding-agent
-sessions into short, source-cited memories and serves them to agents over MCP.
+MemForge is a self-hosted service that turns a team's documents into short,
+source-cited memories and serves them to agents over MCP. Agents also save the
+memories a user asks them to keep, after the user confirms each one.
 This page names the parts and follows the data between them, for people who run
 MemForge or contribute to it.
 
@@ -10,18 +11,19 @@ MemForge or contribute to it.
 | Component | What it does | Code |
 | --- | --- | --- |
 | API service | A FastAPI application that owns sources, sync, memories, reviews and settings | `src/memforge/server` |
-| Source connectors | One per source type: Confluence, Jira, Notion, GitHub Pages, GitHub repositories, Microsoft Teams, local folders and agent sessions. The code calls a connector a *gene*. Each fetches documents and hands them over in one common form | `src/memforge/genes` |
+| Source connectors | One per source type: Confluence, Jira, Notion, GitHub Pages, GitHub repositories, Microsoft Teams and local folders. The code calls a connector a *gene*. Each fetches documents and hands them over in one common form | `src/memforge/genes` |
 | Pipeline | Extracts memories from each document with an LLM, keeps the Evidence each memory rests on, and rechecks memories when their source changes | `src/memforge/pipeline` |
 | Storage | SQLite for documents, memories and sync state, with FTS5 for keyword search, and Chroma for vectors | `src/memforge/storage` |
 | Retrieval | Vector, keyword and entity channels run in parallel and are fused into one ranking | `src/memforge/retrieval` |
-| Agent plugins | Claude Code and Codex plugins. Lifecycle hooks upload redacted session windows, and a local MCP proxy forwards tool calls to the API | `integrations` |
+| Agent plugins | Claude Code and Codex plugins. A `SessionStart` hook adds MemForge usage guidance, and a local MCP proxy forwards tool calls to the API | `integrations` |
 | Local daemon | Uploads files from a local folder or repository for a Local Repository source | `src/memforge/local_agent` |
 | Admin UI | The web UI for sources, memories, reviews, projects and settings. `admin` is replacing `admin-ui`; both ship until the replacement is complete | `admin`, `admin-ui` |
 
 ## How data moves
 
-1. **Capture.** A connector syncs documents on demand or on a schedule. Agent
-   plugins upload bounded, redacted windows of each session.
+1. **Capture.** A connector syncs documents on demand or on a schedule. An
+   agent saves a memory through the MCP `create_memory` tool when the user asks
+   it to remember something and confirms the preview.
 2. **Extract.** The pipeline turns each document into memories: facts,
    decisions, procedures and conventions. Each memory keeps Evidence that
    points back to the text it came from.
@@ -74,7 +76,9 @@ the source and how it learns that something is gone:
   connector supplies a provider that implements the port in
   `conversations/port.py`. Teams works this way.
 
-A Gene of neither family has no sync run; agent sessions are the only such type.
+A Gene of neither family has no sync run. The agent-session type is the only
+one: it holds the private Sources that earlier releases filled from coding
+sessions, and MemForge creates no new ones.
 
 **Write the descriptor.** A `SourceTypeDescriptor` (`source_types/descriptor.py`)
 holds every fact shared code needs about the type: its Gene, the configuration

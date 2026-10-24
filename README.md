@@ -3,7 +3,8 @@
 **Give every agent your team's brain on day one.**
 
 The memory layer for AI agents. Everything your team knows. Cited, and always
-up to date. Built from your docs, tickets, chat and agent sessions.
+up to date. Built from your docs, tickets and chat, plus what you ask your
+agents to remember.
 
 <p>
   <a href="https://github.com/dodo-labs-ai/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dodo-labs-ai/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
@@ -59,8 +60,8 @@ Before you change this, check MemForge for decisions and conventions that
 apply, and show the source for each one you rely on.
 ```
 
-From here on, plugin hooks upload eligible session windows, so what you decide
-in a session becomes memory too.
+When you settle something in a session, ask the agent to remember it. It shows
+you the memory first and saves it after you confirm.
 
 The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers model settings,
 [plugin routing](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#plugin-routing) for a hosted endpoint or
@@ -68,11 +69,11 @@ more than one workspace, local folders, the host CLI and network details.
 
 ## Why MemForge
 
-**One memory for your docs and your sessions.** Confluence, Jira, Notion,
-GitHub, Teams and your Claude Code and Codex sessions land in one store and come
-back from one `search` call. From sessions it keeps what you decided or
-corrected, not everything the agent said. A decision you made in Claude Code is
-there when you open Codex.
+**One memory for your docs and your decisions.** Confluence, Jira, Notion,
+GitHub and Teams land in one store and come back from one `search` call. When
+you tell Claude Code or Codex to remember a decision or a correction, it saves
+that one memory after you confirm, never a transcript. A decision you saved in
+Claude Code is there when you open Codex.
 
 **It follows the source.** When a page or ticket changes, the next sync
 rechecks the memories built on it. Each one is kept, replaced or retired, or it
@@ -93,8 +94,8 @@ always a verbatim quote.
 **Runs on your machine.** Apache-2.0. `docker compose up` starts the service
 with local storage (SQLite, FTS5 and Chroma). You bring your own model
 endpoints and keys, and those providers receive what is sent for inference.
-Session text is redacted in the plugin and again in the service, and raw
-conversation windows are not kept.
+The plugins send no session transcripts: an agent writes only the memory you
+confirm.
 
 See [how MemForge compares](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/comparison.md) with Mem0, Zep, claude-mem and
 Unblocked.
@@ -105,7 +106,7 @@ Unblocked.
 flowchart LR
   subgraph You["Your machine"]
     CC["Claude Code / Codex"]
-    Plugin["MemForge plugin<br/>hooks + MCP proxy"]
+    Plugin["MemForge plugin<br/>MCP proxy"]
   end
   Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local Markdown"]
   API["MemForge API"]
@@ -114,15 +115,14 @@ flowchart LR
   Store[("SQLite + FTS5<br/>Chroma")]
 
   CC --> Plugin
-  Plugin -- "redacted session windows" --> API
   Docs -- "sync" --> API
   API --> Extract --> Recheck --> Store
-  Plugin -- "search / get_memory / get_resource" --> API
+  Plugin -- "search / get_memory / get_resource<br/>create_memory (confirmed)" --> API
   API -- "read" --> Store
 ```
 
-1. **Capture.** Plugin hooks upload redacted session windows, and connectors
-   sync documents.
+1. **Capture.** Connectors sync documents, and an agent saves a memory you ask
+   it to remember after you confirm it.
 2. **Extract.** An LLM turns each source into short memories with supporting
    Evidence.
 3. **Reconcile.** When a source changes, affected memories are rechecked and
@@ -163,13 +163,6 @@ agents that do the work.
   <tr>
     <td>Chat</td>
     <td nowrap><img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/teams.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Teams</td>
-  </tr>
-  <tr>
-    <td>Agent sessions</td>
-    <td nowrap>
-      <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/claude.svg" width="18" height="18" align="absmiddle" alt="">&nbsp;Claude&nbsp;Code&nbsp;&nbsp;&nbsp;
-      <picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/openai-dark.svg"><img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/icons/openai-light.svg" width="18" height="18" align="absmiddle" alt=""></picture>&nbsp;Codex
-    </td>
   </tr>
   <tr>
     <td>Planned</td>
