@@ -16,6 +16,8 @@ Default base URL: `http://127.0.0.1:8765`.
 | Sources | `GET /api/sources` | List configured sources |
 | Sources | `POST /api/sources` | Add a source configuration |
 | Sources | `POST /api/sources/{source_id}/sync` | Queue or run a source sync |
+| Source types | `GET /api/v1/genes/{type}/config-schema` | A source type's form: fields, labelled choices, the conditions that show them, widgets and step purposes |
+| Source types | `POST /api/v1/genes/{type}/config-check` | What saving a configuration would store and refuse, without saving it: derived values, facts and field issues |
 | Memories | `GET /api/memories` | Search and filter memories |
 | Memories | `POST /api/memories/search` | Service-owned ranked memory search for agent MCP proxies |
 | Memories | `GET /api/memories/{memory_id}` | Inspect memory detail and provenance |
@@ -32,6 +34,10 @@ Default base URL: `http://127.0.0.1:8765`.
 | Model settings | `POST /api/v1/model-settings/{kind}/candidate/validate` | Check the edit with one real request and put it to use when it passes; an embedding model of another vector space waits for a reindex |
 | Model settings | `GET /api/v1/model-settings/vector-index` | The Memory vector index in use, whether it fits the embedding model, and the latest reindex |
 | Model settings | `POST /api/v1/model-settings/vector-index/reindex` | Start a rebuild of the vector index for the embedding model |
+
+A refused source configuration answers 400 with `detail`
+`{"code": "config_invalid", "message", "fields": [{"key", "message"}]}`, where
+`key` names the field at fault, or is `null` when no single field is.
 
 The API schema is also available from FastAPI's generated OpenAPI endpoint while
 the service is running.

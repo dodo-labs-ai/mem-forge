@@ -15,6 +15,12 @@ from memforge.api_target import MemForgeTarget, build_target
 from memforge.genes.jira_gene import JiraGene
 from memforge.local_agent import folder_picker
 from memforge.local_agent.runner import CloudJobLeaseLost
+from memforge.local_agent.setup_results import (
+    JiraAuthResult,
+    LocalMarkdownPickRootResult,
+    TeamsAuthCheckResult,
+    TeamsAuthResult,
+)
 from memforge.main import cli
 
 
@@ -1915,10 +1921,7 @@ def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatc
         _cloud_test_client(),
     )
 
-    assert payload == {
-        "operation": "local_markdown_pick_root",
-        "root": str(selected),
-    }
+    assert payload == LocalMarkdownPickRootResult(operation="local_markdown_pick_root", root=str(selected)).model_dump()
     assert calls == [{"title": "Choose folder to sync", "initial_directory": str(tmp_path)}]
 
 
@@ -1937,10 +1940,7 @@ def test_local_agent_cloud_local_markdown_pick_root_reports_cancellation(monkeyp
         _cloud_test_client(),
     )
 
-    assert payload == {
-        "operation": "local_markdown_pick_root",
-        "cancelled": True,
-    }
+    assert payload == LocalMarkdownPickRootResult(operation="local_markdown_pick_root", cancelled=True).model_dump()
 
 
 def test_native_folder_picker_times_out_as_cancellation(monkeypatch):
@@ -3084,12 +3084,10 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
         _cloud_test_client(),
     )
 
-    assert payload == {
-        "operation": "teams_auth",
-        "authenticated": True,
-        "region": "amer",
-        "token_count": 1,
-    }
+    assert (
+        payload
+        == TeamsAuthResult(operation="teams_auth", authenticated=True, region="amer", token_count=1).model_dump()
+    )
     assert captured_regions == ["amer"]
     assert wait_options == [(90, 2.0)]
     assert FakeToolClient.calls == []
@@ -3147,12 +3145,12 @@ def test_local_agent_cloud_jira_auth_opens_interactive_browser_and_uploads_sessi
         browser="chrome",
     )
 
-    assert payload == {
-        "operation": "jira_auth",
-        "source_id": "src-jira",
-        "authenticated": True,
-        "origin": "https://jira.example.test",
-    }
+    assert (
+        payload
+        == JiraAuthResult(
+            operation="jira_auth", source_id="src-jira", authenticated=True, origin="https://jira.example.test"
+        ).model_dump()
+    )
     assert captured["base_url"] == "https://jira.example.test"
     assert captured["browser"] == "chrome"
     assert captured["interactive"] is True
@@ -3186,13 +3184,12 @@ def test_local_agent_cloud_teams_auth_check_uses_daemon_token_status(monkeypatch
         _cloud_test_client(),
     )
 
-    assert payload == {
-        "operation": "teams_auth_check",
-        "region": "apac",
-        "authenticated": True,
-        "expires_in_minutes": 42,
-        "error": None,
-    }
+    assert (
+        payload
+        == TeamsAuthCheckResult(
+            operation="teams_auth_check", region="apac", authenticated=True, expires_in_minutes=42
+        ).model_dump()
+    )
     assert FakeToolClient.calls == []
 
 

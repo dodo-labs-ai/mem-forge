@@ -31,9 +31,11 @@ from memforge.genes.toolkit.github_api import GitHubApi, GitHubRepository, githu
 from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.github_repo_utils import decode_github_contents_payload
 from memforge.models import (
+    ConfigCondition,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
+    ConfigOption,
     ContentItem,
     GeneConfigSchema,
     GeneMetadata,
@@ -103,8 +105,8 @@ class GitHubPagesGene(DocumentGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="scope", label="What to Sync", order=1),
+                ConfigGroup(key="connection", label="Documentation site", order=0, purpose="connection"),
+                ConfigGroup(key="scope", label="Pages to sync", order=1, purpose="content"),
             ],
             fields=[
                 ConfigField(
@@ -112,7 +114,10 @@ class GitHubPagesGene(DocumentGene):
                     label="Authentication Method",
                     field_type=ConfigFieldType.SELECT,
                     required=True,
-                    options=[AUTH_MODE_GITHUB_PAT, AUTH_MODE_NONE],
+                    choices=[
+                        ConfigOption(AUTH_MODE_GITHUB_PAT, "Personal access token"),
+                        ConfigOption(AUTH_MODE_NONE, "No authentication"),
+                    ],
                     default=AUTH_MODE_GITHUB_PAT,
                     help_text="Use a GitHub personal access token for Enterprise GitHub Pages, or no auth for public pages.",
                     group="connection",
@@ -122,17 +127,22 @@ class GitHubPagesGene(DocumentGene):
                     key="pat",
                     label="Personal Access Token",
                     field_type=ConfigFieldType.SECRET,
-                    required=False,
+                    required=True,
                     help_text="Stored encrypted and sent as a bearer token when PAT mode is selected.",
                     group="connection",
                     order=1,
+                    visible_when=(ConfigCondition("auth_mode", (AUTH_MODE_GITHUB_PAT,)),),
                 ),
                 ConfigField(
                     key="sync_mode",
                     label="Sync Mode",
                     field_type=ConfigFieldType.SELECT,
                     required=True,
-                    options=[SYNC_MODE_SINGLE_PAGE, SYNC_MODE_SUBTREE, SYNC_MODE_EXPLICIT_LIST],
+                    choices=[
+                        ConfigOption(SYNC_MODE_SINGLE_PAGE, "Single page"),
+                        ConfigOption(SYNC_MODE_SUBTREE, "Subtree"),
+                        ConfigOption(SYNC_MODE_EXPLICIT_LIST, "Selected pages"),
+                    ],
                     default=SYNC_MODE_SINGLE_PAGE,
                     help_text="Choose one page, all pages under a path, or an explicit URL list.",
                     group="scope",
@@ -142,31 +152,34 @@ class GitHubPagesGene(DocumentGene):
                     key="page_url",
                     label="Page URL",
                     field_type=ConfigFieldType.URL,
-                    required=False,
+                    required=True,
                     placeholder="https://pages.github.example.com/org/repo/path/to/page/",
                     help_text="Published GitHub Pages URL for one documentation page.",
                     group="scope",
                     order=1,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_SINGLE_PAGE,)),),
                 ),
                 ConfigField(
                     key="root_url",
                     label="Subtree Root URL",
                     field_type=ConfigFieldType.URL,
-                    required=False,
+                    required=True,
                     placeholder="https://pages.github.example.com/org/repo/cloud-native-platform/",
                     help_text="Only published pages under this URL path are discovered.",
                     group="scope",
                     order=2,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_SUBTREE,)),),
                 ),
                 ConfigField(
                     key="pages",
                     label="Explicit Page URLs",
                     field_type=ConfigFieldType.TAG_LIST,
-                    required=False,
+                    required=True,
                     placeholder="https://.../page-a/, https://.../page-b/",
                     help_text="Comma-separated documentation page URLs.",
                     group="scope",
                     order=3,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_EXPLICIT_LIST,)),),
                 ),
                 ConfigField(
                     key="max_depth",
@@ -178,6 +191,7 @@ class GitHubPagesGene(DocumentGene):
                     group="scope",
                     order=4,
                     advanced=True,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_SUBTREE,)),),
                 ),
                 ConfigField(
                     key="max_pages",
@@ -189,6 +203,7 @@ class GitHubPagesGene(DocumentGene):
                     group="scope",
                     order=5,
                     advanced=True,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_SUBTREE, SYNC_MODE_EXPLICIT_LIST)),),
                 ),
                 ConfigField(
                     key="exclude_url_patterns",
@@ -200,6 +215,7 @@ class GitHubPagesGene(DocumentGene):
                     group="scope",
                     order=6,
                     advanced=True,
+                    visible_when=(ConfigCondition("sync_mode", (SYNC_MODE_SUBTREE, SYNC_MODE_EXPLICIT_LIST)),),
                 ),
                 ConfigField(
                     key="sitemap_authoritative",
@@ -217,6 +233,19 @@ class GitHubPagesGene(DocumentGene):
                 ),
             ],
         )
+
+    @classmethod
+    def normalize_config(cls, config: dict) -> None:
+        """Fill a blank ``base_url`` with the site root of the configured scope URL.
+
+        A submitted ``base_url`` wins, and the descriptor's ``complete`` keeps
+        a stored one, so the site is the submitted one, else the stored one,
+        else the one the scope URL names.
+        """
+        if not str(config.get("base_url") or "").strip():
+            base_url = _site_root_from_pages_url(_scope_url_for_config(config))
+            if base_url:
+                config["base_url"] = base_url
 
     async def authenticate(self) -> None:
         base_url = _site_root_from_pages_url(
@@ -747,17 +776,25 @@ def _auth_mode(config: dict) -> str:
     return str(config.get("auth_mode") or AUTH_MODE_GITHUB_PAT).strip().lower()
 
 
-def _scope_url_for_config(config: dict) -> str:
+def scope_urls_for_config(config: Mapping[str, Any]) -> list[str]:
+    """The URLs the configured sync mode names, empty when it names none.
+
+    A single page or a subtree root is one URL, read whole because it may
+    itself hold a comma; only an explicit list names several.
+    """
     mode = _sync_mode(config)
-    if mode == SYNC_MODE_SUBTREE:
-        return str(config.get("root_url") or "")
     if mode == SYNC_MODE_EXPLICIT_LIST:
-        pages = list_config(config.get("pages"))
-        return pages[0] if pages else ""
-    return str(config.get("page_url") or "")
+        return list_config(config.get("pages"))
+    url = str(config.get("root_url" if mode == SYNC_MODE_SUBTREE else "page_url") or "").strip()
+    return [url] if url else []
 
 
-def _sync_mode(config: dict) -> str:
+def _scope_url_for_config(config: dict) -> str:
+    urls = scope_urls_for_config(config)
+    return urls[0] if urls else ""
+
+
+def _sync_mode(config: Mapping[str, Any]) -> str:
     return str(config.get("sync_mode") or SYNC_MODE_SINGLE_PAGE).strip().lower()
 
 

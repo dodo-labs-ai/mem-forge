@@ -44,7 +44,12 @@ def test_config_schema_fields():
     assert "conversation_gap_minutes" not in field_keys
     assert "max_block_messages" not in field_keys
     retention = next(f for f in schema.fields if f.key == "rolling_retention_days")
-    assert retention.options == ["forever", "365", "730", "1095"]
+    assert [(option.value, option.label) for option in retention.choices] == [
+        ("forever", "Forever"),
+        ("365", "1 year"),
+        ("730", "2 years"),
+        ("1095", "3 years"),
+    ]
 
 
 @pytest.mark.parametrize("retention_days", [365, 730, 1095])

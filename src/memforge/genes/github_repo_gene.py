@@ -23,7 +23,14 @@ from memforge.genes.local_adapter_packages import (
     source_artifacts_from_package,
 )
 from memforge.genes.local_markdown_gene import _to_markdown
-from memforge.genes.toolkit.config import int_config, list_config, resolve_pat, tls_verify
+from memforge.genes.toolkit.config import (
+    FieldIssue,
+    SourceConfigInvalid,
+    int_config,
+    list_config,
+    resolve_pat,
+    tls_verify,
+)
 from memforge.genes.toolkit.github_api import (
     GitHubApi,
     GitHubRepository,
@@ -54,9 +61,11 @@ from memforge.github_repo_utils import (
     validate_github_file_mode,
 )
 from memforge.models import (
+    ConfigCondition,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
+    ConfigOption,
     ContentItem,
     GeneConfigSchema,
     GeneMetadata,
@@ -172,8 +181,8 @@ class GitHubRepoGene(DocumentGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="scope", label="What to Sync", order=1),
+                ConfigGroup(key="connection", label="Repository access", order=0, purpose="connection"),
+                ConfigGroup(key="scope", label="Files to sync", order=1, purpose="content"),
             ],
             fields=[
                 ConfigField(
@@ -181,7 +190,10 @@ class GitHubRepoGene(DocumentGene):
                     label="Repository Access",
                     field_type=ConfigFieldType.SELECT,
                     required=True,
-                    options=[CONNECTION_MODE_CLOUD_PULL, CONNECTION_MODE_LOCAL_PUSH],
+                    choices=[
+                        ConfigOption(CONNECTION_MODE_CLOUD_PULL, "Cloud access"),
+                        ConfigOption(CONNECTION_MODE_LOCAL_PUSH, "Local sync"),
+                    ],
                     default=CONNECTION_MODE_CLOUD_PULL,
                     help_text="Use Public internet when MemForge Cloud can reach the repo. Use Internal network / VPN when only your machine can reach it.",
                     group="connection",
@@ -205,6 +217,7 @@ class GitHubRepoGene(DocumentGene):
                     help_text="Optional token for private repositories when using cloud pull. Leave blank for public repositories or local push.",
                     group="connection",
                     order=2,
+                    visible_when=(ConfigCondition("connection_mode", (CONNECTION_MODE_CLOUD_PULL,)),),
                 ),
                 ConfigField(
                     key="ref",
@@ -226,6 +239,7 @@ class GitHubRepoGene(DocumentGene):
                     help_text="Repo-relative folders or files to sync. Empty means the whole repository, filtered by extension.",
                     group="scope",
                     order=1,
+                    widget="github_repo_paths",
                 ),
                 ConfigField(
                     key="exclude_paths",
@@ -236,6 +250,7 @@ class GitHubRepoGene(DocumentGene):
                     help_text="Repository-relative folders or files to leave out. Exclusions override selected paths.",
                     group="scope",
                     order=2,
+                    widget="github_repo_paths",
                 ),
                 ConfigField(
                     key="include_extensions",
@@ -267,7 +282,10 @@ class GitHubRepoGene(DocumentGene):
     def normalize_config(cls, config: dict) -> None:
         repo_url = str(config.get("repo_url") or "").strip()
         if repo_url:
-            repo_ref = _parse_repo_url(repo_url)
+            try:
+                repo_ref = _parse_repo_url(repo_url)
+            except ValueError as exc:
+                raise SourceConfigInvalid([FieldIssue("repo_url", str(exc))]) from None
             config["repo_url"] = repo_ref.repo_url
             config["base_url"] = repo_ref.origin
         config["connection_mode"] = _connection_mode(config)

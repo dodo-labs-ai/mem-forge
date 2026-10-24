@@ -87,6 +87,24 @@ opens it. Each built-in type has a module in `source_types` that exports
 descriptor and never branches on a source type name, so a new type adds no
 `if` elsewhere.
 
+**Describe the form.** The Gene's `config_schema()` is the whole setup form;
+the admin UI draws it without per-type code, and the server checks every saved
+configuration against it (`source_types/form.py`). Group fields into steps,
+each with a `purpose`: `connection` to reach the provider, `content` to choose
+what to collect, `options` for settings with working defaults. Give a `select`
+field labelled `choices`. Show a field or a choice only for some modes with
+`visible_when`, a list of `ConfigCondition(field, values)` on an earlier
+`select` field; `required` then means required while visible. Name an
+interactive control with `widget`, or a panel on a group with `panels`. A
+blank field reads the descriptor's `scope_defaults` entry, then its declared
+`default`, so declare a mode's default as the value the connector already
+assumes. Write any value the type infers, such as a mode a pasted URL implies,
+in `normalize_config`, so the stored configuration names it and config-check
+can show it. Keep in `validate` only what a form cannot state, and raise
+`SourceConfigInvalid` naming the field you refuse (`genes/toolkit/config.py`).
+State what a person should see about a configuration, such as the repository a
+URL names, with the descriptor's `facts`.
+
 **Choose the listing kind** (document connectors). A scope listing names every
 item in the configured scope by Document id, completely and without content.
 The run compares it with the Documents the source holds. Ask what defines the
@@ -121,7 +139,10 @@ type and the missing piece: a collecting Gene outside both families, an
 unimplemented abstract method, undeclared `listing_kinds`, `lists_scope` not
 declared as a class method, a query listing without `confirm_absent`,
 `rediscovers_documents` without `rediscover`, a daemon-collected Gene with more
-than one listing kind, or a conversation provider missing a member of the port.
+than one listing kind, a conversation provider missing a member of the port, or
+a form description that a client could not draw: a condition on a later field
+or on a value the field does not offer, a repeated choice, or an unknown
+widget, panel or group purpose.
 
 **Add the contract-suite fakes.** `tests/contracts/test_document_connector_contract.py`
 runs every registered document type against fakes of its provider, kept in

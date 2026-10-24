@@ -31,9 +31,11 @@ from memforge.genes.confluence_pdf import export_confluence_page_pdf
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     AbsenceAnswer,
+    ConfigCondition,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
+    ConfigOption,
     ContentItem,
     GeneConfigSchema,
     GeneMetadata,
@@ -110,8 +112,8 @@ class ConfluenceGene(DocumentGene):
     def config_schema(cls) -> GeneConfigSchema:
         return GeneConfigSchema(
             groups=[
-                ConfigGroup(key="connection", label="Connection", order=0),
-                ConfigGroup(key="scope", label="What to Sync", order=1),
+                ConfigGroup(key="connection", label="Confluence site", order=0, purpose="connection"),
+                ConfigGroup(key="scope", label="Pages to sync", order=1, purpose="content"),
             ],
             fields=[
                 ConfigField(
@@ -124,23 +126,29 @@ class ConfluenceGene(DocumentGene):
                 ConfigField(
                     key="sync_mode", label="Sync Scope",
                     field_type=ConfigFieldType.SELECT, required=False,
-                    options=["page_tree", "space"],
+                    choices=[
+                        ConfigOption("page_tree", "This page tree"),
+                        ConfigOption("space", "Whole space"),
+                    ],
+                    default="space",
                     help_text="Sync one page tree or a whole space",
                     group="scope", order=0,
                 ),
                 ConfigField(
                     key="spaces", label="Spaces to Sync",
-                    field_type=ConfigFieldType.TAG_LIST, required=False,
+                    field_type=ConfigFieldType.TAG_LIST, required=True,
                     placeholder="PAY, ARCH, DevOps",
-                    help_text="Required when syncing whole spaces",
+                    help_text="Space keys to sync",
                     group="scope", order=1,
+                    visible_when=(ConfigCondition("sync_mode", ("space",)),),
                 ),
                 ConfigField(
-                    key="page_tree_root", label="Page Tree Root (optional)",
-                    field_type=ConfigFieldType.STRING, required=False,
+                    key="page_tree_root", label="Page Tree Root",
+                    field_type=ConfigFieldType.STRING, required=True,
                     placeholder="Page ID or URL",
                     help_text="Only sync pages under this root page",
                     group="scope", order=2,
+                    visible_when=(ConfigCondition("sync_mode", ("page_tree",)),),
                 ),
                 ConfigField(
                     key="exclude_labels", label="Exclude Labels",
@@ -148,12 +156,14 @@ class ConfluenceGene(DocumentGene):
                     placeholder="draft, archived, obsolete",
                     help_text="Pages with these labels will be skipped",
                     group="scope", order=3,
+                    advanced=True,
                 ),
                 ConfigField(
                     key="include_children", label="Include Child Pages",
                     field_type=ConfigFieldType.BOOLEAN, required=False,
                     default="true",
                     group="scope", order=4,
+                    visible_when=(ConfigCondition("sync_mode", ("page_tree",)),),
                 ),
                 ConfigField(
                     key="pat", label="Personal Access Token",
@@ -210,7 +220,12 @@ class ConfluenceGene(DocumentGene):
 
     @classmethod
     def normalize_config(cls, config: dict) -> None:
-        """Normalize user-provided Confluence URLs in-place."""
+        """Normalize user-provided Confluence URLs in-place, and name the sync mode.
+
+        A pasted page URL fills the site and the page tree root; a blank
+        ``sync_mode`` becomes ``page_tree`` when a root is set and ``space``
+        otherwise, so the stored configuration names its mode.
+        """
         raw_base_url = str(config.get("base_url") or "").strip()
         parsed = cls._parse_wiki_url(raw_base_url)
         if parsed.get("base_url"):
@@ -228,8 +243,8 @@ class ConfluenceGene(DocumentGene):
         page_tree_root = str(config.get("page_tree_root") or "").strip()
         if page_tree_root:
             config["page_tree_root"] = cls._page_id_from_url(page_tree_root) or page_tree_root
-        if str(config.get("page_tree_root") or "").strip() and not str(config.get("sync_mode") or "").strip():
-            config["sync_mode"] = "page_tree"
+        if not str(config.get("sync_mode") or "").strip():
+            config["sync_mode"] = "page_tree" if page_tree_root else "space"
 
     @classmethod
     def _parse_wiki_url(cls, value: str) -> dict[str, str]:
