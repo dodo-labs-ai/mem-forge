@@ -129,6 +129,34 @@
     {
       "title": "Convention: Kestrel release tags",
       "file": "reconciliation/test-environment-is-not-production.json"
+    },
+    {
+      "title": "Convention: Kestrel release tags",
+      "file": "reconciliation/added-reason-revises-the-convention.json"
+    },
+    {
+      "title": "Decision: Kestrel retries a failed job five times",
+      "file": "reconciliation/added-wait-times-revise-the-rule.json"
+    },
+    {
+      "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
+      "file": "reconciliation/example-drops-parent-task.json"
+    },
+    {
+      "title": "Decision: Kestrel retries a failed job five times",
+      "file": "reconciliation/fuller-list-drops-tuning-advice.json"
+    },
+    {
+      "title": "Runbook: rotating the Kestrel signing key",
+      "file": "reconciliation/next-review-is-another-requirement.json"
+    },
+    {
+      "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
+      "file": "reconciliation/repro-steps-do-not-replace-the-summary.json"
+    },
+    {
+      "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
+      "file": "reconciliation/status-update-drops-environment.json"
     }
   ]
 }

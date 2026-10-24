@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- A document update revises an old memory only after a separate check of that
+  one pair confirms the new claim states every fact of the old one. When the
+  check finds a fact missing (or is unsure), the old memory stays and the new
+  claim is added beside it, instead of a fuller or nearby claim silently
+  replacing knowledge the document still states. The check is one extra model
+  call per revision; sync stats count the checked revisions and those it held
+  back (`refinement_verification_count`, `refinement_verification_dropped_count`,
+  `refinement_verification_unjudged_count`). The public quick cohort adds
+  hand-written situations for both outcomes.
+
 - The quick quality evaluation covers document updates. `compose_smoke.sh
   --quality` syncs second versions of the synthetic documents and evaluates
   Support cases of those updates and hand-written reconciliation cases next to
