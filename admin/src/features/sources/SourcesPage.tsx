@@ -261,7 +261,11 @@ export function SourcesPage() {
         title={`Delete ${pendingDelete?.name ?? "source"}?`}
         description={
           pendingDelete
-            ? `This removes the source and the ${pluralize(pendingDelete.doc_count, "item")} it synced. Of its ${pluralize(pendingDelete.memory_count, "memory", "memories")}, those no other source supports are retired and stop appearing in searches.`
+            ? `This removes the source and the ${pluralize(pendingDelete.doc_count, "item")} it synced.${
+                pendingDelete.memory_count > 0
+                  ? ` Of its ${pluralize(pendingDelete.memory_count, "memory", "memories")}, those no other source supports are retired and stop appearing in searches.`
+                  : ""
+              }`
             : null
         }
         confirmLabel="Delete source"

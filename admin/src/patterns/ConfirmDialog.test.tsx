@@ -8,9 +8,9 @@ function renderDialog(onConfirm: () => Promise<unknown>, onOpenChange = vi.fn())
     <ConfirmDialog
       open
       onOpenChange={onOpenChange}
-      title="Delete Payroll wiki?"
+      title="Archive Payroll wiki?"
       description="This cannot be undone."
-      confirmLabel="Delete source"
+      confirmLabel="Archive"
       tone="danger"
       confirmationText="Payroll wiki"
       onConfirm={onConfirm}
@@ -22,7 +22,7 @@ function renderDialog(onConfirm: () => Promise<unknown>, onOpenChange = vi.fn())
 test("confirms only after the exact text is typed", async () => {
   const onConfirm = vi.fn().mockResolvedValue(undefined);
   const onOpenChange = renderDialog(onConfirm);
-  const confirm = screen.getByRole("button", { name: "Delete source" });
+  const confirm = screen.getByRole("button", { name: "Archive" });
 
   expect(confirm).toBeDisabled();
   await userEvent.type(screen.getByLabelText(/to confirm/), "Payroll wiki");
@@ -35,7 +35,7 @@ test("confirms only after the exact text is typed", async () => {
 test("stays open and shows the reason when the action fails", async () => {
   const onOpenChange = renderDialog(() => Promise.reject(new Error("Source is syncing")));
   await userEvent.type(screen.getByLabelText(/to confirm/), "Payroll wiki");
-  await userEvent.click(screen.getByRole("button", { name: "Delete source" }));
+  await userEvent.click(screen.getByRole("button", { name: "Archive" }));
 
   expect(await screen.findByRole("alert")).toHaveTextContent("Source is syncing");
   expect(onOpenChange).not.toHaveBeenCalledWith(false);
@@ -90,4 +90,10 @@ test("the confirmation text can be selected and copied", async () => {
   await user.click(screen.getByRole("button", { name: "Copy Payroll wiki" }));
 
   expect(await navigator.clipboard.readText()).toBe("Payroll wiki");
+});
+
+test("a dialog that asks for the text at once opens on its input, not on the Copy button", async () => {
+  renderDialog(vi.fn().mockResolvedValue(undefined));
+
+  await vi.waitFor(() => expect(screen.getByLabelText(/to confirm/)).toHaveFocus());
 });
