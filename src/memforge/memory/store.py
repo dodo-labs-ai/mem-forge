@@ -38,6 +38,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
     LifecycleVectorOperation,
+    plan_supersedes_memory,
 )
 from memforge.models import (
     DocumentRecord,
@@ -1427,7 +1428,32 @@ class MemoryStore:
         replacement_reason: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
     ) -> None:
-        """Commit Agent Knowledge replacement through projected lifecycle."""
+        """Commit Agent Knowledge replacement through projected lifecycle.
+
+        When another Unit still supports the old Memory, the Plan keeps it
+        Active and adds the replacement beside it, which commits as an insert.
+        """
+        if not plan_supersedes_memory(lifecycle_plan, old_memory_id):
+            await self.insert_agent_claim_memory(
+                new_memory,
+                projection,
+                lifecycle_plan,
+                doc_id,
+                source_type,
+                claim_id=claim_id,
+                concept_id=concept_id,
+                display_anchor=display_anchor,
+                claim_text=claim_text,
+                memory_type=memory_type,
+                observed_at=observed_at,
+                source_updated_at=source_updated_at,
+                citations=citations,
+                concept_markdown_body=concept_markdown_body,
+                entity_ids=entity_ids,
+                excerpt=excerpt,
+                relation_outcome=relation_outcome,
+            )
+            return
         del source_type, replacement_kind, entity_ids, excerpt, source_updated_at
         context = self._operation_context(doc_id=doc_id)
         await self._emit(
