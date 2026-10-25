@@ -1153,7 +1153,7 @@ class SourceUnitReconciliationReplayExecutor:
         }
 
 
-INCUMBENT_OUTCOMES = ("kept", "review", "revised", "retired")
+INCUMBENT_OUTCOMES = ("kept", "revised", "retired")
 _OUTCOME_BY_ACTION = {
     ReconcileAction.DELETE: "retired", ReconcileAction.SUPERSEDE: "retired", ReconcileAction.UPDATE: "revised",
 }
@@ -1164,17 +1164,14 @@ def incumbent_outcomes(operations: Sequence[ReconcileOperation], incumbent_ids: 
 
     ``DELETE`` removes this Unit's Support, which retires a Memory whose only
     Support it was, so it counts with ``SUPERSEDE`` as ``retired``; ``UPDATE``
-    replaces the claim (``revised``); a removal flagged for Review is ``review``;
-    anything else is ``kept``.
+    replaces the claim (``revised``); anything else is ``kept``.
     """
 
     outcomes = dict.fromkeys(incumbent_ids, "kept")
     for operation in operations:
         if operation.memory_id not in outcomes:
             continue
-        outcome = (
-            "review" if operation.flag_for_review else _OUTCOME_BY_ACTION.get(operation.action, "kept")
-        )
+        outcome = _OUTCOME_BY_ACTION.get(operation.action, "kept")
         if INCUMBENT_OUTCOMES.index(outcome) > INCUMBENT_OUTCOMES.index(outcomes[operation.memory_id]):
             outcomes[operation.memory_id] = outcome
     return outcomes
@@ -3781,7 +3778,6 @@ def _reconcile_operation_payload(operation: ReconcileOperation) -> dict[str, obj
             else None
         ),
         "reason_code": _bounded_reason(operation.reason),
-        "flag_for_review": operation.flag_for_review,
     }
 
 

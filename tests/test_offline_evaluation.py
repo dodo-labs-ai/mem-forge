@@ -62,7 +62,6 @@ class _FixedExecutor:
                     "memory_id": incumbent_id,
                     "memory": None,
                     "reason_code": "bounded",
-                    "flag_for_review": False,
                 }
             ],
             "outcomes": {incumbent_id: "kept"},
@@ -180,7 +179,6 @@ async def test_real_candidate_can_be_annotated_before_ground_truth_exists(db) ->
                     "memory_id": "mem-real",
                     "memory": None,
                     "reason_code": "unchanged",
-                    "flag_for_review": False,
                 }
             ],
             "outcomes": {"mem-real": "kept"},

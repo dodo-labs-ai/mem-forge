@@ -420,8 +420,6 @@ def _operation_presentation(
         result["current_memory"] = existing["content"]
     if isinstance(proposed, Mapping) and proposed.get("content") is not None:
         result["proposed_memory"] = proposed["content"]
-    if operation.get("flag_for_review") is True:
-        result["requires_additional_review"] = True
     return result
 
 

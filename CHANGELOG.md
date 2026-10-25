@@ -14,8 +14,28 @@
   `cross-document-relation-v5`. Reviews of this kind opened by earlier versions
   stay in the review queue; reject them there to keep the current memory, and
   run `memforge sources reprocess` on their documents if you want the claims
-  they held judged again. Reviews for a gated source, for replacing a memory that
-  another document also supports, and for image-based memories are unchanged.
+  they held judged again.
+
+- A document update no longer opens a Review when it revises a memory that
+  another document also supports. The update removes only its own document's
+  backing from that memory, which stays active on the other document, and adds
+  the new claim as its own memory; relation discovery then relates the two as
+  `updates` or `contradicts`. When the other document has itself changed since
+  it was last synced, the update waits for that document's sync, as removing a
+  shared memory's backing already did.
+
+- A document update no longer opens a Review for a memory drawn from an image
+  the generation model cannot read, because the model reads text only or the
+  stored image cannot be used. The memory stays active and unchanged, and sync
+  stats count it in `support_revalidation_unreadable_memory_count`. To judge
+  it again, re-read the document with a model that reads images; an image that
+  cannot be used is judged again once the document holds a usable one.
+  Reconciliation cases no longer accept the `review` outcome in
+  `expected_incumbents`; use `kept`, `revised` or `retired`.
+
+- Reviews of the kinds above that earlier versions opened stay in the review
+  queue and can still be approved or rejected there. A gated source still
+  holds its changes for Review.
 
 - Deleting a Source in the admin UI V2 asks for one confirmation that says how
   many items and memories the Source holds; it no longer asks you to type the

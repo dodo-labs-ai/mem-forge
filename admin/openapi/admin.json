@@ -8293,7 +8293,7 @@
       },
       "ReconciliationCaseRequest": {
         "additionalProperties": false,
-        "description": "One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by\n``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the\n``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels\nincumbents ``kept``, ``review``, ``revised`` or ``retired``.",
+        "description": "One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by\n``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the\n``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels\nincumbents ``kept``, ``revised`` or ``retired``.",
         "properties": {
           "doc_id": {
             "anyOf": [

@@ -1005,8 +1005,6 @@ class ReconcileOperation:
     memory_id: str | None = None  # existing memory ID (for UPDATE/SUPERSEDE/DELETE/NOOP)
     memory: RawMemory | None = None  # new or updated memory (for ADD/UPDATE/SUPERSEDE)
     reason: str | None = None
-    # Source Authority Review of the proposed action.
-    flag_for_review: bool = False
     # Program-owned outcome of L3; never parsed from an LLM reconciliation action.
     support_revalidation_skipped: bool = False
 

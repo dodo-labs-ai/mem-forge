@@ -26,6 +26,7 @@ from memforge.memory.lifecycle_review import (
 )
 from memforge.memory.relation_discovery_contract import relation_discovery_request_id
 from memforge.models import Memory, RawMemory, ReconcileAction, ReconcileOperation, content_hash
+from tests.lifecycle_review_fixture import hold_for_review
 
 
 def _memory(memory_id: str = "mem-old") -> Memory:
@@ -69,7 +70,7 @@ def _defaults() -> NewMemoryDefaults:
     )
 
 
-def _build(*, gate: LifecycleGateState, all_support=("eu-old",), flagged=False, defaults=None):
+def _build(*, gate: LifecycleGateState, all_support=("eu-old",), defaults=None):
     old = _memory()
     return build_lifecycle_plan(
         plan_id="plan-1",
@@ -81,7 +82,6 @@ def _build(*, gate: LifecycleGateState, all_support=("eu-old",), flagged=False, 
                 memory_id=old.id,
                 memory=_replacement(),
                 reason="current source changed",
-                flag_for_review=flagged,
             ),
         ),
         incumbents={old.id: old},
@@ -375,12 +375,25 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
     assert approval.relation_discovery_requests == ()
 
 
-def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
-    original = _build(
+def _shared_support_review_plan():
+    """A Review holding the revision of an old Memory that another Source Unit also supports."""
+    direct = _build(
         gate=LifecycleGateState.ENABLED,
         all_support=("eu-old", "eu-other-source"),
     )
-    mutation = original.mutations[0]
+    [request] = direct.relation_discovery_requests
+    return hold_for_review(
+        direct,
+        "mem-old",
+        action=ReconcileAction.SUPERSEDE,
+        candidate=_replacement(),
+        replacement_memory_id=request.memory_id,
+    )
+
+
+def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
+    original = _shared_support_review_plan()
+    [mutation] = original.mutations
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
         lifecycle_plan_id=original.id,
@@ -420,11 +433,8 @@ def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
 
 
 def test_refresh_rejects_a_non_stale_lifecycle_review() -> None:
-    original = _build(
-        gate=LifecycleGateState.ENABLED,
-        all_support=("eu-old", "eu-other-source"),
-    )
-    mutation = original.mutations[0]
+    original = _shared_support_review_plan()
+    [mutation] = original.mutations
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
         lifecycle_plan_id=original.id,
@@ -498,18 +508,24 @@ def test_private_lifecycle_plan_persists_owner_as_relation_discovery_actor() -> 
     assert request.actor_user_id == "owner-1"
 
 
-def test_support_outside_current_scope_routes_replacement_to_review() -> None:
+def test_revising_a_memory_another_unit_supports_removes_only_this_units_support() -> None:
     plan = _build(
         gate=LifecycleGateState.ENABLED,
         all_support=("eu-old", "eu-other-source"),
     )
 
-    assert [item.mutation_type for item in plan.mutations] == [
-        LifecycleMutationType.CREATE_REVIEW,
+    [request] = plan.relation_discovery_requests
+    assert [(item.mutation_type, item.memory_id) for item in plan.mutations] == [
+        (LifecycleMutationType.CREATE_MEMORY, request.memory_id),
+        (LifecycleMutationType.ATTACH_SUPPORT, request.memory_id),
+        (LifecycleMutationType.REMOVE_SUPPORT, "mem-old"),
+        (LifecycleMutationType.REFRESH_MEMORY_INDEX, "mem-old"),
     ]
-    proposed = plan.mutations[0].payload["staged_evidence"]["proposed_mutations"]
-    assert "supersede_memory" not in {item["mutation_type"] for item in proposed}
-    assert "refresh_memory_index" in {item["mutation_type"] for item in proposed}
+    assert plan.mutations[2].evidence_unit_ids == ("eu-old",)
+    [decision] = plan.coverage_proof.incumbent_decisions
+    assert decision.disposition.value == "remove_support"
+    assert decision.replacement_memory_id is None
+    assert request.memory_id != "mem-old"
 
 
 def test_planner_rejects_incomplete_incumbent_ledger() -> None:

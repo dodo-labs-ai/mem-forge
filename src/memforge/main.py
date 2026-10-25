@@ -1278,8 +1278,7 @@ def eval_seed_reconciliation_cases(ctx: click.Context, spec_path: Path, workspac
     ``cases``, each a synced Document (``doc_id``, or ``source_id`` and
     ``title``) with its ``input`` (``candidates``, ``incumbents`` and their
     ``support``) and ``rubric`` (``expected_incumbents``: incumbent id to
-    ``kept``, ``review``, ``revised`` or ``retired``). Requires a maintenance
-    operator.
+    ``kept``, ``revised`` or ``retired``). Requires a maintenance operator.
     """
 
     _emit_tool_payload(

@@ -392,7 +392,7 @@ def test_relation_support_matrix(
 
     assert [operation.action for operation in operations] == expected_actions
     incumbent_operation = operations[-1]
-    assert incumbent_operation.memory_id == incumbent.id and not incumbent_operation.flag_for_review
+    assert incumbent_operation.memory_id == incumbent.id
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -459,7 +459,6 @@ def test_an_unsupported_claim_loses_support_beside_its_equivalent_and_refinement
         (ReconcileAction.ADD, equivalent), (ReconcileAction.ADD, refinement),
     ]
     assert operation.action is ReconcileAction.DELETE and operation.memory_id == incumbent.id
-    assert not operation.flag_for_review
 
 
 def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:

@@ -271,7 +271,7 @@ def build_lifecycle_plan(
             evidence_free_action = memory_id in authority_grants
             if not current_source_support and not evidence_free_action:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
-            if gate_state is LifecycleGateState.GATED or operation.flag_for_review:
+            if gate_state is LifecycleGateState.GATED:
                 proposed_mutations = []
                 if current_source_support:
                     proposed_mutations.append(
@@ -372,7 +372,7 @@ def build_lifecycle_plan(
                 )
             if not current_source_support and not explicit_owner_action:
                 raise ValueError(f"replacement incumbent lacks current-scope support: {memory_id}")
-            if gate_state is LifecycleGateState.GATED or external_support or operation.flag_for_review:
+            if gate_state is LifecycleGateState.GATED:
                 replacement_id, creation_mutations = memory_creation_mutations(operation.memory)
                 proposed_mutations = [*creation_mutations]
                 if current_source_support:
@@ -433,6 +433,37 @@ def build_lifecycle_plan(
                 )
                 continue
             replacement_id = create_memory(operation.memory)
+            if external_support:
+                # Another Source Unit still supports the old Memory: this Unit revises
+                # only its own Support, the Candidate becomes its own Memory, and
+                # relation discovery relates the pair.
+                decisions.append(
+                    IncumbentDecision(
+                        memory_id,
+                        IncumbentDisposition.REMOVE_SUPPORT,
+                        operation.reason or "revised by this source; other sources still support it",
+                        authority=incumbent_authority(memory_id),
+                        authority_actor_id=incumbent_authority_actor(memory_id),
+                    )
+                )
+                if current_source_support:
+                    mutations.append(
+                        LifecycleMutation(
+                            LifecycleMutationType.REMOVE_SUPPORT,
+                            memory_id=memory_id,
+                            source_id=scope.source_id,
+                            evidence_unit_ids=current_source_support,
+                            payload={"document_id": defaults.doc_id},
+                        )
+                    )
+                mutations.append(
+                    LifecycleMutation(
+                        LifecycleMutationType.REFRESH_MEMORY_INDEX,
+                        memory_id=memory_id,
+                        source_id=scope.source_id,
+                    )
+                )
+                continue
             decisions.append(
                 IncumbentDecision(
                     memory_id,

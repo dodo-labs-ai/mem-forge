@@ -190,7 +190,6 @@ def test_annotation_subject_starts_with_business_readable_review() -> None:
                     "action": "DELETE",
                     "memory_id": "mem-1",
                     "memory": None,
-                    "flag_for_review": False,
                 }
             ]
         },

@@ -111,15 +111,29 @@ _Second = TypeVar("_Second")
 _EMPTY_OBSERVATION_REASON = "source observation is explicitly empty"
 _NOT_INFERENCE_ELIGIBLE_REASON = "current Source Artifact revision is not inference eligible"
 # A model that reads text alone cannot read the images the Evidence may cite,
-# however readable they are, so the Review says so.
+# however readable they are, so the kept Memory's reason says so.
 _TEXT_ONLY_MODEL_REASON = (
     "the generation model reads text only, so the images of the current Source Artifact revision were not read"
 )
 
 
-def _protected_reason(reads_images: bool) -> str:
-    """Why the Review proposes removing a Memory whose current Support could not be re-derived."""
+def _unreadable_evidence_reason(reads_images: bool) -> str:
+    """Why an old Memory whose current Support Evidence the model cannot read is kept unchanged."""
     return _NOT_INFERENCE_ELIGIBLE_REASON if reads_images else _TEXT_ONLY_MODEL_REASON
+
+
+def _keep_unreadable(memory_id: str, reads_images: bool) -> ReconcileOperation:
+    """Keep an old Memory whose Evidence is unreadable, not gone, like an unresolved Support.
+
+    Its Support and validation baseline stay as last proven; reprocessing with a
+    model that reads the Evidence judges it again.
+    """
+    return ReconcileOperation(
+        action=ReconcileAction.NOOP,
+        memory_id=memory_id,
+        reason=_unreadable_evidence_reason(reads_images),
+        support_revalidation_skipped=True,
+    )
 
 __all__ = [
     "DeferredProjectedLifecycleHandle",
@@ -355,7 +369,7 @@ class MemoryEngine:
         incumbent_ids: frozenset[str],
         protected_source_observation_ids: frozenset[str],
     ) -> frozenset[str]:
-        """Keep incumbents whose current Support could not be re-derived."""
+        """Incumbents whose current Support cites Evidence this model cannot read."""
 
         if not incumbent_ids or not protected_source_observation_ids:
             return frozenset()
@@ -911,6 +925,7 @@ class MemoryEngine:
             "support_revalidation_unresolved_invalid_response_count": 0,
             "support_revalidation_unusable_baseline_count": 0,
             "support_revalidation_reprocess_count": 0,
+            "support_revalidation_unreadable_memory_count": 0,
         }
         filtered_memories: list[RawMemory] = []
         for raw in raw_memories:
@@ -1022,15 +1037,12 @@ class MemoryEngine:
             # No Candidate is left, so no Relation work is owed.
             relation_complete = True
             operations = tuple(
-                ReconcileOperation(
+                _keep_unreadable(memory.id, reads_images)
+                if memory.id in derivation_protected_ids
+                else ReconcileOperation(
                     action=ReconcileAction.DELETE,
                     memory_id=memory.id,
-                    reason=(
-                        _protected_reason(reads_images)
-                        if memory.id in derivation_protected_ids
-                        else _EMPTY_OBSERVATION_REASON
-                    ),
-                    flag_for_review=(memory.id in derivation_protected_ids),
+                    reason=_EMPTY_OBSERVATION_REASON,
                 )
                 for memory in sorted(incumbents, key=lambda item: item.id)
             )
@@ -1236,12 +1248,7 @@ class MemoryEngine:
                     stage=_runtime_context.stage,
                 )
             operations = tuple(result.operations) + tuple(
-                ReconcileOperation(
-                    action=ReconcileAction.DELETE,
-                    memory_id=memory_id,
-                    reason=_protected_reason(reads_images),
-                    flag_for_review=True,
-                )
+                _keep_unreadable(memory_id, reads_images)
                 for memory_id in sorted(derivation_protected_ids)
             )
         _runtime_context.stage = "plan_construction"
@@ -1256,6 +1263,7 @@ class MemoryEngine:
         stats["support_revalidation_skipped_memory_count"] = sum(
             operation.support_revalidation_skipped for operation in operations
         )
+        stats["support_revalidation_unreadable_memory_count"] = len(derivation_protected_ids)
         logger.info(
             json.dumps(
                 {

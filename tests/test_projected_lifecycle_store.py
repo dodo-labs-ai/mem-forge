@@ -51,6 +51,7 @@ from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
+from tests.lifecycle_review_fixture import hold_for_review
 from tests.test_source_projection_store import _projection
 from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
 
@@ -931,7 +932,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    original = build_lifecycle_plan(
+    direct = build_lifecycle_plan(
         plan_id="plan-review-refresh-original",
         scope=ReconciliationScope(
             id="scope-review-refresh-original",
@@ -946,7 +947,6 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
                 action=ReconcileAction.DELETE,
                 memory_id=incumbent.id,
                 reason="source no longer supports claim",
-                flag_for_review=True,
             ),
         ),
         incumbents={incumbent.id: incumbent},
@@ -964,9 +964,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
             access_context_hash="workspace",
         ),
     )
-    assert [mutation.mutation_type for mutation in original.mutations] == [
-        LifecycleMutationType.CREATE_REVIEW,
-    ]
+    original = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
     await db.apply_lifecycle_plan(original)
     [stale_review] = await db.list_lifecycle_reviews(
         "src-1",

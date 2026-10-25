@@ -312,9 +312,10 @@ check it, so sync from the **Sources** page when that model reads text only.
 
 With a model that reads text only, MemForge still stores every image and
 still reads the text of every document, but sends the model no images.
-Memories that an image-reading model drew from an image are kept as they are,
-and when such a document changes, the **Review** page asks you about them
-instead of the model judging them without the image. If the check could not
+Memories that an image-reading model drew from an image are kept as they are
+when such a document changes, instead of the model judging them without the
+image; re-reading the document with a model that reads images judges them
+again, as described below. If the check could not
 tell, because the provider did not answer or limited the request rate, the
 model is treated as one that reads images, and the check asks again the next
 time you validate the model. When you pick a model from **Load models**,

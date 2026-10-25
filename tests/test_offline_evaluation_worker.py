@@ -42,7 +42,6 @@ class _Executor:
                     "memory_id": "mem-1",
                     "memory": None,
                     "reason_code": "unchanged",
-                    "flag_for_review": False,
                 }
             ],
             "outcomes": {"mem-1": "kept"},
