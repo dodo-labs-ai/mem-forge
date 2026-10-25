@@ -1604,15 +1604,13 @@ class MemoryEngine:
     ) -> dict[str, int | bool]:
         """Return deletion eligibility from the committed document provenance."""
 
-        pending_review = mutation_types.count("create_review")
         remaining_document_support = await self.db.get_memories_by_source_doc(
             doc_id,
             support_kind=None,
         )
         return {
             "retired": mutation_types.count("retire_memory"),
-            "pending_review": pending_review,
-            "can_delete_document": (pending_review == 0 and not remaining_document_support),
+            "can_delete_document": not remaining_document_support,
         }
 
     def _candidate_can_persist(

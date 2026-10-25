@@ -9684,7 +9684,7 @@ async def test_tombstone_retires_last_supported_incumbent(db: Database) -> None:
 
     retired = await db.get_memory(incumbent.id)
     assert retired is not None and retired.status == "retired"
-    assert result == {"retired": 1, "pending_review": 0, "can_delete_document": True}
+    assert result == {"retired": 1, "can_delete_document": True}
     assert await db.list_lifecycle_vector_tasks() == []
 
     await db.delete_projected_document("confluence-123", source_id=initial.source_id)
@@ -9737,11 +9737,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         lifecycle_cycle_id="unmapped-source-removal",
     )
 
-    assert result == {
-        "retired": 0,
-        "pending_review": 0,
-        "can_delete_document": False,
-    }
+    assert result == {"retired": 0, "can_delete_document": False}
     assert await db.get_document("confluence-123") is not None
     assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == ["confluence-123"]
 

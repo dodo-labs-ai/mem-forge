@@ -2853,7 +2853,7 @@ class NoopMemoryEngine:
         return {"added": 0, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
 
     async def apply_projected_tombstone(self, **kwargs):
-        return {"retired": 0, "pending_review": 0, "can_delete_document": True}
+        return {"retired": 0, "can_delete_document": True}
 
 
 class FailingDocumentDeleteMemoryStore(OrchestratorMemoryStore):
