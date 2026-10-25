@@ -333,3 +333,28 @@ def test_skipped_support_is_exact_scoped_keep_and_never_authorizes_new_attachmen
         destructive.validate()
     with pytest.raises(ValueError, match="Source-scoped KEEP"):
         IncumbentDecision("mem-a", IncumbentDisposition.REMOVE_SUPPORT, "insufficient", skipped_support_ids=("eu-old",))
+
+
+def test_an_applied_plan_payload_yields_only_its_skipped_keep_supports():
+    from memforge.memory.lifecycle_plan import (
+        RetainedSupportEdge,
+        lifecycle_plan_to_payload,
+        skipped_supports_from_plan_payload,
+    )
+
+    plan = LifecyclePlan(
+        id="skip-plan", scope=_scope(), gate_state=LifecycleGateState.GATED,
+        coverage_proof=_proof(
+            IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "unreadable", skipped_support_ids=("eu-old",)),
+            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "supported"),
+        ), stale_guard=_guard(), mutations=(),
+    )
+    payload = lifecycle_plan_to_payload(plan)
+
+    assert skipped_supports_from_plan_payload(payload, source_id="src-1", source_unit_id="unit-1") == frozenset({
+        RetainedSupportEdge(memory_id="mem-a", source_id="src-1", source_unit_id="unit-1", evidence_unit_id="eu-old")
+    })
+    [decision, _] = payload["coverage_proof"]["incumbent_decisions"]
+    decision["disposition"] = IncumbentDisposition.REMOVE_SUPPORT.value
+    with pytest.raises(ValueError, match="Source-scoped KEEP"):
+        skipped_supports_from_plan_payload(payload, source_id="src-1", source_unit_id="unit-1")

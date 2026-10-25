@@ -30,6 +30,8 @@
   stats count it in `support_revalidation_unreadable_memory_count`. To judge
   it again, re-read the document with a model that reads images; an image that
   cannot be used is judged again once the document holds a usable one.
+  Another document that also backs such a memory can still remove or revise
+  its own backing without waiting for that re-read.
   Reconciliation cases no longer accept the `review` outcome in
   `expected_incumbents`; use `kept`, `revised` or `retired`.
 
