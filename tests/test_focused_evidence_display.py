@@ -10,7 +10,7 @@ from memforge.memory.evidence import EvidenceReference, evidence_part_set_digest
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.models import Memory, content_hash
 from memforge.pipeline.revision_assessment import RevisionAssessmentContext
-from memforge.pipeline.support_reading import SupportWorkItem, plan_support_revision, exact_evidence_selection
+from memforge.pipeline.support_reading import SupportWorkItem, plan_support_revision
 from memforge.pipeline.memory_extractor import _SelectionResolution
 from memforge.pipeline.revision_work import RevisionWorkExecutor
 from memforge.plugin_mcp_proxy import _compact_memory_response
@@ -84,7 +84,6 @@ def test_changed_interpretation_never_carries_old_display_to_the_new_revision():
     rebound = RevisionWorkExecutor(client=None, model='unused')._rebound(plan.catalog, plan.supports[0])
     selected = rebound.memory.resolved_evidence_selection.parts[0]
     assert selected.display_text is None and 'Instruction' in selected.excerpt
-    assert exact_evidence_selection(context, (part,)).parts[0].display_text is None
 
 
 @pytest.mark.asyncio

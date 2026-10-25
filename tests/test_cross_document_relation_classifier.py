@@ -288,7 +288,7 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
     framing = " ".join(prompt[len(CROSS_DOCUMENT_RELATION_RULES) :].split())
     for sentence in (
         "Every question below asks for the relation between one candidate statement and the subject statement.",
-        "The subject is one statement; each candidate is one statement from another document.",
+        "The subject is one statement; each candidate is one other statement.",
         "Many candidates repeat one another.",
         "two candidates that state the same thing tell nothing about the subject",
         "a candidate is equivalent only when it and the subject state the same knowledge.",
@@ -296,13 +296,17 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
         assert sentence in framing
 
 
-def test_the_contract_is_v4_and_replays_cases_pinned_under_the_same_input() -> None:
-    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v4"
+def test_the_contract_is_v5_and_replays_cases_pinned_under_the_same_input() -> None:
+    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v5"
     assert CROSS_DOCUMENT_RELATION_INPUT_VERSIONS == {
         "cross-document-relation-v2",
         "cross-document-relation-v3",
         "cross-document-relation-v4",
+        "cross-document-relation-v5",
     }
+    assert " ".join(CROSS_DOCUMENT_RELATION_RULES.split()).startswith(
+        "Each pair holds two statements, taken from the same document or from different ones."
+    )
 
 
 def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> None:

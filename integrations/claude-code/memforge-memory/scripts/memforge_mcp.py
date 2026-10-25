@@ -277,7 +277,7 @@ TOOLS: list[dict[str, Any]] = [
             "Send a self-contained query in the user's language; preserve identifiers and domain terms, "
             "without retrieval-only translation or keyword stuffing. Use total_candidates and offset only "
             "within the ranked window; ranked queries are not exhaustive. relation_notice flags a "
-            "conflicting or newer Memory from another document (see relations[] and get_memory). "
+            "conflicting or newer Memory (see relations[] and get_memory). "
             "Call get_memory for provenance."
         ),
         "inputSchema": {

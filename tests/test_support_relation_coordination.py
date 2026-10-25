@@ -1,21 +1,14 @@
-"""SupportRelationCoordinator end to end: concurrent lines, re-checks and pending coordinator Reviews."""
+"""SupportRelationCoordinator end to end: concurrent lines, re-checks, and conflicts kept as two Memories."""
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from types import SimpleNamespace
 
 import pytest
 
 from memforge.llm.structured import CandidateAdmissionResponse, ClaimRevisionWireResponse, StructuredLlmError, SupportAssessmentWireResponse
-from memforge.memory.coordinator_review import coordinator_review_id
-from memforge.memory.lifecycle_plan import LifecycleReviewStatus
-from memforge.memory.lifecycle_review import (
-    build_lifecycle_review_approval_plan,
-    build_lifecycle_review_rejection_plan,
-)
-from memforge.models import CoordinatorProposal, RawMemory
+from memforge.models import RawMemory
 from memforge.storage.database import Database
 from tests.coordination_fixture import (
     AUDIT,
@@ -75,97 +68,27 @@ async def test_local_admission_skip_and_unresolved_support_commit_independent_me
     assert await support_texts(db, incumbent.id) == {TWO}
 
 
+async def _discovered_memory_ids(db: Database) -> set[str]:
+    rows = await db.db.execute_fetchall("SELECT memory_id FROM relation_discovery_work")
+    return {row["memory_id"] for row in rows}
+
+
 @pytest.mark.asyncio
-async def test_a_contradicted_supported_claim_keeps_one_review_across_revisions(db: Database) -> None:
+async def test_a_contradicted_supported_claim_keeps_both_memories_without_a_review(db: Database) -> None:
     page, memory = await seeded_page(db, TWO, RETENTION)
     client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
 
-    # The source now states both claims: the old one is rebound and the conflict goes to a Review.
+    # The source now states both claims: the old one is rebound and the new one added beside it.
     stats = await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
-    [review] = await lifecycle_reviews(db, memory.id)
-    assert review.id == coordinator_review_id(page.unit_id, memory.id, CoordinatorProposal.SUPERSEDE, ONE)
-    assert review.status is LifecycleReviewStatus.PENDING
-    assert review.staged_evidence["proposal"] == CoordinatorProposal.SUPERSEDE.value
-    assert review.staged_evidence["stale_guard"]["support_set_hash"] == await db.get_memory_support_set_hash(memory.id)
-    assert stats["coordinator_review_count"] == 1 and stats["pending_review"] == 1
-    assert [item.id for item in await db.list_memories()] == [memory.id]
+
+    assert await lifecycle_reviews(db, memory.id) == []
+    assert stats["added"] == 1 and stats["pending_review"] == 0
+    active = {item.content: item for item in await db.list_memories(status="active")}
+    assert set(active) == {TWO, ONE} and active[TWO].id == memory.id
     rebound = await active_support_evidence(db, memory.id, source_id=SOURCE_ID)
     assert {part.validation_unit_revision_id for part in rebound} == {page.current.source_unit_revisions[0].id}
-
-    # An unrelated edit does not extract the Candidate again; its exact Evidence carries the conflict.
-    stats = await page.commit(client, page.next(TWO, ONE, RETENTION, AUDIT))
-    [carried] = await lifecycle_reviews(db, memory.id)
-    assert (carried.id, carried.status) == (review.id, LifecycleReviewStatus.PENDING)
-    assert carried.lifecycle_plan_id != review.lifecycle_plan_id
-    assert stats["coordinator_carried_conflict_count"] == 1 and stats["coordinator_recheck_count"] == 0
-    assert [item.id for item in await db.list_memories()] == [memory.id]
-
-    # The contradicting statement is gone, so the conflict is gone.
-    await page.commit(client, page.next(TWO, RETENTION, AUDIT))
-    [closed] = await lifecycle_reviews(db, memory.id)
-    assert (closed.id, closed.status) == (review.id, LifecycleReviewStatus.STALE)
-
-    # It comes back and reopens the same Review, which a reviewer then approves.
-    await page.commit(client, page.next(TWO, ONE, RETENTION, AUDIT), ONE)
-    [reopened] = await lifecycle_reviews(db, memory.id)
-    assert (reopened.id, reopened.status, reopened.resolved_at) == (review.id, LifecycleReviewStatus.PENDING, None)
-    payload = await db.get_lifecycle_plan_payload(reopened.lifecycle_plan_id)
-    await db.apply_lifecycle_plan(build_lifecycle_review_approval_plan(reopened, payload))
-
-    superseded = await db.get_memory(memory.id)
-    assert superseded is not None and superseded.status == "superseded"
-    assert [item.content for item in await db.list_memories() if item.status == "active"] == [ONE]
-
-
-@pytest.mark.asyncio
-async def test_a_rejected_conflict_is_not_raised_again(db: Database) -> None:
-    page, memory = await seeded_page(db, TWO, RETENTION)
-    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
-    await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
-    [review] = await lifecycle_reviews(db, memory.id)
-    await db.resolve_lifecycle_review(review.id, LifecycleReviewStatus.REJECTED, review_note="Two reviewers stand")
-
-    stats = await page.commit(client, page.next(TWO, ONE + " ", RETENTION), ONE)
-
-    [kept] = await lifecycle_reviews(db, memory.id)
-    assert (kept.id, kept.status) == (review.id, LifecycleReviewStatus.REJECTED)
-    assert stats["pending_review"] == 0 and stats["added"] == 0
-    assert [(item.id, item.status) for item in await db.list_memories()] == [(memory.id, "active")]
-
-
-@pytest.mark.asyncio
-async def test_exact_review_refs_do_not_reuse_a_claim_after_external_qualification(db: Database) -> None:
-    page, memory = await seeded_page(db, TWO, RETENTION)
-    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
-    await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
-    [review] = await lifecycle_reviews(db, memory.id)
-    client.support_requests.clear()
-    client.verdicts[ONE] = [False]
-
-    stats = await page.commit(client, page.next(TWO, ONE, RETENTION, "The one-reviewer rule above is a proposal only."))
-
-    [closed] = await lifecycle_reviews(db, memory.id)
-    assert (closed.id, closed.status) == (review.id, LifecycleReviewStatus.STALE)
-    assert stats["coordinator_carried_conflict_count"] == 0
-    challenger_reads = [request for request in client.support_requests
-                        if any(work["claim"] == ONE for work in request["works"])]
-    assert challenger_reads
-    assert any("The one-reviewer rule above is a proposal only." in client.supplied_texts(request)
-               for request in challenger_reads)
-
-
-@pytest.mark.asyncio
-async def test_two_historical_review_occurrences_cannot_match_one_current_occurrence(db: Database) -> None:
-    page, memory = await seeded_page(db, TWO, RETENTION)
-    client = ScriptedClient(relations={(ONE, TWO): "contradicts"})
-    await page.commit(client, page.next(TWO, ONE, ONE, RETENTION), ONE)
-    [review] = await lifecycle_reviews(db, memory.id)
-
-    stats = await page.commit(client, page.next(TWO, ONE, RETENTION))
-
-    [preserved] = await lifecycle_reviews(db, memory.id)
-    assert (preserved.id, preserved.status) == (review.id, LifecycleReviewStatus.PENDING)
-    assert stats["coordinator_carried_conflict_count"] == 0
+    # Relation discovery after commit relates the new Memory to the old one of its own Unit.
+    assert active[ONE].id in await _discovered_memory_ids(db)
 
 
 @pytest.mark.asyncio
@@ -180,8 +103,8 @@ async def test_an_unaffected_claim_contradicted_by_the_source_is_read_once_in_th
     # The re-check is an ordinary ordered read that may reach every group of the revision.
     [recheck] = client.support_requests
     assert TWO in client.supplied_texts(recheck)
-    [review] = await lifecycle_reviews(db, memory.id)
-    assert review.staged_evidence["proposal"] == CoordinatorProposal.SUPERSEDE.value
+    assert await lifecycle_reviews(db, memory.id) == []
+    assert sorted(item.content for item in await db.list_memories(status="active")) == sorted([TWO, ONE])
 
 
 @pytest.mark.asyncio
@@ -203,19 +126,14 @@ async def test_an_unsupported_claim_with_an_equivalent_is_rechecked_against_that
     # The re-check reads only the ReadingGroup that holds the Candidate's Evidence, with the page title.
     assert RESTATED in client.supplied_texts(recheck) and RETENTION not in client.supplied_texts(recheck)
     assert stats["coordinator_recheck_count"] == 1
-    assert [item.id for item in await db.list_memories()] == [memory.id]
+    assert await lifecycle_reviews(db, memory.id) == []
     if recheck_supported:
-        assert await lifecycle_reviews(db, memory.id) == []
+        assert [item.id for item in await db.list_memories()] == [memory.id]
         assert await support_texts(db, memory.id) == {RESTATED}
         return
-    [review] = await lifecycle_reviews(db, memory.id)
-    assert review.staged_evidence["proposal"] == CoordinatorProposal.REBIND.value
-    assert review.staged_evidence["candidate"]["content"] == RESTATED
-    assert await support_texts(db, memory.id) == {TWO}
-    payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-    await db.apply_lifecycle_plan(build_lifecycle_review_approval_plan(review, payload))
-    assert (await db.get_memory(memory.id)).status == "active"
-    assert await support_texts(db, memory.id) == {RESTATED}
+    # Still unsupported: the old claim follows its own result and the restatement stands on its own.
+    assert (await db.get_memory(memory.id)).status != "active"
+    assert [item.content for item in await db.list_memories(status="active")] == [RESTATED]
 
 
 @pytest.mark.asyncio
@@ -247,27 +165,19 @@ async def test_a_failed_recheck_leaves_the_revision_uncommitted_and_a_retry_keep
 
 
 @pytest.mark.asyncio
-async def test_rejecting_a_conflict_with_an_equivalent_binds_the_claim_to_that_equivalent(db: Database) -> None:
+async def test_a_claim_restated_and_contradicted_in_one_revision_stays_on_its_restatement(db: Database) -> None:
     page, memory = await seeded_page(db, TWO, RETENTION)
     client = ScriptedClient(
-        relations={(RESTATED, TWO): "equivalent", (ONE, TWO): "contradicts"}, verdicts={TWO: [False]},
+        relations={(RESTATED, TWO): "equivalent", (ONE, TWO): "contradicts"},
+        support_text={TWO: RESTATED}, verdicts={TWO: [False, True]},
     )
 
     stats = await page.commit(client, page.next(RESTATED, ONE, RETENTION), RESTATED, ONE)
 
-    assert stats["coordinator_recheck_count"] == 0
-    [review] = await lifecycle_reviews(db, memory.id)
-    assert review.staged_evidence["candidate"]["content"] == ONE
-    assert review.staged_evidence["rejection_candidate"]["content"] == RESTATED
-    payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-    rejection = build_lifecycle_review_rejection_plan(review, payload, review_note="Two reviewers stand")
-    assert rejection is not None
-    await db.apply_lifecycle_plan(rejection)
-
-    [rejected] = await lifecycle_reviews(db, memory.id)
-    assert rejected.status is LifecycleReviewStatus.REJECTED
-    assert (await db.get_memory(memory.id)).status == "active"
+    assert stats["coordinator_recheck_count"] == 1
+    assert await lifecycle_reviews(db, memory.id) == []
     assert await support_texts(db, memory.id) == {RESTATED}
+    assert sorted(item.content for item in await db.list_memories(status="active")) == sorted([TWO, ONE])
 
 
 class _OmitsRow(ScriptedClient):
@@ -498,7 +408,7 @@ async def test_a_partial_coverage_equivalent_rebinds_the_claim_after_one_recheck
 
 
 @pytest.mark.asyncio
-async def test_a_partial_coverage_contradiction_is_reviewed_and_never_superseded(db: Database) -> None:
+async def test_a_partial_coverage_contradiction_keeps_the_claim_unchanged_and_adds_the_candidate(db: Database) -> None:
     memory, first, second = await _jira_incumbent(db)
     claim = "A7 is dropped for regular payroll."
     client = ScriptedClient(relations={(claim, memory.content): "contradicts"})
@@ -506,76 +416,9 @@ async def test_a_partial_coverage_contradiction_is_reviewed_and_never_superseded
 
     stats = await _commit_jira(db, client, first, second, claim)
 
-    assert stats["superseded"] == 0 and stats["coordinator_recheck_count"] == 0
+    assert stats["superseded"] == 0 and stats["coordinator_recheck_count"] == 0 and stats["added"] == 1
     assert client.support_requests == []
-    [review] = await lifecycle_reviews(db, memory.id)
-    assert review.staged_evidence["proposal"] == CoordinatorProposal.SUPERSEDE.value
+    assert await lifecycle_reviews(db, memory.id) == []
     assert (await db.get_memory(memory.id)).status == "active"
     assert await active_support_evidence(db, memory.id, source_id=SOURCE_ID) == before
-
-
-class _DeliveredStore:
-    """Stands in for the vector store: every lifecycle Plan's vector work is delivered."""
-
-    async def attempt_lifecycle_vector_delivery(self, lifecycle_plan_id=None, *, source_id=None):
-        return SimpleNamespace(pending=False, error_types=())
-
-
-async def _decide(client, review_id: str, decision: str, note: str | None = None):
-    detail = client.get(f"/api/v1/memory-reviews/{review_id}")
-    assert detail.status_code == 200, detail.text
-    body = {"expected_fingerprint": detail.json()["decision_fingerprint"], **({"note": note} if note else {})}
-    return client.post(f"/api/v1/memory-reviews/{review_id}/{decision}", json=body)
-
-
-@pytest.mark.asyncio
-async def test_a_coordinator_review_whose_guard_moved_waits_for_the_next_revision(
-    db: Database, tmp_path, monkeypatch,
-) -> None:
-    from fastapi.testclient import TestClient
-
-    from memforge.config import AppConfig
-    from memforge.server.admin_api import create_admin_app
-
-    async def delivered_store(*args, **kwargs):
-        return _DeliveredStore()
-
-    monkeypatch.setattr("memforge.server.admin_api._build_memory_store", delivered_store)
-    none = "No reviewer approves payroll."
-    page, memory = await seeded_page(db, TWO, RETENTION)
-    client = ScriptedClient(
-        relations={(RESTATED, TWO): "equivalent", (ONE, TWO): "contradicts", (none, TWO): "contradicts"},
-        verdicts={TWO: [False]},
-    )
-    await page.commit(client, page.next(RESTATED, ONE, none, RETENTION), RESTATED, ONE, none)
-    reviews = {review.staged_evidence["candidate"]["content"]: review for review in await lifecycle_reviews(db, memory.id)}
-    assert set(reviews) == {ONE, none}
-    assert {review.staged_evidence["rejection_candidate"]["content"] for review in reviews.values()} == {RESTATED}
-
-    config = AppConfig(base_dir=tmp_path / "memforge")
-    config.sync.worker_enabled = False
-    app = create_admin_app(db=db, config=config, runtime_provider=SimpleNamespace())
-    with TestClient(app) as http:
-        # Keeping the current state rebinds the old Memory to its restatement.
-        rejected = await _decide(http, reviews[ONE].id, "reject", note="Two reviewers stand")
-        assert rejected.status_code == 200, rejected.text
-        assert await support_texts(db, memory.id) == {RESTATED}
-        # That rebind moved the other Review's guard: it is refused and stays pending.
-        refused = await _decide(http, reviews[none].id, "approve")
-        assert refused.status_code == 409
-        assert "raises this conflict again" in refused.json()["detail"]
-        held = await db.get_lifecycle_review(reviews[none].id)
-        assert held.status is LifecycleReviewStatus.PENDING
-
-    # The next revision carries the conflict against the rebound Support and refreshes its guard.
-    await page.commit(client, page.next(RESTATED, ONE, none, RETENTION, AUDIT))
-    [rejected_review, refreshed] = sorted(
-        await lifecycle_reviews(db, memory.id), key=lambda review: review.status is LifecycleReviewStatus.PENDING,
-    )
-    assert (rejected_review.id, rejected_review.status) == (reviews[ONE].id, LifecycleReviewStatus.REJECTED)
-    assert (refreshed.id, refreshed.status) == (reviews[none].id, LifecycleReviewStatus.PENDING)
-    with TestClient(app) as http:
-        approved = await _decide(http, refreshed.id, "approve")
-        assert approved.status_code == 200, approved.text
-    assert (await db.get_memory(memory.id)).status == "superseded"
-    assert [item.content for item in await db.list_memories() if item.status == "active"] == [none]
+    assert sorted(item.content for item in await db.list_memories(status="active")) == sorted([memory.content, claim])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -16,7 +17,9 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     LifecycleAction,
 )
+from memforge.memory.cross_document_relation_reader import read_memory_relations
 from memforge.memory.relation_candidate_retrieval import (
+    CrossDocumentCandidateRetriever,
     CrossDocumentCandidateSelection,
     RetrievedRelationCandidate,
 )
@@ -32,12 +35,29 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkState,
     RelationDiscoveryWorkStatus,
 )
-from memforge.models import DocumentRecord, Memory, MemoryStatus, content_hash
+from memforge.models import (
+    ContentItem,
+    DocumentRecord,
+    Memory,
+    MemoryStatus,
+    NormalizedContent,
+    RawContent,
+    RawMemory,
+    content_hash,
+)
+from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.release import current_release
+from memforge.source_projection import SourceProjection
+from memforge.storage.adapters.context import LOCAL_DEV_USER_ID, AccessScope
 from memforge.storage.adapters.protocols import (
     build_active_memory_unit_support_states,
 )
+from memforge.storage.adapters.sqlite import build_sqlite_adapters
+from memforge.storage.database import Database
+from tests.coordination_fixture import DOC_ID, FIRST_REVISION_AT, JIRA_DOCUMENT, SOURCE_ID, ScriptedClient, coordination_engine
 from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
+from tests.test_projected_lifecycle_integration import _selected, _set_fixture_source_type
+from tests.test_projected_lifecycle_integration import db as db
 
 
 def _memory(memory_id: str, content: str) -> Memory:
@@ -90,9 +110,10 @@ class _Candidates:
         self.actor_user_id = None
         self.excluded_source_ids = ()
 
-    async def retrieve(self, **kwargs):
-        self.actor_user_id = kwargs["actor_user_id"]
-        self.excluded_source_ids = tuple(kwargs["excluded_source_ids"])
+    async def retrieve(self, *, challenger, entity_ids, actor_user_id, source_id, excluded_source_ids=()):
+        del challenger, entity_ids, source_id
+        self.actor_user_id = actor_user_id
+        self.excluded_source_ids = tuple(excluded_source_ids)
         return CrossDocumentCandidateSelection(
             discovery=tuple(
                 RetrievedRelationCandidate(
@@ -113,11 +134,20 @@ class _Candidates:
             audit={"candidate_count_kind": "windowed"},
         )
 
-    async def load_selected_memories(self, selection, **_kwargs):
+    async def load_selected_memories(self, selection, *, challenger, source_id, excluded_source_ids=()):
+        del challenger, source_id, excluded_source_ids
         return selection, {candidate.id: candidate for candidate in self._candidates}
 
-    async def ensure_selection_current(self, *_args, **_kwargs):
-        return None
+    async def ensure_selection_current(
+        self,
+        selection,
+        *,
+        challenger,
+        source_id,
+        excluded_source_ids=(),
+        expected_support_set_hashes=None,
+    ):
+        del selection, challenger, source_id, excluded_source_ids, expected_support_set_hashes
 
 
 class _Store:
@@ -633,3 +663,136 @@ async def test_private_relation_discovery_without_explicit_actor_runs_as_the_own
     assert [record.label for record in store.completed.relations] == [
         CrossDocumentRelationLabel.CONTRADICTS
     ]
+
+
+def _jira_issue_with_comments(*comments: tuple[str, str, str]) -> SourceProjection:
+    """One Jira issue whose ``(id, created, body)`` comments are each their own Observation."""
+    item = ContentItem(
+        item_id=DOC_ID,
+        title="PAY-12",
+        source_url="https://jira.example.test/browse/PAY-12",
+        last_modified=FIRST_REVISION_AT,
+        version="1",
+        extra={"issue_key": "PAY-12", "issue_id": "10012"},
+    )
+    payload = {
+        "id": "10012",
+        "key": "PAY-12",
+        "fields": {
+            "summary": "Payroll approval",
+            "description": "Payroll approval policy.",
+            "status": None,
+            "priority": None,
+            "assignee": None,
+            "labels": [],
+            "resolution": None,
+            "updated": None,
+        },
+        "renderedFields": {"description": "<p>Payroll approval policy.</p>"},
+        "_comments": [
+            {"id": comment_id, "body": body, "renderedBody": f"<p>{body}</p>", "created": created, "updated": created}
+            for comment_id, created, body in comments
+        ],
+        "_comments_included": True,
+        "_comments_total": len(comments),
+        "changelog": {"startAt": 0, "histories": [], "total": 0},
+    }
+    return project_source_item(
+        source_id=SOURCE_ID,
+        source_type="jira",
+        run_id="projection-same-unit-relation",
+        item=item,
+        raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body=JIRA_DOCUMENT),
+    )
+
+
+class _RecordingUpdatesClassifier:
+    """Label every pair ``updates`` and keep the pairs each challenger was shown."""
+
+    def __init__(self) -> None:
+        self.pairs: list = []
+
+    def pairs_of(self, challenger_id: str) -> list:
+        return [pair for pair in self.pairs if pair.challenger.memory_id == challenger_id]
+
+    async def classify(self, pairs):
+        self.pairs.extend(pairs)
+        return CrossDocumentRelationClassification(
+            judgments=tuple(
+                CrossDocumentRelationJudgment(pair=pair, label=CrossDocumentRelationLabel.UPDATES) for pair in pairs
+            ),
+            llm_calls=1 if pairs else 0,
+            prompt_chars=10 * len(pairs),
+        )
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_evidence_time(db: Database) -> None:
+    older_claim = "Payroll approval needs two reviewers."
+    newer_claim = "Payroll approval needs three reviewers."
+    await _set_fixture_source_type(db, "jira")
+    projection = _jira_issue_with_comments(
+        ("501", "2026-07-10T09:00:00.000+0000", older_claim),
+        ("502", "2026-07-14T09:00:00.000+0000", newer_claim),
+    )
+    await coordination_engine(db, ScriptedClient()).prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id=DOC_ID,
+        raw_memories=_selected(
+            projection,
+            [
+                RawMemory(content=older_claim, memory_type="decision", evidence_quote=older_claim),
+                RawMemory(content=newer_claim, memory_type="decision", evidence_quote=newer_claim),
+            ],
+        ),
+        doc_type="ticket",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=JIRA_DOCUMENT,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=FIRST_REVISION_AT,
+    )
+    by_content = {memory.content: memory for memory in await db.list_memories(source=SOURCE_ID, status="active")}
+    older, newer = by_content[older_claim], by_content[newer_claim]
+    # Both Memories hold Primary Evidence in the one Source Unit, each on its own comment.
+    work_rows = await db.db.execute_fetchall("SELECT memory_id, source_unit_id, doc_id FROM relation_discovery_work")
+    assert {row["memory_id"] for row in work_rows} == {older.id, newer.id}
+    assert len({(row["source_unit_id"], row["doc_id"]) for row in work_rows}) == 1
+    [older_unit] = await db.get_memory_evidence_units(older.id)
+    [newer_unit] = await db.get_memory_evidence_units(newer.id)
+    assert older_unit.source_unit_id == newer_unit.source_unit_id
+    assert older_unit.items[0].anchor.observation_id != newer_unit.items[0].anchor.observation_id
+    classifier = _RecordingUpdatesClassifier()
+    adapters = build_sqlite_adapters(db, object())
+
+    result = await RelationDiscovery(
+        store=db,
+        candidate_retriever=CrossDocumentCandidateRetriever(
+            relational=adapters.relational, keyword=adapters.keyword, vector=adapters.vector
+        ),
+        pair_classifier=classifier,
+    ).process_slice(worker_id="relation-worker")
+
+    assert result.failed_work == 0
+    assert result.completed_work == 2
+    # Real retrieval selected the other Memory of the challenger's own Source Unit.
+    [pair] = classifier.pairs_of(newer.id)
+    assert pair.candidate.memory_id == older.id
+    assert (pair.challenger.evidence_time, pair.candidate.evidence_time) == ("2026-07-14", "2026-07-10")
+    scope = AccessScope(
+        user_id=LOCAL_DEV_USER_ID,
+        include_private=True,
+        allowed_statuses=("active",),
+        active_project=None,
+        scope_mode="workspace",
+    )
+    relations = await read_memory_relations(db, (newer.id, older.id), scope)
+    [newer_side] = relations[newer.id]
+    [older_side] = relations[older.id]
+    assert (newer_side.label, newer_side.role, newer_side.counterpart.memory_id) == ("updates", "newer", older.id)
+    assert newer_side.counterpart.evidence_time == "2026-07-10"
+    assert (older_side.label, older_side.role, older_side.counterpart.memory_id) == ("updates", "older", newer.id)
+    assert older_side.counterpart.evidence_time == "2026-07-14"

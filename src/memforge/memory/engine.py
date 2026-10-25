@@ -38,11 +38,6 @@ from memforge.memory.candidate_admission import (
     CandidateRejection,
     admit_candidates,
 )
-from memforge.memory.coordinator_review import (
-    carried_conflicts,
-    carry_into_ledger,
-    is_coordinator_review,
-)
 from memforge.llm.decision_model import decision_task_model
 from memforge.memory.entity_resolver import EntityResolver
 from memforge.memory.evidence import (
@@ -52,7 +47,6 @@ from memforge.memory.evidence import (
 from memforge.memory.lifecycle_plan import (
     LifecycleGateState,
     LifecyclePlan,
-    LifecycleReview,
     ProjectedLifecycleDeferredError,
     AuthorityPlanStaleError,
     ProjectedSupportInvariantError,
@@ -96,7 +90,6 @@ from memforge.source_derivation import (
 from memforge.storage.adapters.protocols import EntityResolutionScope
 from memforge.llm.failure_trace import failure_trace_context, enrich_failure_trace_context
 from memforge.models import (
-    CoordinatorProposal,
     Memory,
     RawMemory,
     ReconcileAction,
@@ -174,7 +167,6 @@ class _PreparedLifecyclePlanInputs:
     defaults: NewMemoryDefaults
     evidence_units: tuple[EvidenceUnit, ...]
     evidence_references: tuple[EvidenceReference, ...]
-    unresolved_coordinator_review_ids: frozenset[str] = frozenset()
 
 
 @dataclass(slots=True)
@@ -355,17 +347,6 @@ class MemoryEngine:
             if memory.status == "active":
                 incumbents_by_id.setdefault(memory.id, memory)
         return [incumbents_by_id[key] for key in sorted(incumbents_by_id)], unit_support
-
-    async def _coordinator_reviews(
-        self, *, source_unit_id: str, incumbent_ids: Sequence[str],
-    ) -> tuple[LifecycleReview, ...]:
-        """Every coordinator Review this Source Unit raised on these incumbents, in any status."""
-
-        return tuple(
-            review
-            for review in await self.db.list_lifecycle_reviews(incumbent_memory_ids=tuple(incumbent_ids))
-            if is_coordinator_review(review, source_unit_id=source_unit_id)
-        )
 
     async def _derivation_protected_incumbents(
         self,
@@ -652,10 +633,6 @@ class MemoryEngine:
             defaults=inputs.defaults,
             evidence_units=inputs.evidence_units,
             evidence_references=inputs.evidence_references,
-            coordinator_reviews=await self._coordinator_reviews(
-                source_unit_id=inputs.scope.source_unit_id, incumbent_ids=incumbent_ids,
-            ),
-            unresolved_coordinator_review_ids=inputs.unresolved_coordinator_review_ids,
         )
 
     def _prepared_runtime_bundle(
@@ -981,7 +958,6 @@ class MemoryEngine:
                 target_unit_revision_id=scope.target_unit_revision_id,
                 operation_input_hash=operation_input_hash, execution_owner_id=lifecycle_execution_owner_id))
         _runtime_context.incumbent_count = len(incumbents)
-        unresolved_coordinator_review_ids = frozenset()
         _runtime_context.stage = "candidate_admission"
         evidence_image_loader = _projection_evidence_image_loader(projection, self.document_store)
         admission = await admit_candidates(
@@ -1021,8 +997,6 @@ class MemoryEngine:
             project_key=project_key, repo_identifier=repo_identifier,
         )
         supports: dict[str, MemorySupport] = {}
-        # This Source Unit's coordinator Reviews of the old Memories the model judges.
-        unit_reviews: tuple[LifecycleReview, ...] = ()
         required_derivation_work_ids = admission.work_ids
         model_incumbent_count = 0
         model_batch_count = 0
@@ -1094,7 +1068,7 @@ class MemoryEngine:
                     without_baseline=derivation_support_without_baseline,
                 )
                 work_items, work_by_memory = support_work.items, support_work.by_memory
-                assessment_context, assessment_context_for = support_work.context, support_work.context_for
+                assessment_context = support_work.context
                 stats["support_revalidation_reprocess_count"] += support_work.reprocess_count
                 stats["support_revalidation_unusable_baseline_count"] += support_work.unusable_baseline_count
             stats["support_revalidation_work_item_count"] += len(work_items)
@@ -1168,59 +1142,14 @@ class MemoryEngine:
                 if relation.failure is not None:
                     result = ReconciliationResult(operations=[], failure=relation.failure, metrics=relation.metrics)
                 else:
-                    if assessment_context is not None:
-                        unit_reviews = await self._coordinator_reviews(
-                            source_unit_id=scope.source_unit_id,
-                            incumbent_ids=tuple(memory.id for memory in model_incumbents),
-                        )
-                        staged_revision_ids = {
-                            str(part["observation_revision_id"])
-                            for review in unit_reviews
-                            for name in ("candidate", "rejection_candidate")
-                            for part in (review.staged_evidence.get(name) or {}).get("evidence", ())
-                            if isinstance(part, Mapping) and part.get("observation_revision_id")
-                        }
-                        missing = staged_revision_ids - set(assessment_context.revisions)
-                        if missing:
-                            assessment_context.revisions.update(await self.db.get_source_observation_revisions(missing))
-                    async def context_for_review(review):
-                        # The existing Plan names the complete revision where this
-                        # staged claim last stood. The incumbent's newer baseline
-                        # is not a validation baseline for the challenger.
-                        payload = await self.db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-                        review_scope = payload.get("scope", {}) if isinstance(payload, Mapping) else {}
-                        baseline_id = review_scope.get("target_unit_revision_id")
-                        historical = None
-                        if (review_scope.get("source_id") == projection.source_id
-                                and review_scope.get("source_unit_id") == scope.source_unit_id
-                                and baseline_id):
-                            historical = await self.db.get_source_unit_revision_projection(scope.source_unit_id, baseline_id)
-                            if (historical is not None and (historical.source_id != projection.source_id
-                                    or len(historical.source_unit_revisions) != 1
-                                    or historical.source_unit_revisions[0].source_unit_id != scope.source_unit_id
-                                    or historical.source_unit_revisions[0].id != baseline_id)):
-                                historical = None
-                        # No proven baseline means ordinary full-current assessment.
-                        return assessment_context_for(historical)
-
-                    carried = await carried_conflicts(
-                        unit_reviews, assessment_context, evaluator=evaluator, context_for_review=context_for_review,
-                    ) if unit_reviews else None
-                    unresolved_coordinator_review_ids = carried.unresolved_review_ids if carried else frozenset()
-                    ledger = carry_into_ledger(
-                        filtered_memories, relation.entries,
-                        carried.conflicts if carried else (),
-                    )
-                    stats["coordinator_carried_conflict_count"] = len(ledger.carried_pairs)
                     result = await join_support_and_relation(
-                        replace(relation, entries=ledger.entries),
-                        new_extractions=ledger.candidates,
+                        relation,
+                        new_extractions=filtered_memories,
                         existing_memories=model_incumbents,
                         supports=supports,
                         structured_llm_client=self.structured_llm_client,
                         llm_model=self.llm_model,
                         recheck=recheck,
-                        rechecked_pairs=ledger.carried_pairs,
                         relation_complete=relation_complete,
                     )
                     supports = dict(result.supports)
@@ -1265,7 +1194,6 @@ class MemoryEngine:
                         reconciliation_metrics.refinement_verification_unjudged_count
                     ),
                     "coordinator_recheck_count": len(result.rechecks),
-                    "coordinator_review_count": sum(len(operation.reviews) for operation in result.operations),
                     "coordinator_unresolved_candidate_count": result.unresolved_candidate_count,
                 }
             )
@@ -1363,15 +1291,9 @@ class MemoryEngine:
             )
         )
         proposed_memories = [
-            *(
-                operation.memory for operation in operations
-                if operation.action in {ReconcileAction.ADD, ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE}
-                and operation.memory is not None
-            ),
-            *(
-                review.candidate for operation in operations for review in operation.reviews
-                if review.proposal is CoordinatorProposal.SUPERSEDE
-            ),
+            operation.memory for operation in operations
+            if operation.action in {ReconcileAction.ADD, ReconcileAction.UPDATE, ReconcileAction.SUPERSEDE}
+            and operation.memory is not None
         ]
         for proposed in proposed_memories:
             quality = classify_memory_candidate(proposed)
@@ -1425,10 +1347,6 @@ class MemoryEngine:
             support = supports.get(operation.memory_id or "")
             if operation.memory is not None and support is not None and support.evidence[:1] == (operation.memory,):
                 evidence_memories.extend(support.evidence[1:])
-            for review in operation.reviews:
-                evidence_memories.append(review.candidate)
-                if review.rejection_rebind is not None:
-                    evidence_memories.append(review.rejection_rebind)
         # A partial projection names its carried members by revision; their
         # Observations are the committed Unit revision's.
         carried_observations = ()
@@ -1453,20 +1371,7 @@ class MemoryEngine:
             return projected_evidence.canonical_memories_by_claim_hash[content_hash(raw.content.strip())]
 
         operations = tuple(
-            replace(
-                operation,
-                memory=canonical(operation.memory) if operation.memory is not None else None,
-                reviews=tuple(
-                    replace(
-                        review,
-                        candidate=canonical(review.candidate),
-                        rejection_rebind=(
-                            canonical(review.rejection_rebind) if review.rejection_rebind is not None else None
-                        ),
-                    )
-                    for review in operation.reviews
-                ),
-            )
+            replace(operation, memory=canonical(operation.memory) if operation.memory is not None else None)
             for operation in operations
         )
         defaults = NewMemoryDefaults(
@@ -1538,7 +1443,6 @@ class MemoryEngine:
                 defaults=defaults,
                 evidence_units=projected_evidence.units,
                 evidence_references=projected_evidence.references,
-                unresolved_coordinator_review_ids=unresolved_coordinator_review_ids,
             ),
             document=document,
             unit_input=unit_input,

@@ -230,7 +230,6 @@ async def join_support_and_relation(
     llm_model: str,
     relation_complete: bool,
     recheck: RecheckSupports | None = None,
-    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
 ) -> ReconciliationResult:
     """Run SupportRelationCoordinator over both finished lines of a complete Relation ledger.
 
@@ -250,7 +249,6 @@ async def join_support_and_relation(
         "candidates": new_extractions,
         "incumbents": existing_memories,
         "proofs": relation.proofs,
-        "rechecked_pairs": rechecked_pairs,
         "unjudged_candidates": frozenset(relation.unjudged),
     }
     entries = list(relation.entries)

@@ -115,7 +115,6 @@ from memforge.memory.cross_document_relation_reader import (
     read_memory_relations,
     relation_notice,
 )
-from memforge.memory.coordinator_review import is_coordinator_review
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.lifecycle_plan import (
     LifecycleGate,
@@ -4647,8 +4646,7 @@ async def _lifecycle_review_response(
         "created_at": review.created_at,
         "resolved_at": review.resolved_at,
         "is_stale": review.status.value == "stale",
-        # A coordinator Review is refreshed by the next revision that raises its conflict again.
-        "refreshable": review.status.value == "stale" and not is_coordinator_review(review),
+        "refreshable": review.status.value == "stale",
         "decision_fingerprint": lifecycle_review_decision_fingerprint(review),
         "presentation": _presentation_response(
             present_lifecycle_review(
@@ -8136,10 +8134,7 @@ def create_admin_app(
         config: AppConfig | None = None,
         runtime_provider: RuntimeProvider | None = None,
     ) -> dict[str, object]:
-        from memforge.memory.lifecycle_review import (
-            build_lifecycle_review_approval_plan,
-            build_lifecycle_review_rejection_plan,
-        )
+        from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 
         source = await db.get_source(source_id)
         if not source:
@@ -8182,24 +8177,18 @@ def create_admin_app(
             if not note or not note.strip():
                 raise HTTPException(status_code=400, detail="A note is required to keep the current state")
             try:
-                plan = build_lifecycle_review_rejection_plan(
-                    review, payload, reviewer=reviewer, review_note=note.strip(),
-                )
-                if plan is None:
-                    rejected = await db.resolve_lifecycle_review(
-                        review_id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=note.strip(),
-                    )
-            except ValueError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if plan is None:
-                return {"source_id": source_id, "review_id": review_id, "status": rejected.status.value}
-        else:
-            try:
-                plan = build_lifecycle_review_approval_plan(
-                    review, payload, reviewer=reviewer, review_note=note.strip() if note else None,
+                rejected = await db.resolve_lifecycle_review(
+                    review_id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=note.strip(),
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return {"source_id": source_id, "review_id": review_id, "status": rejected.status.value}
+        try:
+            plan = build_lifecycle_review_approval_plan(
+                review, payload, reviewer=reviewer, review_note=note.strip() if note else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return await _apply_lifecycle_review_plan(
             source_id, review, plan, db, config=config, runtime_provider=runtime_provider,
         )
@@ -8213,12 +8202,10 @@ def create_admin_app(
         config: AppConfig | None,
         runtime_provider: RuntimeProvider | None,
     ) -> dict[str, object]:
-        """Apply one human decision's Plan and deliver its vector changes.
+        """Apply one approval's Plan and deliver its vector changes.
 
-        A decision whose guard no longer holds marks an ordinary Review stale for
-        a reviewer to refresh. A coordinator Review stays pending: stale means
-        its conflict is gone, and the next revision of its Source Unit raises the
-        conflict again against the current state.
+        An approval whose guard no longer holds marks the Review stale for a
+        reviewer to refresh.
         """
         gate = await db.get_lifecycle_gate(source_id)
         if gate.state is not LifecycleGateState.ENABLED:
@@ -8229,10 +8216,7 @@ def create_admin_app(
             await db.apply_lifecycle_plan(plan)
         except ValueError as exc:
             detail = str(exc)
-            outdated = "stale guard" in detail or "already" in detail
-            if outdated and is_coordinator_review(review):
-                detail = f"{detail}; the next revision of its Source Unit raises this conflict again"
-            elif outdated:
+            if "stale guard" in detail or "already" in detail:
                 try:
                     await db.resolve_lifecycle_review(review.id, LifecycleReviewStatus.STALE)
                 except ValueError:

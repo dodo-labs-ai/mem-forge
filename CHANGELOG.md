@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- A document update no longer opens a Review when the document states two
+  incompatible claims that both still have source text, for example an
+  earlier Jira comment saying a bug reproduces and a later one saying it is
+  fixed. Both memories stay active, the new one is searchable at once, and
+  relation discovery, which now also compares memories of the same document,
+  records the pair as `updates` (newer first in search, the older one pointing
+  to it) or `contradicts`. A restatement whose source text Support cannot
+  confirm no longer opens a Review either: the old memory follows its Support
+  result, and the restatement is added when that result removes the old one. The relation classifier contract is
+  `cross-document-relation-v5`. Reviews of this kind opened by earlier versions
+  stay in the review queue; reject them there to keep the current memory, and
+  run `memforge sources reprocess` on their documents if you want the claims
+  they held judged again. Reviews for a gated source, for replacing a memory that
+  another document also supports, and for image-based memories are unchanged.
+
 - Deleting a Source in the admin UI V2 asks for one confirmation that says how
   many items and memories the Source holds; it no longer asks you to type the
   Source's name.

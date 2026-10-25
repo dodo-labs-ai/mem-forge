@@ -157,6 +157,10 @@
     {
       "title": "Decision: the Kestrel job queue is stored in SQLite",
       "file": "reconciliation/status-update-drops-environment.json"
+    },
+    {
+      "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
+      "file": "reconciliation/later-comment-reports-the-fix.json"
     }
   ]
 }

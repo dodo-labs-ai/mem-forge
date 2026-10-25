@@ -95,12 +95,6 @@ export function expiredExplanation(review: Pick<ReviewListItem, "review_origin" 
       canRecheck: true,
     };
   }
-  if (review.review_origin === "lifecycle") {
-    return {
-      text: "The underlying memory changed before a decision was applied. The next revision of its source raises this conflict again, so there is nothing to recheck here.",
-      canRecheck: false,
-    };
-  }
   return {
     text: "The memories in this proposal changed before a decision was applied, so it can no longer be applied. This record remains in audit history.",
     canRecheck: false,

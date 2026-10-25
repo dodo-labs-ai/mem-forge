@@ -160,7 +160,7 @@ async def seeded_page(db: Database, *paragraphs: str, claim: str = TWO):
 
 
 async def lifecycle_reviews(db: Database, memory_id: str):
-    return await db.list_lifecycle_reviews(incumbent_memory_ids=(memory_id,))
+    return [review for review in await db.list_lifecycle_reviews() if review.incumbent_memory_id == memory_id]
 
 
 async def support_texts(db: Database, memory_id: str) -> set[str | None]:

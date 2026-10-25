@@ -23,7 +23,7 @@ from memforge.storage.adapters.protocols import (
 def _candidate(
     memory_id: str,
     *,
-    doc_id: str = "doc-other",
+    doc_id: str | None = "doc-other",
     source_id: str = "src-enabled",
     visibility: str = "workspace",
     owner_user_id: str | None = None,
@@ -49,7 +49,7 @@ class _Relational:
         assert entity_ids == [7]
         assert memory_types is None
         assert limit == 4
-        return [("mem-a", 0.9), ("mem-b", 0.8), ("mem-same-doc", 0.7)]
+        return [("mem-a", 0.9), ("mem-b", 0.8), ("mem-e", 0.7)]
 
     async def list_active_candidate_memories(self, memory_ids):
         self.provenance_ids = tuple(memory_ids)
@@ -58,7 +58,7 @@ class _Relational:
             _candidate("mem-b"),
             _candidate("mem-c"),
             _candidate("mem-d"),
-            _candidate("mem-same-doc", doc_id="doc-new"),
+            _candidate("mem-e"),
         ]
 
     async def list_active_memories(self, memory_ids):
@@ -124,7 +124,6 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
     selection = await retriever.retrieve(
         challenger=challenger,
         entity_ids=[7],
-        doc_id="doc-new",
         actor_user_id="user-a",
         source_id="src-new",
     )
@@ -133,7 +132,7 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
     assert relational.provenance_ids == (
         "mem-a",
         "mem-b",
-        "mem-same-doc",
+        "mem-e",
         "mem-c",
         "mem-d",
     )
@@ -145,7 +144,6 @@ async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_lo
     materialized, loaded = await retriever.load_selected_memories(
         selection,
         challenger=challenger,
-        doc_id="doc-new",
         source_id="src-new",
     )
     assert relational.full_memory_ids == selection.candidate_ids
@@ -202,7 +200,6 @@ async def test_selected_ledger_fails_closed_when_one_full_row_disappears() -> No
     selection = await retriever.retrieve(
         challenger=challenger,
         entity_ids=[7],
-        doc_id="doc-new",
         actor_user_id="user-a",
         source_id="src-new",
     )
@@ -211,7 +208,6 @@ async def test_selected_ledger_fails_closed_when_one_full_row_disappears() -> No
         await retriever.load_selected_memories(
             selection,
             challenger=challenger,
-            doc_id="doc-new",
             source_id="src-new",
         )
 
@@ -273,7 +269,6 @@ async def test_selection_revalidation_fails_when_current_support_changes() -> No
     await retriever.ensure_selection_current(
         selection,
         challenger=challenger,
-        doc_id="doc-new",
         source_id="src-new",
         expected_support_set_hashes=expected,
     )
@@ -283,7 +278,6 @@ async def test_selection_revalidation_fails_when_current_support_changes() -> No
         await retriever.ensure_selection_current(
             selection,
             challenger=challenger,
-            doc_id="doc-new",
             source_id="src-new",
             expected_support_set_hashes=expected,
         )
@@ -321,7 +315,6 @@ async def test_worker_cancellation_is_not_downgraded_to_channel_failure() -> Non
         await retriever.retrieve(
             challenger=challenger,
             entity_ids=[7],
-            doc_id="doc-new",
             actor_user_id="user-a",
             source_id="src-new",
         )
@@ -357,7 +350,6 @@ async def test_failed_discovery_channel_is_audited_without_making_it_mandatory()
     selection = await retriever.retrieve(
         challenger=challenger,
         entity_ids=[7],
-        doc_id="doc-new",
         actor_user_id="user-a",
         source_id="src-new",
     )
@@ -387,7 +379,6 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
                 (memory_id, 1.0)
                 for memory_id in (
                     "eligible",
-                    "same-doc",
                     "wrong-visibility",
                     "wrong-owner",
                     "wrong-repo",
@@ -401,7 +392,6 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
             del memory_ids
             return [
                 _candidate("eligible"),
-                _candidate("same-doc", doc_id="doc-new"),
                 _candidate("wrong-visibility", visibility="private"),
                 _candidate("wrong-owner", owner_user_id="other"),
                 _candidate("wrong-repo", repo_identifier="repo-b"),
@@ -442,7 +432,6 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
     selection = await retriever.retrieve(
         challenger=challenger,
         entity_ids=[7],
-        doc_id="doc-new",
         actor_user_id="user-a",
         source_id="src-new",
         excluded_source_ids=("src-disabled",),
@@ -455,6 +444,59 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
     }
     selected = {item.memory.memory_id: item.memory for item in selection.discovery}
     assert selected["same-and-cross-source"].source_id == "src-other"
+
+
+@pytest.mark.asyncio
+async def test_memories_of_the_challengers_own_document_are_eligible_candidates() -> None:
+    class SameDocumentRelational:
+        async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
+            del entity_ids, scope, memory_types, limit, kwargs
+            return [(memory_id, 1.0) for memory_id in ("mem-new", "same-doc", "other-doc", "no-doc")]
+
+        async def list_active_candidate_memories(self, memory_ids):
+            del memory_ids
+            return [
+                _candidate("mem-new", doc_id="doc-new", source_id="src-new"),
+                _candidate("same-doc", doc_id="doc-new", source_id="src-new"),
+                _candidate("other-doc"),
+                _candidate("no-doc", doc_id=None),
+            ]
+
+    class EmptyKeyword:
+        async def search(self, query, scope, memory_types, limit):
+            del query, scope, memory_types, limit
+            return []
+
+    class EmptyVector:
+        distance_metric = "cosine"
+
+        async def get_record(self, memory_id):
+            del memory_id
+            return None
+
+    retriever = CrossDocumentCandidateRetriever(
+        relational=SameDocumentRelational(),
+        keyword=EmptyKeyword(),
+        vector=EmptyVector(),
+    )
+    challenger = SimpleNamespace(
+        id="mem-new",
+        content="Payroll runs weekly.",
+        memory_type="fact",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="repo-a",
+        project_key="PAY",
+    )
+
+    selection = await retriever.retrieve(
+        challenger=challenger,
+        entity_ids=[7],
+        actor_user_id="user-a",
+        source_id="src-new",
+    )
+
+    assert set(selection.candidate_ids) == {"same-doc", "other-doc"}
 
 
 @pytest.mark.asyncio
@@ -522,7 +564,6 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
     selection = await retriever.retrieve(
         challenger=challenger,
         entity_ids=[7],
-        doc_id="doc-new",
         actor_user_id="user-a",
         source_id="src-new",
     )

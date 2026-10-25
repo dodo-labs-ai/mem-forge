@@ -122,7 +122,7 @@ async def test_uncertain_relation_never_becomes_add():
 
 
 @pytest.mark.asyncio
-async def test_an_equivalent_candidate_of_an_unsupported_incumbent_stays_unresolved():
+async def test_an_unsupported_incumbent_keeps_its_result_and_its_equivalent_candidate_is_added():
     client = Client("equivalent")
     result = await reconcile_memories(
         new_extractions=[candidate()],
@@ -131,10 +131,12 @@ async def test_an_equivalent_candidate_of_an_unsupported_incumbent_stays_unresol
         supports=dict([pinned("memory", False, "Current source no longer states it")]),
     )
     assert result.failure is None
-    [operation] = result.operations
-    assert operation.action == ReconcileAction.NOOP and operation.memory_id == "memory"
-    assert operation.memory is None and not operation.flag_for_review
-    assert operation.support_revalidation_skipped
+    # Without a re-check the claim stays unsupported: it loses this source's Support beside the added Candidate.
+    assert [recheck.memory_id for recheck in result.rechecks] == ["memory"]
+    assert [(op.action, op.memory_id) for op in result.operations] == [
+        (ReconcileAction.ADD, None), (ReconcileAction.DELETE, "memory"),
+    ]
+    assert not any(op.flag_for_review or op.support_revalidation_skipped for op in result.operations)
     assert client.calls == 1
 
 
@@ -375,7 +377,7 @@ async def test_a_revision_that_cannot_be_verified_stays_uncertain():
 
     assert result.failure is None and result.unresolved_candidate_count == 1
     [operation] = result.operations
-    assert operation.action == ReconcileAction.NOOP and operation.relation_undecided
+    assert operation.action == ReconcileAction.NOOP
 
 
 @pytest.mark.asyncio
@@ -435,16 +437,15 @@ def _named(memory_id, claim):
 
 @pytest.mark.asyncio
 async def test_the_callers_coverage_verdict_decides_whether_revisions_are_verified():
-    """A Candidate carried from a pending Review lengthens the Candidate list; it must not switch verification off."""
+    """Verification follows the caller's verdict on the Relation line's coverage, the one DestructiveValidation reads."""
     from memforge.pipeline.reconciler import join_support_and_relation
 
-    carried = RawMemory(content="A carried claim from a pending Review.", memory_type="fact")
     results = {}
     for complete in (True, False):
         client = Client("refines", "challenger_to_candidate")
         client.refinement_answer = "drops"
         results[complete] = (client, await join_support_and_relation(
-            _refinement_ledger("memory"), new_extractions=[candidate(), carried], existing_memories=[memory()],
+            _refinement_ledger("memory"), new_extractions=[candidate()], existing_memories=[memory()],
             supports=dict([pinned("memory", True)]), structured_llm_client=client, llm_model="test-model",
             relation_complete=complete,
         ))
@@ -479,9 +480,10 @@ async def test_each_pair_takes_its_own_answer():
     )
 
     by_memory = {op.memory_id: op for op in result.operations if op.memory_id}
-    assert by_memory["m1"].action is ReconcileAction.NOOP and not by_memory["m1"].relation_undecided
+    assert by_memory["m1"].action is ReconcileAction.NOOP and by_memory["m3"].action is ReconcileAction.NOOP
     assert by_memory["m2"].action is ReconcileAction.UPDATE
-    assert by_memory["m3"].relation_undecided
+    # The dropped revision adds its Candidate beside m1; the unjudged one is consumed and leaves m3 unresolved.
+    assert result.unresolved_candidate_count == 1
     assert [op.memory.content for op in result.operations if op.action is ReconcileAction.ADD] == ["New claim one."]
     assert (result.metrics.refinement_verification_count, result.metrics.refinement_verification_dropped_count,
             result.metrics.refinement_verification_unjudged_count) == (3, 1, 1)

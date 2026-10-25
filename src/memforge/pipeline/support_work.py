@@ -10,7 +10,7 @@ the same work through this one function, over the store or over a pinned case.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -38,16 +38,11 @@ class SupportBaselineStore(Protocol):
 
 @dataclass(frozen=True)
 class SupportWork:
-    """The work items in assessment order, by Memory, and the contexts they read.
-
-    ``context`` reads against the committed base; ``context_for`` builds one
-    against another baseline that shares its Fragment indexes.
-    """
+    """The work items in assessment order, by Memory, and the context of the committed base."""
 
     items: tuple[SupportWorkItem, ...]
     by_memory: Mapping[str, tuple[SupportWorkItem, ...]]
     context: RevisionAssessmentContext
-    context_for: Callable[[SourceProjection | None], RevisionAssessmentContext]
     unusable_baseline_count: int
     reprocess_count: int
 
@@ -152,7 +147,6 @@ async def plan_support_work(
         items=tuple(items),
         by_memory={memory_id: tuple(memory_items) for memory_id, memory_items in by_memory.items()},
         context=context,
-        context_for=context_for,
         unusable_baseline_count=unusable_count,
         reprocess_count=reprocess_count,
     )

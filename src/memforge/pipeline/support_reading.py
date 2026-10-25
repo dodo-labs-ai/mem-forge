@@ -43,26 +43,6 @@ def evidence_digests(selection: ResolvedEvidenceSelection) -> tuple[EvidenceDige
     }))
 
 
-def exact_evidence_selection(
-    context: RevisionAssessmentContext, parts: Sequence[ActiveSupportEvidence],
-) -> ResolvedEvidenceSelection | None:
-    """Use the same pinned, bilateral correspondence for a staged selection."""
-    catalog = context.catalog(context.full_fragments)
-    refs: dict[EvidenceRole, list[str]] = {EvidenceRole.PRIMARY: [], EvidenceRole.REQUIRED: []}
-    displays = {}
-    for correspondence in correspond_evidence(context, parts):
-        if correspondence.status is not EvidenceCorrespondence.EXACT_UNCHANGED:
-            return None
-        refs[correspondence.evidence.role].append(correspondence.current[0].reference)
-        if correspondence.evidence.presentation_sha256 == correspondence.current[0].presentation_sha256:
-            displays[correspondence.current[0].reference] = correspondence.evidence.display_text
-    if len(refs[EvidenceRole.PRIMARY]) != 1:
-        return None
-    primary_ref = refs[EvidenceRole.PRIMARY][0]
-    required = tuple(dict.fromkeys(ref for ref in refs[EvidenceRole.REQUIRED] if ref != primary_ref))
-    return catalog.resolve_selection(primary_ref=primary_ref, required_refs=required, display_text_by_ref=displays)
-
-
 def correspond_evidence(context, parts):
     """Correspond pinned parts against the complete operation-local indexes."""
     catalog = context.catalog(context.full_fragments)

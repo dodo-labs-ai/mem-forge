@@ -252,7 +252,6 @@ class RelationDiscovery:
         selection = await self._candidate_retriever.retrieve(
             challenger=challenger,
             entity_ids=entity_ids,
-            doc_id=evidence_unit.doc_id or request.doc_id,
             actor_user_id=actor_user_id,
             source_id=request.source_id,
             excluded_source_ids=disabled_source_ids,
@@ -260,7 +259,6 @@ class RelationDiscovery:
         selection, loaded_by_id = await self._candidate_retriever.load_selected_memories(
             selection,
             challenger=challenger,
-            doc_id=evidence_unit.doc_id or request.doc_id,
             source_id=request.source_id,
             excluded_source_ids=disabled_source_ids,
         )
@@ -298,7 +296,6 @@ class RelationDiscovery:
             await self._candidate_retriever.ensure_selection_current(
                 selection,
                 challenger=challenger,
-                doc_id=evidence_unit.doc_id or request.doc_id,
                 source_id=request.source_id,
                 excluded_source_ids=disabled_source_ids,
                 expected_support_set_hashes=candidate_support_set_hashes,

@@ -18,7 +18,6 @@ from memforge.memory.lifecycle_plan import (
     ReconciliationScope,
     StaleGuard,
 )
-from memforge.memory.coordinator_review import is_coordinator_review
 from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryRequest,
     relation_discovery_request_id,
@@ -35,10 +34,8 @@ def build_lifecycle_review_approval_plan(
     """Turn a pending proposal into a fresh atomic plan with the Review's stale guards.
 
     Approval never mutates from the review row alone. The creating plan supplies
-    the source-unit revision, while the review carries only the mutations
-    proposed for its one incumbent. A coordinator Review is guarded by the
-    incumbent state its creating plan left behind; any other Review by the
-    creating plan's own incumbent snapshot.
+    the source-unit revision and the incumbent snapshot that guards it, while the
+    review carries only the mutations proposed for its one incumbent.
     """
 
     _require_pending(review)
@@ -75,41 +72,6 @@ def build_lifecycle_review_approval_plan(
             source_unit_id=_text(scope_payload.get("source_unit_id"), "scope.source_unit_id"),
             source_unit_revision_id=_optional_text(scope_payload.get("target_unit_revision_id")),
         ),
-    )
-
-
-def build_lifecycle_review_rejection_plan(
-    review: LifecycleReview,
-    original_plan_payload: Mapping[str, object],
-    *,
-    reviewer: str | None = None,
-    review_note: str | None = None,
-) -> LifecyclePlan | None:
-    """Plan a rejection that must change state, or None when rejection keeps the status quo.
-
-    A coordinator Review of an old Memory that also has an equivalent Candidate
-    records how rejection keeps it: bound to that Candidate's Evidence. The
-    rebind is guarded exactly like approval.
-    """
-
-    _require_pending(review)
-    if review.staged_evidence.get("rejection_mutations") is None:
-        return None
-    source_id = _review_source_id(original_plan_payload)
-    return _review_decision_plan(
-        review,
-        original_plan_payload,
-        plan_id=f"lifecycle-review-rejection-{review.id}",
-        scope_kind="review-rejection",
-        status=LifecycleReviewStatus.REJECTED,
-        decision=IncumbentDecision(
-            memory_id=review.incumbent_memory_id,
-            disposition=IncumbentDisposition.KEEP,
-            reason=review_note or "rejected lifecycle review",
-        ),
-        mutations=_staged_mutations(review, "rejection_mutations", source_id),
-        reviewer=reviewer,
-        review_note=review_note,
     )
 
 
@@ -196,13 +158,6 @@ def _review_stale_guard(review: LifecycleReview, original_plan_payload: Mapping[
         str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
     )
     incumbent_id = review.incumbent_memory_id
-    if is_coordinator_review(review):
-        own = _mapping(review.staged_evidence.get("stale_guard"), "staged_evidence.stale_guard")
-        return StaleGuard(
-            observation_revision_ids=observation_revision_ids,
-            support_set_hashes={incumbent_id: _text(own.get("support_set_hash"), "stale_guard.support_set_hash")},
-            memory_versions={incumbent_id: _text(own.get("memory_version"), "stale_guard.memory_version")},
-        )
     support_hashes = _string_mapping(stale_payload.get("support_set_hashes"), "support_set_hashes")
     memory_versions = _string_mapping(stale_payload.get("memory_versions"), "memory_versions")
     if incumbent_id not in support_hashes or incumbent_id not in memory_versions:
@@ -231,10 +186,6 @@ def build_lifecycle_review_refresh_plan(
 
     if review.status is not LifecycleReviewStatus.STALE:
         raise ValueError("only a stale lifecycle review can be refreshed")
-    if is_coordinator_review(review):
-        raise ValueError(
-            "a coordinator Review is refreshed by the next revision of its Source Unit, which raises its conflict again"
-        )
     if not current_support_set_hash or not current_memory_version:
         raise ValueError("lifecycle review refresh requires a current incumbent snapshot")
 

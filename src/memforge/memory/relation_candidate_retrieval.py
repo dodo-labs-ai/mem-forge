@@ -1,4 +1,4 @@
-"""Provider-neutral candidate retrieval for cross-document relation checks."""
+"""Provider-neutral candidate retrieval for relation discovery."""
 
 from __future__ import annotations
 
@@ -160,7 +160,6 @@ class CrossDocumentCandidateRetriever:
         *,
         challenger: Memory,
         entity_ids: Sequence[int],
-        doc_id: str,
         actor_user_id: str | None,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
@@ -177,7 +176,6 @@ class CrossDocumentCandidateRetriever:
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=challenger,
-            doc_id=doc_id,
             source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
@@ -226,7 +224,6 @@ class CrossDocumentCandidateRetriever:
         selection: CrossDocumentCandidateSelection,
         *,
         challenger: Memory,
-        doc_id: str,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
     ) -> tuple[CrossDocumentCandidateSelection, Mapping[str, Memory]]:
@@ -238,7 +235,6 @@ class CrossDocumentCandidateRetriever:
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=challenger,
-            doc_id=doc_id,
             source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
@@ -262,7 +258,6 @@ class CrossDocumentCandidateRetriever:
         selection: CrossDocumentCandidateSelection,
         *,
         challenger: Memory,
-        doc_id: str,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
         expected_support_set_hashes: Mapping[str, str] | None = None,
@@ -280,7 +275,6 @@ class CrossDocumentCandidateRetriever:
         eligible = _eligible_candidate_rows(
             provenance_rows,
             challenger=current_challenger,
-            doc_id=doc_id,
             source_id=source_id,
             excluded_source_ids=frozenset(excluded_source_ids),
         )
@@ -414,10 +408,10 @@ def _eligible_candidate_rows(
     rows: Sequence[CandidateMemory],
     *,
     challenger: Memory,
-    doc_id: str,
     source_id: str,
     excluded_source_ids: frozenset[str],
 ) -> dict[str, CandidateMemory]:
+    """Active Memories the challenger may be related to, its own Source Unit's included."""
     eligible: dict[str, CandidateMemory] = {}
     for candidate in rows:
         if candidate.memory_id == challenger.id:
@@ -428,7 +422,7 @@ def _eligible_candidate_rows(
             continue
         if candidate.repo_identifier != challenger.repo_identifier:
             continue
-        if not candidate.doc_id or candidate.doc_id == doc_id:
+        if not candidate.doc_id:
             continue
         if candidate.source_id is not None and candidate.source_id in excluded_source_ids:
             continue
