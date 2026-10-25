@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Deleting a Source in the admin UI V2 asks for one confirmation that says how
+  many items and memories the Source holds; it no longer asks you to type the
+  Source's name.
+
 - A document update revises an old memory only after a separate check of that
   one pair confirms the new claim states every fact of the old one. When the
   check finds a fact missing (or is unsure), the old memory stays and the new

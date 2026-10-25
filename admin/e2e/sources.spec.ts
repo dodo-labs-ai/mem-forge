@@ -95,11 +95,16 @@ test("a source's scope change in progress shows in its drawer and restores the p
   await expect.poll(() => saved).toEqual([{ config: restoreConfig, expected_scope_transition_id: "scope-transition-1" }]);
 });
 
-test("the delete dialog wraps a long Source name as one sentence above the input", async ({ page }) => {
+test("deleting a source is one confirmation with nothing to type", async ({ page }) => {
   const name = "Teams - Flexible Payroll Dev Group";
-  await page.setViewportSize({ width: 800, height: 900 });
+  let deleted = false;
   await page.route("**/api/**", (route) => {
-    const path = new URL(route.request().url()).pathname;
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "DELETE" && path === `/api/v1/sources/${SOURCE.id}`) {
+      deleted = true;
+      return route.fulfill({ json: { status: "deleted" } });
+    }
     const body = path === "/api/v1/sources" ? { data: [{ ...SOURCE, name }] } : RESPONSES[path];
     return body === undefined ? route.fulfill({ status: 404, json: { detail: "Not stubbed" } }) : route.fulfill({ json: body });
   });
@@ -108,20 +113,12 @@ test("the delete dialog wraps a long Source name as one sentence above the input
   await page.getByRole("button", { name: `More actions for ${name}` }).click();
   await page.getByRole("menuitem", { name: "Delete source" }).click();
 
-  const dialog = page.getByRole("dialog");
-  const input = dialog.getByLabel(/to confirm/);
-  // The dialog opens ready to type the name.
-  await expect(input).toBeFocused();
-  const label = dialog.locator('label[for="confirm-dialog-text"]');
-  const labelBox = await label.boundingBox();
-  const nameBox = await label.locator("span").boundingBox();
-  const inputBox = await input.boundingBox();
-  // One sentence that wraps as text, not three flex columns side by side.
-  await expect(label).toHaveCSS("display", "block");
-  // The wrapped name stays inside its label, and the label stays above the input.
-  expect(nameBox!.y).toBeGreaterThanOrEqual(labelBox!.y - 1);
-  expect(nameBox!.y + nameBox!.height).toBeLessThanOrEqual(labelBox!.y + labelBox!.height + 1);
-  expect(labelBox!.y + labelBox!.height).toBeLessThanOrEqual(inputBox!.y);
-  await expect(label).toHaveCSS("user-select", "text");
-  await expect(dialog.getByRole("button", { name: `Copy ${name}` })).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: `Delete ${name}?` });
+  await expect(dialog).toContainText("412 items it synced");
+  await expect(dialog).toContainText("96 memories");
+  await expect(dialog.getByRole("textbox")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Delete source" }).click();
+
+  await expect(dialog).toBeHidden();
+  expect(deleted).toBe(true);
 });
