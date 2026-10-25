@@ -252,6 +252,7 @@ def build_lifecycle_plan(
                 mutations.append(
                     _review_mutation(
                         scope,
+                        plan_id,
                         operation,
                         memory_id,
                         proposed_mutations=tuple(proposed_mutations),
@@ -311,6 +312,7 @@ def build_lifecycle_plan(
                 mutations.append(
                     _review_mutation(
                         scope,
+                        plan_id,
                         operation,
                         memory_id,
                         proposed_mutations=tuple(proposed_mutations),
@@ -418,6 +420,7 @@ def build_lifecycle_plan(
                 mutations.append(
                     _review_mutation(
                         scope,
+                        plan_id,
                         operation,
                         memory_id,
                         proposed_mutations=tuple(proposed_mutations),
@@ -561,6 +564,7 @@ def lifecycle_plan_id(scope: ReconciliationScope) -> str:
 
 def _review_mutation(
     scope: ReconciliationScope,
+    plan_id: str,
     operation: ReconcileOperation,
     memory_id: str,
     *,
@@ -585,10 +589,8 @@ def _review_mutation(
         memory_id=memory_id,
         source_id=scope.source_id,
         payload={
-            # A run's scope covers many Source Units, and an old Memory may have Support in several.
-            "review_id": lifecycle_stable_id(
-                "review", scope.id, scope.source_unit_id, memory_id, operation.action.value,
-            ),
+            # One Review per Plan and incumbent: a retry of the same Plan names the same Review.
+            "review_id": lifecycle_stable_id("review", plan_id, memory_id, operation.action.value),
             "reason": operation.reason or "lifecycle review required",
             "staged_evidence": staged,
         },

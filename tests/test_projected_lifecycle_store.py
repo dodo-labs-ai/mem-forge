@@ -748,11 +748,12 @@ def _gated_retirement_plan(
     support_hash: str,
     *,
     plan_id: str,
+    scope_id: str | None = None,
 ) -> LifecyclePlan:
     return build_lifecycle_plan(
         plan_id=plan_id,
         scope=ReconciliationScope(
-            id=f"scope-{plan_id}",
+            id=scope_id or f"scope-{plan_id}",
             source_id="src-1",
             source_unit_id="unit-page-1",
             base_unit_revision_id="unitrev-page-1-v1",
@@ -782,6 +783,19 @@ def _gated_retirement_plan(
         ),
     )
 
+
+
+def test_each_plan_names_its_own_review_of_one_incumbent() -> None:
+    incumbent = Memory(id="mem-1", content="claim", content_hash=content_hash("claim"), memory_type="fact")
+
+    def review_id(plan_id: str) -> str:
+        plan = _gated_retirement_plan("unit-1", incumbent, "hash", plan_id=plan_id, scope_id="scope:run-1")
+        [create] = [item for item in plan.mutations if item.mutation_type is LifecycleMutationType.CREATE_REVIEW]
+        return create.payload["review_id"]
+
+    # Two Plans of one run share a scope; only a retry of the same Plan names the same Review.
+    assert review_id("plan-a") != review_id("plan-b")
+    assert review_id("plan-a") == review_id("plan-a")
 
 @pytest.mark.asyncio
 async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(db: Database) -> None:

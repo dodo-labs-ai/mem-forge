@@ -28,8 +28,8 @@ MemForge or contribute to it.
    decisions, procedures and conventions. Each memory keeps Evidence that
    points back to the text it came from.
 3. **Reconcile.** When a source changes, the memories built on it are rechecked
-   against the new revision. A memory is kept, replaced or retired; a source
-   that states two incompatible claims keeps both. Two memories, from one
+   against the new revision. A memory is kept, replaced or retired, or it waits
+   for a review; a source that states two incompatible claims keeps both. Two memories, from one
    document or from different ones, are related when they state the same thing,
    update one another or contradict one another.
 4. **Recall.** An agent calls `search` for memory cards, `get_memory` for a
