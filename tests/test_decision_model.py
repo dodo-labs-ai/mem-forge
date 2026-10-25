@@ -344,7 +344,6 @@ def test_source_lifecycle_operation_identity_names_the_model_of_each_decision_ta
         candidates=[],
         incumbents=[],
         support_hashes={},
-        gate_state="enabled",
         update_mode="incremental",
         changed_hunks=None,
         update_plan_stats=None,

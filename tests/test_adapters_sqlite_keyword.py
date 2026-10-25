@@ -385,15 +385,15 @@ async def test_metadata_trigram_recall_handles_compound_no_space_query(db):
 
 @pytest.mark.asyncio
 async def test_metadata_index_populates_from_atomic_memory_source_insert(db):
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
+        source="user_memory",
     )
     await db.insert_memory_with_source_and_relation(
         _memory("m-blocker", "Lifecycle assignment skips person assignment creation"),
         doc_id="PAYR-179397",
-        source_type="jira",
+        source_type="user_memory",
         source_updated_at=datetime.now(timezone.utc),
     )
 

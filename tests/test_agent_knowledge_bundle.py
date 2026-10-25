@@ -71,7 +71,6 @@ async def bundle_stack(tmp_path, monkeypatch):
         created_by_user_id="u-andrew",
         execution_owner_user_id="u-andrew",
     )
-    await db.enable_lifecycle_gate("src-agent-sessions-codex")
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
     store = MemoryStore(
@@ -1014,7 +1013,6 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert source_unit is not None
     initial_revision = await db.get_current_source_unit_revision(source_unit.id)
     assert initial_revision is not None
-    await db.enable_lifecycle_gate("src-agent-sessions-codex")
 
     updated = await service.apply_patch_proposal(
         proposal=_proposal(

@@ -155,7 +155,6 @@ async def test_atomic_commit_requires_complete_final_work(tmp_path, work_kind):
     from memforge.memory.lifecycle_plan import (
         LifecyclePlan,
         ReconciliationScope,
-        LifecycleGateState,
         CoverageProof,
         StaleGuard,
     )
@@ -173,7 +172,6 @@ async def test_atomic_commit_requires_complete_final_work(tmp_path, work_kind):
             base_unit_revision_id=delta.previous_unit_revision_id,
             target_unit_revision_id=delta.current_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.GATED,
         coverage_proof=CoverageProof((), (), (), ()),
         stale_guard=StaleGuard((), {}),
         mutations=(),

@@ -132,7 +132,6 @@ async def test_reprocessed_claim_naming_another_identifier_than_immutable_source
     db: Database, correction: bool,
 ) -> None:
     await _set_fixture_source_type(db, "jira")
-    await db.enable_lifecycle_gate(SOURCE_ID)
     first = _jira_projection(
         run_id="complete-support-1", description="Payroll context.", comment_id="501", comment_body=DECISION,
     )

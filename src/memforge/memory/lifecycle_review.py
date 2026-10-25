@@ -9,7 +9,6 @@ from memforge.memory.lifecycle_plan import (
     CoverageProof,
     IncumbentDecision,
     IncumbentDisposition,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
@@ -113,7 +112,6 @@ def _review_decision_plan(
     plan = LifecyclePlan(
         id=plan_id,
         scope=scope,
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=(review.incumbent_memory_id,),
             incumbent_decisions=(decision,),
@@ -173,7 +171,6 @@ def build_lifecycle_review_refresh_plan(
     review: LifecycleReview,
     original_plan_payload: Mapping[str, object],
     *,
-    gate_state: LifecycleGateState,
     current_support_set_hash: str,
     current_memory_version: str,
 ) -> tuple[LifecyclePlan, str]:
@@ -263,7 +260,6 @@ def build_lifecycle_review_refresh_plan(
     plan = LifecyclePlan(
         id=plan_id,
         scope=scope,
-        gate_state=gate_state,
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=(incumbent_id,),
             incumbent_decisions=(

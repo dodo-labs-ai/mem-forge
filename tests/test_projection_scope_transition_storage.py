@@ -13,7 +13,6 @@ import pytest_asyncio
 from memforge.memory.evidence import EVIDENCE_UNIT_SUPPORT_SCOPE
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
-    LifecycleGateState,
     LifecyclePlan,
     ReconciliationScope,
     StaleGuard,
@@ -114,7 +113,7 @@ async def _member_revisions(db: Database, transition_id: str) -> dict[str, str]:
     return {str(row["doc_id"]): str(row["unit_revision_id"]) for row in rows}
 
 
-def _plan(projection: SourceProjection, gate_state: LifecycleGateState) -> LifecyclePlan:
+def _plan(projection: SourceProjection, *, observation_revision_ids: tuple[str, ...] = ()) -> LifecyclePlan:
     delta = projection.deltas[0]
     return LifecyclePlan(
         id=f"plan-{projection.run_id}",
@@ -125,9 +124,8 @@ def _plan(projection: SourceProjection, gate_state: LifecycleGateState) -> Lifec
             base_unit_revision_id=None,
             target_unit_revision_id=delta.current_unit_revision_id,
         ),
-        gate_state=gate_state,
         coverage_proof=CoverageProof((), (), (), ()),
-        stale_guard=StaleGuard((), {}),
+        stale_guard=StaleGuard(observation_revision_ids, {}),
         mutations=(),
     )
 
@@ -322,16 +320,16 @@ async def test_a_member_rolls_back_with_its_lifecycle_commit(db: Database) -> No
     refused, refused_input = _document("a.md", "refused")
     committed, committed_input = _document("b.md", "committed")
 
-    with pytest.raises(ValueError, match="gate stale guard"):
+    with pytest.raises(ValueError, match="observation revision stale guard"):
         await db.apply_source_projection_lifecycle(
             refused,
-            _plan(refused, LifecycleGateState.ENABLED),
+            _plan(refused, observation_revision_ids=("obsrev-superseded",)),
             unit_input=refused_input,
             scope_transition_id="t1",
         )
     await db.apply_source_projection_lifecycle(
         committed,
-        _plan(committed, LifecycleGateState.GATED),
+        _plan(committed),
         unit_input=committed_input,
         scope_transition_id="t1",
     )

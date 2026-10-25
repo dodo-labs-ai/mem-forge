@@ -150,8 +150,6 @@ from memforge.memory.evidence import (
 from memforge.memory.lifecycle_plan import (
     RetainedSupportEdge,
     contested_supports_from_staged_evidence,
-    LifecycleGate,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
@@ -1621,15 +1619,6 @@ CREATE TABLE IF NOT EXISTS source_derivation_work (
     work_id TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     PRIMARY KEY (derivation_id, work_id)
-);
-
-CREATE TABLE IF NOT EXISTS source_lifecycle_gates (
-    source_id   TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
-    state       TEXT NOT NULL CHECK (state IN ('gated', 'enabled')),
-    reason      TEXT,
-    audited_at  TEXT,
-    enabled_at  TEXT,
-    updated_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS evidence_references (
@@ -5162,6 +5151,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE projection_scope_transitions ADD COLUMN listed_count INTEGER "
             "CHECK (listed_count IS NULL OR listed_count >= 0)",
         ],
+    ),
+    (
+        130,
+        "Remove the per-Source lifecycle gate",
+        # Every Source applies its lifecycle Plans under the planner's
+        # current-Support check and the Plan stale guards.
+        ["DROP TABLE IF EXISTS source_lifecycle_gates"],
     ),
 ]
 
@@ -9799,77 +9795,6 @@ class Database:
                 )
         return tuple((key, unit) for (key, _unit_id), unit in sorted(holders.items()))
 
-    async def count_active_source_memories_without_support(self, source_id: str) -> int:
-        """Count active Memories whose same-source support invariant is absent."""
-
-        async with self.db.execute(
-            """SELECT COUNT(DISTINCT ms.memory_id) AS count
-               FROM memory_sources ms
-               JOIN memories m ON m.id = ms.memory_id
-               WHERE ms.source_id = ?
-                 AND m.status = 'active'
-                 AND NOT EXISTS (
-                     SELECT 1
-                     FROM memory_unit_support_assertions msa
-                     JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-                     WHERE msa.memory_id = ms.memory_id
-                       AND msa.source_id = ms.source_id
-                       AND msa.active = 1
-                       AND eu.source_id = msa.source_id
-                       AND eu.doc_id = ms.doc_id
-                 )""",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["count"] if row is not None else 0)
-
-    async def count_active_supported_memories_without_source_provenance(
-        self,
-        source_id: str,
-    ) -> int:
-        """Count active supported Memories missing their same-source provenance projection."""
-
-        async with self.db.execute(
-            """SELECT COUNT(DISTINCT msa.memory_id) AS count
-               FROM memory_unit_support_assertions msa
-               JOIN memories m ON m.id = msa.memory_id
-               LEFT JOIN evidence_units eu ON eu.id = msa.evidence_unit_id
-               WHERE msa.source_id = ?
-                 AND msa.active = 1
-                 AND m.status = 'active'
-                 AND (
-                     eu.id IS NULL OR eu.doc_id IS NULL OR NOT EXISTS (
-                         SELECT 1 FROM memory_sources ms
-                         WHERE ms.memory_id = msa.memory_id
-                           AND ms.source_id = msa.source_id
-                           AND ms.doc_id = eu.doc_id
-                     )
-                 )""",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["count"] if row is not None else 0)
-
-    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
-        async with self.db.execute(
-            "SELECT * FROM source_lifecycle_gates WHERE source_id = ?",
-            (source_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return LifecycleGate(
-                source_id=source_id,
-                state=LifecycleGateState.GATED,
-                reason="lifecycle gate has not been enabled for this Source",
-            )
-        return LifecycleGate(
-            source_id=row["source_id"],
-            state=LifecycleGateState(row["state"]),
-            reason=row["reason"],
-            enabled_at=row["enabled_at"],
-            audited_at=row["audited_at"],
-        )
-
     async def _assert_source_activity_fence_unlocked(
         self,
         source_id: str,
@@ -9901,45 +9826,6 @@ class Database:
             or str(lease["lease_until"]) <= _utc_iso(now)
         ):
             raise SourceActivityConflict(f"source activity fence is not current: {source_activity.id}")
-
-    async def enable_lifecycle_gate(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate:
-        """Enable destructive lifecycle once every active Memory has complete Support."""
-
-        async with self._write_lock:
-            try:
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                if await self.count_active_source_memories_without_support(source_id):
-                    raise ValueError("source-backed Memory lacks validated support lineage")
-                if await self.count_active_supported_memories_without_source_provenance(source_id):
-                    raise ValueError("active support lacks source provenance")
-                now = _now_iso()
-                await self.db.execute(
-                    """INSERT INTO source_lifecycle_gates (
-                        source_id, state, reason, audited_at, enabled_at, updated_at
-                    ) VALUES (?, 'enabled', NULL, ?, ?, ?)
-                    ON CONFLICT(source_id) DO UPDATE SET
-                        state='enabled', reason=NULL, audited_at=excluded.audited_at,
-                        enabled_at=COALESCE(source_lifecycle_gates.enabled_at, excluded.enabled_at),
-                        updated_at=excluded.updated_at""",
-                    (source_id, now, now, now),
-                )
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        return await self.get_lifecycle_gate(source_id)
 
     async def _acquire_source_activity_unlocked(
         self,
@@ -10891,14 +10777,6 @@ class Database:
                         return
                     raise ValueError(f"lifecycle plan is already {existing['status']}")
 
-                async with self.db.execute(
-                    "SELECT state FROM source_lifecycle_gates WHERE source_id = ?",
-                    (plan.scope.source_id,),
-                ) as cursor:
-                    gate_row = await cursor.fetchone()
-                gate_state = LifecycleGateState(gate_row["state"]) if gate_row else LifecycleGateState.GATED
-                if gate_state is not plan.gate_state:
-                    raise ValueError("lifecycle plan gate stale guard failed")
                 async with self.db.execute(
                     "SELECT current_revision_id FROM source_units WHERE id = ?",
                     (plan.scope.source_unit_id,),
@@ -15104,13 +14982,11 @@ class Database:
             return
         placeholders = ", ".join("?" for _ in writers)
         async with self.db.execute(
-            f"""SELECT 1 FROM source_lifecycle_gates
-                WHERE source_id IN ({placeholders}) AND state = ?
-                LIMIT 1""",
-            (*writers, LifecycleGateState.ENABLED.value),
+            f"SELECT 1 FROM sources WHERE id IN ({placeholders}) LIMIT 1",
+            writers,
         ) as cursor:
-            gate = await cursor.fetchone()
-        if gate is not None:
+            configured_writer = await cursor.fetchone()
+        if configured_writer is not None:
             raise ValueError(
                 "direct configured-source Memory write rejected; projected lifecycle required"
             )

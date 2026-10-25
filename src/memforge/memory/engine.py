@@ -45,7 +45,6 @@ from memforge.memory.evidence import (
     EvidenceUnit,
 )
 from memforge.memory.lifecycle_plan import (
-    LifecycleGateState,
     LifecyclePlan,
     ProjectedLifecycleDeferredError,
     AuthorityPlanStaleError,
@@ -171,7 +170,6 @@ class SourceUnitLifecycleExecutionError(RuntimeError):
 class _PreparedLifecyclePlanInputs:
     plan_id: str
     scope: ReconciliationScope
-    gate_state: LifecycleGateState
     operations: tuple[ReconcileOperation, ...]
     incumbents: Mapping[str, Memory]
     memory_authority_hashes: Mapping[str, str]
@@ -347,8 +345,8 @@ class MemoryEngine:
         A provider-backed rename can change ``doc_id`` without changing the
         Source Unit. Unit Support is therefore authoritative for the projected
         path; an active Memory with same-document extracted provenance but no
-        Support in this Unit is included so the conservative lineage gate
-        still sees it.
+        Support in this Unit is included so the planner's current-Support
+        check still sees it.
         """
         unit_support = await self.db.get_source_unit_support_unit_ids(source_unit_id)
         incumbents_by_id = {
@@ -547,11 +545,6 @@ class MemoryEngine:
         """Refresh only deterministic commit inputs for one prepared intent."""
 
         inputs = prepared.plan_inputs
-        gate = await self.db.get_lifecycle_gate(inputs.scope.source_id)
-        if gate.state is not inputs.gate_state:
-            raise ProjectedSupportInvariantError(
-                "prepared lifecycle gate changed before commit"
-            )
         visibility, owner_user_id = await memory_visibility_for_source_id(
             self.db,
             source_id=inputs.scope.source_id,
@@ -636,7 +629,6 @@ class MemoryEngine:
         return build_lifecycle_plan(
             plan_id=inputs.plan_id,
             scope=inputs.scope,
-            gate_state=inputs.gate_state,
             operations=inputs.operations,
             incumbents=current_incumbents,
             source_support_unit_ids=source_support,
@@ -943,7 +935,6 @@ class MemoryEngine:
             doc_id=doc_id,
             source_unit_id=scope.source_unit_id,
         )
-        gate = await self.db.get_lifecycle_gate(scope.source_id)
         incumbent_support_states = await self.db.get_active_memory_support_states(
             tuple(memory.id for memory in incumbents)
         )
@@ -956,7 +947,6 @@ class MemoryEngine:
             candidates=filtered_memories,
             incumbents=incumbents,
             support_hashes=support_hashes,
-            gate_state=gate.state.value,
             update_mode=update_mode,
             changed_hunks=changed_hunks,
             update_plan_stats=update_plan_stats,
@@ -1436,7 +1426,6 @@ class MemoryEngine:
             plan_inputs=_PreparedLifecyclePlanInputs(
                 plan_id=lifecycle_plan_id(scope),
                 scope=scope,
-                gate_state=gate.state,
                 operations=operations,
                 incumbents=incumbents_by_id,
                 memory_authority_hashes={
@@ -1516,8 +1505,8 @@ class MemoryEngine:
 
         Provider absence is already an explicit deterministic fact at this
         boundary. Every active same-document incumbent therefore receives a
-        DELETE ledger entry, while the per-source lifecycle gate still decides
-        whether that becomes support removal/retirement or a durable review.
+        DELETE ledger entry, which the planner applies as removal of this
+        Unit's Support and, when no other Support remains, retirement.
         """
 
         if len(projection.deltas) != 1 or not projection.coverage.proves_absence:
@@ -1568,7 +1557,6 @@ class MemoryEngine:
             )
             for memory_id in sorted(incumbents_by_id)
         )
-        gate = await self.db.get_lifecycle_gate(scope.source_id)
         support_states = await self.db.get_active_memory_support_states(tuple(incumbents_by_id))
         all_support = {memory_id: state.unit_ids for memory_id, state in support_states.items()}
         support_hashes = {memory_id: state.support_set_hash for memory_id, state in support_states.items()}
@@ -1576,7 +1564,6 @@ class MemoryEngine:
         plan = build_lifecycle_plan(
             plan_id=plan_id,
             scope=scope,
-            gate_state=gate.state,
             operations=operations,
             incumbents=incumbents_by_id,
             source_support_unit_ids=unit_support,
@@ -1758,7 +1745,6 @@ def _source_lifecycle_operation_input_hash(
     candidates: Sequence[RawMemory],
     incumbents: Sequence[Memory],
     support_hashes: Mapping[str, str],
-    gate_state: str,
     update_mode: str,
     changed_hunks: str | None,
     update_plan_stats: Mapping[str, Any] | None,
@@ -1798,7 +1784,6 @@ def _source_lifecycle_operation_input_hash(
             }
             for incumbent in sorted(incumbents, key=lambda item: item.id)
         ],
-        "gate_state": gate_state,
         "update_mode": update_mode,
         "changed_hunks_hash": (
             hashlib.sha256(changed_hunks.encode("utf-8")).hexdigest()

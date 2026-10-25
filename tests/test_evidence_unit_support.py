@@ -475,7 +475,6 @@ def test_part_and_support_identity_exclude_presentation_only_changes() -> None:
 @pytest.mark.asyncio
 async def test_lifecycle_removes_one_complete_unit_then_retires_last_support(db) -> None:
     memory_id, unit_id, source_id, access_hash = await _seed_complete_unit_support(db)
-    await db.enable_lifecycle_gate(source_id)
     memory = await db.get_memory(memory_id)
     assert memory is not None
     states = await db.get_active_memory_support_states((memory_id,))
@@ -491,7 +490,6 @@ async def test_lifecycle_removes_one_complete_unit_then_retires_last_support(db)
     plan = build_lifecycle_plan(
         plan_id="plan-v2-delete",
         scope=scope,
-        gate_state=(await db.get_lifecycle_gate(source_id)).state,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -724,7 +722,6 @@ def test_evidence_for_a_partial_projection_requires_every_member_observation() -
 @pytest.mark.asyncio
 async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> None:
     await _seed_complete_unit_support(db)
-    await db.enable_lifecycle_gate("source-1")
     now = datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
     body = "# Deployment rule\n\nDeploy only after approval.\n"
     item = ContentItem(
@@ -819,7 +816,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     plan = build_lifecycle_plan(
         plan_id="plan-v9-add",
         scope=scope,
-        gate_state=(await db.get_lifecycle_gate("source-1")).state,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.ADD,
@@ -951,7 +947,6 @@ async def test_v9_fragment_selection_commits_one_complete_unit_support(db) -> No
     update_plan = build_lifecycle_plan(
         plan_id="plan-v9-update",
         scope=update_scope,
-        gate_state=(await db.get_lifecycle_gate("source-1")).state,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.UPDATE,

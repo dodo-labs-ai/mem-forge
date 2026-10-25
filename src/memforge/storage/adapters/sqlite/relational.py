@@ -29,7 +29,6 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.lifecycle_plan import (
-    LifecycleGate,
     LifecyclePlan,
     LifecycleReview,
     LifecycleReviewStatus,
@@ -724,29 +723,6 @@ class SqliteRelationalStore:
             observation_type=observation_type,
             provider_keys=provider_keys,
             locator_equals=locator_equals,
-        )
-
-    async def count_active_source_memories_without_support(self, source_id: str) -> int:
-        return await self._db.count_active_source_memories_without_support(source_id)
-
-    async def count_active_supported_memories_without_source_provenance(
-        self,
-        source_id: str,
-    ) -> int:
-        return await self._db.count_active_supported_memories_without_source_provenance(source_id)
-
-    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
-        return await self._db.get_lifecycle_gate(source_id)
-
-    async def enable_lifecycle_gate(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate:
-        return await self._db.enable_lifecycle_gate(
-            source_id,
-            source_activity=source_activity,
         )
 
     async def renew_source_activity(

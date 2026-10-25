@@ -25,11 +25,6 @@ def lifecycle_stable_id(prefix: str, *values: object) -> str:
     return f"{prefix}-{digest[:_LIFECYCLE_ID_DIGEST_CHARS]}"
 
 
-class LifecycleGateState(str, Enum):
-    GATED = "gated"
-    ENABLED = "enabled"
-
-
 class LifecyclePlanStatus(str, Enum):
     STAGED = "staged"
     APPLIED = "applied"
@@ -129,15 +124,6 @@ class LifecycleReviewStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     STALE = "stale"
-
-
-@dataclass(frozen=True, slots=True)
-class LifecycleGate:
-    source_id: str
-    state: LifecycleGateState
-    reason: str | None = None
-    enabled_at: str | None = None
-    audited_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,7 +394,6 @@ class LifecycleMutation:
 class LifecyclePlan:
     id: str
     scope: ReconciliationScope
-    gate_state: LifecycleGateState
     coverage_proof: CoverageProof
     stale_guard: StaleGuard
     mutations: tuple[LifecycleMutation, ...]
@@ -420,10 +405,6 @@ class LifecyclePlan:
         self.coverage_proof.validate()
         if any(item.source_id != self.scope.source_id for item in self.mutations):
             raise ValueError("plan mutation belongs to another source")
-        if self.gate_state is LifecycleGateState.GATED and any(
-            item.mutation_type in DESTRUCTIVE_MUTATIONS for item in self.mutations
-        ):
-            raise ValueError("destructive mutation rejected by lifecycle gate")
         incumbents = set(self.coverage_proof.mandatory_incumbent_ids)
         skipped_ids = {
             decision.memory_id for decision in self.coverage_proof.incumbent_decisions
@@ -659,7 +640,6 @@ def lifecycle_plan_to_payload(plan: LifecyclePlan) -> dict[str, object]:
             "target_unit_revision_id": plan.scope.target_unit_revision_id,
             "dependency_unit_ids": list(plan.scope.dependency_unit_ids),
         },
-        "gate_state": plan.gate_state.value,
         "coverage_proof": {
             "mandatory_incumbent_ids": list(plan.coverage_proof.mandatory_incumbent_ids),
             "incumbent_decisions": [

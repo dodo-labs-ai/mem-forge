@@ -117,8 +117,6 @@ from memforge.memory.cross_document_relation_reader import (
 )
 from memforge.memory.lifecycle import normalize_memory_status
 from memforge.memory.lifecycle_plan import (
-    LifecycleGate,
-    LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
     LifecycleReview,
@@ -494,15 +492,6 @@ def _source_management_forbidden() -> HTTPException:
             "message": "Only the source owner or a workspace admin can manage this source.",
         },
     )
-
-
-def _lifecycle_gate_payload(gate: LifecycleGate) -> dict[str, object]:
-    return {
-        "state": gate.state.value,
-        "reason": gate.reason,
-        "audited_at": gate.audited_at,
-        "enabled_at": gate.enabled_at,
-    }
 
 
 def _require_source_management(request: Request, source: dict[str, Any]) -> None:
@@ -8038,13 +8027,12 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Return independent scope, gate, review, and delivery axes."""
+        """Return independent scope transition, review, and delivery axes."""
 
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_management(request, source)
-        gate = await db.get_lifecycle_gate(source_id)
         reviews = await db.list_lifecycle_reviews(source_id)
         vector_tasks = await db.list_lifecycle_vector_tasks(source_id=source_id, limit=200)
         scope_transitions = await db.list_projection_scope_transitions(source_id)
@@ -8064,7 +8052,6 @@ def create_admin_app(
                 }
                 for transition in scope_transitions
             ],
-            "gate": _lifecycle_gate_payload(gate),
             "reviews": [
                 {
                     "id": review.id,
@@ -8097,30 +8084,6 @@ def create_admin_app(
                 for task in vector_tasks
             ],
         }
-
-    @source_router.post("/{source_id}/memory-lifecycle/gate")
-    async def enable_source_memory_lifecycle_gate(
-        source_id: str,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        """Enable destructive lifecycle once every active Memory has complete Support.
-
-        Sources created by this version start enabled. A Source recorded before
-        lifecycle gates existed stays gated, and its destructive Reviews cannot
-        be approved, until this check passes.
-        """
-
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_management(request, source)
-        try:
-            gate = await db.enable_lifecycle_gate(source_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"source_id": source_id, "gate": _lifecycle_gate_payload(gate)}
-
 
     async def _decide_lifecycle_review(
         source_id: str,
@@ -8207,9 +8170,6 @@ def create_admin_app(
         An approval whose guard no longer holds marks the Review stale for a
         reviewer to refresh.
         """
-        gate = await db.get_lifecycle_gate(source_id)
-        if gate.state is not LifecycleGateState.ENABLED:
-            raise HTTPException(status_code=409, detail="Source lifecycle gate is not enabled")
         if config is None or runtime_provider is None:
             raise RuntimeError("Lifecycle approval requires the configured runtime")
         try:
@@ -8252,7 +8212,7 @@ def create_admin_app(
         config: AppConfig = Depends(get_config),
         runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
     ):
-        """Use the latest state after gate and stale-guard checks."""
+        """Use the latest state after the stale-guard checks."""
 
         return await _decide_lifecycle_review(
             source_id,
@@ -8737,9 +8697,6 @@ def create_admin_app(
                 creator_user_id if is_local_agent_backed_source(source_for_classification) else None
             ),
         )
-        # A newly created Source has no Memories yet, so every Memory it ever
-        # holds is written through the projected lifecycle.
-        await db.enable_lifecycle_gate(source_id)
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
                 source_id,
@@ -10285,12 +10242,10 @@ def create_admin_app(
         incumbent = await db.get_memory(lifecycle_review.incumbent_memory_id)
         if incumbent is None or incumbent.status != "active":
             raise HTTPException(status_code=409, detail="Lifecycle review incumbent is no longer active")
-        gate = await db.get_lifecycle_gate(source_id)
         try:
             plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
                 lifecycle_review,
                 payload,
-                gate_state=gate.state,
                 current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
                 current_memory_version=lifecycle_memory_version(incumbent),
             )

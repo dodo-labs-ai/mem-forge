@@ -7,7 +7,6 @@ from memforge.memory.lifecycle_plan import (
     IncumbentAuthority,
     IncumbentDecision,
     IncumbentDisposition,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
@@ -74,35 +73,10 @@ def test_coverage_proof_requires_all_batches() -> None:
         proof.validate()
 
 
-def test_gated_source_rejects_destructive_plan() -> None:
+def test_a_plan_creates_a_memory_and_attaches_its_support() -> None:
     plan = LifecyclePlan(
         id="plan-1",
         scope=_scope(),
-        gate_state=LifecycleGateState.GATED,
-        coverage_proof=_proof(
-            IncumbentDecision("mem-a", IncumbentDisposition.REMOVE_SUPPORT, "removed"),
-            IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "disjoint"),
-        ),
-        stale_guard=_guard(),
-        mutations=(
-            LifecycleMutation(
-                mutation_type=LifecycleMutationType.REMOVE_SUPPORT,
-                memory_id="mem-a",
-                source_id="src-1",
-                evidence_unit_ids=("eu-a",),
-            ),
-        ),
-    )
-
-    with pytest.raises(ValueError, match="lifecycle gate"):
-        plan.validate()
-
-
-def test_gated_source_still_allows_create_and_attach_support() -> None:
-    plan = LifecyclePlan(
-        id="plan-1",
-        scope=_scope(),
-        gate_state=LifecycleGateState.GATED,
         coverage_proof=_proof(
             IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "checked"),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "checked"),
@@ -130,7 +104,6 @@ def test_supersession_is_distinct_from_support_removal_and_retirement() -> None:
     plan = LifecyclePlan(
         id="plan-1",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=_proof(
             IncumbentDecision(
                 "mem-a",
@@ -174,7 +147,6 @@ def test_maintenance_operator_authority_cannot_supersede_a_memory() -> None:
     plan = LifecyclePlan(
         id="plan-maintenance-supersede",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=_proof(
             IncumbentDecision(
                 "mem-a",
@@ -208,7 +180,6 @@ def test_maintenance_operator_authority_cannot_attach_support_during_retirement(
     plan = LifecyclePlan(
         id="plan-maintenance-support",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=_proof(
             IncumbentDecision(
                 "mem-a",
@@ -251,7 +222,6 @@ def test_maintenance_operator_authority_requires_exactly_one_retirement() -> Non
     plan = LifecyclePlan(
         id="plan-maintenance-duplicate-retirement",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=_proof(
             IncumbentDecision(
                 "mem-a",
@@ -277,7 +247,6 @@ def test_plan_rejects_mutation_for_memory_outside_incumbent_ledger() -> None:
     plan = LifecyclePlan(
         id="plan-1",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=_proof(
             IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "keep"),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "keep"),
@@ -302,7 +271,7 @@ def test_skipped_support_is_exact_scoped_keep_and_never_authorizes_new_attachmen
     from memforge.memory.lifecycle_plan import lifecycle_plan_to_payload, plan_skips_support_revalidation
 
     plan = LifecyclePlan(
-        id="skip-plan", scope=_scope(), gate_state=LifecycleGateState.GATED,
+        id="skip-plan", scope=_scope(),
         coverage_proof=_proof(
             IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "insufficient", skipped_support_ids=("eu-old",)),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "supported"),
@@ -325,7 +294,7 @@ def test_skipped_support_is_exact_scoped_keep_and_never_authorizes_new_attachmen
     assert not skipped(attached)
     with pytest.raises(ValueError, match="cannot advance preserved assertions"):
         attached.validate()
-    destructive = replace(plan, gate_state=LifecycleGateState.ENABLED, mutations=(LifecycleMutation(
+    destructive = replace(plan, mutations=(LifecycleMutation(
         LifecycleMutationType.REMOVE_SUPPORT, memory_id="mem-a", source_id="src-1",
         evidence_unit_ids=("eu-old",),
     ),))
@@ -343,7 +312,7 @@ def test_an_applied_plan_payload_maps_each_decided_memory_to_its_skipped_support
     )
 
     plan = LifecyclePlan(
-        id="skip-plan", scope=_scope(), gate_state=LifecycleGateState.GATED,
+        id="skip-plan", scope=_scope(),
         coverage_proof=_proof(
             IncumbentDecision("mem-a", IncumbentDisposition.KEEP, "unreadable", skipped_support_ids=("eu-old",)),
             IncumbentDecision("mem-b", IncumbentDisposition.KEEP, "supported"),

@@ -36,8 +36,18 @@
   `expected_incumbents`; use `kept`, `revised` or `retired`.
 
 - Reviews of the kinds above that earlier versions opened stay in the review
-  queue and can still be approved or rejected there. A gated source still
-  holds its changes for Review.
+  queue and can still be approved or rejected there.
+
+- Sources no longer have a lifecycle gate, so no document update opens a
+  Review any more. A source recorded before gates existed, which used to hold
+  its memory updates and removals for Review until the gate was enabled, now
+  updates and removes its memories like any other source, and its pending
+  Reviews can be approved. `POST /api/v1/sources/{id}/memory-lifecycle/gate` is
+  removed, `GET /api/v1/sources/{id}/memory-lifecycle` no longer returns
+  `gate`, and approving a Review no longer answers 409 for an ungated source.
+  The gate table is dropped when the server starts. A memory written directly
+  (not through a sync) can no longer target a document that a configured
+  source holds; memories you write yourself are unaffected.
 
 - Deleting a Source in the admin UI V2 asks for one confirmation that says how
   many items and memories the Source holds; it no longer asks you to type the

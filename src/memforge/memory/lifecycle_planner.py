@@ -17,7 +17,6 @@ from memforge.memory.lifecycle_plan import (
     IncumbentAuthorityGrant,
     IncumbentDecision,
     IncumbentDisposition,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
@@ -58,7 +57,6 @@ def build_lifecycle_plan(
     *,
     plan_id: str,
     scope: ReconciliationScope,
-    gate_state: LifecycleGateState,
     operations: Sequence[ReconcileOperation],
     incumbents: Mapping[str, Memory],
     source_support_unit_ids: Mapping[str, tuple[str, ...]],
@@ -151,13 +149,14 @@ def build_lifecycle_plan(
     def support_ids_for(raw: RawMemory) -> tuple[str, ...]:
         return _claim_support_ids(raw, evidence_unit_ids_by_claim_hash, new_evidence_unit_ids)
 
-    def memory_creation_mutations(raw: RawMemory) -> tuple[str, tuple[LifecycleMutation, ...]]:
+    def create_memory(raw: RawMemory) -> str:
         memory_id = _new_memory_id(scope.id, raw)
+        if memory_id in created_ids:
+            return memory_id
         support_ids = support_ids_for(raw)
         if not support_ids:
             raise ValueError("new Memory candidate lacks support-granting evidence")
-        return (
-            memory_id,
+        mutations.extend(
             (
                 LifecycleMutation(
                     LifecycleMutationType.CREATE_MEMORY,
@@ -175,32 +174,15 @@ def build_lifecycle_plan(
                         "source_updated_at": defaults.source_updated_at,
                     },
                 ),
-            ),
-        )
-
-    def create_memory(raw: RawMemory) -> str:
-        memory_id, creation_mutations = memory_creation_mutations(raw)
-        if memory_id not in created_ids:
-            mutations.extend(creation_mutations)
-            created_ids.add(memory_id)
-            request_relation_discovery(
-                memory_id,
-                content_hash(raw.content.strip()),
-                entity_ids_for(raw),
             )
+        )
+        created_ids.add(memory_id)
+        request_relation_discovery(
+            memory_id,
+            content_hash(raw.content.strip()),
+            entity_ids_for(raw),
+        )
         return memory_id
-
-    def relation_discovery_seed(replacement_id: str, raw: RawMemory) -> dict[str, object]:
-        return {
-            "memory_id": replacement_id,
-            "expected_content_hash": content_hash(raw.content.strip()),
-            "source_id": scope.source_id,
-            "source_unit_id": scope.source_unit_id,
-            "source_unit_revision_id": scope.target_unit_revision_id,
-            "doc_id": defaults.doc_id,
-            "actor_user_id": relation_discovery_actor_user_id,
-            "entity_ids": list(entity_ids_for(raw)),
-        }
 
     for operation in add_operations:
         assert operation.memory is not None
@@ -217,11 +199,14 @@ def build_lifecycle_plan(
         ):
             raise ValueError("skipped Support revalidation requires a bare NOOP")
         if operation.action is ReconcileAction.NOOP:
+            decisions.append(IncumbentDecision(
+                memory_id, IncumbentDisposition.KEEP, operation.reason or "kept",
+                skipped_support_ids=tuple(current_source_support) if operation.support_revalidation_skipped else (),
+            ))
             support_ids = support_ids_for(operation.memory) if operation.memory is not None else ()
-            proposed_mutations: list[LifecycleMutation] = []
             if support_ids:
                 if _rebind_removes_support(current_source_support, support_ids):
-                    proposed_mutations.append(
+                    mutations.append(
                         LifecycleMutation(
                             LifecycleMutationType.REMOVE_SUPPORT,
                             memory_id=memory_id,
@@ -229,7 +214,7 @@ def build_lifecycle_plan(
                             evidence_unit_ids=current_source_support,
                         )
                     )
-                proposed_mutations.append(
+                mutations.append(
                     LifecycleMutation(
                         LifecycleMutationType.ATTACH_SUPPORT,
                         memory_id=memory_id,
@@ -242,84 +227,12 @@ def build_lifecycle_plan(
                         },
                     )
                 )
-            gated_removal = gate_state is LifecycleGateState.GATED and _rebind_removes_support(
-                current_source_support, support_ids,
-            )
-            if gated_removal:
-                decisions.append(
-                    IncumbentDecision(memory_id, IncumbentDisposition.REVIEW, operation.reason or "gate")
-                )
-                mutations.append(
-                    _review_mutation(
-                        scope,
-                        plan_id,
-                        operation,
-                        memory_id,
-                        proposed_mutations=tuple(proposed_mutations),
-                        disposition=IncumbentDisposition.KEEP,
-                    )
-                )
-                continue
-            decisions.append(IncumbentDecision(
-                memory_id, IncumbentDisposition.KEEP, operation.reason or "kept",
-                skipped_support_ids=tuple(current_source_support) if operation.support_revalidation_skipped else (),
-            ))
-            mutations.extend(proposed_mutations)
             continue
 
         if operation.action is ReconcileAction.DELETE:
             evidence_free_action = memory_id in authority_grants
             if not current_source_support and not evidence_free_action:
                 raise ValueError(f"destructive incumbent lacks current-scope support: {memory_id}")
-            if gate_state is LifecycleGateState.GATED:
-                proposed_mutations = []
-                if current_source_support:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.REMOVE_SUPPORT,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                            evidence_unit_ids=current_source_support,
-                            payload={"document_id": defaults.doc_id},
-                        )
-                    )
-                if not external_support:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.RETIRE_MEMORY,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                            payload={"reason": operation.reason or "support removed"},
-                        )
-                    )
-                else:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.REFRESH_MEMORY_INDEX,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                        )
-                    )
-                decisions.append(
-                    IncumbentDecision(
-                        memory_id,
-                        IncumbentDisposition.REVIEW,
-                        operation.reason or "gate",
-                        authority=incumbent_authority(memory_id),
-                        authority_actor_id=incumbent_authority_actor(memory_id),
-                    )
-                )
-                mutations.append(
-                    _review_mutation(
-                        scope,
-                        plan_id,
-                        operation,
-                        memory_id,
-                        proposed_mutations=tuple(proposed_mutations),
-                        disposition=IncumbentDisposition.REMOVE_SUPPORT,
-                    )
-                )
-                continue
             decisions.append(
                 IncumbentDecision(
                     memory_id,
@@ -372,66 +285,6 @@ def build_lifecycle_plan(
                 )
             if not current_source_support and not explicit_owner_action:
                 raise ValueError(f"replacement incumbent lacks current-scope support: {memory_id}")
-            if gate_state is LifecycleGateState.GATED:
-                replacement_id, creation_mutations = memory_creation_mutations(operation.memory)
-                proposed_mutations = [*creation_mutations]
-                if current_source_support:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.REMOVE_SUPPORT,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                            evidence_unit_ids=current_source_support,
-                            payload={"document_id": defaults.doc_id},
-                        )
-                    )
-                if not external_support:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.SUPERSEDE_MEMORY,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                            replacement_memory_id=replacement_id,
-                            payload={
-                                "reason": operation.reason or "authoritative replacement",
-                                "replacement_kind": (
-                                    "revision" if operation.action is ReconcileAction.UPDATE else "supersession"
-                                ),
-                            },
-                        )
-                    )
-                else:
-                    proposed_mutations.append(
-                        LifecycleMutation(
-                            LifecycleMutationType.REFRESH_MEMORY_INDEX,
-                            memory_id=memory_id,
-                            source_id=scope.source_id,
-                        )
-                    )
-                decisions.append(
-                    IncumbentDecision(
-                        memory_id,
-                        IncumbentDisposition.REVIEW,
-                        operation.reason or "review",
-                        authority=incumbent_authority(memory_id),
-                        authority_actor_id=incumbent_authority_actor(memory_id),
-                    )
-                )
-                mutations.append(
-                    _review_mutation(
-                        scope,
-                        plan_id,
-                        operation,
-                        memory_id,
-                        proposed_mutations=tuple(proposed_mutations),
-                        disposition=(
-                            IncumbentDisposition.REMOVE_SUPPORT if external_support else IncumbentDisposition.SUPERSEDE
-                        ),
-                        replacement_memory_id=replacement_id,
-                        relation_discovery_seed=relation_discovery_seed(replacement_id, operation.memory),
-                    )
-                )
-                continue
             replacement_id = create_memory(operation.memory)
             if external_support:
                 # Another Source Unit still supports the old Memory: this Unit revises
@@ -506,7 +359,6 @@ def build_lifecycle_plan(
     plan = LifecyclePlan(
         id=plan_id,
         scope=scope,
-        gate_state=gate_state,
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=incumbent_ids,
             incumbent_decisions=tuple(decisions),
@@ -591,52 +443,6 @@ def lifecycle_plan_id(scope: ReconciliationScope) -> str:
         ).encode("utf-8")
     ).hexdigest()[:20]
     return f"lplan-{digest}"
-
-
-def _review_mutation(
-    scope: ReconciliationScope,
-    plan_id: str,
-    operation: ReconcileOperation,
-    memory_id: str,
-    *,
-    proposed_mutations: tuple[LifecycleMutation, ...],
-    disposition: IncumbentDisposition,
-    replacement_memory_id: str | None = None,
-    relation_discovery_seed: Mapping[str, object] | None = None,
-) -> LifecycleMutation:
-    staged = {"action": operation.action.value}
-    if operation.memory is not None:
-        staged["candidate"] = {
-            "content": operation.memory.content,
-            "memory_type": operation.memory.memory_type,
-        }
-    staged["proposed_disposition"] = disposition.value
-    staged["replacement_memory_id"] = replacement_memory_id
-    staged["proposed_mutations"] = [_serialize_mutation(item) for item in proposed_mutations]
-    if relation_discovery_seed is not None:
-        staged["relation_discovery_seed"] = dict(relation_discovery_seed)
-    return LifecycleMutation(
-        LifecycleMutationType.CREATE_REVIEW,
-        memory_id=memory_id,
-        source_id=scope.source_id,
-        payload={
-            # One Review per Plan and incumbent: a retry of the same Plan names the same Review.
-            "review_id": lifecycle_stable_id("review", plan_id, memory_id, operation.action.value),
-            "reason": operation.reason or "lifecycle review required",
-            "staged_evidence": staged,
-        },
-    )
-
-
-def _serialize_mutation(mutation: LifecycleMutation) -> dict[str, object]:
-    return {
-        "mutation_type": mutation.mutation_type.value,
-        "memory_id": mutation.memory_id,
-        "source_id": mutation.source_id,
-        "evidence_unit_ids": list(mutation.evidence_unit_ids),
-        "replacement_memory_id": mutation.replacement_memory_id,
-        "payload": dict(mutation.payload),
-    }
 
 
 def _memory_payload(

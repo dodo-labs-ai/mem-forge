@@ -819,7 +819,6 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
     assert created.memory_id is not None
     old = await db.get_memory(created.memory_id)
     assert old is not None
-    await db.enable_lifecycle_gate("src-agent-sessions-codex")
     service = MemoryLifecycleService(db=db, memory_store=store)
 
     result = await service.propose_memory_correction(
@@ -917,7 +916,6 @@ async def _legacy_limited_managed_agent_claim(
     )
     memory = await db.get_memory(created.memory_id or "")
     assert memory is not None
-    await db.enable_lifecycle_gate(source_id)
     await db.db.execute(
         "DELETE FROM memory_unit_support_assertions WHERE memory_id = ?",
         (memory.id,),

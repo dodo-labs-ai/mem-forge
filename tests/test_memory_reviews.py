@@ -797,6 +797,31 @@ class TestUnifiedLifecycleReviewApi:
         assert new_review.staged_evidence["refreshed_from_review_id"] == review_id
 
     @pytest.mark.asyncio
+    async def test_approving_a_pending_lifecycle_review_applies_its_plan(self, db, tmp_path):
+        review_id = await _seed_refreshable_stale_lifecycle_review(db)
+        await db.db.execute(
+            "UPDATE lifecycle_reviews SET status = 'pending', resolved_at = NULL WHERE id = ?",
+            (review_id,),
+        )
+        await db.db.commit()
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            detail = client.get(f"/api/v1/memory-reviews/{review_id}").json()
+            approved = client.post(
+                f"/api/v1/memory-reviews/{review_id}/approve",
+                json={"expected_fingerprint": detail["decision_fingerprint"]},
+            )
+
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["status"] == "approved"
+        stored = await db.get_lifecycle_review(review_id)
+        assert stored is not None and stored.status is LifecycleReviewStatus.APPROVED
+        current = await db.get_memory("mem-lifecycle-current")
+        assert current is not None and current.status == "active"
+
+    @pytest.mark.asyncio
     async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(
         self,
         db,

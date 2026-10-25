@@ -250,6 +250,18 @@ async def _insert_doc(db: Database, doc_id: str = "doc-1", source: str = "src-1"
     await db.db.commit()
 
 
+async def _insert_user_memory_doc(db: Database, doc_id: str = "doc-1") -> None:
+    """A Document no configured Source holds, which direct Memory writes may target."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO documents
+           (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
+           VALUES (?, 'user_memory', ?, ?, ?, ?, ?, ?, ?)""",
+        (doc_id, f"memforge://user-memory/{doc_id}", doc_id, "TEST", now, "1", f"hash-{doc_id}", now),
+    )
+    await db.db.commit()
+
+
 async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-1") -> None:
     now = datetime.now(timezone.utc).isoformat()
     await db.db.execute(
@@ -415,7 +427,7 @@ def _store(
 
 @pytest.mark.asyncio
 async def test_dedup_ignores_stale_chroma_candidate(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     retired = _memory("mem-stale1", "Old inactive fact", status="retired")
     await db.insert_memory(retired)
     candidate = _memory("mem-new001", "New active fact")
@@ -496,7 +508,7 @@ async def test_agent_claim_retry_with_unknown_source_timestamp_clears_stale_valu
         "owner@example.com",
         created_by_user_id="owner@example.com",
     )
-    await _insert_doc(db, source="agent-source-codex")
+    await _insert_user_memory_doc(db)
     observed_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
     source_updated_at = datetime(2026, 6, 19, 8, 30, tzinfo=timezone.utc)
     memory = _memory("mem-agent-claim-source-updated", "Agent claim source timestamp")
@@ -602,7 +614,7 @@ async def test_dedup_query_failure_aborts_and_records_failed_index_event(db: Dat
 
 @pytest.mark.asyncio
 async def test_insert_audit_events_share_one_operation_id(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     memory = _memory("mem-auditop", "Grouped audit fact")
     store = _store(db, RecordingCollection())
 
@@ -1217,7 +1229,7 @@ async def test_promote_quarantined_challenger_routes_indexes_and_audit(db: Datab
 
 @pytest.mark.asyncio
 async def test_promoted_challenger_preserves_staged_source_updated_at(db: Database):
-    await _insert_doc(db, doc_id="doc-review")
+    await _insert_user_memory_doc(db, doc_id="doc-review")
     incumbent = _memory("mem-incobserved", "Old approved fact")
     challenger = _memory("mem-chalobserved", "New approved fact", status="pending_review")
     source_updated_at = datetime(2026, 6, 20, 4, 23, 51, tzinfo=timezone.utc)
@@ -1753,7 +1765,7 @@ async def test_purge_memory_restores_chroma_when_delete_mutates_then_fails(db: D
 
 @pytest.mark.asyncio
 async def test_insert_memory_raises_and_avoids_committed_event_when_chroma_upsert_fails(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     memory = _memory("mem-upsert-fail", "Cannot index")
     store = _store(db, FailingUpsertCollection())
 
@@ -1768,7 +1780,7 @@ async def test_insert_memory_raises_and_avoids_committed_event_when_chroma_upser
 
 @pytest.mark.asyncio
 async def test_insert_memory_cleans_chroma_when_upsert_mutates_then_fails(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     memory = _memory("mem-insert-mutating-fail", "Cannot index cleanly")
     collection = MutatingFailingUpsertCollection()
     store = _store(db, collection)
@@ -1782,7 +1794,7 @@ async def test_insert_memory_cleans_chroma_when_upsert_mutates_then_fails(db: Da
 
 @pytest.mark.asyncio
 async def test_insert_memory_purges_sqlite_when_chroma_cleanup_fails(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     memory = _memory("mem-insert-cleanup-fail", "Cleanup cannot finish")
     collection = MutatingFailingUpsertAndDeleteCollection()
     store = _store(db, collection)
@@ -1795,7 +1807,7 @@ async def test_insert_memory_purges_sqlite_when_chroma_cleanup_fails(db: Databas
 
 @pytest.mark.asyncio
 async def test_insert_memory_rebuilds_fts_from_canonical_entity_links(db: Database):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     alpha_id = await db.upsert_entity("alpha", display_name="Alpha")
     beta_id = await db.upsert_entity("beta", display_name="Beta")
     memory = _memory("mem-canonical-fts", "Canonical entity search text")
@@ -1870,7 +1882,7 @@ async def test_insert_memory_rolls_back_sqlite_when_source_link_fails(db: Databa
 
 @pytest.mark.asyncio
 async def test_insert_memory_rolls_back_when_relation_bundle_fails(db: Database, monkeypatch):
-    await _insert_doc(db)
+    await _insert_user_memory_doc(db)
     memory = _memory("mem-create-relation-fail", "Create relation failure")
     collection = RecordingCollection()
     store = _store(db, collection)
