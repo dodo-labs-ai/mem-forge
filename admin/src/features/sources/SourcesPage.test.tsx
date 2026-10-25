@@ -813,3 +813,24 @@ test("the drawer shows the evaluation chip and offers Full sync", async () => {
 
   expect(await screen.findByRole("dialog", { name: "Run a full sync of Payroll wiki?" })).toBeInTheDocument();
 });
+
+test("deleting a source asks for one confirmation that names what it removes, with nothing to type", async () => {
+  const { calls } = renderPage([makeSource({ doc_count: 412, memory_count: 96 })], {
+    "DELETE /api/v1/sources/src-wiki": () => ({ status: "deleted" }),
+  });
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Payroll wiki");
+  await userEvent.click(within(table).getByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Delete source" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Delete Payroll wiki?" });
+  expect(dialog).toHaveTextContent("412 items it synced");
+  expect(dialog).toHaveTextContent("96 memories");
+  expect(within(dialog).queryByRole("textbox")).not.toBeInTheDocument();
+  await userEvent.click(within(dialog).getByRole("button", { name: "Delete source" }));
+
+  await vi.waitFor(() =>
+    expect(calls.some((request) => request.method === "DELETE" && new URL(request.url).pathname === "/api/v1/sources/src-wiki")).toBe(true),
+  );
+});
