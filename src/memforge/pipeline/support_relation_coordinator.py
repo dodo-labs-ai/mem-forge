@@ -4,36 +4,35 @@ SupportRelationCoordinator is program code. It runs after both lines finish and
 combines, for every same-Unit old Memory, its Memory-level Support result with
 the Relation edges that point at it. Neither line decides the other's truth.
 
-Rows are matched in precedence order and the first match wins:
-
-1. ``UNRESOLVED(capacity)`` or ``UNRESOLVED(invalid_response)``, a claim that
-   could not be judged: keep unchanged; related Candidates are consumed.
-2. An equivalent and a contradicts edge on the same old Memory: coordinator
-   Review that stages the contradicting Candidate and proposes supersession;
-   rejection rebinds the old Memory to the equivalent Candidate's Evidence.
-3. The remaining rows:
+A claim that could not be judged (``UNRESOLVED(capacity)`` or
+``UNRESOLVED(invalid_response)``) is kept unchanged and its related Candidates
+are consumed; every other claim takes its row:
 
    ======================================  ============  ==========================================
    Support                                 Relation      Action
    ======================================  ============  ==========================================
    SUPPORTED, or UNAFFECTED                none, equiv.  keep and rebind; equivalents consumed
-   SUPPORTED                               contradicts   keep and rebind; Review proposes supersession
+   SUPPORTED                               contradicts   keep and rebind; the Candidate is added
    UNAFFECTED                              contradicts   re-check in the normal reading order
    UNSUPPORTED                             equivalent    re-check with the Candidate's Evidence
    UNSUPPORTED                             contradicts   SUPERSEDE
    UNSUPPORTED                             none          remove this source's Support
    UNRESOLVED(partial_coverage)            equivalent    re-check with the Candidate's Evidence
-   UNRESOLVED(partial_coverage)            contradicts   keep; Review proposes supersession
+   UNRESOLVED(partial_coverage)            contradicts   keep unchanged; the Candidate is added
    UNRESOLVED(partial_coverage)            none          keep unchanged
    ======================================  ============  ==========================================
 
-A claim is re-checked at most once per revision. A supported re-check with a
-Candidate's Evidence keeps the old Memory, binds it to that Evidence and
-consumes the Candidate; a claim still unsupported gets a Review that proposes
-exactly that rebind. A normal-order re-check yields an ordinary Support result
-that enters the table again. REFINES and uncertain edges keep the local
-unresolved relationship rules. A Candidate that receives different treatments
-across old Memories, or is staged in the Reviews of more than one, leaves its
+The table raises no Review. Two incompatible claims that both keep Support stay
+Active, and relation discovery after commit records their relation as for any
+two Memories. A claim is re-checked at most once per revision. A supported
+re-check with a Candidate's Evidence keeps the old Memory, binds it to that
+Evidence and consumes the Candidate; a claim still unsupported keeps its own
+result, so an UNSUPPORTED one loses this source's Support and the Candidate is
+added, and a partially covered one stays unchanged with the Candidate consumed.
+A normal-order re-check yields an ordinary Support result that enters the table
+again. REFINES and uncertain edges keep the local unresolved relationship
+rules; a refinement revises only an old Memory no Candidate contradicts. A
+Candidate that receives different treatments across old Memories leaves its
 whole related component unresolved: consumed this round, with no ADD and no
 destructive action. An unresolved relationship withholds only what a Candidate
 would do. An old Memory of the component whose own Support result keeps it is
@@ -53,8 +52,6 @@ from types import MappingProxyType
 from memforge.memory.evidence import RelationDirection
 from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.models import (
-    CoordinatorProposal,
-    CoordinatorReview,
     Memory,
     RawMemory,
     ReconcileAction,
@@ -133,7 +130,7 @@ class MemorySupport:
     reason: str
     # The claim bound to the current Evidence of each Support that keeps it; the first leads.
     evidence: tuple[RawMemory, ...] = ()
-    # This revision already re-checked the claim; a remaining conflict goes to Review.
+    # This revision already re-checked the claim; the table takes this result as final.
     rechecked: bool = False
     # The Support assessments this result rests on; DestructiveValidation verifies them.
     assessments: tuple[SupportAssessment, ...] = ()
@@ -248,7 +245,6 @@ class Coordination:
 
 class _Treatment(str, Enum):
     CONSUMED = "consumed"
-    STAGED = "staged"
     REPLACES = "replaces"
 
 
@@ -259,8 +255,6 @@ class _Ledger:
     relations: Sequence[RelationLedgerEntry]
     proofs: Mapping[tuple[int, str], RevisionCompositionProof]
     supports: Mapping[str, MemorySupport]
-    # Candidate/Memory pairs whose conflict a pending Review already holds: no re-check repeats it.
-    rechecked_pairs: frozenset[tuple[int, str]]
     # Candidates the Relation line could not judge even alone.
     unjudged_candidates: frozenset[int] = frozenset()
     # Revisions whose Refinement verification found a fact of the old claim missing.
@@ -282,7 +276,6 @@ def _ledger(
     relations: Sequence[RelationLedgerEntry],
     proofs: Sequence[RevisionCompositionProof],
     supports: Mapping[str, MemorySupport],
-    rechecked_pairs: frozenset[tuple[int, str]],
     unjudged_candidates: frozenset[int],
     unverified_revisions: frozenset[tuple[int, str]] = frozenset(),
 ) -> _Ledger:
@@ -302,10 +295,7 @@ def _ledger(
     proofs_by_pair = {(proof.candidate_index, proof.incumbent_id): proof for proof in proofs}
     if len(proofs_by_pair) != len(proofs):
         raise ReconciliationContractError("duplicate_revision_proof", "duplicate revision composition proof")
-    return _Ledger(
-        candidates, incumbents, relations, proofs_by_pair, supports, rechecked_pairs, unjudged_candidates,
-        unverified_revisions,
-    )
+    return _Ledger(candidates, incumbents, relations, proofs_by_pair, supports, unjudged_candidates, unverified_revisions)
 
 
 def plan_rechecks(
@@ -315,13 +305,12 @@ def plan_rechecks(
     relations: Sequence[RelationLedgerEntry],
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
-    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
     unjudged_candidates: frozenset[int] = frozenset(),
 ) -> tuple[SupportRecheckRequest, ...]:
     """The single re-check each conflicting claim gets before the table decides."""
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
+        unjudged_candidates=unjudged_candidates,
     )
     _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     requests = []
@@ -330,20 +319,13 @@ def plan_rechecks(
         if memory.id in unresolved or support.rechecked:
             continue
         equivalents = ledger.edges(memory.id, MemoryRelationType.EQUIVALENT)
-        contradictions = ledger.edges(memory.id, MemoryRelationType.CONTRADICTS)
-        if equivalents and contradictions:
-            continue
-        if support.result is SupportResult.UNAFFECTED and any(
-            (entry.candidate_index, memory.id) not in ledger.rechecked_pairs for entry in contradictions
-        ):
+        if support.result is SupportResult.UNAFFECTED and ledger.edges(memory.id, MemoryRelationType.CONTRADICTS):
             requests.append(SupportRecheckRequest(memory.id, RecheckReading.NORMAL_ORDER))
-        elif support.result in {SupportResult.UNSUPPORTED, SupportResult.UNRESOLVED_PARTIAL_COVERAGE}:
-            fresh = tuple(
-                ledger.candidates[entry.candidate_index] for entry in equivalents
-                if (entry.candidate_index, memory.id) not in ledger.rechecked_pairs
-            )
-            if fresh:
-                requests.append(SupportRecheckRequest(memory.id, RecheckReading.CANDIDATE_EVIDENCE, fresh))
+        elif equivalents and support.result in {SupportResult.UNSUPPORTED, SupportResult.UNRESOLVED_PARTIAL_COVERAGE}:
+            requests.append(SupportRecheckRequest(
+                memory.id, RecheckReading.CANDIDATE_EVIDENCE,
+                tuple(ledger.candidates[entry.candidate_index] for entry in equivalents),
+            ))
     return tuple(requests)
 
 
@@ -354,17 +336,16 @@ def supported_refiners(
     relations: Sequence[RelationLedgerEntry],
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
-    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
     unjudged_candidates: frozenset[int] = frozenset(),
 ) -> dict[str, tuple[int, ...]]:
-    """Candidates that refine each old Memory whose Support keeps it; only these may revise it.
+    """Candidates that refine each old Memory the table may revise: kept by its Support and not contradicted.
 
-    An old Memory in an unresolved component gets no decision this round, so its
-    refinements need no comparison.
+    An old Memory in an unresolved component gets no decision this round, and a
+    contradicted one is never revised, so their refinements need no comparison.
     """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
+        unjudged_candidates=unjudged_candidates,
     )
     _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     grouped: dict[str, list[int]] = {}
@@ -374,6 +355,7 @@ def supported_refiners(
             and ledger.supports[entry.incumbent_id].result in _KEEPS_SUPPORT
             and entry.relation_type is MemoryRelationType.REFINES
             and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
+            and not ledger.edges(entry.incumbent_id, MemoryRelationType.CONTRADICTS)
         ):
             grouped.setdefault(entry.incumbent_id, []).append(entry.candidate_index)
     return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
@@ -386,7 +368,6 @@ def revisions_to_verify(
     relations: Sequence[RelationLedgerEntry],
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
-    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
     unjudged_candidates: frozenset[int] = frozenset(),
 ) -> tuple[tuple[int, str], ...]:
     """Each (Candidate index, old Memory id) the table would revise, before Refinement verification answers.
@@ -399,7 +380,7 @@ def revisions_to_verify(
     """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
+        unjudged_candidates=unjudged_candidates,
     )
     _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     pairs = []
@@ -425,7 +406,6 @@ def coordinate(
     relations: Sequence[RelationLedgerEntry],
     proofs: Sequence[RevisionCompositionProof] = (),
     supports: Mapping[str, MemorySupport],
-    rechecked_pairs: frozenset[tuple[int, str]] = frozenset(),
     unjudged_candidates: frozenset[int] = frozenset(),
     unverified_revisions: frozenset[tuple[int, str]] = frozenset(),
 ) -> Coordination:
@@ -437,23 +417,18 @@ def coordinate(
     """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
-        rechecked_pairs=rechecked_pairs, unjudged_candidates=unjudged_candidates,
-        unverified_revisions=unverified_revisions,
+        unjudged_candidates=unjudged_candidates, unverified_revisions=unverified_revisions,
     )
     seeds = _seeds(ledger)
     _, unresolved = _unresolved_component(ledger, seeds)
     decided = {memory.id: _decide(ledger, memory) for memory in ledger.incumbents if memory.id not in unresolved}
 
-    # A Candidate treated differently by different old Memories, or staged in the
-    # Reviews of several, has no single decision: each approval would apply it anew.
-    treatments: dict[int, list[_Treatment]] = {}
+    # A Candidate treated differently by different old Memories has no single decision.
+    treatments: dict[int, set[_Treatment]] = {}
     for decision in decided.values():
         for index, treatment in decision.treatments:
-            treatments.setdefault(index, []).append(treatment)
-    divided = {
-        index for index, kinds in treatments.items()
-        if len(set(kinds)) > 1 or kinds.count(_Treatment.STAGED) > 1
-    }
+            treatments.setdefault(index, set()).add(treatment)
+    divided = {index for index, kinds in treatments.items() if len(kinds) > 1}
     if divided:
         seeds |= {
             (entry.candidate_index, entry.incumbent_id) for entry in ledger.relations
@@ -500,43 +475,9 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
         # Reached only without related Candidates; related ones seed the unresolved component.
         return _Decision(_kept_unchanged(support.reason))
 
-    if equivalents and contradictions:
-        rejection_rebind = candidate(equivalents[0].candidate_index)
-        return _Decision(
-            replace(
-                _kept(support),
-                reviews=tuple(
-                    CoordinatorReview(
-                        candidate=candidate(entry.candidate_index),
-                        proposal=CoordinatorProposal.SUPERSEDE,
-                        reason=entry.reason or "the current source states an equivalent and a contradicting claim",
-                        rejection_rebind=rejection_rebind,
-                    )
-                    for entry in contradictions
-                ),
-            ),
-            (*_staged(contradictions), *_staged(equivalents)),
-        )
-
-    if contradictions and support.result is not SupportResult.UNSUPPORTED:
-        # SUPPORTED, UNAFFECTED whose re-check could not run, or partial coverage.
-        return _Decision(
-            replace(
-                _kept(support),
-                reviews=tuple(
-                    CoordinatorReview(
-                        candidate=candidate(entry.candidate_index),
-                        proposal=CoordinatorProposal.SUPERSEDE,
-                        reason=entry.reason or "current claim contradicts the old Memory",
-                    )
-                    for entry in contradictions
-                ),
-            ),
-            _staged(contradictions),
-        )
-
     if support.result in _KEEPS_SUPPORT:
-        if len(refiners) == 1:
+        # A contradicting Candidate is added beside the kept old Memory; discovery relates the two.
+        if len(refiners) == 1 and not contradictions:
             refiner = refiners[0]
             proof = ledger.proofs.get((refiner.candidate_index, memory.id))
             if (
@@ -553,25 +494,9 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
                 )
         return _Decision(_kept(support, equivalents[0].reason if equivalents else None), _consumed(equivalents))
 
-    if equivalents:
-        # UNSUPPORTED or partial coverage, still not supported after its one re-check.
-        return _Decision(
-            replace(
-                _kept(support),
-                reviews=tuple(
-                    CoordinatorReview(
-                        candidate=candidate(entry.candidate_index),
-                        proposal=CoordinatorProposal.REBIND,
-                        reason=entry.reason or "an equivalent current claim is not confirmed by Support",
-                    )
-                    for entry in equivalents
-                ),
-            ),
-            _staged(equivalents),
-        )
-
     if support.result is SupportResult.UNRESOLVED_PARTIAL_COVERAGE:
-        return _Decision(_kept_unchanged(support.reason))
+        # Its unknown part keeps the old Memory; an equivalent restates it, a contradiction is added.
+        return _Decision(_kept_unchanged(support.reason), _consumed(equivalents))
 
     # UNSUPPORTED after the whole reading order.
     if len(contradictions) == 1 and len(related) == 1:
@@ -604,16 +529,10 @@ def _kept(support: MemorySupport, reason: str | None = None) -> ReconcileOperati
 def _kept_undecided(support: MemorySupport) -> ReconcileOperation:
     """Keep an old Memory of an unresolved component; its own Support result still applies."""
     if support.result in _KEEPS_SUPPORT and support.evidence:
-        return replace(
-            _kept(support, "Unresolved claim relationship; keep on verified current Evidence"),
-            relation_undecided=True,
-        )
-    return replace(
-        _kept_unchanged(
-            support.reason if support.result.unjudged
-            else "Unresolved claim relationship; preserve existing Support and Evidence"
-        ),
-        relation_undecided=True,
+        return _kept(support, "Unresolved claim relationship; keep on verified current Evidence")
+    return _kept_unchanged(
+        support.reason if support.result.unjudged
+        else "Unresolved claim relationship; preserve existing Support and Evidence"
     )
 
 
@@ -627,10 +546,6 @@ def _kept_unchanged(reason: str) -> ReconcileOperation:
 
 def _consumed(entries: Sequence[RelationLedgerEntry]) -> tuple[tuple[int, _Treatment], ...]:
     return tuple((entry.candidate_index, _Treatment.CONSUMED) for entry in entries)
-
-
-def _staged(entries: Sequence[RelationLedgerEntry]) -> tuple[tuple[int, _Treatment], ...]:
-    return tuple((entry.candidate_index, _Treatment.STAGED) for entry in entries)
 
 
 def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:

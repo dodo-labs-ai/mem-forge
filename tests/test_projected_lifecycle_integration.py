@@ -791,7 +791,7 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
 
 
 @pytest.mark.asyncio
-async def test_conflicting_reconciliation_judgments_commit_pending_review(
+async def test_a_contradiction_of_a_supported_claim_keeps_both_and_gates_the_rebind(
     db: Database,
 ) -> None:
     first = _projection(
@@ -866,16 +866,21 @@ async def test_conflicting_reconciliation_judgments_commit_pending_review(
     )
     event_window_end = datetime.now(timezone.utc) + timedelta(seconds=1)
 
-    assert stats["pending_review"] == 1
+    # Both claims keep Support: the contradicting Candidate is added beside the kept incumbent.
+    assert (stats["added"], stats["pending_review"]) == (1, 1)
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == previous_support
-    assert [memory.id for memory in await db.list_memories()] == [incumbent.id]
+    memories = {memory.content: memory for memory in await db.list_memories()}
+    assert set(memories) == {"Service uses PostgreSQL 15.", "Service uses PostgreSQL 16."}
+    assert all(memory.status == "active" for memory in memories.values())
+    # The gated Source holds only the incumbent's rebind to current Evidence for a Review.
     [review] = await db.list_lifecycle_reviews(
         "src-1",
         status=LifecycleReviewStatus.PENDING,
     )
     assert review.incumbent_memory_id == incumbent.id
+    assert review.staged_evidence["proposed_disposition"] == "keep"
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )

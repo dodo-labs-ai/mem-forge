@@ -1164,8 +1164,8 @@ def incumbent_outcomes(operations: Sequence[ReconcileOperation], incumbent_ids: 
 
     ``DELETE`` removes this Unit's Support, which retires a Memory whose only
     Support it was, so it counts with ``SUPERSEDE`` as ``retired``; ``UPDATE``
-    replaces the claim (``revised``); a kept Memory whose decision a Review holds,
-    or a removal flagged for Review, is ``review``; anything else is ``kept``.
+    replaces the claim (``revised``); a removal flagged for Review is ``review``;
+    anything else is ``kept``.
     """
 
     outcomes = dict.fromkeys(incumbent_ids, "kept")
@@ -1173,8 +1173,7 @@ def incumbent_outcomes(operations: Sequence[ReconcileOperation], incumbent_ids: 
         if operation.memory_id not in outcomes:
             continue
         outcome = (
-            "review" if operation.flag_for_review or operation.reviews
-            else _OUTCOME_BY_ACTION.get(operation.action, "kept")
+            "review" if operation.flag_for_review else _OUTCOME_BY_ACTION.get(operation.action, "kept")
         )
         if INCUMBENT_OUTCOMES.index(outcome) > INCUMBENT_OUTCOMES.index(outcomes[operation.memory_id]):
             outcomes[operation.memory_id] = outcome
@@ -3783,15 +3782,6 @@ def _reconcile_operation_payload(operation: ReconcileOperation) -> dict[str, obj
         ),
         "reason_code": _bounded_reason(operation.reason),
         "flag_for_review": operation.flag_for_review,
-        "reviews": [
-            {
-                "proposal": review.proposal.value,
-                "candidate": memory_extraction_output_payload(MemoryExtractionResult(memories=[review.candidate]))[
-                    "memories"
-                ][0],
-            }
-            for review in operation.reviews
-        ],
     }
 
 

@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from memforge.llm.structured import ClaimRevisionWireResponse
-from memforge.models import CoordinatorProposal, ReconcileAction
+from memforge.models import ReconcileAction
 from memforge.pipeline.claim_revision import assess_claim_pairs
 from memforge.pipeline.reconciler import reconcile_memories
 from tests.revision_client_fixture import pinned
@@ -107,7 +107,7 @@ async def test_valid_json_with_incomplete_finish_is_not_empty_success(monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("omit_second", [False, True])
-async def test_competing_replacements_expose_the_accepted_omission_tradeoff(omit_second):
+async def test_competing_contradictions_of_a_supported_claim_are_each_added(omit_second):
     edges = [dict(existing_id="MEM-0001", relation="contradicts", contradiction=dict(
         same_subject_and_scope=True, incompatible_assertions="ten/fifteen minutes versus five minutes"))]
     client = SparseClient(dict(results=[
@@ -118,13 +118,10 @@ async def test_competing_replacements_expose_the_accepted_omission_tradeoff(omit
         llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
     assert result.failure is None
     assert client.calls == 1
-    # A supported old Memory is kept; each contradicting Candidate is staged in its own Review.
+    # A supported old Memory is kept; a contradicting or omitted Candidate is added beside it alike.
     [kept] = [op for op in result.operations if op.memory_id == "memory"]
     assert kept.action == ReconcileAction.NOOP
-    assert [review.proposal for review in kept.reviews] == [CoordinatorProposal.SUPERSEDE] * (1 if omit_second else 2)
-    assert [op.action for op in result.operations if op.memory_id is None] == (
-        [ReconcileAction.ADD] if omit_second else []
-    )
+    assert [op.action for op in result.operations if op.memory_id is None] == [ReconcileAction.ADD] * 2
 
 
 @pytest.mark.asyncio

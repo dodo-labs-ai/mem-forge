@@ -72,9 +72,6 @@ describe("decidedBanner", () => {
 describe("expiredExplanation", () => {
   test("offers a recheck only when the server can refresh the proposal", () => {
     expect(expiredExplanation({ review_origin: "lifecycle", refreshable: true }).canRecheck).toBe(true);
-    const raisedAgain = expiredExplanation({ review_origin: "lifecycle", refreshable: false });
-    expect(raisedAgain.canRecheck).toBe(false);
-    expect(raisedAgain.text).toMatch(/next revision of its source/);
     expect(expiredExplanation({ review_origin: "memory", refreshable: false }).text).toMatch(/audit history/);
   });
 });

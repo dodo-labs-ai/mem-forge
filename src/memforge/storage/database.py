@@ -10956,7 +10956,6 @@ class Database:
                         source_unit_id=plan.scope.source_unit_id,
                         now=now,
                     )
-                await self._record_review_stale_guards_unlocked(plan)
                 for request in plan.relation_discovery_requests:
                     await self._enqueue_relation_discovery_work_unlocked(
                         plan.id,
@@ -11141,28 +11140,6 @@ class Database:
             raise ProjectedLifecycleDeferredError(
                 "projected lifecycle depends on stale cross-Unit Support",
                 all_deferred_blockers,
-            )
-
-    async def _record_review_stale_guards_unlocked(self, plan: LifecyclePlan) -> None:
-        """Give each Review this Plan created the guard of its incumbent after the Plan's own mutations."""
-
-        for mutation in plan.mutations:
-            if mutation.mutation_type is not LifecycleMutationType.CREATE_REVIEW:
-                continue
-            review_id = _created_review_id(plan.id, mutation)
-            async with self.db.execute(
-                "SELECT status, content_hash, updated_at FROM memories WHERE id = ?",
-                (mutation.memory_id,),
-            ) as cursor:
-                memory_row = await cursor.fetchone()
-            staged = dict(mutation.payload.get("staged_evidence", {}))
-            staged["stale_guard"] = {
-                "support_set_hash": await self._memory_unit_support_set_hash_unlocked(mutation.memory_id),
-                "memory_version": _lifecycle_memory_version(memory_row),
-            }
-            await self.db.execute(
-                "UPDATE lifecycle_reviews SET staged_evidence_json = ? WHERE id = ?",
-                (json.dumps(staged, sort_keys=True), review_id),
             )
 
     async def _durable_pending_review_contested_supports_unlocked(
@@ -11583,31 +11560,15 @@ class Database:
             review_id = _created_review_id(plan_id, mutation)
             staged_evidence_json = json.dumps(mutation.payload.get("staged_evidence", {}), sort_keys=True)
             reason = str(mutation.payload.get("reason") or "lifecycle review required")
-            async with self.db.execute(
-                "SELECT status, incumbent_memory_id FROM lifecycle_reviews WHERE id = ?",
-                (review_id,),
-            ) as cursor:
-                existing = await cursor.fetchone()
-            if existing is None:
-                await self.db.execute(
-                    """INSERT INTO lifecycle_reviews (
-                        id, lifecycle_plan_id, incumbent_memory_id, status,
-                        staged_evidence_json, reason, review_note, reviewer, created_at, resolved_at
-                    ) VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL, ?, NULL)""",
-                    (review_id, plan_id, mutation.memory_id, staged_evidence_json, reason, now),
-                )
-                return
-            # The same conflict raised again: a pending Review is refreshed and a stale one reopens.
-            if existing["incumbent_memory_id"] != mutation.memory_id:
-                raise ValueError(f"lifecycle review {review_id} belongs to another incumbent")
-            if existing["status"] not in {LifecycleReviewStatus.PENDING.value, LifecycleReviewStatus.STALE.value}:
-                raise ValueError(f"lifecycle review {review_id} is {existing['status']} and cannot be raised again")
+            async with self.db.execute("SELECT 1 FROM lifecycle_reviews WHERE id = ?", (review_id,)) as cursor:
+                if await cursor.fetchone() is not None:
+                    raise ValueError(f"lifecycle review {review_id} already exists")
             await self.db.execute(
-                """UPDATE lifecycle_reviews
-                      SET lifecycle_plan_id = ?, status = 'pending', staged_evidence_json = ?, reason = ?,
-                          review_note = NULL, reviewer = NULL, resolved_at = NULL
-                    WHERE id = ?""",
-                (plan_id, staged_evidence_json, reason, review_id),
+                """INSERT INTO lifecycle_reviews (
+                    id, lifecycle_plan_id, incumbent_memory_id, status,
+                    staged_evidence_json, reason, review_note, reviewer, created_at, resolved_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL, ?, NULL)""",
+                (review_id, plan_id, mutation.memory_id, staged_evidence_json, reason, now),
             )
             return
         if mutation_type is LifecycleMutationType.RESOLVE_REVIEW:
@@ -11783,7 +11744,6 @@ class Database:
         source_id: str | None = None,
         *,
         status: LifecycleReviewStatus | None = None,
-        incumbent_memory_ids: Sequence[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
         newest_first: bool = False,
@@ -11803,11 +11763,6 @@ class Database:
         if status is not None:
             conditions.append("lr.status = ?")
             params.append(status.value)
-        if incumbent_memory_ids is not None:
-            if not incumbent_memory_ids:
-                return []
-            conditions.append(f"lr.incumbent_memory_id IN ({', '.join('?' for _ in incumbent_memory_ids)})")
-            params.extend(incumbent_memory_ids)
         direction = "DESC" if newest_first else "ASC"
         query = (
             "SELECT lr.*, lp.source_id AS source_id FROM lifecycle_reviews lr "

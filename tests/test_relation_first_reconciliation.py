@@ -28,7 +28,6 @@ from memforge.memory.evidence import (
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.memory.relation_classifier import MemoryRelationType
 from memforge.models import (
-    CoordinatorProposal,
     Memory,
     RawMemory,
     ReconcileAction,
@@ -353,22 +352,22 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
 
 
 @pytest.mark.parametrize(
-    ("supported", "relation_type", "expected_actions", "review"),
+    ("supported", "relation_type", "expected_actions"),
     [
-        (True, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], None),
-        (True, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP], None),
-        (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.NOOP], CoordinatorProposal.SUPERSEDE),
-        (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE], None),
-        (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE], None),
-        # Still unsupported after its one re-check.
-        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP], CoordinatorProposal.REBIND),
+        (True, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP]),
+        (True, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP]),
+        # Both claims keep Support: the contradicting Candidate is added beside the kept old Memory.
+        (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.ADD, ReconcileAction.NOOP]),
+        (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE]),
+        (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE]),
+        # Still unsupported after its one re-check: the claim keeps its own result.
+        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.ADD, ReconcileAction.DELETE]),
     ],
 )
 def test_relation_support_matrix(
     supported: bool,
     relation_type: MemoryRelationType,
     expected_actions: list[ReconcileAction],
-    review: CoordinatorProposal | None,
 ) -> None:
     incumbent = _memory("mem-current", "The service uses PostgreSQL 15.")
     candidate = RawMemory(
@@ -393,8 +392,7 @@ def test_relation_support_matrix(
 
     assert [operation.action for operation in operations] == expected_actions
     incumbent_operation = operations[-1]
-    assert not incumbent_operation.flag_for_review
-    assert [item.proposal for item in incumbent_operation.reviews] == ([review] if review else [])
+    assert incumbent_operation.memory_id == incumbent.id and not incumbent_operation.flag_for_review
 
 
 @pytest.mark.parametrize("supported", [True, False])
@@ -420,23 +418,17 @@ def test_multiple_contradiction_candidates_never_guess_a_successor(supported: bo
         supports=dict([pinned(incumbent.id, supported)]),
     )
 
-    if supported:
-        # Each contradicting Candidate is staged in its own Review of the kept old Memory.
-        [operation] = operations
-        assert operation.action is ReconcileAction.NOOP and operation.memory_id == incumbent.id
-        assert [review.candidate for review in operation.reviews] == candidates
-        return
-    # A read without Support removes it; the Candidates stand on their own.
+    # A supported old Memory is kept and a read without Support removes it; the Candidates stand on their own.
     assert [operation.action for operation in operations] == [
         ReconcileAction.ADD,
         ReconcileAction.ADD,
-        ReconcileAction.DELETE,
+        ReconcileAction.NOOP if supported else ReconcileAction.DELETE,
     ]
     assert [operation.memory for operation in operations[:2]] == candidates
     assert operations[-1].memory_id == incumbent.id
 
 
-def test_an_unsupported_equivalent_is_held_in_a_rebind_review() -> None:
+def test_an_unsupported_claim_loses_support_beside_its_equivalent_and_refinement() -> None:
     incumbent = _memory("mem-current", "The client timeout is 30 seconds.")
     equivalent = RawMemory(content="Client timeout: 30 seconds.", memory_type="fact")
     refinement = RawMemory(content="Upload timeout is 30 seconds.", memory_type="fact")
@@ -461,13 +453,13 @@ def test_an_unsupported_equivalent_is_held_in_a_rebind_review() -> None:
         supports=dict([pinned(incumbent.id, False)]),
     )
 
-    # The refinement proves nothing about the old Memory's truth, so it stands on its own.
-    add, operation = operations
-    assert add.action is ReconcileAction.ADD and add.memory is refinement
-    assert operation.action is ReconcileAction.NOOP and operation.memory is None
-    assert operation.support_revalidation_skipped and not operation.flag_for_review
-    [review] = operation.reviews
-    assert review.proposal is CoordinatorProposal.REBIND and review.candidate is equivalent
+    # Neither Candidate proves the old Memory's truth, so both stand on their own.
+    *added, operation = operations
+    assert [(add.action, add.memory) for add in added] == [
+        (ReconcileAction.ADD, equivalent), (ReconcileAction.ADD, refinement),
+    ]
+    assert operation.action is ReconcileAction.DELETE and operation.memory_id == incumbent.id
+    assert not operation.flag_for_review
 
 
 def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
@@ -495,7 +487,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
         ReconcileAction.NOOP,
     ]
     assert [operation.memory_id for operation in operations] == [first.id, second.id]
-    assert all(not operation.reviews and not operation.support_revalidation_skipped for operation in operations)
+    assert all(not operation.support_revalidation_skipped for operation in operations)
 
 
 def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add() -> None:

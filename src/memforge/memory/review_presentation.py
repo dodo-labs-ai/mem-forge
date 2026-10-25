@@ -10,8 +10,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, Mapping
 
-from memforge.models import CoordinatorProposal
-
 
 ReviewActionKey = Literal["use_latest_state", "keep_current_state"]
 ReviewDecision = Literal["approve", "reject"]
@@ -88,19 +86,7 @@ def present_lifecycle_review(
     disposition = staged_evidence.get("proposed_disposition")
     candidate = staged_evidence.get("candidate")
     has_candidate = isinstance(candidate, Mapping) and bool(candidate.get("content"))
-    keep_current = _KEEP_CURRENT_CONSEQUENCE
-    if staged_evidence.get("rejection_mutations"):
-        keep_current = (
-            "Keep the current memory active and base it on the source text that restates it; "
-            "discard the conflicting proposal."
-        )
-    if staged_evidence.get("proposal") == CoordinatorProposal.REBIND.value:
-        decision_label = "Updated"
-        summary = "The source restates this memory, but its Support was not confirmed. Base the memory on the new text?"
-        use_latest = "Keep the current memory and base it on the proposed source text instead of its previous Evidence."
-        proposed_label = "Restating source claim"
-        proposed_empty_text = "The restating source claim is unavailable."
-    elif disposition == "supersede" or has_candidate:
+    if disposition == "supersede" or has_candidate:
         decision_label = "Updated"
         summary = "Use the proposed source state or keep the current memory?"
         use_latest = "Use the proposed state going forward and keep the previous state in audit history."
@@ -129,7 +115,7 @@ def present_lifecycle_review(
         proposed_label=proposed_label,
         proposed_empty_text=proposed_empty_text,
         use_latest_consequence=use_latest,
-        keep_current_consequence=keep_current,
+        keep_current_consequence=_KEEP_CURRENT_CONSEQUENCE,
         technical_reason=reason,
     )
 

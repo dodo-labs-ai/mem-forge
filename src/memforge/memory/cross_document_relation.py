@@ -1,7 +1,7 @@
 """Cross-document relation contract: one closed label per Memory pair.
 
-Discovery compares a committed Memory with bounded candidates from other Source
-Units after commit. Each pair receives exactly one label. A relation annotates
+Discovery compares a committed Memory with bounded candidates from any Source
+Unit, its own included, after commit. Each pair receives exactly one label. A relation annotates
 both Memories for readers; it never changes either Memory's lifecycle.
 """
 
@@ -50,13 +50,18 @@ class CrossDocumentRelationDecider(str, Enum):
     REVIEW = "review"
 
 
-CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v4"
+CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v5"
 # Classifier contracts that read the current ``RelationSubject`` input. An
 # evaluation case pinned under any of them holds the input this contract reads
 # and is replayed under it; a contract that changes the input is evaluated on a
 # set seeded again under it.
 CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
-    {"cross-document-relation-v2", "cross-document-relation-v3", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION}
+    {
+        "cross-document-relation-v2",
+        "cross-document-relation-v3",
+        "cross-document-relation-v4",
+        CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    }
 )
 CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
 
@@ -437,8 +442,8 @@ class RelationDismissalConflict(ValueError):
     """The dismissal names content or a relation that is no longer current."""
 
 
-CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements taken from different documents.
-Each statement comes with its memory type, the source type and title of its
+CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements, taken from the same document or from different
+ones. Each statement comes with its memory type, the source type and title of its
 document, evidence_time (the date on which its source recorded the Evidence,
 null when unknown), and the Evidence text it was taken from. Use all of them
 to tell what each statement is about.
@@ -487,7 +492,7 @@ reader of both statements, while a missed one only omits a hint.
 CROSS_DOCUMENT_RELATION_QUESTION = "What is the relation of this candidate to the subject?"
 CROSS_DOCUMENT_RELATION_PROMPT = CROSS_DOCUMENT_RELATION_RULES + """
 Every question below asks for the relation between one candidate statement and the subject statement. \
-The subject is one statement; each candidate is one statement from another document.
+The subject is one statement; each candidate is one other statement.
 Many candidates repeat one another. Judge each candidate only against the subject: \
 two candidates that state the same thing tell nothing about the subject, \
 and a candidate is equivalent only when it and the subject state the same knowledge.

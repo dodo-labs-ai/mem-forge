@@ -108,8 +108,10 @@ async def test_import_scopes_the_case_to_the_document_and_renders_its_evidence_a
 @pytest.mark.parametrize(
     ("relation", "support", "outcome"),
     [
-        # A contradiction of a claim that still holds is held for Review, not applied.
-        ("contradicts", "supported", "review"),
+        # A contradiction of a claim that still holds keeps it; the Candidate is added beside it.
+        ("contradicts", "supported", "kept"),
+        # A claim whose Support could not be fully read is kept whatever contradicts it.
+        ("contradicts", "unresolved_partial_coverage", "kept"),
         ("contradicts", "unsupported", "retired"),
         # DestructiveValidation keeps a removal whose read did not cover the whole revision.
         ("contradicts", {"result": "unsupported", "complete_read": False}, "kept"),
@@ -144,23 +146,15 @@ async def test_a_removal_waits_for_a_complete_relation_line(db) -> None:
     assert output["outcomes"] == {"friday": "kept"}
 
 
-@pytest.mark.parametrize(
-    ("relation", "support", "reason"),
-    [
-        # A contradiction of a claim whose Support could not be read waits for a Review.
-        ("contradicts", "unresolved_partial_coverage", "review"),
-        # Production re-reads an unsupported claim an equivalent Candidate restates before rebinding it.
-        ("equivalent", "unsupported", "review:before_recheck"),
-    ],
-)
-async def test_an_undecided_support_never_retires_and_a_recheck_is_named(db, relation, support, reason) -> None:
+async def test_an_outcome_production_would_recheck_first_names_the_recheck(db) -> None:
     _, output, checks = await _replayed(
-        db, situation("Production releases ship every Friday.", support=support), Client(relation),
+        db, situation("Production releases ship every Friday.", support="unsupported"), Client("equivalent"),
         {"expected_incumbents": {}},
     )
 
-    assert output["outcomes"] == {"friday": "review"}
-    assert [check.reason_code for check in checks[-1:]] == [reason]
+    # Production re-reads an unsupported claim with the equivalent Candidate's Evidence; the replay does not.
+    assert output["outcomes"] == {"friday": "retired"}
+    assert [check.reason_code for check in checks[-1:]] == ["retired:before_recheck"]
 
 
 async def test_each_of_several_incumbents_gets_its_own_outcome(db) -> None:

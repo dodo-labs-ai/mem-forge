@@ -1,0 +1,34 @@
+{
+  "situation": "A later comment on a ticket reports that the bug is fixed; the earlier comment that describes the failure is still on the ticket, so the old claim keeps its Support.",
+  "input": {
+    "candidates": [
+      {
+        "claim": "KES-418 is fixed in Kestrel 3.4.2: a worker that loses its lease now releases the queue lock, so the queue keeps moving after a worker crash.",
+        "memory_type": "fact",
+        "evidence": [
+          {
+            "role": "primary",
+            "excerpt": "Comment (2026-10-21): Fixed in 3.4.2. A worker that loses its lease now releases the queue lock. Verified on staging: the queue keeps moving after a worker crash.",
+            "observation": "ticket-KES-418-comment-2",
+            "revision": "v2"
+          }
+        ]
+      }
+    ],
+    "incumbents": [
+      {
+        "id": "stall",
+        "claim": "In KES-418, a Kestrel worker that crashes while holding the queue lock never releases it, and the queue stalls until someone clears the lock by hand.",
+        "memory_type": "fact"
+      }
+    ],
+    "support": {
+      "stall": "supported"
+    }
+  },
+  "rubric": {
+    "expected_incumbents": {
+      "stall": "kept"
+    }
+  }
+}

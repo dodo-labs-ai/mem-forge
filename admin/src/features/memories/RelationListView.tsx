@@ -31,7 +31,7 @@ export function RelationListView({ state, onStateChange, viewSwitch, counts }: R
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
         {viewSwitch}
-        <p className="text-sm text-muted-foreground">Relations between Memories from different documents</p>
+        <p className="text-sm text-muted-foreground">Relations between Memories</p>
         {total !== undefined ? (
           <span className="ml-auto text-sm text-muted-foreground tabular-nums">{pluralize(total, "relation")}</span>
         ) : null}
@@ -73,7 +73,7 @@ export function RelationListView({ state, onStateChange, viewSwitch, counts }: R
           empty={
             <EmptyState
               title="No relations found"
-              description="Discovery records relations between Memories from different documents."
+              description="Discovery records relations between Memories."
             />
           }
         />
