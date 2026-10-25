@@ -6847,6 +6847,108 @@ async def test_another_unit_changes_a_memory_kept_on_unreadable_evidence(db: Dat
     assert current is not None and current.id == target.source_unit_revisions[0].id
 
 
+async def _apply_later_plan_on_current_revision(db: Database, projection, *, decided_memory_id: str) -> None:
+    """Record a Review-shaped Plan that decides one incumbent on the Unit's current revision.
+
+    A Review approval or refresh Plan copies the creating Plan's scope, so it
+    lands later on the same Unit revision with a decision for its one incumbent.
+    """
+    revision_id = projection.source_unit_revisions[0].id
+    [row] = await db.db.execute_fetchall(
+        "SELECT payload_json, applied_at FROM lifecycle_plans"
+        " WHERE target_unit_revision_id = ? AND status = 'applied'",
+        (revision_id,),
+    )
+    payload = json.loads(row["payload_json"])
+    plan_id = f"lifecycle-review-approval-{decided_memory_id}"
+    payload["id"] = plan_id
+    payload["scope"]["id"] = f"{payload['scope']['id']}:review:{decided_memory_id}"
+    payload["coverage_proof"] = {
+        "mandatory_incumbent_ids": [decided_memory_id],
+        "incumbent_decisions": [
+            {"memory_id": decided_memory_id, "disposition": "keep", "reason": "approved lifecycle review"}
+        ],
+        "batch_ids": [f"{payload['scope']['id']}:batch:0"],
+        "completed_batch_ids": [f"{payload['scope']['id']}:batch:0"],
+    }
+    payload["mutations"] = []
+    payload_json = json.dumps(payload, sort_keys=True)
+    applied_at = (datetime.fromisoformat(row["applied_at"]) + timedelta(seconds=1)).isoformat()
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+            id, reconciliation_scope_id, source_id, source_unit_id,
+            target_unit_revision_id, status, payload_json, payload_hash,
+            created_at, applied_at
+        ) VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?)""",
+        (
+            plan_id,
+            payload["scope"]["id"],
+            payload["scope"]["source_id"],
+            payload["scope"]["source_unit_id"],
+            revision_id,
+            payload_json,
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            applied_at,
+            applied_at,
+        ),
+    )
+    await db.db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decides_kept_memory", [False, True], ids=["another_incumbent", "the_kept_memory"])
+async def test_a_later_plan_on_the_unreadable_revision_settles_only_the_memories_it_decides(
+    db: Database, decides_kept_memory: bool,
+) -> None:
+    second, incumbent, unreadable_support, alternative = await _keep_unreadable_shared_memory(
+        db, prefix=f"projection-unreadable-later-{decides_kept_memory}",
+    )
+    await _apply_later_plan_on_current_revision(
+        db,
+        second,
+        decided_memory_id=incumbent.id if decides_kept_memory else "mem-another-incumbent",
+    )
+    target = _projection(
+        run_id=f"projection-unreadable-later-{decides_kept_memory}-alternative-2",
+        body="",
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(alternative),
+    )
+    adapters = build_sqlite_adapters(db, object())
+    commit = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=target,
+        doc_id="confluence-456",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="",
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> empty",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    if decides_kept_memory:
+        # The kept Memory's latest decision skipped nothing, so its old Support
+        # is again a revision waiting to commit.
+        with pytest.raises(ProjectedLifecycleDeferredError) as raised:
+            await commit
+        assert raised.value.blocking_evidence_unit_ids == unreadable_support
+        return
+    await commit
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == unreadable_support
+    current = await db.get_current_source_unit_revision(alternative.source_units[0].id)
+    assert current is not None and current.id == target.source_unit_revisions[0].id
+
+
 @pytest.mark.asyncio
 async def test_a_newer_revision_of_the_unreadable_unit_defers_another_units_removal(db: Database) -> None:
     second, incumbent, unreadable_support, alternative = await _keep_unreadable_shared_memory(

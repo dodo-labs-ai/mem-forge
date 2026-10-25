@@ -171,7 +171,7 @@ from memforge.memory.lifecycle_plan import (
     pending_review_contested_supports,
     plan_requires_complete_current_support,
     plan_skips_support_revalidation,
-    skipped_supports_from_plan_payload,
+    skipped_supports_by_memory_from_plan_payload,
 )
 from memforge.memory.origin import references_source_row
 from memforge.memory.cross_document_relation import (
@@ -11170,7 +11170,13 @@ class Database:
         source_id: str,
         source_unit_ids: set[str],
     ) -> frozenset[RetainedSupportEdge]:
-        """Load the old Support each Unit's latest current-revision Plan kept skipped."""
+        """Load the old Support each Memory's latest current-revision decision kept skipped.
+
+        Every applied Plan on a Unit's current revision, including a Review's
+        approval or refresh Plan that decides one incumbent, is folded in apply
+        order, so each Memory keeps only the skipped Support of its latest
+        decision.
+        """
 
         ordered_unit_ids = sorted(source_unit_ids)
         if not ordered_unit_ids:
@@ -11185,29 +11191,23 @@ class Database:
                    AND su.source_id = lp.source_id
                    AND lp.target_unit_revision_id = su.current_revision_id
                    AND lp.source_unit_id IN ({placeholders})
-                   AND NOT EXISTS (
-                       SELECT 1 FROM lifecycle_plans later
-                        WHERE later.source_id = lp.source_id
-                          AND later.source_unit_id = lp.source_unit_id
-                          AND later.target_unit_revision_id = lp.target_unit_revision_id
-                          AND later.status = 'applied'
-                          AND later.applied_at > lp.applied_at
-                   )""",
+                 ORDER BY lp.applied_at, lp.id""",
             (source_id, *ordered_unit_ids),
         )
-        settled: set[RetainedSupportEdge] = set()
+        latest: dict[tuple[str, str], frozenset[RetainedSupportEdge]] = {}
         for row in rows:
             payload = json.loads(row["payload_json"])
             if not isinstance(payload, Mapping):
                 raise ValueError("applied lifecycle plan requires a payload object")
-            settled.update(
-                skipped_supports_from_plan_payload(
-                    payload,
-                    source_id=source_id,
-                    source_unit_id=str(row["source_unit_id"]),
-                )
+            source_unit_id = str(row["source_unit_id"])
+            decided = skipped_supports_by_memory_from_plan_payload(
+                payload,
+                source_id=source_id,
+                source_unit_id=source_unit_id,
             )
-        return frozenset(settled)
+            for memory_id, skipped in decided.items():
+                latest[(source_unit_id, memory_id)] = skipped
+        return frozenset(edge for skipped in latest.values() for edge in skipped)
 
     async def _durable_pending_review_contested_supports_unlocked(
         self,

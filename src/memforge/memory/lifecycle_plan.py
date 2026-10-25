@@ -575,19 +575,21 @@ def pending_review_contested_supports(
     return frozenset(contested)
 
 
-def skipped_supports_from_plan_payload(
+def skipped_supports_by_memory_from_plan_payload(
     payload: Mapping[str, object],
     *,
     source_id: str,
     source_unit_id: str,
-) -> frozenset[RetainedSupportEdge]:
-    """Parse the exact old Support edges an applied Plan's skipped KEEPs retained.
+) -> dict[str, frozenset[RetainedSupportEdge]]:
+    """Map each Memory an applied Plan decided to the old Support its KEEP skipped.
 
     A KEEP whose Support could not be revalidated, because the assessment was
     unresolved or the model cannot read the Evidence, leaves that Unit's exact
     old Support on its earlier revision. When the Plan committed the Unit's
     current revision, those edges are the Unit's settled state rather than a
-    revision still waiting to commit.
+    revision still waiting to commit. Every decided Memory is a key, with an
+    empty set when its decision skipped nothing, so a later Plan on the same
+    revision that decides the Memory again replaces what an earlier one kept.
     """
 
     proof = payload.get("coverage_proof")
@@ -596,34 +598,32 @@ def skipped_supports_from_plan_payload(
     decisions = proof.get("incumbent_decisions")
     if not isinstance(decisions, Sequence) or isinstance(decisions, (str, bytes)):
         raise ValueError("lifecycle plan payload requires incumbent_decisions")
-    retained: set[RetainedSupportEdge] = set()
+    skipped_by_memory: dict[str, frozenset[RetainedSupportEdge]] = {}
     for raw_decision in decisions:
         if not isinstance(raw_decision, Mapping):
             raise ValueError("lifecycle plan incumbent decision must be an object")
-        support_ids = raw_decision.get("skipped_support_ids")
-        if not support_ids:
-            continue
         memory_id = raw_decision.get("memory_id")
-        if (
+        if not isinstance(memory_id, str) or not memory_id:
+            raise ValueError("lifecycle plan incumbent decision requires memory_id")
+        support_ids = raw_decision.get("skipped_support_ids")
+        if support_ids and (
             not isinstance(support_ids, Sequence)
             or isinstance(support_ids, (str, bytes))
             or not all(isinstance(item, str) and item for item in support_ids)
-            or not isinstance(memory_id, str)
-            or not memory_id
             or raw_decision.get("disposition") != IncumbentDisposition.KEEP.value
             or "authority" in raw_decision
         ):
             raise ValueError("skipped Support revalidation requires Source-scoped KEEP")
-        retained.update(
+        skipped_by_memory[memory_id] = frozenset(
             RetainedSupportEdge(
                 memory_id=memory_id,
                 source_id=source_id,
                 source_unit_id=source_unit_id,
                 evidence_unit_id=support_id,
             )
-            for support_id in support_ids
+            for support_id in support_ids or ()
         )
-    return frozenset(retained)
+    return skipped_by_memory
 
 
 @runtime_checkable
