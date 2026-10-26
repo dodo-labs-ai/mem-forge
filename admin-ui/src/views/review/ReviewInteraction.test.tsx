@@ -204,32 +204,16 @@ describe("Review interaction", () => {
     );
   });
 
-  it("refreshes a stale lifecycle proposal and opens the new pending Review", async () => {
-    const stale = {
-      ...lifecycleDetailFixture(),
-      status: "stale" as const,
-      is_stale: true,
-      refreshable: true,
-      decision_fingerprint: "review-decision-v1:stale-lifecycle",
-    };
-    const refreshed = {
-      ...lifecycleDetailFixture(),
-      id: "review-lifecycle-refreshed",
-      decision_fingerprint: "review-decision-v1:refreshed",
-    };
-    getMock.mockResolvedValue({ data: stale });
-    postMock.mockResolvedValue({ data: refreshed });
-    const user = userEvent.setup();
+  it("shows an expired lifecycle proposal as audit history without a decision", async () => {
+    getMock.mockResolvedValue({
+      data: { ...lifecycleDetailFixture(), status: "stale" as const, is_stale: true },
+    });
 
     renderAt("/review/review-lifecycle", <ReviewDetailPage />);
-    await user.click(await screen.findByRole("button", { name: "Recheck current state" }));
 
-    await waitFor(() =>
-      expect(postMock).toHaveBeenCalledWith("/memory-reviews/review-lifecycle/refresh", {
-        expected_fingerprint: "review-decision-v1:stale-lifecycle",
-      }),
-    );
-    expect(screen.getByText(/This record remains in audit history/)).toBeTruthy();
+    expect(await screen.findByText(/This record remains in audit history/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Use latest state" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Recheck/ })).toBeNull();
   });
 
   it("surfaces a stale decision response and keeps the Review actionable after refetch", async () => {

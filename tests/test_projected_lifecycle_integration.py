@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tests.evidence_display_fixture import evidence_displays
-from tests.lifecycle_review_fixture import hold_for_review
+from tests.lifecycle_review_fixture import StoredLifecycleReview, held_for_review, store_lifecycle_review
 
 import asyncio
 import hashlib
@@ -89,6 +89,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutationType,
     ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
+    LifecycleReview,
     LifecycleReviewStatus,
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
@@ -4016,56 +4017,36 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             access_context_hash="workspace-eng",
         ),
     )
-    plan = hold_for_review(direct, reviewed.id, action=ReconcileAction.DELETE)
-
-    with pytest.raises(ValueError, match="stale or incomplete Unit support"):
-        await db.apply_source_projection_lifecycle(second, plan)
-
-    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
-    assert current_unit is not None
-    assert current_unit.id == first.source_unit_revisions[0].id
-    assert await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"])) is None
-
-
-@pytest.mark.asyncio
-async def test_review_preserves_its_exact_contested_incumbent_support(
-    db: Database,
-) -> None:
-    first = _projection(run_id="projection-reviewed-support-1", body="A7 is removed.")
-    await db.record_source_projection(first)
-    incumbent = await _seed_incumbent_support(db, projection=first)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
-
-    second = _projection(
-        run_id="projection-reviewed-support-2",
-        body="A7 is retained.",
-        prior=first.source_unit_revisions[0],
-        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
-    )
-    delta = second.deltas[0]
-    scope = ReconciliationScope(
-        id="scope-reviewed-support",
-        source_id="src-1",
-        source_unit_id=delta.source_unit_id,
-        base_unit_revision_id=delta.previous_unit_revision_id,
-        target_unit_revision_id=delta.current_unit_revision_id,
-    )
-    direct = build_lifecycle_plan(
-        plan_id="plan-reviewed-support",
-        scope=scope,
+    await db.record_source_projection(second)
+    review = await store_lifecycle_review(db, held_for_review(direct, reviewed.id, action=ReconcileAction.DELETE))
+    keep_both = build_lifecycle_plan(
+        plan_id="plan-after-review-support-exemption",
+        scope=replace(scope, id="scope-after-review-support-exemption"),
         operations=(
             ReconcileOperation(
-                action=ReconcileAction.DELETE,
-                memory_id=incumbent.id,
-                reason="the source now disputes this claim",
+                action=ReconcileAction.NOOP,
+                memory_id=reviewed.id,
+                reason="the pending Review still holds this claim",
+            ),
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=unrelated.id,
+                reason="incorrectly kept without current evidence",
             ),
         ),
-        incumbents={incumbent.id: incumbent},
-        source_support_unit_ids={incumbent.id: old_support},
-        all_active_support_unit_ids={incumbent.id: old_support},
-        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        incumbents={reviewed.id: reviewed, unrelated.id: unrelated},
+        source_support_unit_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        all_active_support_unit_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        support_set_hashes={
+            reviewed.id: await db.get_memory_support_set_hash(reviewed.id),
+            unrelated.id: await db.get_memory_support_set_hash(unrelated.id),
+        },
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -4078,19 +4059,11 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         ),
     )
 
-    plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
-    await db.apply_source_projection_lifecycle(second, plan)
+    with pytest.raises(ValueError, match=f"stale or incomplete Unit support: {unrelated.id}"):
+        await db.apply_lifecycle_plan(keep_both)
 
-    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
-    assert current_unit is not None
-    assert current_unit.id == second.source_unit_revisions[0].id
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert support_state.unit_ids == old_support
-    assert support_state.current_unit_ids == ()
-    review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
-    assert review is not None
-    assert review.status is LifecycleReviewStatus.PENDING
+    assert await db.get_lifecycle_plan_status(keep_both.id) is None
+    assert (await db.get_lifecycle_review(review.id)).status is LifecycleReviewStatus.PENDING  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -4142,8 +4115,8 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             access_context_hash="workspace-eng",
         ),
     )
-    review_plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
-    await db.apply_source_projection_lifecycle(changed, review_plan)
+    await db.record_source_projection(changed)
+    held = await store_lifecycle_review(db, held_for_review(direct, incumbent.id, action=ReconcileAction.DELETE))
 
     later = _projection(
         run_id="projection-durable-review-later-unit",
@@ -4188,14 +4161,14 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
 
     assert await db.get_lifecycle_plan_status(later_plan.id) == "applied"
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    review = await db.get_lifecycle_review(str(review_plan.mutations[0].payload["review_id"]))
+    review = await db.get_lifecycle_review(held.id)
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("destructive", [False, True])
-async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_plan(
+async def test_stale_cross_unit_support_allows_a_support_preserving_plan_but_defers_a_destructive_one(
     db: Database, destructive: bool,
 ) -> None:
     first = _projection(run_id="projection-review-unit-1", body="A7 is removed.")
@@ -4217,25 +4190,7 @@ async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_pla
     )
     await db.record_source_projection(other)
     plan = SimpleNamespace(
-        mutations=(
-            LifecycleMutation(
-                mutation_type=LifecycleMutationType.CREATE_REVIEW,
-                memory_id=incumbent.id,
-                source_id="src-1",
-                payload={
-                    "staged_evidence": {
-                        "proposed_mutations": [
-                            {
-                                "mutation_type": "remove_support",
-                                "memory_id": incumbent.id,
-                                "source_id": "src-1",
-                                "evidence_unit_ids": list(old_support),
-                            }
-                        ]
-                    }
-                },
-            ),
-        ),
+        mutations=(),
         coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
@@ -4280,26 +4235,38 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
         (_body_revision(other).id, support[0]),
     )
     await db.db.commit()
-    plan = SimpleNamespace(
-        mutations=(
-            LifecycleMutation(
-                mutation_type=LifecycleMutationType.CREATE_REVIEW,
-                memory_id=incumbent.id,
-                source_id="src-1",
-                payload={
-                    "staged_evidence": {
-                        "proposed_mutations": [
-                            {
-                                "mutation_type": "remove_support",
-                                "memory_id": incumbent.id,
-                                "source_id": "src-1",
-                                "evidence_unit_ids": list(support),
-                            }
-                        ]
-                    }
+    await store_lifecycle_review(
+        db,
+        StoredLifecycleReview(
+            plan_payload={
+                "scope": {
+                    "id": "scope-review-lineage",
+                    "source_id": "src-1",
+                    "source_unit_id": first.source_units[0].id,
+                    "target_unit_revision_id": first.source_unit_revisions[0].id,
                 },
+            },
+            review=LifecycleReview(
+                id="review-lineage",
+                lifecycle_plan_id="plan-review-lineage",
+                incumbent_memory_id=incumbent.id,
+                status=LifecycleReviewStatus.PENDING,
+                staged_evidence={
+                    "proposed_mutations": [
+                        {
+                            "mutation_type": "remove_support",
+                            "memory_id": incumbent.id,
+                            "source_id": "src-1",
+                            "evidence_unit_ids": list(support),
+                        }
+                    ]
+                },
+                reason="the source disputes this claim",
             ),
         ),
+    )
+    plan = SimpleNamespace(
+        mutations=(),
         coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",

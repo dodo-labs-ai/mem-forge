@@ -2,11 +2,20 @@
 
 ## Unreleased
 
-- Sync stats no longer report `pending_review`, and lifecycle runtime events no
-  longer carry `review_count`: a document update never opens a Review, so both
-  were always zero. Reviews of every kind and status stay readable in the
-  review queue, a pending one can still be approved or rejected, and an expired
-  Lifecycle Review can still be rechecked against the current state.
+- Breaking: `POST /api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/approve`
+  and `/reject` are removed. A script that called them now gets `404`; decide
+  a Review with `POST /api/v1/memory-reviews/{review_id}/approve` or `/reject`,
+  as the admin UI and the MCP tools already do.
+
+- An expired Review can no longer be rechecked into a new one. A document
+  update never opens a Review, so the next sync of the document, or
+  `memforge sources reprocess`, judges its memories again without waiting for
+  a person. `POST /api/v1/memory-reviews/{review_id}/refresh`, the Recheck
+  current state button in both admin UIs and the `refreshable` field of Review
+  responses are removed. Expired, approved and rejected Reviews stay readable
+  in the review queue, and a pending one can still be approved or rejected.
+  Sync stats no longer report `pending_review`, and lifecycle runtime events
+  no longer carry `review_count`.
 
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use

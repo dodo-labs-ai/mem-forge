@@ -72,7 +72,6 @@ export function makeReviewListItem(overrides: Partial<ReviewListItem> = {}): Rev
     created_at: "2026-09-29T09:00:00Z",
     resolved_at: null,
     is_stale: false,
-    refreshable: false,
     decision_fingerprint: "review-decision-v1:current",
     presentation: PRESENTATION,
     can_decide: true,

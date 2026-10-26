@@ -1,19 +1,19 @@
 import { AlertCircle, Loader2, RefreshCw, ShieldCheck } from "lucide-react";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { useSourceTypeLabels } from "@/features/sources";
 import { errorMessage } from "@/lib/errors";
-import { REVIEW_PATH, reviewPath } from "@/lib/paths";
+import { REVIEW_PATH } from "@/lib/paths";
 import { BackLink, EmptyState } from "@/patterns";
 import { Button } from "@/ui/button";
 import { AlsoAffected } from "./AlsoAffected";
-import { useRecheckReview, useReviewDetail } from "./api";
+import { useReviewDetail } from "./api";
 import { DecisionPanel } from "./DecisionPanel";
 import { MemoryStateCard } from "./MemoryStateCard";
 import { decisionOptions, reviewState } from "./model/reviewDecision";
 import { reviewSourceLabel } from "./model/reviewQueue";
 import type { ReviewDetail } from "./model/types";
 import { DecidedBanner, ExpiredBanner } from "./ReviewBanners";
-import { queueSearchFrom, type ReviewLinkState } from "./reviewLinkState";
+import { queueSearchFrom } from "./reviewLinkState";
 import { TechnicalDetails } from "./TechnicalDetails";
 
 function BackToQueue({ search }: { search: string }) {
@@ -21,19 +21,10 @@ function BackToQueue({ search }: { search: string }) {
 }
 
 function ReviewView({ review, queueSearch, onReload }: { review: ReviewDetail; queueSearch: string; onReload: () => void }) {
-  const navigate = useNavigate();
   const typeLabels = useSourceTypeLabels();
-  const recheck = useRecheckReview(review);
   const state = reviewState(review);
   const options = decisionOptions(review.presentation);
   const { presentation } = review;
-
-  function recheckReview() {
-    recheck.mutate(undefined, {
-      onSuccess: (rechecked) =>
-        navigate(reviewPath(rechecked.id), { state: { queueSearch } satisfies ReviewLinkState }),
-    });
-  }
 
   return (
     <div className="space-y-5">
@@ -51,9 +42,7 @@ function ReviewView({ review, queueSearch, onReload }: { review: ReviewDetail; q
         </p>
       </div>
 
-      {state === "expired" ? (
-        <ExpiredBanner review={review} onRecheck={recheckReview} rechecking={recheck.isPending} recheckError={recheck.error} />
-      ) : null}
+      {state === "expired" ? <ExpiredBanner /> : null}
       {state === "applied" || state === "kept" ? <DecidedBanner review={review} /> : null}
 
       <div className="grid gap-4 lg:grid-cols-2">

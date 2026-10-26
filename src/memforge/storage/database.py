@@ -150,7 +150,6 @@ from memforge.memory.evidence import (
 from memforge.memory.lifecycle_plan import (
     RetainedSupportEdge,
     contested_supports_from_staged_evidence,
-    LifecycleMutation,
     LifecycleMutationType,
     LifecyclePlan,
     AuthorityPlanStaleError,
@@ -166,7 +165,6 @@ from memforge.memory.lifecycle_plan import (
     LifecycleVectorTaskStatus,
     lifecycle_plan_to_payload,
     lifecycle_review_candidate_memory_id,
-    pending_review_contested_supports,
     plan_requires_complete_current_support,
     plan_skips_support_revalidation,
     skipped_supports_by_memory_from_plan_payload,
@@ -728,11 +726,6 @@ def _utc_iso(dt: datetime | None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc).isoformat()
-
-
-def _created_review_id(plan_id: str, mutation: LifecycleMutation) -> str:
-    """The Review a ``CREATE_REVIEW`` mutation writes: its own ID, or one derived from its Plan."""
-    return str(mutation.payload.get("review_id") or f"review-{plan_id}-{mutation.memory_id}")
 
 
 def _lifecycle_memory_version(row: Any | None) -> str:
@@ -10870,16 +10863,15 @@ class Database:
         """Fail closed when committed source support is not current, stable lineage.
 
         A pending Review intentionally preserves only its exact incumbent edge
-        while a human decides. The current Plan's staged Reviews and prior
-        applied Reviews whose own Source Unit revision remains current share
-        that contract. An insufficient assessment may also preserve the exact
-        old Support recorded on this Plan's KEEP decision. Unrelated historical
-        Support cannot block a non-destructive write; a destructive write that
-        depends on stale Support in another Source Unit is deferred until that
-        Unit's revision commits. Stale Support that the Plan of the other
-        Unit's current revision kept by a skipped KEEP is that Unit's settled
-        state and does not defer. Newly activated Memories and new attachments
-        still need current Unit support.
+        while a human decides, as long as the Source Unit revision of the Plan
+        that staged it remains current. An insufficient assessment may also
+        preserve the exact old Support recorded on this Plan's KEEP decision.
+        Unrelated historical Support cannot block a non-destructive write; a
+        destructive write that depends on stale Support in another Source Unit
+        is deferred until that Unit's revision commits. Stale Support that the
+        Plan of the other Unit's current revision kept by a skipped KEEP is
+        that Unit's settled state and does not defer. Newly activated Memories
+        and new attachments still need current Unit support.
         """
 
         created_ids = {
@@ -10896,12 +10888,9 @@ class Database:
                 if mutation.mutation_type is LifecycleMutationType.ATTACH_SUPPORT
             }
         )
-        contested = set(pending_review_contested_supports(plan))
-        contested.update(
-            await self._durable_pending_review_contested_supports_unlocked(
-                source_id=plan.scope.source_id,
-                memory_ids=candidate_ids,
-            )
+        contested = await self._durable_pending_review_contested_supports_unlocked(
+            source_id=plan.scope.source_id,
+            memory_ids=candidate_ids,
         )
         all_deferred_blockers: list[ProjectedLifecycleBlocker] = []
         for memory_id in sorted(candidate_ids):
@@ -11499,21 +11488,6 @@ class Database:
                 mutation.memory_id,
                 LifecycleVectorOperation.DELETE,
                 now=now,
-            )
-            return
-        if mutation_type is LifecycleMutationType.CREATE_REVIEW:
-            review_id = _created_review_id(plan_id, mutation)
-            staged_evidence_json = json.dumps(mutation.payload.get("staged_evidence", {}), sort_keys=True)
-            reason = str(mutation.payload.get("reason") or "lifecycle review required")
-            async with self.db.execute("SELECT 1 FROM lifecycle_reviews WHERE id = ?", (review_id,)) as cursor:
-                if await cursor.fetchone() is not None:
-                    raise ValueError(f"lifecycle review {review_id} already exists")
-            await self.db.execute(
-                """INSERT INTO lifecycle_reviews (
-                    id, lifecycle_plan_id, incumbent_memory_id, status,
-                    staged_evidence_json, reason, review_note, reviewer, created_at, resolved_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL, ?, NULL)""",
-                (review_id, plan_id, mutation.memory_id, staged_evidence_json, reason, now),
             )
             return
         if mutation_type is LifecycleMutationType.RESOLVE_REVIEW:

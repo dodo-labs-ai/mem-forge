@@ -1,8 +1,12 @@
-"""Approval planning for durable, source-local lifecycle reviews."""
+"""Decision planning for durable, source-local Lifecycle Reviews.
+
+No revision raises a Lifecycle Review. A Review an earlier version raised stays
+readable, and while it is pending a person approves it through a fresh atomic
+Plan or rejects it.
+"""
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping, Sequence
 
 from memforge.memory.lifecycle_plan import (
@@ -167,122 +171,6 @@ def _review_stale_guard(review: LifecycleReview, original_plan_payload: Mapping[
     )
 
 
-def build_lifecycle_review_refresh_plan(
-    review: LifecycleReview,
-    original_plan_payload: Mapping[str, object],
-    *,
-    current_support_set_hash: str,
-    current_memory_version: str,
-) -> tuple[LifecyclePlan, str]:
-    """Reissue one stale proposal against the incumbent's current snapshot.
-
-    The stale Review remains immutable audit history. The returned plan creates
-    a new pending Review only; approving that Review still uses the ordinary
-    lifecycle decision transaction and its complete stale guards.
-    """
-
-    if review.status is not LifecycleReviewStatus.STALE:
-        raise ValueError("only a stale lifecycle review can be refreshed")
-    if not current_support_set_hash or not current_memory_version:
-        raise ValueError("lifecycle review refresh requires a current incumbent snapshot")
-
-    scope_payload = _mapping(original_plan_payload.get("scope"), "scope")
-    stale_payload = _mapping(original_plan_payload.get("stale_guard"), "stale_guard")
-    source_id = _text(scope_payload.get("source_id"), "scope.source_id")
-    if review.source_id is not None and review.source_id != source_id:
-        raise ValueError("lifecycle review belongs to another source")
-    incumbent_id = review.incumbent_memory_id
-    original_support_hashes = _string_mapping(
-        stale_payload.get("support_set_hashes"),
-        "support_set_hashes",
-    )
-    original_memory_versions = _string_mapping(
-        stale_payload.get("memory_versions"),
-        "memory_versions",
-    )
-    if incumbent_id not in original_support_hashes or incumbent_id not in original_memory_versions:
-        raise ValueError("review incumbent is absent from original stale guard")
-    proposed = _staged_mutations(review, "proposed_mutations", source_id)
-    if any(
-        mutation.mutation_type
-        in {
-            LifecycleMutationType.SUPERSEDE_MEMORY,
-            LifecycleMutationType.RETIRE_MEMORY,
-        }
-        for mutation in proposed
-    ):
-        raise ValueError(
-            "stale terminal lifecycle proposal requires source replanning, not Review refresh"
-        )
-
-    source_unit_id = _text(scope_payload.get("source_unit_id"), "scope.source_unit_id")
-    target_unit_revision_id = _optional_text(scope_payload.get("target_unit_revision_id"))
-    observation_revision_ids = tuple(
-        str(value) for value in _sequence(stale_payload.get("observation_revision_ids", ()))
-    )
-    refresh_digest = hashlib.sha256(
-        "\x1f".join(
-            (
-                review.id,
-                source_id,
-                source_unit_id,
-                target_unit_revision_id or "",
-                current_support_set_hash,
-                current_memory_version,
-                *observation_revision_ids,
-            )
-        ).encode("utf-8")
-    ).hexdigest()[:20]
-    plan_id = f"lifecycle-review-refresh-{refresh_digest}"
-    refreshed_review_id = f"review-{refresh_digest}"
-    scope = ReconciliationScope(
-        id=f"{_text(scope_payload.get('id'), 'scope.id')}:refresh:{refresh_digest}",
-        source_id=source_id,
-        source_unit_id=source_unit_id,
-        base_unit_revision_id=_optional_text(scope_payload.get("base_unit_revision_id")),
-        target_unit_revision_id=target_unit_revision_id,
-        dependency_unit_ids=tuple(
-            str(value) for value in _sequence(scope_payload.get("dependency_unit_ids", ()))
-        ),
-    )
-    staged_evidence = dict(review.staged_evidence)
-    staged_evidence["refreshed_from_review_id"] = review.id
-    create_review = LifecycleMutation(
-        mutation_type=LifecycleMutationType.CREATE_REVIEW,
-        memory_id=incumbent_id,
-        source_id=source_id,
-        payload={
-            "review_id": refreshed_review_id,
-            "reason": review.reason or "refreshed lifecycle review required",
-            "staged_evidence": staged_evidence,
-        },
-    )
-    plan = LifecyclePlan(
-        id=plan_id,
-        scope=scope,
-        coverage_proof=CoverageProof(
-            mandatory_incumbent_ids=(incumbent_id,),
-            incumbent_decisions=(
-                IncumbentDecision(
-                    memory_id=incumbent_id,
-                    disposition=IncumbentDisposition.REVIEW,
-                    reason=review.reason or "refreshed lifecycle review required",
-                ),
-            ),
-            batch_ids=(f"{scope.id}:batch:0",),
-            completed_batch_ids=(f"{scope.id}:batch:0",),
-        ),
-        stale_guard=StaleGuard(
-            observation_revision_ids=observation_revision_ids,
-            support_set_hashes={incumbent_id: current_support_set_hash},
-            memory_versions={incumbent_id: current_memory_version},
-        ),
-        mutations=(create_review,),
-    )
-    plan.validate()
-    return plan, refreshed_review_id
-
-
 def _relation_discovery_requests(
     review: LifecycleReview,
     *,
@@ -364,7 +252,7 @@ def _deserialize_mutation(
         raise ValueError(
             f"review stale guard failed: unsupported mutation {raw_mutation_type}"
         ) from exc
-    if mutation_type in {LifecycleMutationType.CREATE_REVIEW, LifecycleMutationType.RESOLVE_REVIEW}:
+    if mutation_type is LifecycleMutationType.RESOLVE_REVIEW:
         raise ValueError("review proposal contains a nested review mutation")
     memory_id = _text(raw.get("memory_id"), "mutation.memory_id")
     replacement_memory_id = _optional_text(raw.get("replacement_memory_id"))

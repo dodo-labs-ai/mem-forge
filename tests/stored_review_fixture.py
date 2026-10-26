@@ -1,8 +1,8 @@
 """Stored Review rows for tests of the reads and decisions they still get.
 
 A pending supersede Review comes from a Memory correction, and related
-challengers come only from earlier versions. Tests that need such a row in a
-given state write it here, as storage holds it.
+challengers and Lifecycle Reviews come only from earlier versions. Tests that
+need such a row in a given state write it here, as storage holds it.
 """
 
 from __future__ import annotations

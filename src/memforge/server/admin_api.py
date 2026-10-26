@@ -3486,8 +3486,6 @@ class MemoryReviewResponse(BaseModel):
     created_at: str | None = None
     resolved_at: str | None = None
     is_stale: bool = False
-    # A stale proposal a reviewer may reissue against the current state.
-    refreshable: bool = False
     decision_fingerprint: str
     presentation: ReviewPresentationResponse
     can_decide: bool = Field(
@@ -3714,12 +3712,6 @@ class AgentEvaluationLangfuseExportRequest(BaseModel):
     provider_reviewer_id: str = Field(min_length=1)
     queue_id: str = Field(min_length=1)
     score_config_id: str = Field(min_length=1)
-
-
-class MemoryReviewRefreshRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_fingerprint: str = Field(min_length=1)
 
 
 class MemoryReviewManifestDecision(BaseModel):
@@ -4635,7 +4627,6 @@ async def _lifecycle_review_response(
         "created_at": review.created_at,
         "resolved_at": review.resolved_at,
         "is_stale": review.status.value == "stale",
-        "refreshable": review.status.value == "stale",
         "decision_fingerprint": lifecycle_review_decision_fingerprint(review),
         "presentation": _presentation_response(
             present_lifecycle_review(
@@ -8167,8 +8158,7 @@ def create_admin_app(
     ) -> dict[str, object]:
         """Apply one approval's Plan and deliver its vector changes.
 
-        An approval whose guard no longer holds marks the Review stale for a
-        reviewer to refresh.
+        An approval whose guard no longer holds marks the Review stale.
         """
         if config is None or runtime_provider is None:
             raise RuntimeError("Lifecycle approval requires the configured runtime")
@@ -8198,60 +8188,6 @@ def create_admin_app(
             "status": decided.status.value,
             "lifecycle_plan_id": plan.id,
         }
-
-    @source_router.post(
-        "/{source_id}/memory-lifecycle/reviews/{review_id}/approve",
-        dependencies=[Depends(refuse_memory_writes_during_reindex)],
-    )
-    async def approve_source_lifecycle_review(
-        source_id: str,
-        review_id: str,
-        request: Request,
-        req: MemoryReviewDecisionRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Use the latest state after the stale-guard checks."""
-
-        return await _decide_lifecycle_review(
-            source_id,
-            review_id,
-            request,
-            db,
-            action="use_latest_state",
-            expected_fingerprint=req.expected_fingerprint,
-            note=req.note,
-            config=config,
-            runtime_provider=runtime_provider,
-        )
-
-    @source_router.post(
-        "/{source_id}/memory-lifecycle/reviews/{review_id}/reject",
-        dependencies=[Depends(refuse_memory_writes_during_reindex)],
-    )
-    async def reject_source_lifecycle_review(
-        source_id: str,
-        review_id: str,
-        request: Request,
-        req: MemoryReviewDecisionRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Keep the current state and discard the staged proposal."""
-
-        return await _decide_lifecycle_review(
-            source_id,
-            review_id,
-            request,
-            db,
-            action="keep_current_state",
-            expected_fingerprint=req.expected_fingerprint,
-            note=req.note,
-            config=config,
-            runtime_provider=runtime_provider,
-        )
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
@@ -10203,65 +10139,6 @@ def create_admin_app(
             incumbent=incumbent,
             challenger=challenger,
             related_challengers=related_memories,
-            config=config,
-            artifact_store=artifact_store,
-        )
-
-    @review_router.post("/{review_id}/refresh", response_model=MemoryReviewDetailResponse)
-    async def refresh_memory_review(
-        review_id: str,
-        request: Request,
-        req: MemoryReviewRefreshRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        artifact_store: DocumentArtifactStore = Depends(get_document_store),
-    ):
-        """Create a new pending Lifecycle Review from a stale proposal."""
-
-        from memforge.memory.lifecycle_planner import lifecycle_memory_version
-        from memforge.memory.lifecycle_review import build_lifecycle_review_refresh_plan
-
-        lifecycle_review = await db.get_lifecycle_review(review_id)
-        memory_review = await db.get_memory_review(review_id)
-        if lifecycle_review is not None and memory_review is not None:
-            raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
-        if lifecycle_review is None:
-            if memory_review is not None:
-                raise HTTPException(status_code=400, detail="Only stale Lifecycle Reviews can be refreshed")
-            raise HTTPException(status_code=404, detail="Review not found")
-        payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-        scope = payload.get("scope") if isinstance(payload, Mapping) else None
-        source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-        source = await db.get_source(source_id) if source_id else None
-        if source is None:
-            raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
-        await _require_lifecycle_review_visibility(request, db, lifecycle_review)
-        _require_review_decision_authority(request, [source])
-        if lifecycle_review_decision_fingerprint(lifecycle_review) != req.expected_fingerprint:
-            raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
-        incumbent = await db.get_memory(lifecycle_review.incumbent_memory_id)
-        if incumbent is None or incumbent.status != "active":
-            raise HTTPException(status_code=409, detail="Lifecycle review incumbent is no longer active")
-        try:
-            plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
-                lifecycle_review,
-                payload,
-                current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
-                current_memory_version=lifecycle_memory_version(incumbent),
-            )
-            await db.apply_lifecycle_plan(plan)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        refreshed = await db.get_lifecycle_review(refreshed_review_id)
-        if refreshed is None:
-            raise HTTPException(status_code=409, detail="Refreshed Lifecycle Review is unavailable")
-        return await _lifecycle_review_response(
-            db,
-            refreshed,
-            source,
-            request=request,
-            detail=True,
             config=config,
             artifact_store=artifact_store,
         )

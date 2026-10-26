@@ -34,7 +34,6 @@ const REVIEW = {
   created_at: new Date().toISOString(),
   resolved_at: null,
   is_stale: false,
-  refreshable: false,
   decision_fingerprint: "review-decision-v1:current",
   can_decide: true,
   presentation: {

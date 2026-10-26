@@ -183,7 +183,6 @@ class IncumbentDisposition(str, Enum):
     KEEP = "keep"
     REMOVE_SUPPORT = "remove_support"
     SUPERSEDE = "supersede"
-    REVIEW = "review"
 
 
 class IncumbentAuthority(str, Enum):
@@ -212,7 +211,6 @@ class LifecycleMutationType(str, Enum):
     REMOVE_SUPPORT = "remove_support"
     SUPERSEDE_MEMORY = "supersede_memory"
     RETIRE_MEMORY = "retire_memory"
-    CREATE_REVIEW = "create_review"
     RESOLVE_REVIEW = "resolve_review"
     REFRESH_MEMORY_INDEX = "refresh_memory_index"
 
@@ -249,8 +247,7 @@ def plan_requires_complete_current_support(
 
     An unrelated historical Support edge cannot authorize a destructive
     decision, but it also must not block a support-preserving write that does
-    not consume that edge.  Pending Review creation is support-preserving: its
-    proposed mutations remain staged until a later authorized resolution.
+    not consume that edge.
     """
 
     mutation_types = {
@@ -521,21 +518,21 @@ def contested_supports_from_staged_evidence(
     contested: set[RetainedSupportEdge] = set()
     proposed = staged_evidence.get("proposed_mutations")
     if not isinstance(proposed, Sequence) or isinstance(proposed, (str, bytes)):
-        raise ValueError("create_review mutation requires proposed_mutations")
+        raise ValueError("pending lifecycle review requires proposed_mutations")
     for raw_mutation in proposed:
         if not isinstance(raw_mutation, Mapping):
-            raise ValueError("create_review proposed mutation must be an object")
+            raise ValueError("pending lifecycle review proposed mutation must be an object")
         if raw_mutation.get("mutation_type") != LifecycleMutationType.REMOVE_SUPPORT.value:
             continue
         if raw_mutation.get("memory_id") != incumbent_memory_id or raw_mutation.get("source_id") != source_id:
-            raise ValueError("create_review remove_support targets another incumbent")
+            raise ValueError("pending lifecycle review remove_support targets another incumbent")
         unit_ids = raw_mutation.get("evidence_unit_ids")
         if not isinstance(unit_ids, Sequence) or isinstance(unit_ids, (str, bytes)):
-            raise ValueError("create_review remove_support requires Evidence Unit ids")
+            raise ValueError("pending lifecycle review remove_support requires Evidence Unit ids")
         if not unit_ids or not all(
             isinstance(unit_id, str) and unit_id for unit_id in unit_ids
         ):
-            raise ValueError("create_review remove_support requires stable Evidence Unit ids")
+            raise ValueError("pending lifecycle review remove_support requires stable Evidence Unit ids")
         contested.update(
             RetainedSupportEdge(
                 memory_id=incumbent_memory_id,
@@ -544,29 +541,6 @@ def contested_supports_from_staged_evidence(
                 evidence_unit_id=unit_id,
             )
             for unit_id in unit_ids
-        )
-    return frozenset(contested)
-
-
-def pending_review_contested_supports(
-    plan: LifecyclePlan,
-) -> frozenset[RetainedSupportEdge]:
-    """Return exact contested edges staged by Reviews in the current Plan."""
-
-    contested: set[RetainedSupportEdge] = set()
-    for review_mutation in plan.mutations:
-        if review_mutation.mutation_type is not LifecycleMutationType.CREATE_REVIEW:
-            continue
-        staged = review_mutation.payload.get("staged_evidence")
-        if not isinstance(staged, Mapping):
-            raise ValueError("create_review mutation requires staged_evidence")
-        contested.update(
-            contested_supports_from_staged_evidence(
-                incumbent_memory_id=review_mutation.memory_id,
-                source_id=review_mutation.source_id,
-                source_unit_id=plan.scope.source_unit_id,
-                staged_evidence=staged,
-            )
         )
     return frozenset(contested)
 

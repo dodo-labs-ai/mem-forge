@@ -152,20 +152,6 @@ export function ReviewDetailPage() {
     onError: invalidate,
   });
 
-  const refreshMutation = useMutation({
-    mutationFn: () =>
-      resourceClient
-        .post(`/memory-reviews/${id}/refresh`, {
-          expected_fingerprint: detailQuery.data?.decision_fingerprint,
-        })
-        .then((response) => response.data),
-    onSuccess: (data: MemoryReviewDetail) => {
-      invalidate();
-      navigate(`/review/${data.id}`);
-    },
-    onError: invalidate,
-  });
-
   if (detailQuery.isLoading) {
     return (
       <div className="flex items-center justify-center gap-2 px-6 py-16 text-sm text-muted-foreground">
@@ -198,12 +184,8 @@ export function ReviewDetailPage() {
   const resolvedAction = review.presentation.actions.find(
     (action) => action.decision === (review.status === "approved" ? "approve" : "reject"),
   );
-  const mutationPending =
-    useLatestMutation.isPending || keepCurrentMutation.isPending || refreshMutation.isPending;
-  const decisionError =
-    extractError(useLatestMutation.error) ??
-    extractError(keepCurrentMutation.error) ??
-    extractError(refreshMutation.error);
+  const mutationPending = useLatestMutation.isPending || keepCurrentMutation.isPending;
+  const decisionError = extractError(useLatestMutation.error) ?? extractError(keepCurrentMutation.error);
 
   return (
     <div className="space-y-6">
@@ -230,22 +212,6 @@ export function ReviewDetailPage() {
             The underlying memory changed before a decision was applied. This record remains in
             audit history.
           </p>
-          {review.refreshable && (
-            <Button
-              className="mt-3"
-              variant="outline"
-              size="sm"
-              disabled={mutationPending}
-              onClick={() => refreshMutation.mutate()}
-            >
-              Recheck current state
-            </Button>
-          )}
-          {decisionError && (
-            <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
-              {decisionError}
-            </div>
-          )}
         </div>
       )}
 

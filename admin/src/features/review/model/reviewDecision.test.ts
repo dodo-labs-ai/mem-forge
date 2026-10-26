@@ -7,7 +7,6 @@ import {
   decisionFailure,
   decisionNote,
   decisionOptions,
-  expiredExplanation,
   noteHint,
   reviewState,
 } from "./reviewDecision";
@@ -66,13 +65,6 @@ describe("decidedBanner", () => {
   test("leaves out what the server did not record", () => {
     const review = makeReviewDetail({ status: "rejected", reviewer: null, resolved_at: null, review_note: " " });
     expect(decidedBanner(review, formatWhen)).toEqual({ title: "Keep current state recorded", byline: null, note: null });
-  });
-});
-
-describe("expiredExplanation", () => {
-  test("offers a recheck only when the server can refresh the proposal", () => {
-    expect(expiredExplanation({ review_origin: "lifecycle", refreshable: true }).canRecheck).toBe(true);
-    expect(expiredExplanation({ review_origin: "memory", refreshable: false }).text).toMatch(/audit history/);
   });
 });
 

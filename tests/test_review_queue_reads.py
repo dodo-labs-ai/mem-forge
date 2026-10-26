@@ -497,8 +497,6 @@ async def test_lifecycle_visibility_precedes_management_for_members(db, tmp_path
         for path, payload in (
             (f"/api/v1/memory-reviews/{review_id}/approve", {"expected_fingerprint": "synthetic"}),
             (f"/api/v1/memory-reviews/{review_id}/reject", {"expected_fingerprint": "synthetic", "note": "keep current"}),
-            (f"/api/v1/memory-reviews/{review_id}/refresh", {"expected_fingerprint": "synthetic"}),
-            (f"/api/v1/sources/{SOURCE_ID}/memory-lifecycle/reviews/{review_id}/approve", {"expected_fingerprint": "synthetic"}),
         ):
             response = client.post(path, json=payload)
             assert response.status_code == expected, (path, response.text)
