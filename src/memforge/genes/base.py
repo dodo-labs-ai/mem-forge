@@ -85,13 +85,12 @@ class Gene(ABC):
     - ``requires_pdf_artifact()`` -- whether a document must retain PDF provenance
     - ``close()``         -- release what the Gene holds beyond ``self._client``
 
-    A connector subclasses one family's base rather than this class:
+    Every connector subclasses one family's base rather than this class:
     :class:`~memforge.genes.document_gene.DocumentGene` for providers whose
     items can be listed, and
     :class:`~memforge.genes.conversation_gene.ConversationGene` for message
-    streams collected through the conversation layer. Only a managed-capture
-    Gene, whose Source receives content as it is captured and has no sync run,
-    subclasses this class itself.
+    streams collected through the conversation layer. The source-type contract
+    refuses a Gene of neither family at startup.
     """
 
     # ------------------------------------------------------------------
