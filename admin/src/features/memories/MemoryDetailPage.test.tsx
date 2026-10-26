@@ -30,7 +30,7 @@ test("shows the memory's details, relations and evidence", async () => {
   expect(within(details).getByText("payroll-v2")).toBeInTheDocument();
   expect(within(details).getByText("Payroll handbook")).toBeInTheDocument();
 
-  const related = screen.getByRole("region", { name: "Related memories in other documents" });
+  const related = screen.getByRole("region", { name: "Related memories" });
   expect(within(related).getByText("Conflicts with")).toBeInTheDocument();
   expect(within(related).getByRole("link", { name: /on-demand lifecycle does not support/ })).toHaveAttribute(
     "href",

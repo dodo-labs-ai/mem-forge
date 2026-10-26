@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Admin: a related Memory shows when its source recorded it as a readable
+  date and time, such as "Mar 3, 2026, 12:30 PM", or as a date alone for a
+  relation decided from dates, instead of the raw stored value. The card on a
+  Memory's page is titled "Related memories", since a relation can connect
+  Memories of one document.
+
 - Relations between memories are named memory relations throughout, since
   they connect memories of one document as well as of different ones. The
   modules are `memforge.memory.memory_relation`,

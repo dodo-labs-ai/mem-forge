@@ -75,7 +75,7 @@ export function MemoryRelationsCard({ memory }: { memory: Memory }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">Related Memories in other documents</CardTitle>
+        <CardTitle className="text-sm">Related Memories</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {failure && <p className="text-sm text-destructive">{failure}</p>}
