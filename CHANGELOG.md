@@ -13,8 +13,10 @@
   the recovery point with `memforge backup restore <id>`, resolve that work on
   the previous release, delete the Source in the admin UI, then upgrade.
   `POST /api/v1/agent-sessions/windows` and `POST /api/v1/hooks/receipts` now
-  answer `404`, and `source_filter.clients` is removed from the search API, so
-  a request that sends it gets `422`. Memory responses keep `origin_client`
+  answer `404`, so an earlier plugin shows
+  `MemForge hook skipped: /hooks/receipts returned HTTP 404`; update the plugin
+  as described for 0.2.0b2. `source_filter.clients` is removed from the search
+  API, so a request that sends it gets `422`. Memory responses keep `origin_client`
   for Memories a coding agent wrote with `create_memory`. Source list rows no
   longer carry `client`, and `GET /api/v1/genes` no longer carries `managed`;
   the admin UI offers every registered source type. For connector and adapter
