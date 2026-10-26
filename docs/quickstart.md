@@ -294,6 +294,18 @@ MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS=32768
 MEMFORGE_LLM_MAX_OUTPUT_TOKENS=4096
 ```
 
+A route LiteLLM has no limits for, such as an alias on a hosted LiteLLM
+gateway, can instead take the limits of the model it serves. Name that model
+for each such route in `MEMFORGE_LLM_METADATA_MODELS`, a JSON object from
+route to LiteLLM model:
+
+```bash
+MEMFORGE_LLM_METADATA_MODELS='{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}'
+```
+
+The route is then sized and its requests counted as that model's, and a limit
+set in Settings or `.env` still lowers what LiteLLM gives.
+
 Every request asks for the most the model can write, up to a quarter of the
 context window. A provider bills only what the model writes, but some, such as
 AWS Bedrock and Azure OpenAI, count the requested output against your rate

@@ -401,7 +401,7 @@ def test_credentials_from_the_environment_cannot_be_saved_for_an_endpoint_a_requ
         ({"provider": "openai", "model_id": "gpt-5-mini"}, "https://api.openai.com/v1"),
         ({"provider": "openai", "model_id": "gpt-5-mini", "endpoint": "https://api.openai.com/v1/"}, "https://api.openai.com/v1"),
         ({"provider": "anthropic", "model_id": "claude-x", "endpoint": ""}, "https://api.anthropic.com"),
-        ({"provider": "litellm", "model_id": "litellm_proxy/claude"}, None),
+        ({"provider": "litellm", "model_id": "litellm_proxy/team-claude"}, None),
     ],
     ids=["openai_default", "openai_default_written_out", "anthropic_default", "litellm_route"],
 )
@@ -1344,9 +1344,9 @@ def test_a_server_with_nothing_configured_makes_no_model_request_at_start(
 def _deployment_config(tmp_path: Path) -> AppConfig:
     config = _config(tmp_path)
     config.server.llm_config_writable = False
-    config.llm.enrichment_model = "litellm_proxy/claude-sonnet"
+    config.llm.enrichment_model = "litellm_proxy/team-claude-sonnet"
     config.llm.enrichment_base_url = ""
-    config.llm.embedding_model = "litellm_proxy/text-embedding-3-small"
+    config.llm.embedding_model = "litellm_proxy/team-text-embedding"
     config.llm.embedding_base_url = ""
     return config
 
@@ -1369,12 +1369,12 @@ def test_a_deployment_managed_installation_reads_its_bindings_and_refuses_every_
     active = payload["generation"]["active"]
     assert (active["provider"], active["route"], active["auth_strategy"], active["config_source"]) == (
         "litellm",
-        "litellm_proxy/claude-sonnet",
+        "litellm_proxy/team-claude-sonnet",
         "environment",
         "deployment",
     )
     assert active["api_key"] == {"is_set": False, "source": None, "last4": None}
-    assert payload["embedding"]["active"]["route"] == "litellm_proxy/text-embedding-3-small"
+    assert payload["embedding"]["active"]["route"] == "litellm_proxy/team-text-embedding"
     for response in writes:
         assert response.status_code == 405
         assert response.json()["detail"]["error"] == "model_settings_read_only"

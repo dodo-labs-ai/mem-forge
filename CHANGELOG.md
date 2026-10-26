@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A route LiteLLM has no limits for, such as an alias on a hosted LiteLLM
+  gateway, can take the token limits of the model it serves:
+  `MEMFORGE_LLM_METADATA_MODELS` is a JSON object from route to LiteLLM model,
+  for example `{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}`.
+  The route is sized and its requests counted as that model's, and a limit
+  set in Settings or `MEMFORGE_LLM_*` still lowers what LiteLLM gives; a value
+  that is not such an object fails with an error naming the variable.
+  MemForge itself maps no route. Cloud: set `MEMFORGE_LLM_METADATA_MODELS` for
+  each generation route that relied on MemForge mapping it before pinning this
+  change.
+
 - `Database.insert_memory_and_upsert_agent_claim`, which nothing called, is
   removed. Cloud: remove the HANA store's `insert_memory_and_upsert_agent_claim`
   and its protocol entry.

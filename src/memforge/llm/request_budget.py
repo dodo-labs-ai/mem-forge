@@ -2,21 +2,49 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import hashlib
 import json
 import logging
+import os
+from types import MappingProxyType
 
 import litellm
 
 logger = logging.getLogger(__name__)
 
+METADATA_MODELS_VARIABLE = "MEMFORGE_LLM_METADATA_MODELS"
+
 
 def metadata_model(model: str) -> str:
-    """Route aliases identify models; all capacity numbers remain SDK-owned."""
-    return {
-        "litellm_proxy/claude-sonnet": "bedrock/anthropic.claude-sonnet-4-6",
-    }.get(model, model)
+    """The LiteLLM model whose token limits and tokenizer stand for ``model``.
+
+    A deployment that reaches a model under a route name LiteLLM does not
+    know, such as an alias on a hosted LiteLLM gateway, names the model the
+    route serves in ``MEMFORGE_LLM_METADATA_MODELS``, a JSON object from
+    route to LiteLLM model::
+
+        MEMFORGE_LLM_METADATA_MODELS='{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}'
+
+    The capacity numbers stay LiteLLM's, and every other route is its own
+    metadata model.
+    """
+    return _metadata_models(os.environ.get(METADATA_MODELS_VARIABLE, "")).get(model, model)
+
+
+@lru_cache(maxsize=4)
+def _metadata_models(raw: str) -> Mapping[str, str]:
+    if not raw.strip():
+        return MappingProxyType({})
+    try:
+        aliases = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{METADATA_MODELS_VARIABLE} must be a JSON object") from exc
+    if not isinstance(aliases, dict) or not all(isinstance(target, str) and target for target in aliases.values()):
+        raise ValueError(f"{METADATA_MODELS_VARIABLE} must map each route to a LiteLLM model name")
+    return MappingProxyType(aliases)
 
 
 @dataclass(frozen=True)
@@ -38,8 +66,9 @@ class RequestBudget:
         is what the operator's machine holds, which the model's own window
         does not tell.
         """
+        catalog_model = metadata_model(model)
         try:
-            info = litellm.get_model_info(metadata_model(model))
+            info = litellm.get_model_info(catalog_model)
         except Exception:
             info = {}
 

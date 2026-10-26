@@ -650,7 +650,7 @@ async def test_a_declared_schema_the_provider_rejects_is_asked_for_again_as_json
         (ResolvedInvocation(route="ollama_chat/qwen3:0.6b", provider="ollama", native_schema=True), True, True),
         (ResolvedInvocation(route="openrouter/openai/gpt-5-mini", provider="openrouter", native_schema=True), True, None),
         (ResolvedInvocation(route="openrouter/meituan/longcat-2.0", provider="openrouter", native_schema=False), False, None),
-        (ResolvedInvocation(route="litellm_proxy/gpt-5-mini", provider="litellm"), None, None),
+        (ResolvedInvocation(route="litellm_proxy/team-gpt-mini", provider="litellm"), None, None),
         (ResolvedInvocation(route="openai/gpt-5-mini"), None, None),
     ],
     ids=["ollama", "openrouter-declared", "openrouter-declined", "litellm-route", "no-descriptor"],
@@ -2120,24 +2120,30 @@ def test_correction_consumes_its_existing_reserve(monkeypatch):
     assert client.request_fits('correction', response_format=SupportAssessmentWireResponse, reserve_correction=False)
 
 
-def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeypatch):
+def test_a_mapped_gateway_route_is_sized_and_counted_as_its_metadata_model(monkeypatch):
     seen = []
     def info(model):
         seen.append(model)
         return {"max_input_tokens": 1000000, "max_output_tokens": 64000}
+    counted = []
+    def token_counter(**kwargs):
+        counted.append(kwargs["model"])
+        return 100
+    monkeypatch.setenv("MEMFORGE_LLM_METADATA_MODELS", '{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}')
     monkeypatch.setattr("memforge.llm.structured.litellm.get_model_info", info)
-    config = StructuredLlmConfig(model="litellm_proxy/claude-sonnet", base_url=None,
+    monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", token_counter)
+    config = StructuredLlmConfig(model="litellm_proxy/team-claude-sonnet", base_url=None,
         api_key=None, timeout_s=1, max_input_tokens=10000, context_window_tokens=16000, max_output_tokens=1024)
     client = LiteLlmStructuredClient(config)
     budget = client.request_budget()
-    assert seen == ["bedrock/anthropic.claude-sonnet-4-6"]
+    assert seen == ["anthropic/claude-sonnet-4-6"]
     assert (budget.input_limit, budget.context_limit, budget.output_limit) == (10000, 16000, 1024)
     assert budget.output_tokens == config.max_output_tokens
     from memforge.llm.batch_runner import LlmBatchRunner, LlmRequest
-    monkeypatch.setattr("memforge.llm.structured.litellm.token_counter", lambda **kwargs: 100)
     runner = LlmBatchRunner(client, model=config.model)
     request = LlmRequest("extract", ProjectionFragmentMemoryExtractionResponse)
     assert runner.fit(lambda: request) == request
+    assert counted and set(counted) == {"anthropic/claude-sonnet-4-6"}
 
 
 @pytest.mark.asyncio

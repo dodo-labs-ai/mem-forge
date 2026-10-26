@@ -132,10 +132,10 @@ async def _store_active(db: Database, kind: str, *, api_key: str | None = None, 
         ("embedding", "ollama/nomic-embed-text", "", False, ("litellm", "ollama/nomic-embed-text", None, "environment")),
         (
             "embedding",
-            "litellm_proxy/text-embedding-3-small",
+            "litellm_proxy/team-text-embedding",
             "",
             False,
-            ("litellm", "litellm_proxy/text-embedding-3-small", None, "environment"),
+            ("litellm", "litellm_proxy/team-text-embedding", None, "environment"),
         ),
     ],
 )
@@ -281,9 +281,9 @@ async def test_a_deployment_managed_installation_compiles_from_the_environment_a
 ) -> None:
     config = _config(tmp_path)
     config.server.llm_config_writable = False
-    config.llm.enrichment_model = "litellm_proxy/claude-sonnet"
+    config.llm.enrichment_model = "litellm_proxy/team-claude-sonnet"
     config.llm.enrichment_base_url = ""
-    config.llm.embedding_model = "litellm_proxy/text-embedding-3-small"
+    config.llm.embedding_model = "litellm_proxy/team-text-embedding"
     config.llm.embedding_base_url = ""
     await _store_active(db, "generation", provider="ollama", model_id="stored-and-ignored")
     stored_before = sqlite3.connect(db.db_path).execute("SELECT kind, slot FROM model_bindings").fetchall()
@@ -294,8 +294,8 @@ async def test_a_deployment_managed_installation_compiles_from_the_environment_a
     assert binding.config_source == "deployment"
     assert binding.provider == "litellm"
     assert binding.auth_strategy == "environment"
-    assert models.generation == ResolvedInvocation(route="litellm_proxy/claude-sonnet", provider="litellm")
-    assert models.embedding == ResolvedInvocation(route="litellm_proxy/text-embedding-3-small", provider="litellm")
+    assert models.generation == ResolvedInvocation(route="litellm_proxy/team-claude-sonnet", provider="litellm")
+    assert models.embedding == ResolvedInvocation(route="litellm_proxy/team-text-embedding", provider="litellm")
     assert sqlite3.connect(db.db_path).execute("SELECT kind, slot FROM model_bindings").fetchall() == stored_before
 
 
