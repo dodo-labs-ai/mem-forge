@@ -1,6 +1,6 @@
-"""Convert a workspace's Cross-Source Conflict Reviews into cross-document relations.
+"""Convert a workspace's Cross-Source Conflict Reviews into memory relations.
 
-Cross-document discovery records relations and creates no Review, so the Reviews
+Relation discovery records relations and creates no Review, so the Reviews
 it created before are converted once per workspace. A decided Review
 converts by its relation label: ``contradicts`` when confirmed and ``none`` when
 dismissed, unless the report and apply requests relabel it by Review id.
@@ -45,8 +45,8 @@ import hashlib
 import json
 from typing import Protocol
 
-from memforge.memory.cross_document_relation import (
-    CrossDocumentRelationLabel,
+from memforge.memory.memory_relation import (
+    MemoryRelationLabel,
     RelationSubjectStore,
     load_relation_subjects,
     pair_key,
@@ -71,8 +71,8 @@ CONVERTED_REVIEWS_DELETED_EVENT = "cross_source_reviews_deleted"
 CONVERSION_RERUN_REASON = "cross_source_review_conversion"
 # The labels a dismissed Review rejects: each says the two statements cannot both hold.
 DISMISSED_REVIEW_LABELS = (
-    CrossDocumentRelationLabel.CONTRADICTS,
-    CrossDocumentRelationLabel.UPDATES,
+    MemoryRelationLabel.CONTRADICTS,
+    MemoryRelationLabel.UPDATES,
 )
 _PAGE_SIZE = 100
 
@@ -99,7 +99,7 @@ class ConvertedReviewDecision:
     """
 
     review_id: str
-    label: CrossDocumentRelationLabel
+    label: MemoryRelationLabel
     memory_low_id: str
     memory_high_id: str
     low_content_hash: str
@@ -217,7 +217,7 @@ class CrossSourceReviewConversionStore(CrossSourceConflictReviewStore, RelationS
 async def build_conversion_plan(
     store: CrossSourceReviewConversionStore,
     *,
-    label_overrides: Mapping[str, CrossDocumentRelationLabel],
+    label_overrides: Mapping[str, MemoryRelationLabel],
     max_attempts: int,
 ) -> CrossSourceReviewConversionPlan:
     """Classify every Cross-Source Conflict Review and the exhausted discovery work.
@@ -234,7 +234,7 @@ async def build_conversion_plan(
             [memory_id for review in reviews for memory_id in (review.challenger_memory_id, review.incumbent_memory_id)]
         )
     }
-    decided: list[tuple[MemoryReview, CrossDocumentRelationLabel, Memory, Memory]] = []
+    decided: list[tuple[MemoryReview, MemoryRelationLabel, Memory, Memory]] = []
     dismissals: list[ConvertedReviewDecision] = []
     discarded: list[str] = []
     rerun: list[str] = []
@@ -250,12 +250,12 @@ async def build_conversion_plan(
             and incumbent is not None
             and review_memories_unchanged(review, challenger=challenger, incumbent=incumbent)
         ):
-            if label is CrossDocumentRelationLabel.NONE:
+            if label is MemoryRelationLabel.NONE:
                 dismissals.append(_converted_decision(review, label, challenger, incumbent))
             else:
                 decided.append((review, label, challenger, incumbent))
             continue
-        if label is CrossDocumentRelationLabel.NONE:
+        if label is MemoryRelationLabel.NONE:
             discarded.append(review.id)
             continue
         work = (
@@ -302,7 +302,7 @@ async def apply_conversion(
     store: CrossSourceReviewConversionStore,
     *,
     report_id: str,
-    label_overrides: Mapping[str, CrossDocumentRelationLabel],
+    label_overrides: Mapping[str, MemoryRelationLabel],
     actor: str,
     max_attempts: int,
 ) -> CrossSourceReviewConversionReceipt:
@@ -341,7 +341,7 @@ async def delete_converted_reviews(
 
 def _converted_decision(
     review: MemoryReview,
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     challenger: Memory,
     incumbent: Memory,
     *,
@@ -355,7 +355,7 @@ def _converted_decision(
         review_id=review.id,
         label=(
             label
-            if label is CrossDocumentRelationLabel.NONE
+            if label is MemoryRelationLabel.NONE
             else recorded_relation_label(label, low_id, high_id, low_time, high_time)
         ),
         memory_low_id=low_id,

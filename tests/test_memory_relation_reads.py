@@ -1,4 +1,4 @@
-"""Reading, ordering and dismissing Cross-Document Relations."""
+"""Reading, ordering and dismissing Memory Relations."""
 
 from __future__ import annotations
 
@@ -12,16 +12,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.memory.cross_document_relation import (
+from memforge.memory.memory_relation import (
     MAX_RELATIONS_PER_MEMORY,
-    CrossDocumentRelationDecider,
-    CrossDocumentRelationLabel,
-    CurrentCrossDocumentRelation,
+    MemoryRelationDecider,
+    MemoryRelationLabel,
+    CurrentMemoryRelation,
     RelationDismissalConflict,
     pair_key,
     recorded_relation_label,
 )
-from memforge.memory.cross_document_relation_reader import (
+from memforge.memory.memory_relation_reader import (
     RelationGraph,
     RelationRole,
     dismiss_relation,
@@ -43,9 +43,9 @@ from tests.embedding_fixture import unconfigured_embedding
 OTHER_USER_ID = "someone-else"
 EARLIER = "2026-07-01"
 LATER = "2026-08-01"
-CONTRADICTS = CrossDocumentRelationLabel.CONTRADICTS
-UPDATES = CrossDocumentRelationLabel.UPDATES
-EQUIVALENT = CrossDocumentRelationLabel.EQUIVALENT
+CONTRADICTS = MemoryRelationLabel.CONTRADICTS
+UPDATES = MemoryRelationLabel.UPDATES
+EQUIVALENT = MemoryRelationLabel.EQUIVALENT
 
 
 def _scope(user_id: str = LOCAL_DEV_USER_ID, *, include_private: bool = True) -> AccessScope:
@@ -78,7 +78,7 @@ async def _relate(
     db: Database,
     first: Memory,
     second: Memory,
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     *,
     times: Mapping[str, str] | None = None,
     decided_at: str = EARLIER,
@@ -102,7 +102,7 @@ async def _relate(
             by_id[high_id].content_hash,
             evidence_times.get(low_id),
             evidence_times.get(high_id),
-            CrossDocumentRelationDecider.CLASSIFIER.value,
+            MemoryRelationDecider.CLASSIFIER.value,
             decided_at,
         ),
     )
@@ -179,7 +179,7 @@ async def _pair(db: Database, label=CONTRADICTS) -> tuple[Memory, Memory]:
 async def test_relation_is_current_from_both_memories(db):
     first, second = await _pair(db)
 
-    relations = await SqliteRelationalStore(db).list_cross_document_relations((first.id, second.id), _scope())
+    relations = await SqliteRelationalStore(db).list_memory_relations((first.id, second.id), _scope())
 
     assert [item.counterpart_of(first.id) for item in relations[first.id]] == [second.id]
     assert [item.counterpart_of(second.id) for item in relations[second.id]] == [first.id]
@@ -198,7 +198,7 @@ async def test_the_migration_drops_the_relation_reason_and_keeps_the_relations(d
     await migrated.connect()
     try:
         columns = {row[1] for row in await migrated.db.execute_fetchall("PRAGMA table_info(cross_document_relations)")}
-        relations = await SqliteRelationalStore(migrated).list_cross_document_relations((first.id,), _scope())
+        relations = await SqliteRelationalStore(migrated).list_memory_relations((first.id,), _scope())
     finally:
         await migrated.close()
         await db.connect()
@@ -215,8 +215,8 @@ async def test_relation_needs_both_memories_visible_to_the_caller(db):
     await db.insert_memory(private)
     await _relate(db, visible, private, CONTRADICTS)
 
-    as_caller = await db.list_cross_document_relations((visible.id,), _scope())
-    as_owner = await db.list_cross_document_relations((visible.id,), _scope(OTHER_USER_ID))
+    as_caller = await db.list_memory_relations((visible.id,), _scope())
+    as_owner = await db.list_memory_relations((visible.id,), _scope(OTHER_USER_ID))
 
     assert as_caller == {visible.id: ()}
     assert len(as_owner[visible.id]) == 1
@@ -227,10 +227,10 @@ async def test_relation_stops_being_current_when_either_memory_changes(db):
     first, second = await _pair(db)
 
     await _change_content(db, second, "Payroll closes on the 26th.")
-    after_content_change = await db.list_cross_document_relations((first.id,), _scope())
+    after_content_change = await db.list_memory_relations((first.id,), _scope())
     await _change_content(db, second, second.content)
     await db.db.execute("UPDATE memories SET status = 'retired' WHERE id = ?", (first.id,))
-    after_retirement = await db.list_cross_document_relations((second.id,), _scope())
+    after_retirement = await db.list_memory_relations((second.id,), _scope())
 
     assert after_content_change == {first.id: ()}
     assert after_retirement == {second.id: ()}
@@ -248,7 +248,7 @@ async def test_relations_per_memory_are_bounded_most_consequential_first(db):
     await db.insert_memory(conflicting)
     await _relate(db, center, conflicting, CONTRADICTS)
 
-    [*relations] = (await db.list_cross_document_relations((center.id,), _scope()))[center.id]
+    [*relations] = (await db.list_memory_relations((center.id,), _scope()))[center.id]
 
     assert len(relations) == MAX_RELATIONS_PER_MEMORY
     assert relations[0].label is CONTRADICTS
@@ -306,7 +306,7 @@ async def test_source_refs_name_only_sources_the_caller_may_read(db):
 async def test_dismissal_hides_the_relation_until_either_memory_changes(db):
     first, second = await _pair(db)
 
-    dismissal = await db.record_cross_document_relation_dismissal(
+    dismissal = await db.record_memory_relation_dismissal(
         memory_id=first.id,
         counterpart_memory_id=second.id,
         label=CONTRADICTS,
@@ -315,7 +315,7 @@ async def test_dismissal_hides_the_relation_until_either_memory_changes(db):
         actor="reader-1",
         note="Different payroll areas.",
     )
-    again = await db.record_cross_document_relation_dismissal(
+    again = await db.record_memory_relation_dismissal(
         memory_id=second.id,
         counterpart_memory_id=first.id,
         label=CONTRADICTS,
@@ -323,17 +323,17 @@ async def test_dismissal_hides_the_relation_until_either_memory_changes(db):
         counterpart_expected_content_hash=first.content_hash,
         actor="reader-2",
     )
-    hidden = await db.list_cross_document_relations((first.id,), _scope())
-    in_force = await db.list_active_cross_document_relation_dismissals(first.id, _scope(), limit=10)
+    hidden = await db.list_memory_relations((first.id,), _scope())
+    in_force = await db.list_active_memory_relation_dismissals(first.id, _scope(), limit=10)
     changed = await _change_content(db, second, "Payroll closes on the 26th.")
     await _relate_replacing(db, first, changed, CONTRADICTS)
-    shown_again = await db.list_cross_document_relations((first.id,), _scope())
+    shown_again = await db.list_memory_relations((first.id,), _scope())
 
     assert again == dismissal
     assert hidden == {first.id: ()}
     assert [item.id for item in in_force] == [dismissal.id]
     assert len(shown_again[first.id]) == 1
-    assert await db.list_active_cross_document_relation_dismissals(first.id, _scope(), limit=10) == ()
+    assert await db.list_active_memory_relation_dismissals(first.id, _scope(), limit=10) == ()
     [event] = await db.list_memory_audit_events(event_type="cross_document_relation_dismissed")
     assert event.actor_id == "reader-1"
     assert event.payload["dismissal_id"] == dismissal.id
@@ -352,7 +352,7 @@ async def _relate_replacing(db: Database, first: Memory, second: Memory, label) 
 @pytest.mark.asyncio
 async def test_dismissal_of_one_label_does_not_hide_another(db):
     first, second = await _pair(db)
-    await db.record_cross_document_relation_dismissal(
+    await db.record_memory_relation_dismissal(
         memory_id=first.id,
         counterpart_memory_id=second.id,
         label=CONTRADICTS,
@@ -362,7 +362,7 @@ async def test_dismissal_of_one_label_does_not_hide_another(db):
     )
     await _relate_replacing(db, first, second, UPDATES)
 
-    relations = await db.list_cross_document_relations((first.id,), _scope())
+    relations = await db.list_memory_relations((first.id,), _scope())
 
     assert [item.label for item in relations[first.id]] == [UPDATES]
 
@@ -372,7 +372,7 @@ async def test_dismissal_rejects_content_the_caller_did_not_see(db):
     first, second = await _pair(db)
 
     with pytest.raises(RelationDismissalConflict):
-        await db.record_cross_document_relation_dismissal(
+        await db.record_memory_relation_dismissal(
             memory_id=first.id,
             counterpart_memory_id=second.id,
             label=CONTRADICTS,
@@ -386,7 +386,7 @@ async def test_dismissal_rejects_content_the_caller_did_not_see(db):
 @pytest.mark.asyncio
 async def test_restore_undoes_the_dismissal_and_is_audited(db):
     first, second = await _pair(db)
-    dismissal = await db.record_cross_document_relation_dismissal(
+    dismissal = await db.record_memory_relation_dismissal(
         memory_id=first.id,
         counterpart_memory_id=second.id,
         label=CONTRADICTS,
@@ -395,12 +395,12 @@ async def test_restore_undoes_the_dismissal_and_is_audited(db):
         actor="reader-1",
     )
 
-    restored = await db.restore_cross_document_relation_dismissals(
+    restored = await db.restore_memory_relation_dismissals(
         memory_id=second.id,
         counterpart_memory_id=first.id,
         actor="reader-2",
     )
-    restored_again = await db.restore_cross_document_relation_dismissals(
+    restored_again = await db.restore_memory_relation_dismissals(
         memory_id=second.id,
         counterpart_memory_id=first.id,
         actor="reader-2",
@@ -408,7 +408,7 @@ async def test_restore_undoes_the_dismissal_and_is_audited(db):
 
     assert [item.id for item in restored] == [dismissal.id]
     assert restored_again == ()
-    assert len((await db.list_cross_document_relations((first.id,), _scope()))[first.id]) == 1
+    assert len((await db.list_memory_relations((first.id,), _scope()))[first.id]) == 1
     [event] = await db.list_memory_audit_events(event_type="cross_document_relation_restored")
     assert event.actor_id == "reader-2"
     assert event.payload["dismissal_id"] == dismissal.id
@@ -420,12 +420,12 @@ async def test_restore_undoes_the_dismissal_and_is_audited(db):
 def _stored(
     first: str,
     second: str,
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     times: Mapping[str, str] | None = None,
-) -> CurrentCrossDocumentRelation:
+) -> CurrentMemoryRelation:
     low_id, high_id = pair_key(first, second)
     evidence_times = times or {}
-    return CurrentCrossDocumentRelation(
+    return CurrentMemoryRelation(
         memory_low_id=low_id,
         memory_high_id=high_id,
         label=label,
@@ -433,12 +433,12 @@ def _stored(
         high_content_hash="high",
         low_evidence_time=evidence_times.get(low_id),
         high_evidence_time=evidence_times.get(high_id),
-        decided_by=CrossDocumentRelationDecider.CLASSIFIER,
+        decided_by=MemoryRelationDecider.CLASSIFIER,
         decided_at=EARLIER,
     )
 
 
-def _graph(relations: list[CurrentCrossDocumentRelation]) -> RelationGraph:
+def _graph(relations: list[CurrentMemoryRelation]) -> RelationGraph:
     by_memory: dict[str, list] = {}
     for relation in relations:
         for memory_id in (relation.memory_low_id, relation.memory_high_id):
@@ -457,6 +457,15 @@ def test_updates_is_ordered_by_evidence_time_and_otherwise_recorded_as_contradic
         with pytest.raises(ValueError, match="order the pair"):
             _stored("mem-a", "mem-b", UPDATES, {"mem-a": low_time, "mem-b": high_time})
     assert recorded_relation_label(EQUIVALENT, "mem-a", "mem-b", None, None) is EQUIVALENT
+
+
+def test_updates_of_one_day_is_ordered_by_instant_and_a_date_orders_only_by_date():
+    morning, evening = "2026-08-01T08:00:00+00:00", "2026-08-01T19:30:00+00:00"
+
+    assert _stored("mem-a", "mem-b", UPDATES, {"mem-a": morning, "mem-b": evening}).newer_memory_id == "mem-b"
+    assert _stored("mem-a", "mem-b", UPDATES, {"mem-a": EARLIER, "mem-b": evening}).newer_memory_id == "mem-b"
+    for low_time, high_time in ((morning, morning), (LATER, evening)):
+        assert recorded_relation_label(UPDATES, "mem-a", "mem-b", low_time, high_time) is CONTRADICTS
 
 
 def test_window_order_puts_each_memory_after_every_newer_one_in_an_updates_chain():
@@ -565,7 +574,7 @@ async def test_dismissal_names_the_label_the_reader_sees(db):
     )
 
     assert dismissal.label is UPDATES
-    assert await db.list_cross_document_relations((first.id,), _scope()) == {first.id: ()}
+    assert await db.list_memory_relations((first.id,), _scope()) == {first.id: ()}
 
 
 # ---------------------------------------------------------------- search
@@ -720,7 +729,7 @@ async def test_admin_detail_lists_dismissals_only_with_a_visible_other_memory(db
     await db.insert_memory(visible)
     await db.insert_memory(private)
     await _relate(db, visible, private, CONTRADICTS)
-    await db.record_cross_document_relation_dismissal(
+    await db.record_memory_relation_dismissal(
         memory_id=visible.id,
         counterpart_memory_id=private.id,
         label=CONTRADICTS,
@@ -733,9 +742,9 @@ async def test_admin_detail_lists_dismissals_only_with_a_visible_other_memory(db
         detail = client.get(f"/api/v1/memories/{visible.id}").json()
 
     assert detail["dismissed_relations"] == []
-    assert await db.list_active_cross_document_relation_dismissals(visible.id, _scope(), limit=10) == ()
+    assert await db.list_active_memory_relation_dismissals(visible.id, _scope(), limit=10) == ()
     assert len(
-        await db.list_active_cross_document_relation_dismissals(visible.id, _scope(OTHER_USER_ID), limit=10)
+        await db.list_active_memory_relation_dismissals(visible.id, _scope(OTHER_USER_ID), limit=10)
     ) == 1
 
 

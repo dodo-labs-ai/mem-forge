@@ -36,7 +36,7 @@ from memforge.memory.evidence import (
     RelationOutcomeBundle,
 )
 from memforge.memory.audit import MemoryAuditEvent
-from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
+from memforge.memory.memory_relation import MemoryRelationOutcome, CurrentMemoryRelation
 from memforge.memory.lifecycle_plan import (
     LifecyclePlan,
     LifecycleReview,
@@ -307,11 +307,11 @@ class RelationalStore(Protocol):
         """Return each Memory's Sources that the caller may read, virtual Sources included."""
         ...
 
-    async def list_cross_document_relations(
+    async def list_memory_relations(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+    ) -> Mapping[str, tuple[CurrentMemoryRelation, ...]]:
         """Return up to MAX_RELATIONS_PER_MEMORY current relations per Memory.
 
         A relation is current when both Memories are active and visible under
@@ -778,7 +778,7 @@ class RelationalStore(Protocol):
         worker_id: str,
         lease_token: str,
         relation_run: RelationOutcomeBundle,
-        document_relations: CrossDocumentRelationOutcome,
+        memory_relations: MemoryRelationOutcome,
     ) -> None: ...
     async def fail_relation_discovery_work(
         self,

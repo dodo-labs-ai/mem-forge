@@ -60,7 +60,7 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
     )
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
+        relation_candidates=_candidate_retriever(adapters),
         db=db,
         memory_store=_OutboxDrainer(db),
         structured_llm_client=client,

@@ -12,10 +12,10 @@ from memforge.llm import decision_model
 from memforge.llm.decision_model import EVALUATED_DECISION_TASKS, DecisionTask, decision_task_model
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.memory import engine
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CROSS_DOCUMENT_RELATION_TASK,
-    StructuredCrossDocumentRelationClassifier,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MEMORY_RELATION_TASK,
+    StructuredMemoryRelationClassifier,
 )
 from memforge.memory.entity_resolver import (
     ENTITY_ADJUDICATION_CONTRACT,
@@ -34,8 +34,8 @@ from memforge.memory.relation_classifier import (
 from memforge.pipeline.revision_work import CHANGE_IMPACT_CONTRACT, CHANGE_IMPACT_TASK, RevisionWorkExecutor
 from memforge.runtime import DefaultRuntimeProvider, resolve_models
 from tests.test_change_impact import ImpactClient, cohort, impact_works
-from tests.test_cross_document_relation_classifier import _Client as RelationClient
-from tests.test_cross_document_relation_classifier import _pairs
+from tests.test_memory_relation_classifier import _Client as RelationClient
+from tests.test_memory_relation_classifier import _pairs
 from tests.test_entity_resolver import _SCOPE, EntityClient, FakeEntityStore, _match_first_candidate
 from tests.test_revision_work import Store
 from tests.embedding_fixture import fixed_vector_embedding
@@ -58,13 +58,13 @@ def test_every_decision_task_carries_its_current_contract_version() -> None:
     tasks = (
         CHANGE_IMPACT_TASK,
         PAIR_REVIEW_TASK,
-        CROSS_DOCUMENT_RELATION_TASK,
+        MEMORY_RELATION_TASK,
         ENTITY_ADJUDICATION_TASK,
     )
     assert [task.contract_version for task in tasks] == [
         CHANGE_IMPACT_CONTRACT,
         MEMORY_PAIR_REVIEW_CONTRACT,
-        CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+        MEMORY_RELATION_CLASSIFIER_VERSION,
         ENTITY_ADJUDICATION_CONTRACT,
     ]
     assert len({task.name for task in tasks}) == len(tasks)
@@ -246,9 +246,9 @@ class DecisionRelationClient(RelationClient):
     def __post_init__(self):
         self.models = []
 
-    async def classify_cross_document_relations(self, prompt, *, model=None):
+    async def classify_relation_candidates(self, prompt, *, model=None):
         self.models.append(model)
-        return await super().classify_cross_document_relations(prompt, model=model)
+        return await super().classify_relation_candidates(prompt, model=model)
 
 
 @pytest.mark.asyncio
@@ -257,25 +257,25 @@ class DecisionRelationClient(RelationClient):
     [
         pytest.param({}, MAIN_MODEL, id="unregistered"),
         pytest.param(
-            {CROSS_DOCUMENT_RELATION_TASK.name: CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION},
+            {MEMORY_RELATION_TASK.name: MEMORY_RELATION_CLASSIFIER_VERSION},
             DECISION_MODEL,
             id="registered",
         ),
     ],
 )
-async def test_cross_document_relations_run_on_the_model_their_registration_selects(
+async def test_memory_relations_run_on_the_model_their_registration_selects(
     monkeypatch, registered, expected,
 ) -> None:
     register(monkeypatch, registered)
     client = DecisionRelationClient()
 
-    await StructuredCrossDocumentRelationClassifier(client=client, model=MAIN_MODEL).classify(_pairs(2))
+    await StructuredMemoryRelationClassifier(client=client, model=MAIN_MODEL).classify(_pairs(2))
 
     assert client.models == [expected]
 
 
 def test_pair_review_is_registered_by_its_own_task_name(monkeypatch) -> None:
-    register(monkeypatch, {CROSS_DOCUMENT_RELATION_TASK.name: CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION})
+    register(monkeypatch, {MEMORY_RELATION_TASK.name: MEMORY_RELATION_CLASSIFIER_VERSION})
     client = SimpleNamespace(decision_model=DECISION_MODEL)
     assert StructuredMemoryPairClassifier(client=client, model=MAIN_MODEL)._model == MAIN_MODEL
 
@@ -404,8 +404,8 @@ async def test_decision_model_calls_use_their_own_schema_transport_and_report_th
         telemetry_sink=telemetry.append,
     )
 
-    await client.classify_cross_document_relations("classify", model=DECISION_MODEL)
-    await client.classify_cross_document_relations("classify")
+    await client.classify_relation_candidates("classify", model=DECISION_MODEL)
+    await client.classify_relation_candidates("classify")
 
     assert [call["model"] for call in calls] == [DECISION_MODEL, MAIN_MODEL]
     assert calls[0]["response_format"]["type"] == "json_schema"

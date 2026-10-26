@@ -111,7 +111,7 @@ flowchart LR
   Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local Markdown"]
   API["MemForge API"]
   Extract["Extract memories<br/>with source Evidence"]
-  Recheck["Plan updates<br/>relate across documents"]
+  Recheck["Plan updates<br/>relate memories"]
   Store[("SQLite + FTS5<br/>Chroma")]
 
   CC --> Plugin

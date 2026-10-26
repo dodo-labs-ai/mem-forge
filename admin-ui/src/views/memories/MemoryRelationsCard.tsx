@@ -40,7 +40,7 @@ function CounterpartLine({ memory }: { memory: RelatedMemory }) {
 }
 
 /**
- * Current Cross-Document Relations of one Memory and the dismissals a person
+ * Current Memory Relations of one Memory and the dismissals a person
  * can undo. A relation is a hint for readers; dismissing it changes no Memory.
  */
 export function MemoryRelationsCard({ memory }: { memory: Memory }) {
@@ -75,7 +75,7 @@ export function MemoryRelationsCard({ memory }: { memory: Memory }) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">Related Memories in other documents</CardTitle>
+        <CardTitle className="text-sm">Related Memories</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {failure && <p className="text-sm text-destructive">{failure}</p>}

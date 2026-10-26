@@ -42,7 +42,7 @@ from memforge.memory.lifecycle_planner import (
     lifecycle_access_context_hash,
     lifecycle_plan_id,
 )
-from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.relation_candidate_retrieval import RelationCandidateRetriever
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
     LifecyclePlan,
@@ -9997,7 +9997,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         doc_store=StubDocumentStore(),
         memory_extractor=extractor,
         memory_engine=MemoryEngine(
-            cross_document_candidates=CrossDocumentCandidateRetriever(
+            relation_candidates=RelationCandidateRetriever(
                 relational=adapters.relational,
                 keyword=adapters.keyword,
                 vector=adapters.vector,
@@ -10437,7 +10437,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
 
     class AuditingEngine(NoopMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):
-            await client.classify_memory_relations("audit")
+            await client.classify_same_unit_pairs("audit")
             raise AssertionError("failed mandatory audit must not commit")
 
     orchestrator = GeneSyncOrchestrator(

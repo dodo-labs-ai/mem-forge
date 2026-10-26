@@ -11,6 +11,20 @@ const dateTimeFormat = new Intl.DateTimeFormat("en-US", {
   hour: "numeric",
   minute: "2-digit",
 });
+const dateTimeWithYearFormat = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+const calendarDateFormat = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  year: "numeric",
+  timeZone: "UTC",
+});
+const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 export function formatCount(value: number): string {
   return numberFormat.format(value);
@@ -27,6 +41,17 @@ export function formatDate(iso: string): string {
 
 export function formatDateTime(iso: string): string {
   return dateTimeFormat.format(new Date(iso));
+}
+
+/**
+ * When a source recorded something: the date and local time of an instant
+ * ("Mar 3, 2026, 12:30 PM"), the date alone for a calendar date
+ * ("Mar 3, 2026"), and the value as given when it is neither.
+ */
+export function formatSourceTime(value: string): string {
+  if (CALENDAR_DATE.test(value)) return calendarDateFormat.format(new Date(`${value}T00:00:00Z`));
+  const instant = new Date(value);
+  return Number.isNaN(instant.getTime()) ? value : dateTimeWithYearFormat.format(instant);
 }
 
 /** "just now", "5 min ago", "3 h ago", "2 days ago", then a calendar date. */

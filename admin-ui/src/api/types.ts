@@ -35,14 +35,14 @@ export interface Memory {
    * correct single brand mark.
    */
   origin_client?: string | null;
-  /** Current Cross-Document Relations; present on Memory detail. */
+  /** Current Memory Relations; present on Memory detail. */
   relations?: MemoryRelation[];
   relation_notice?: string | null;
   /** Relation Dismissals in force that the caller can undo; present on Memory detail. */
   dismissed_relations?: DismissedRelation[];
 }
 
-// Cross-Document Relations
+// Memory Relations
 
 export type RelationLabel = "equivalent" | "updates" | "contradicts";
 
@@ -57,7 +57,7 @@ export interface RelatedMemory {
   summary: string;
   content_hash: string;
   sources: MemorySourceRef[];
-  /** UTC date (YYYY-MM-DD) on which the source recorded the Evidence the relation was decided on. */
+  /** UTC time (ISO 8601 instant, or a YYYY-MM-DD date when the relation was decided from dates) at which the source recorded the Evidence the relation was decided on. */
   evidence_time: string | null;
 }
 

@@ -74,8 +74,8 @@ from memforge.pipeline.support_relation_coordinator import (
     SupportRecheckRequest,
     memory_support,
 )
-from memforge.memory.cross_document_relation import StructuredCrossDocumentRelationClassifier
-from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.memory_relation import StructuredMemoryRelationClassifier
+from memforge.memory.relation_candidate_retrieval import RelationCandidateRetriever
 from memforge.source_access import (
     memory_visibility_for_source_id,
 )
@@ -299,7 +299,7 @@ class MemoryEngine:
 
     def __init__(
         self,
-        cross_document_candidates: CrossDocumentCandidateRetriever,
+        relation_candidates: RelationCandidateRetriever,
         db: Database,
         memory_store: MemoryStore,
         embedding: EmbeddingRuntime | None = None,
@@ -308,7 +308,7 @@ class MemoryEngine:
         runtime_event_trace_sink: RuntimeEventTraceSink | None = None,
         document_store: Any = None,
     ) -> None:
-        self.cross_document_candidates = cross_document_candidates
+        self.relation_candidates = relation_candidates
         self.db = db
         self.memory_store = memory_store
         self.document_store = document_store
@@ -319,11 +319,11 @@ class MemoryEngine:
             self.runtime_event_trace_sink
         )
         self.pair_classifier = (
-            StructuredCrossDocumentRelationClassifier(
+            StructuredMemoryRelationClassifier(
                 client=structured_llm_client,
                 model=llm_model,
             )
-            if callable(getattr(structured_llm_client, "classify_cross_document_relations", None))
+            if callable(getattr(structured_llm_client, "classify_relation_candidates", None))
             else None
         )
         # Entity resolver with embedding + LLM capabilities

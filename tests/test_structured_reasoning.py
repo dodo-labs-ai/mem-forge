@@ -108,8 +108,8 @@ def _recording(*responses):
 
 async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
     calls = {
-        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
-        "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
+        "classify_same_unit_pairs": lambda: client.classify_same_unit_pairs("prompt"),
+        "classify_relation_candidates": lambda: client.classify_relation_candidates("prompt"),
         "change_impact": lambda: client.evaluate_revision_work(
             "prompt", response_format=ChangeImpactWireResponse),
         "admit_candidates": lambda: client.admit_candidates("prompt"),
@@ -129,8 +129,8 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
 
 
 DIRECT_ANSWER_OPERATIONS = (
-    "classify_memory_relations",
-    "classify_cross_document_relations",
+    "classify_same_unit_pairs",
+    "classify_relation_candidates",
     "change_impact",
     "admit_candidates",
     "validate_entity_batch",
@@ -183,7 +183,7 @@ async def test_a_route_without_a_known_safe_parameter_is_sent_the_call_as_before
         StructuredLlmConfig.for_invocation(invocation, timeout_s=5.0), completion_transport=transport,
     )
 
-    await client.classify_cross_document_relations("prompt")
+    await client.classify_relation_candidates("prompt")
 
     [call] = calls
     assert set(call) == {"model", "messages", "timeout", "max_tokens", "num_retries", *invocation.request_kwargs()}
@@ -195,7 +195,7 @@ async def test_the_decision_model_is_asked_for_a_direct_answer_by_its_own_route(
         transport, provider="openai", model="openai/gpt-5.1", decision_model="openai/gpt-5-mini",
     )
 
-    await client.classify_cross_document_relations("prompt", model=client.decision_model)
+    await client.classify_relation_candidates("prompt", model=client.decision_model)
 
     [call] = calls
     assert (call["model"], call["reasoning_effort"]) == ("openai/gpt-5-mini", "minimal")
@@ -214,7 +214,7 @@ async def test_a_route_that_reasons_by_default_answers_a_one_pair_relation_direc
     transport, calls = _recording(openrouter)
     client, telemetry = _client(transport)
 
-    result = await client.classify_cross_document_relations("prompt")
+    result = await client.classify_relation_candidates("prompt")
 
     assert [(decision.pair_index, decision.label) for decision in result.decisions] == [(0, "none")]
     [call] = calls
@@ -239,7 +239,7 @@ async def test_a_truncated_reply_fails_the_call_without_another_request(reply) -
     client, telemetry = _client(transport)
 
     with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt")
+        await client.classify_relation_candidates("prompt")
 
     assert failed.value.error_code == "output_truncated"
     assert [call["max_tokens"] for call in calls] == [ROUTE_OUTPUT_TOKENS]
@@ -255,8 +255,8 @@ async def test_a_provider_that_refuses_to_turn_reasoning_off_is_asked_without_it
     transport, calls = _recording(refusal, _response(ONE_PAIR_ANSWER), _response(ONE_PAIR_ANSWER))
     client, telemetry = _client(transport)
 
-    await client.classify_cross_document_relations("prompt")
-    await client.classify_cross_document_relations("prompt")
+    await client.classify_relation_candidates("prompt")
+    await client.classify_relation_candidates("prompt")
 
     assert ["extra_body" in call for call in calls] == [True, False, False]
     assert [entry.terminal_category for entry in telemetry] == ["success", "success"]
@@ -269,8 +269,8 @@ async def test_a_rejection_that_is_not_about_reasoning_is_not_sent_again_without
     client, _telemetry = _client(transport)
 
     with pytest.raises(StructuredLlmError) as failed:
-        await client.classify_cross_document_relations("prompt")
-    await client.classify_cross_document_relations("prompt")
+        await client.classify_relation_candidates("prompt")
+    await client.classify_relation_candidates("prompt")
 
     assert failed.value.terminal_category == "request_error"
     assert ["extra_body" in call for call in calls] == [True, True]
@@ -290,7 +290,7 @@ async def test_a_route_that_rejects_native_schema_falls_back_with_reasoning_stil
     client, telemetry = _client(transport)
 
     for _ in range(2):
-        await client.classify_cross_document_relations("prompt")
+        await client.classify_relation_candidates("prompt")
 
     # Each call is one rejected native-schema request and one JSON-text request.
     assert [("response_format" in call, "extra_body" in call) for call in calls] == [

@@ -1578,23 +1578,13 @@
         "title": "CreateSourceRequest",
         "type": "object"
       },
-      "CrossDocumentRelationLabel": {
-        "enum": [
-          "none",
-          "equivalent",
-          "updates",
-          "contradicts"
-        ],
-        "title": "CrossDocumentRelationLabel",
-        "type": "string"
-      },
       "CrossSourceReviewConversionApplyRequest": {
         "additionalProperties": false,
         "description": "Apply a report with the relabels it was made with.",
         "properties": {
           "label_overrides": {
             "additionalProperties": {
-              "$ref": "#/components/schemas/CrossDocumentRelationLabel"
+              "$ref": "#/components/schemas/MemoryRelationLabel"
             },
             "title": "Label Overrides",
             "type": "object"
@@ -1698,7 +1688,7 @@
           },
           "relation_labels": {
             "additionalProperties": {
-              "$ref": "#/components/schemas/CrossDocumentRelationLabel"
+              "$ref": "#/components/schemas/MemoryRelationLabel"
             },
             "title": "Relation Labels",
             "type": "object"
@@ -1780,7 +1770,7 @@
         "properties": {
           "label_overrides": {
             "additionalProperties": {
-              "$ref": "#/components/schemas/CrossDocumentRelationLabel"
+              "$ref": "#/components/schemas/MemoryRelationLabel"
             },
             "title": "Label Overrides",
             "type": "object"
@@ -5440,7 +5430,7 @@
         "type": "object"
       },
       "MemoryRelationDetail": {
-        "description": "A current Cross-Document Relation read from this Memory.",
+        "description": "A current Memory Relation read from this Memory.",
         "properties": {
           "counterpart": {
             "$ref": "#/components/schemas/RelatedMemoryDetail"
@@ -5480,6 +5470,16 @@
         ],
         "title": "MemoryRelationDetail",
         "type": "object"
+      },
+      "MemoryRelationLabel": {
+        "enum": [
+          "none",
+          "equivalent",
+          "updates",
+          "contradicts"
+        ],
+        "title": "MemoryRelationLabel",
+        "type": "string"
       },
       "MemoryResponse": {
         "properties": {
@@ -8768,7 +8768,7 @@
           },
           "labels": {
             "additionalProperties": {
-              "$ref": "#/components/schemas/CrossDocumentRelationLabel"
+              "$ref": "#/components/schemas/MemoryRelationLabel"
             },
             "title": "Labels",
             "type": "object"

@@ -3,7 +3,7 @@ from pydantic import ValidationError
 
 from memforge.llm.structured import (
     ClaimRevisionDecision,
-    MemoryRelationAssessment,
+    SameUnitRelationAssessment,
     RevisionAssessment,
     StructuredLlmError,
 )
@@ -38,7 +38,7 @@ class Client(RevisionClientFixture):
         response = ClaimRevisionDecision(
             pair_index=0,
             status=self.status,
-            relation=MemoryRelationAssessment(
+            relation=SameUnitRelationAssessment(
                 classification=self.classification,
                 direction=self.direction,
                 same_subject_and_scope=self.classification == "contradicts",
@@ -321,14 +321,14 @@ async def test_small_output_cap_can_assess_one_complete_pair():
 
 @pytest.mark.asyncio
 async def test_conflicting_current_refiners_skip_their_incumbent():
-    from memforge.llm.structured import MemoryRelationResponse, MemoryRelationDecision
+    from memforge.llm.structured import SameUnitPairResponse, SameUnitPairDecision
     class Conflicting(Client):
         async def assess_claim_revisions(self, prompt, **kwargs):
             response = await super().assess_claim_revisions(prompt, **kwargs)
             return response.model_copy(update={"results": [response.results[0],
                 response.results[0].model_copy(update={"candidate_id": "NEW-0002"})]})
-        async def classify_memory_relations(self, prompt, **kwargs):
-            return MemoryRelationResponse(decisions=[MemoryRelationDecision(pair_index=0, classification="contradicts")])
+        async def classify_same_unit_pairs(self, prompt, **kwargs):
+            return SameUnitPairResponse(decisions=[SameUnitPairDecision(pair_index=0, classification="contradicts")])
     client = Conflicting("refines", "challenger_to_candidate")
     result = await reconcile_memories(new_extractions=[candidate(), candidate()], existing_memories=[memory()],
         llm_model="test-model", structured_llm_client=client, supports=dict([pinned("memory", True)]))
@@ -416,11 +416,11 @@ def _refinement_ledger(*memory_ids):
     from memforge.pipeline.reconciler import RelationLine
     from memforge.pipeline.support_relation_coordinator import RelationLedgerEntry, RevisionCompositionProof
     from memforge.memory.evidence import RelationDirection
-    from memforge.memory.relation_classifier import MemoryRelationType
+    from memforge.memory.relation_classifier import SameUnitRelationType
 
     return RelationLine(
         entries=tuple(
-            RelationLedgerEntry(index, memory_id, MemoryRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
+            RelationLedgerEntry(index, memory_id, SameUnitRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
             for index, memory_id in enumerate(memory_ids)
         ),
         proofs=tuple(RevisionCompositionProof(index, memory_id, True, True, True) for index, memory_id in enumerate(memory_ids)),

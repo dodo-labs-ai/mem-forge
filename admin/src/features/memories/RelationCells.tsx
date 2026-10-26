@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { formatSourceTime } from "@/lib/format";
 import { memoryPath } from "@/lib/paths";
 import { RelationLabelBadge, SourceLabel } from "./MemoryBadges";
 import { useMemoryTable } from "./memoryTableContext";
@@ -26,7 +27,7 @@ export function RelatedMemorySummary({ memory, typeLabels }: RelatedMemorySummar
           <SourceLabel key={source.source_id} source={source} name={sourceName(source, typeLabels)} />
         ))}
         {memory.evidence_time ? (
-          <span className="text-xs text-muted-foreground">Recorded {memory.evidence_time}</span>
+          <span className="text-xs text-muted-foreground">Recorded {formatSourceTime(memory.evidence_time)}</span>
         ) : null}
       </div>
     </div>
