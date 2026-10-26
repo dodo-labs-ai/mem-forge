@@ -324,6 +324,8 @@ class MemoryExtractor:
                 },
             )
         skipped = reading.report_unread({item_id: outcome.error_code for item_id, outcome in failures.items()})
+        unresolved = {item_id for item_id, outcome in failures.items() if isinstance(outcome.error, UnresolvedSelection)}
+        selections.signal_unresolved(unresolved)
         bound = dict(chunks[0] for chunks in outcomes.values() if not isinstance(chunks, ItemFailure))
         memories = [memory for _request, request_memories in bound.values() for memory in request_memories]
         requests = [request for request, _memories in bound.values()]
@@ -334,9 +336,7 @@ class MemoryExtractor:
             "skipped_reading_group_count": len(skipped),
             "image_count": sum(len(request.images) for request in requests),
             "image_bytes": sum(len(image.body) for request in requests for image in request.images),
-            **selections.metrics(
-                skipped=sum(isinstance(outcome.error, UnresolvedSelection) for outcome in failures.values()),
-            ),
+            **selections.metrics(skipped=len(unresolved)),
         })
 
 
@@ -364,15 +364,19 @@ def _rejection_line(index: int, error: FragmentSelectionError) -> str:
 class _SelectionResolution:
     """Bind each response's candidates to exact Evidence, across one operation's requests.
 
-    A response binds whole or not at all. Every rejected candidate is counted and
-    signalled when it is read, whether its response is then corrected, halved or
-    skipped; bound candidates are signalled once their response is accepted.
+    A response binds whole or not at all. Every rejected candidate is counted when
+    it is read, in every response including corrections and halved requests. Bound
+    candidates are signalled once their response is accepted; a rejection is
+    signalled only when its ReadingGroup is skipped, because a rejection the
+    correction or a halved request recovers loses nothing.
     """
 
     def __init__(self) -> None:
         self.resolved = 0
         self.rejection_counts: dict[str, int] = {}
         self.corrected_requests = 0
+        # The rejections of each request's latest response that did not bind.
+        self._unresolved: dict[tuple[str, ...], list[QualitySignal]] = {}
         self._rejected_requests: set[tuple[str, ...]] = set()
 
     def bind(self, candidates, *, catalog, prompt_hash: str, request_key: tuple[str, ...]) -> list[RawMemory]:
@@ -380,6 +384,7 @@ class _SelectionResolution:
 
         memories: list[RawMemory] = []
         accepted: list[QualitySignal] = []
+        rejected: list[QualitySignal] = []
         rejections: list[tuple[int, FragmentSelectionError]] = []
         for candidate_index, candidate in enumerate(candidates):
             candidate_hash = catalog.selection_fingerprint(
@@ -396,7 +401,7 @@ class _SelectionResolution:
             except FragmentSelectionError as error:
                 rejections.append((candidate_index, error))
                 self.rejection_counts[error.code.value] = self.rejection_counts.get(error.code.value, 0) + 1
-                record_quality_signal(
+                rejected.append(
                     QualitySignal(
                         event_name="evidence_admission_outcome",
                         outcome="rejected",
@@ -434,13 +439,27 @@ class _SelectionResolution:
             )
         if rejections:
             self._rejected_requests.add(request_key)
+            self._unresolved[request_key] = rejected
             raise UnresolvedSelection(tuple(rejections))
+        self._unresolved.pop(request_key, None)
         for signal in accepted:
             record_quality_signal(signal)
         self.resolved += len(memories)
         if request_key in self._rejected_requests:
             self.corrected_requests += 1
         return memories
+
+    def signal_unresolved(self, skipped: set[str]) -> None:
+        """Signal the final rejections of each skipped ReadingGroup.
+
+        A ReadingGroup is skipped only after the request that holds it alone
+        stays unbound, so its rejections are that request's latest response's.
+        """
+
+        for request_key, signals in self._unresolved.items():
+            if len(request_key) == 1 and request_key[0] in skipped:
+                for signal in signals:
+                    record_quality_signal(signal)
 
     def metrics(self, *, skipped: int) -> dict[str, object]:
         """Per-reason rejections, and how the rejected requests ended: corrected, or skipped ReadingGroups."""

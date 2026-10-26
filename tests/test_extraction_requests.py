@@ -308,6 +308,55 @@ async def test_a_reading_group_beyond_the_route_capacity_alone_is_skipped_locall
 
 
 @pytest.mark.asyncio
+async def test_only_the_reading_group_a_halved_request_cannot_bind_signals_its_rejection():
+    from memforge.evals.agent_evaluation import QualitySignalCollector, quality_signal_scope
+
+    projection = _projection(
+        primary_content="Rule one applies.\n\nRule two confuses the model.\n", context_content="Country: US.\n",
+    )
+    context = RevisionAssessmentContext(projection=projection, base=None, access_context_hash="scope")
+
+    class UnknownRefClient(Client):
+        """Cites a ref outside the catalog for rule two, even after the correction."""
+
+        def __init__(self):
+            super().__init__(limit=40000)
+            self.extraction_prompts = []
+
+        async def extract_projection_fragment_memories(self, prompt, **kwargs):
+            self.extraction_prompts.append(prompt)
+            payload = json.loads(prompt.split("<evidence_fragment_catalog", 1)[1].split(">", 1)[1].split(
+                "\n</evidence_fragment_catalog>", 1)[0])
+            memories = []
+            for ref, text, *_rest in payload["primary_candidates"]:
+                primary_ref = "p999999" if "confuses" in text else ref
+                memories.append({
+                    "content": text.strip(), "memory_type": "fact", "primary_ref": primary_ref,
+                    "required_refs": [], "evidence_displays": evidence_displays(primary_ref, []),
+                })
+            return ProjectionFragmentMemoryExtractionResponse.model_validate({"memories": memories})
+
+    client = UnknownRefClient()
+    extractor = MemoryExtractor(model="fixture", structured_llm_client=client)
+    [request] = plan(projection, ExtractionAuthority({body_id(projection): None}), extractor=extractor)
+    collector = QualitySignalCollector()
+    with quality_signal_scope(collector):
+        result = await extractor.extract_projection_fragment_memories(
+            request.catalog, source_type="confluence", revision_context=context,
+        )
+
+    assert result.error_type is None
+    assert [m.content for m in result.memories] == ["Rule one applies."]
+    # Both groups together, its correction, then rule two alone and its correction.
+    assert len(client.extraction_prompts) == 5
+    assert result.metadata["fragment_selection_rejection_counts"] == {"unknown_ref": 4}
+    assert result.metadata["selection_skipped_reading_group_count"] == 1
+    assert sorted((s.outcome, s.reason_code) for s in collector.snapshot()) == [
+        ("expected", "fragment_selection_resolved"), ("rejected", "unknown_ref"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_reading_group_whose_output_stays_invalid_is_skipped_locally():
     projection = _projection(
         primary_content="Rule one applies.\n\nRule two confuses the model.\n", context_content="Country: US.\n",
@@ -466,9 +515,8 @@ async def test_teams_reply_selected_as_required_only_is_corrected_to_primary_on_
     assert result.metadata["fragment_selection_rejection_counts"] == {"ineligible_role": 1}
     assert result.metadata["selection_corrected_request_count"] == 1
     assert result.metadata["skipped_reading_group_count"] == 0
-    assert [(s.outcome, s.reason_code) for s in signals] == [
-        ("rejected", "ineligible_role"), ("expected", "fragment_selection_resolved"),
-    ]
+    # The correction recovered the rejection, so only the bound selection is signalled.
+    assert [(s.outcome, s.reason_code) for s in signals] == [("expected", "fragment_selection_resolved")]
 
 
 @pytest.mark.asyncio
@@ -485,7 +533,8 @@ async def test_teams_reply_still_selected_as_required_only_skips_its_reading_gro
     assert result.metadata["selection_skipped_reading_group_count"] == 1
     assert result.metadata["skipped_reading_group_count"] == 1
     assert "extraction_reading_group_unread" in caplog.text
-    assert [(s.outcome, s.reason_code) for s in signals] == [("rejected", "ineligible_role")] * 2
+    # The skipped ReadingGroup signals its final rejection once; the metrics count both attempts.
+    assert [(s.outcome, s.reason_code) for s in signals] == [("rejected", "ineligible_role")]
 
     _initial, target, _authority = _teams_reply_window()
     unit = assemble_source_derivation_results(projection=target, plan=extraction, results=(result,))
