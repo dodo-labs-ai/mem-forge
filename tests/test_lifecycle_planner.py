@@ -5,8 +5,6 @@ from dataclasses import replace
 import pytest
 
 from memforge.memory.lifecycle_plan import (
-    IncumbentAuthority,
-    IncumbentAuthorityGrant,
     LifecycleMutation,
     LifecycleMutationType,
     ReconciliationScope,
@@ -124,48 +122,6 @@ def test_unsupported_destructive_incumbent_still_fails_without_explicit_owner_au
             new_evidence_unit_ids=("eu-new",),
             defaults=_defaults(),
         )
-
-
-def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support() -> None:
-    old = _memory()
-
-    plan = build_lifecycle_plan(
-        plan_id="plan-unsupported-owner",
-        scope=_scope(),
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.SUPERSEDE,
-                memory_id=old.id,
-                memory=_replacement(),
-                reason="owner corrected managed claim",
-            ),
-        ),
-        incumbents={old.id: old},
-        source_support_unit_ids={old.id: ()},
-        all_active_support_unit_ids={old.id: ()},
-        support_set_hashes={old.id: "empty-support-hash"},
-        observation_revision_ids=("obsrev-2",),
-        new_evidence_unit_ids=("eu-new",),
-        defaults=_defaults(),
-        incumbent_authority_grants={
-            old.id: IncumbentAuthorityGrant(
-                authority=IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM,
-                actor_id="owner@example.test",
-            )
-        },
-    )
-
-    assert [mutation.mutation_type for mutation in plan.mutations] == [
-        LifecycleMutationType.CREATE_MEMORY,
-        LifecycleMutationType.ATTACH_SUPPORT,
-        LifecycleMutationType.SUPERSEDE_MEMORY,
-    ]
-    assert plan.coverage_proof.incumbent_decisions[0].authority.value == (
-        "explicit_owner_managed_claim"
-    )
-    assert plan.coverage_proof.incumbent_decisions[0].authority_actor_id == (
-        "owner@example.test"
-    )
 
 
 def test_noop_evidence_rebind_moves_this_units_support_and_keeps_the_memory() -> None:

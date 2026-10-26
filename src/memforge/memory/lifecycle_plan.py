@@ -189,7 +189,6 @@ class IncumbentAuthority(str, Enum):
     """Authority that admits an incumbent to one destructive decision."""
 
     CURRENT_SOURCE_SUPPORT = "current_source_support"
-    EXPLICIT_OWNER_MANAGED_CLAIM = "explicit_owner_managed_claim"
     MAINTENANCE_OPERATOR = "maintenance_operator"
 
 
