@@ -8417,7 +8417,7 @@ def create_admin_app(
         return {"sort_mode": req.sort_mode}
 
     # ===================================================================
-    # 4c. Recent Changes
+    # 4b. Recent Changes
     # ===================================================================
 
     @recent_change_router.get("")
@@ -9762,7 +9762,7 @@ def create_admin_app(
         }
 
     # ===================================================================
-    # 4d. Agent Hook Context
+    # 4c. Agent Hook Context
     # ===================================================================
 
     @hook_router.post("/context")

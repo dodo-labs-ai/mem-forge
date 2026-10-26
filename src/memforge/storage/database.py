@@ -5425,9 +5425,9 @@ class Database:
                 result = await self._retire_source_unlocked(source_id)
             except ValueError as exc:
                 raise RuntimeError(
-                    f"agent-session Source {source_id} cannot be retired: {exc}. Restore the recovery "
-                    "point taken before this upgrade, resolve that work with the previous MemForge "
-                    "release, delete the Source in the admin UI, then upgrade again"
+                    f"agent-session Source {source_id} cannot be retired: {exc}. Go back to the data as "
+                    "it was before this upgrade, resolve that work with the previous MemForge release, "
+                    "delete the Source in the admin UI, then upgrade again"
                 ) from exc
             logger.info(
                 "Retired agent-session Source %s and %d of its Memories",
@@ -15713,7 +15713,7 @@ class Database:
         return list(dict.fromkeys(ids))
 
     # ==================================================================
-    # Agent Knowledge Bundle
+    # Memory Origins and Support
     # ==================================================================
 
     async def get_origin_source_pairs(
