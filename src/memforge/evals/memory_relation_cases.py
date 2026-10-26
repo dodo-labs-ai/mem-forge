@@ -1,4 +1,4 @@
-"""Pin human-labeled Memories as cross-document relation evaluation cases.
+"""Pin human-labeled Memories as memory relation evaluation cases.
 
 Two sets are pinned. The pair set comes from people's decisions on
 Cross-Source Conflict Reviews: one case is one Memory pair. The group set comes
@@ -11,9 +11,9 @@ A case pins every Memory as the classifier sees it, together with the
 classifier contract version whose input it holds, so the set survives the
 removal of the Reviews and any later change of the Memories. A case is
 replayed by any classifier contract that reads the input it pinned
-(``CROSS_DOCUMENT_RELATION_INPUT_VERSIONS``), and it expects the label the
+(``MEMORY_RELATION_INPUT_VERSIONS``), and it expects the label the
 program records for the human label, the same label the Review conversion
-stores (``CrossDocumentRelationJudgment.recorded_label``). A case is pinned
+stores (``MemoryRelationJudgment.recorded_label``). A case is pinned
 only when every Memory it shows comes from an active workspace Source: the set
 is shared workspace content, and a decision or group it cannot pin is counted
 by reason, never read.
@@ -33,11 +33,11 @@ from memforge.evals.offline_evaluation import (
     AgentEvaluationRole,
     OfflineAgentEvaluation,
 )
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CrossDocumentRelationJudgment,
-    CrossDocumentRelationLabel,
-    CrossDocumentRelationPair,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MemoryRelationJudgment,
+    MemoryRelationLabel,
+    MemoryRelationPair,
     RelationSubject,
     RelationSubjectReader,
     RelationSubjectStore,
@@ -101,16 +101,16 @@ class RelationCaseSeedReport:
 class _PinnedCase:
     case_id: str
     ground_truth_revision_id: str
-    label: CrossDocumentRelationLabel
+    label: MemoryRelationLabel
     population: AgentEvaluationPopulation
 
 
-async def seed_cross_document_relation_cases(
+async def seed_memory_relation_cases(
     store: RelationCaseStore,
     evaluation: OfflineAgentEvaluation,
     *,
     actor: str,
-    label_overrides: Mapping[str, CrossDocumentRelationLabel],
+    label_overrides: Mapping[str, MemoryRelationLabel],
 ) -> RelationCaseSeedReport:
     """Pin every decided Review whose Memories are unchanged and freeze one cohort.
 
@@ -160,7 +160,7 @@ async def seed_cross_document_relation_cases(
             created_by=actor,
         )
         cohort_id = cohort.cohort_id
-    label_counts = {label.value: 0 for label in CrossDocumentRelationLabel}
+    label_counts = {label.value: 0 for label in MemoryRelationLabel}
     for case in pinned:
         label_counts[case.label.value] += 1
     return RelationCaseSeedReport(
@@ -178,7 +178,7 @@ async def _pin_review_case(
     *,
     review: MemoryReview,
     actor: str,
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
 ) -> _PinnedCase | RelationCaseSkip:
     by_id = {
         memory.id: memory
@@ -220,7 +220,7 @@ async def _pin_case(
     challenger: Memory,
     candidate: Memory,
     origin: Mapping[str, Any],
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     population: AgentEvaluationPopulation,
     actor: str,
 ) -> _PinnedCase | RelationCaseSkip:
@@ -228,17 +228,17 @@ async def _pin_case(
     if isinstance(pinned, RelationCaseSkip):
         return pinned
     unit, subjects = pinned
-    expected_label = CrossDocumentRelationJudgment(
-        pair=CrossDocumentRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id]),
+    expected_label = MemoryRelationJudgment(
+        pair=MemoryRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id]),
         label=label,
     ).recorded_label
     case = await evaluation.curate_case(
-        case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
+        case_kind=AgentEvaluationCaseKind.MEMORY_RELATION,
         source_id=unit.source_id,
         doc_id=unit.doc_id,
         source_unit_id=unit.source_unit_id,
         manifest={
-            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "classifier_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "challenger": subjects[challenger.id].to_manifest(),
             "candidate": subjects[candidate.id].to_manifest(),
             "origin": dict(origin),
@@ -274,7 +274,7 @@ class RelationGroupLabels:
 
     challenger_memory_id: str
     candidate_memory_ids: tuple[str, ...]
-    labels: Mapping[str, CrossDocumentRelationLabel]
+    labels: Mapping[str, MemoryRelationLabel]
     content_hashes: Mapping[str, str]
 
     def __post_init__(self) -> None:
@@ -311,10 +311,10 @@ class _PinnedGroup:
     case_id: str
     ground_truth_revision_id: str
     candidate_count: int
-    labels: Mapping[str, CrossDocumentRelationLabel]
+    labels: Mapping[str, MemoryRelationLabel]
 
 
-async def seed_cross_document_relation_group_cases(
+async def seed_memory_relation_group_cases(
     store: RelationGroupCaseStore,
     evaluation: OfflineAgentEvaluation,
     *,
@@ -366,7 +366,7 @@ async def seed_cross_document_relation_group_cases(
             created_by=actor,
         )
         cohort_id = cohort.cohort_id
-    label_counts = {label.value: 0 for label in CrossDocumentRelationLabel}
+    label_counts = {label.value: 0 for label in MemoryRelationLabel}
     for case in pinned:
         for label in case.labels.values():
             label_counts[label.value] += 1
@@ -412,19 +412,19 @@ async def _pin_group_case(
     unit, subjects = pinned
     subject = subjects[challenger.id]
     expected_labels = {
-        memory_id: CrossDocumentRelationJudgment(
-            pair=CrossDocumentRelationPair(challenger=subject, candidate=subjects[memory_id]),
+        memory_id: MemoryRelationJudgment(
+            pair=MemoryRelationPair(challenger=subject, candidate=subjects[memory_id]),
             label=label,
         ).recorded_label
         for memory_id, label in group.labels.items()
     }
     case = await evaluation.curate_case(
-        case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP,
+        case_kind=AgentEvaluationCaseKind.MEMORY_RELATION_GROUP,
         source_id=unit.source_id,
         doc_id=unit.doc_id,
         source_unit_id=unit.source_unit_id,
         manifest={
-            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "classifier_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "challenger": subject.to_manifest(),
             "candidates": [subjects[candidate.id].to_manifest() for candidate in candidates],
             "origin": {"labelled_by": labelled_by},

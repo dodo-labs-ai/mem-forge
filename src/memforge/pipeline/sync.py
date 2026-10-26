@@ -3371,9 +3371,9 @@ class GeneSyncOrchestrator:
             support_without_baseline=reprocessing,
             unit_input=unit_input,
         )
-        # Extraction owns the only document-content model call. Historical
-        # cross-document/cross-source discovery remains post-commit Relation
-        # work; same-source incumbents are loaded by exact lifecycle lineage.
+        # Extraction owns the only document-content model call. Relation
+        # discovery between committed Memories is post-commit work;
+        # same-source incumbents are loaded by exact lifecycle lineage.
         diagnostics.stage = "derivation"
         extraction_result = await self._extract_for_document_update(
             projection=projection,

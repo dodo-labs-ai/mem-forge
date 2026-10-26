@@ -1,4 +1,4 @@
-"""Operator paths for cross-document discovery: exhausted work, re-runs and Review conversion."""
+"""Operator paths for relation discovery: exhausted work, re-runs and Review conversion."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.evals.cross_document_relation_cases import RELATION_CASE_POLICY_VERSION
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel, pair_key
+from memforge.evals.memory_relation_cases import RELATION_CASE_POLICY_VERSION
+from memforge.memory.memory_relation import MemoryRelationLabel, pair_key
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.cross_source_review_conversion import (
     CONVERSION_APPLIED_EVENT,
@@ -555,8 +555,8 @@ async def test_conversion_apply_writes_relations_dismissals_reruns_once(db: Data
         "SELECT * FROM cross_document_relation_dismissals ORDER BY label"
     )
     assert [row["label"] for row in dismissals] == [
-        CrossDocumentRelationLabel.CONTRADICTS.value,
-        CrossDocumentRelationLabel.UPDATES.value,
+        MemoryRelationLabel.CONTRADICTS.value,
+        MemoryRelationLabel.UPDATES.value,
     ]
     for dismissal in dismissals:
         assert (dismissal["memory_low_id"], dismissal["memory_high_id"]) == ("c", "d")
@@ -642,7 +642,10 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
         "SELECT label, decided_by, low_evidence_time, high_evidence_time FROM cross_document_relations"
     )
     assert (relation["label"], relation["decided_by"]) == ("updates", "review")
-    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == ("2026-07-02", "2026-06-30")
+    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == (
+        "2026-07-02T08:00:00+00:00",
+        "2026-06-30T08:00:00+00:00",
+    )
     [event] = await db.db.execute_fetchall(
         "SELECT payload FROM memory_audit_events WHERE event_type = ?",
         (CONVERSION_APPLIED_EVENT,),
@@ -655,8 +658,8 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "times",
-    [{}, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-07-02T17:00:00+00:00"}],
-    ids=["unknown", "same-date"],
+    [{}, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-07-02T08:00:00+00:00"}],
+    ids=["unknown", "same-time"],
 )
 async def test_conversion_records_an_updates_relabel_as_contradicts_when_evidence_times_do_not_order_it(
     db: Database, tmp_path, times: dict[str, str]

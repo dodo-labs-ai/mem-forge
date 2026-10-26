@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge.memory.evidence import RelationDirection
-from memforge.memory.relation_classifier import MemoryRelationType
+from memforge.memory.relation_classifier import SameUnitRelationType
 from memforge.models import Memory, RawMemory, ReconcileAction, content_hash
 from memforge.pipeline.revision_assessment import SupportAssessment
 from memforge.pipeline.support_relation_coordinator import (
@@ -24,9 +24,9 @@ from memforge.pipeline.support_relation_coordinator import (
     supported_refiners,
 )
 
-EQUIVALENT = MemoryRelationType.EQUIVALENT
-CONTRADICTS = MemoryRelationType.CONTRADICTS
-REFINES = MemoryRelationType.REFINES
+EQUIVALENT = SameUnitRelationType.EQUIVALENT
+CONTRADICTS = SameUnitRelationType.CONTRADICTS
+REFINES = SameUnitRelationType.REFINES
 
 SUPPORTED = SupportResult.SUPPORTED
 UNAFFECTED = SupportResult.UNAFFECTED
@@ -58,7 +58,7 @@ def _support(result: SupportResult, *, rechecked: bool = False) -> MemorySupport
     return MemorySupport(result, f"{result.value} reason", evidence, rechecked)
 
 
-def _edge(index: int, relation: MemoryRelationType | None, memory_id: str = "mem-old", **kwargs) -> RelationLedgerEntry:
+def _edge(index: int, relation: SameUnitRelationType | None, memory_id: str = "mem-old", **kwargs) -> RelationLedgerEntry:
     return RelationLedgerEntry(
         candidate_index=index, incumbent_id=memory_id, relation_type=relation,
         direction=kwargs.pop("direction", RelationDirection.SYMMETRIC), reason=kwargs.pop("reason", ""),

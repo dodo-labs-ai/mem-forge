@@ -26,7 +26,7 @@ from memforge.memory.evidence import (
     ResolvedEvidenceSelection,
 )
 from memforge.source_projection import AnchorKind, SourceAnchor
-from memforge.memory.relation_classifier import MemoryRelationType
+from memforge.memory.relation_classifier import SameUnitRelationType
 from memforge.models import (
     Memory,
     RawMemory,
@@ -145,7 +145,7 @@ async def test_supported_incumbent_and_unrelated_case25_keep_and_add() -> None:
     ))
 
     class RelationFirstClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             del prompt, kwargs
             return FixtureRelationResponse(
                 decisions=[
@@ -191,7 +191,7 @@ async def test_additive_refinement_with_complete_current_evidence_is_revision() 
     ))
 
     class RevisionClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             del prompt, kwargs
             return FixtureRelationResponse(
                 decisions=[
@@ -252,7 +252,7 @@ async def test_revision_response_failure_cannot_fall_back_to_add() -> None:
     ))
 
     class ProofFailureClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _single_refines_response()
 
@@ -289,7 +289,7 @@ async def test_missing_conditional_assessment_preserves_incumbent() -> None:
         def __init__(self) -> None:
             self.proof_calls = 0
 
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             del prompt, kwargs
             return _single_refines_response()
 
@@ -332,7 +332,7 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
             RelationLedgerEntry(
                 candidate_index=0,
                 incumbent_id=incumbent.id,
-                relation_type=MemoryRelationType.REFINES,
+                relation_type=SameUnitRelationType.REFINES,
                 direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
             )
         ],
@@ -354,19 +354,19 @@ def test_refinement_without_revision_proof_falls_back_to_keep_and_add() -> None:
 @pytest.mark.parametrize(
     ("supported", "relation_type", "expected_actions"),
     [
-        (True, MemoryRelationType.EQUIVALENT, [ReconcileAction.NOOP]),
-        (True, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP]),
+        (True, SameUnitRelationType.EQUIVALENT, [ReconcileAction.NOOP]),
+        (True, SameUnitRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.NOOP]),
         # Both claims keep Support: the contradicting Candidate is added beside the kept old Memory.
-        (True, MemoryRelationType.CONTRADICTS, [ReconcileAction.ADD, ReconcileAction.NOOP]),
-        (False, MemoryRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE]),
-        (False, MemoryRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE]),
+        (True, SameUnitRelationType.CONTRADICTS, [ReconcileAction.ADD, ReconcileAction.NOOP]),
+        (False, SameUnitRelationType.UNRELATED, [ReconcileAction.ADD, ReconcileAction.DELETE]),
+        (False, SameUnitRelationType.CONTRADICTS, [ReconcileAction.SUPERSEDE]),
         # Still unsupported after its one re-check: the claim keeps its own result.
-        (False, MemoryRelationType.EQUIVALENT, [ReconcileAction.ADD, ReconcileAction.DELETE]),
+        (False, SameUnitRelationType.EQUIVALENT, [ReconcileAction.ADD, ReconcileAction.DELETE]),
     ],
 )
 def test_relation_support_matrix(
     supported: bool,
-    relation_type: MemoryRelationType,
+    relation_type: SameUnitRelationType,
     expected_actions: list[ReconcileAction],
 ) -> None:
     incumbent = _memory("mem-current", "The service uses PostgreSQL 15.")
@@ -410,7 +410,7 @@ def test_multiple_contradiction_candidates_never_guess_a_successor(supported: bo
             RelationLedgerEntry(
                 candidate_index=index,
                 incumbent_id=incumbent.id,
-                relation_type=MemoryRelationType.CONTRADICTS,
+                relation_type=SameUnitRelationType.CONTRADICTS,
                 direction=RelationDirection.SYMMETRIC,
             )
             for index in range(len(candidates))
@@ -440,13 +440,13 @@ def test_an_unsupported_claim_loses_support_beside_its_equivalent_and_refinement
             RelationLedgerEntry(
                 candidate_index=0,
                 incumbent_id=incumbent.id,
-                relation_type=MemoryRelationType.EQUIVALENT,
+                relation_type=SameUnitRelationType.EQUIVALENT,
                 direction=RelationDirection.SYMMETRIC,
             ),
             RelationLedgerEntry(
                 candidate_index=1,
                 incumbent_id=incumbent.id,
-                relation_type=MemoryRelationType.REFINES,
+                relation_type=SameUnitRelationType.REFINES,
                 direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
             ),
         ],
@@ -473,7 +473,7 @@ def test_equivalent_candidate_rebinds_each_supported_incumbent() -> None:
             RelationLedgerEntry(
                 candidate_index=0,
                 incumbent_id=memory.id,
-                relation_type=MemoryRelationType.EQUIVALENT,
+                relation_type=SameUnitRelationType.EQUIVALENT,
                 direction=RelationDirection.SYMMETRIC,
             )
             for memory in (first, second)
@@ -518,7 +518,7 @@ def test_runbook_candidate_with_multiple_incumbents_falls_back_to_keep_and_add()
             RelationLedgerEntry(
                 candidate_index=0,
                 incumbent_id=incumbent.id,
-                relation_type=MemoryRelationType.REFINES,
+                relation_type=SameUnitRelationType.REFINES,
                 direction=RelationDirection.CHALLENGER_TO_CANDIDATE,
                 reason="The current procedure is related but does not prove lossless replacement.",
             )
@@ -587,7 +587,7 @@ async def test_a_candidate_whose_relation_row_stays_invalid_is_consumed_without_
 @pytest.mark.asyncio
 async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
     class FailingClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             del prompt, kwargs
             raise StructuredLlmError("structured unavailable", terminal_category="provider_error")
 
@@ -607,13 +607,13 @@ async def test_relation_provider_failure_fails_closed_with_incumbents() -> None:
 def test_unresolved_pair_preserves_related_component_and_allows_independent_work():
     candidates = [RawMemory(content=f"Claim {n}", memory_type="fact") for n in range(3)]
     old = [_memory(f"mem-{n}", f"Old {n}") for n in range(3)]
-    relations = [RelationLedgerEntry(c, m.id, MemoryRelationType.UNRELATED, RelationDirection.SYMMETRIC)
+    relations = [RelationLedgerEntry(c, m.id, SameUnitRelationType.UNRELATED, RelationDirection.SYMMETRIC)
                  for c in range(3) for m in old]
     # Candidate 0 is unresolved against old0 and equivalent to old1. Candidate1
     # also touches old1. All four must stay together; candidate2/old2 may advance.
     from dataclasses import replace
-    types = {(0, "mem-0"): None, (0, "mem-1"): MemoryRelationType.EQUIVALENT,
-             (1, "mem-1"): MemoryRelationType.CONTRADICTS}
+    types = {(0, "mem-0"): None, (0, "mem-1"): SameUnitRelationType.EQUIVALENT,
+             (1, "mem-1"): SameUnitRelationType.CONTRADICTS}
     relations = [replace(r, relation_type=types.get((r.candidate_index, r.incumbent_id), r.relation_type))
                  for r in relations]
     operations = coordinated_operations(
@@ -633,7 +633,7 @@ async def test_refinements_whose_comparison_stays_invalid_leave_their_edges_unce
     from memforge.pipeline.reconciler import RelationLine, join_support_and_relation
 
     class InvalidComparisonClient(RevisionClientFixture):
-        async def classify_memory_relations(self, prompt: str, **kwargs):
+        async def classify_same_unit_pairs(self, prompt: str, **kwargs):
             return FixtureRelationResponse(decisions=[])
 
     incumbent = _memory("mem-timeout", "The client timeout is 30 seconds.")
@@ -643,7 +643,7 @@ async def test_refinements_whose_comparison_stays_invalid_leave_their_edges_unce
     ]
     relation = RelationLine(
         entries=tuple(
-            RelationLedgerEntry(index, incumbent.id, MemoryRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
+            RelationLedgerEntry(index, incumbent.id, SameUnitRelationType.REFINES, RelationDirection.CHALLENGER_TO_CANDIDATE)
             for index in range(len(refinements))
         ),
         completed_candidate_count=len(refinements), incumbent_ids=frozenset({incumbent.id}),

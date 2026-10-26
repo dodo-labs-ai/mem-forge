@@ -7,22 +7,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.evals.cross_document_relation_cases import (
+from memforge.evals.memory_relation_cases import (
     RelationCaseSkip,
-    seed_cross_document_relation_cases,
+    seed_memory_relation_cases,
 )
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCaseKind,
     AgentEvaluationPopulation,
-    CrossDocumentRelationReplayExecutor,
+    MemoryRelationReplayExecutor,
     OfflineAgentEvaluation,
     relation_label_metrics,
 )
-from memforge.llm.structured import CrossDocumentRelationResponse
+from memforge.llm.structured import RelationCandidateResponse
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CrossDocumentRelationLabel,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MemoryRelationLabel,
 )
 from memforge.models import Memory, MemoryReview, content_hash
 from memforge.storage.database import Database
@@ -145,10 +145,10 @@ def _review_store(db: Database) -> _ReviewStore:
 async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Database) -> None:
     store = _review_store(db)
     evaluation = OfflineAgentEvaluation(db, executors={})
-    overrides = {"rev-updated": CrossDocumentRelationLabel.UPDATES}
+    overrides = {"rev-updated": MemoryRelationLabel.UPDATES}
 
-    report = await seed_cross_document_relation_cases(store, evaluation, actor=ACTOR, label_overrides=overrides)
-    again = await seed_cross_document_relation_cases(store, evaluation, actor=ACTOR, label_overrides=overrides)
+    report = await seed_memory_relation_cases(store, evaluation, actor=ACTOR, label_overrides=overrides)
+    again = await seed_memory_relation_cases(store, evaluation, actor=ACTOR, label_overrides=overrides)
 
     assert report == again
     assert report.pinned_case_count == 3
@@ -165,13 +165,13 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
     for item in cohort.items:
         case = await db.get_agent_evaluation_case(item.case_id)
         ground_truth = await db.get_accepted_ground_truth_revision(item.ground_truth_revision_id)
-        assert case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION
+        assert case.case_kind is AgentEvaluationCaseKind.MEMORY_RELATION
         assert case.source_id == "src-teams"
-        assert case.manifest["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+        assert case.manifest["classifier_version"] == MEMORY_RELATION_CLASSIFIER_VERSION
         challenger_id = case.manifest["challenger"]["memory_id"]
         assert case.manifest["challenger"]["statement"] == store.memories[challenger_id].content
         assert case.manifest["challenger"]["evidence"] == [f"Evidence for {challenger_id}."]
-        assert case.manifest["challenger"]["evidence_time"] == "2026-03-25"
+        assert case.manifest["challenger"]["evidence_time"] == "2026-03-25T10:00:00+00:00"
         assert case.manifest["candidate"]["document_title"].startswith("Title ")
         labels_by_review[case.manifest["origin"]["review_id"]] = (
             ground_truth.rubric["expected_label"],
@@ -185,15 +185,15 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
 
 
 @pytest.mark.asyncio
-async def test_seed_pins_an_updates_relabel_on_a_same_day_pair_as_contradicts(db: Database) -> None:
+async def test_seed_pins_an_updates_relabel_on_a_same_time_pair_as_contradicts(db: Database) -> None:
     store = _review_store(db)
 
-    # rev-confirmed pairs mem-a and mem-b, both recorded on the same date.
-    report = await seed_cross_document_relation_cases(
+    # rev-confirmed pairs mem-a and mem-b, both recorded at the same time.
+    report = await seed_memory_relation_cases(
         store,
         OfflineAgentEvaluation(db, executors={}),
         actor=ACTOR,
-        label_overrides={"rev-confirmed": CrossDocumentRelationLabel.UPDATES},
+        label_overrides={"rev-confirmed": MemoryRelationLabel.UPDATES},
     )
 
     assert report.label_counts == {"none": 1, "equivalent": 0, "updates": 0, "contradicts": 2}
@@ -212,15 +212,15 @@ async def test_seed_skips_a_pair_without_source_evidence_and_rejects_unknown_rel
     store.units["mem-a"] = ()
     evaluation = OfflineAgentEvaluation(db, executors={})
 
-    report = await seed_cross_document_relation_cases(store, evaluation, actor=ACTOR, label_overrides={})
+    report = await seed_memory_relation_cases(store, evaluation, actor=ACTOR, label_overrides={})
 
     assert report.skipped[RelationCaseSkip.NO_SOURCE_EVIDENCE.value] == 1
     with pytest.raises(ValueError, match="rev-pending"):
-        await seed_cross_document_relation_cases(
+        await seed_memory_relation_cases(
             store,
             evaluation,
             actor=ACTOR,
-            label_overrides={"rev-pending": CrossDocumentRelationLabel.UPDATES},
+            label_overrides={"rev-pending": MemoryRelationLabel.UPDATES},
         )
 
 
@@ -269,7 +269,7 @@ async def test_seed_skips_a_pair_shown_from_an_unreadable_or_missing_source(
         replace(primary_evidence_unit_fixture(shown_memory_id), source_id=UNREADABLE_SOURCE_ID),
     )
 
-    report = await seed_cross_document_relation_cases(
+    report = await seed_memory_relation_cases(
         store,
         OfflineAgentEvaluation(db, executors={}),
         actor=ACTOR,
@@ -303,30 +303,30 @@ class _LabelClient:
     def request_fits(self, prompt, **_kwargs):
         return True
 
-    async def classify_cross_document_relations(self, prompt, *, model=None):
+    async def classify_relation_candidates(self, prompt, *, model=None):
         label = "contradicts" if "weekly" in prompt else "none"
-        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": label}])
+        return RelationCandidateResponse(decisions=[{"pair_index": 0, "label": label}])
 
 
 class _UpdatesClient(_LabelClient):
     """Labels every pair updates."""
 
-    async def classify_cross_document_relations(self, prompt, *, model=None):
-        return CrossDocumentRelationResponse(decisions=[{"pair_index": 0, "label": "updates"}])
+    async def classify_relation_candidates(self, prompt, *, model=None):
+        return RelationCandidateResponse(decisions=[{"pair_index": 0, "label": "updates"}])
 
 
 @pytest.mark.asyncio
 async def test_relation_run_reports_label_precision_and_recall(db: Database) -> None:
     store = _review_store(db)
-    seed = await seed_cross_document_relation_cases(
+    seed = await seed_memory_relation_cases(
         store,
         OfflineAgentEvaluation(db, executors={}),
         actor=ACTOR,
-        label_overrides={"rev-updated": CrossDocumentRelationLabel.UPDATES},
+        label_overrides={"rev-updated": MemoryRelationLabel.UPDATES},
     )
     evaluation = OfflineAgentEvaluation(
         db,
-        executors={AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION: CrossDocumentRelationReplayExecutor(_LabelClient())},
+        executors={AgentEvaluationCaseKind.MEMORY_RELATION: MemoryRelationReplayExecutor(_LabelClient())},
     )
 
     report = await evaluation.execute_run(
@@ -335,7 +335,7 @@ async def test_relation_run_reports_label_precision_and_recall(db: Database) -> 
             "code_revision": "test",
             "prompt_hash": "test",
             "schema_version": "1",
-            "contract_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "contract_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "model": FIXTURE_MODEL,
             "replay_harness_version": "1",
         },
@@ -393,7 +393,7 @@ async def test_seed_route_requires_a_maintenance_operator(db: Database, tmp_path
 
 
 async def _executed_relation_run(db: Database) -> str:
-    seed = await seed_cross_document_relation_cases(
+    seed = await seed_memory_relation_cases(
         _review_store(db),
         OfflineAgentEvaluation(db, executors={}),
         actor=ACTOR,
@@ -401,7 +401,7 @@ async def _executed_relation_run(db: Database) -> str:
     )
     evaluation = OfflineAgentEvaluation(
         db,
-        executors={AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION: CrossDocumentRelationReplayExecutor(_LabelClient())},
+        executors={AgentEvaluationCaseKind.MEMORY_RELATION: MemoryRelationReplayExecutor(_LabelClient())},
     )
     report = await evaluation.execute_run(
         cohort_id=seed.cohort_id,
@@ -409,7 +409,7 @@ async def _executed_relation_run(db: Database) -> str:
             "code_revision": "test",
             "prompt_hash": "test",
             "schema_version": "1",
-            "contract_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "contract_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "model": FIXTURE_MODEL,
             "replay_harness_version": "1",
         },
@@ -430,7 +430,7 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
 
     with pytest.raises(ValueError, match="cross-document-relation-v1"):
         await OfflineAgentEvaluation(db, executors={}).curate_case(
-            case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
+            case_kind=AgentEvaluationCaseKind.MEMORY_RELATION,
             source_id=output.case.source_id,
             doc_id=output.case.doc_id,
             source_unit_id=output.case.source_unit_id,
@@ -439,38 +439,53 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
             created_by=ACTOR,
         )
     with pytest.raises(ValueError, match="cross-document-relation-v1"):
-        await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
+        await MemoryRelationReplayExecutor(_LabelClient()).execute(
             replace(output.case, manifest=earlier),
             {"model": FIXTURE_MODEL},
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pinned_version", ["cross-document-relation-v2", "cross-document-relation-v3"])
-async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(
-    db: Database, pinned_version: str,
+@pytest.mark.parametrize(
+    ("pinned_version", "challenger_time", "candidate_time", "recorded"),
+    [
+        ("cross-document-relation-v2", "2026-03-25", "2026-03-01", "updates"),
+        ("cross-document-relation-v5", "2026-03-25", "2026-03-01", "updates"),
+        # A date holds no time of day, so a pinned pair of one day stays unordered.
+        ("cross-document-relation-v5", "2026-03-25", "2026-03-25", "contradicts"),
+    ],
+)
+async def test_a_case_pinned_with_evidence_dates_is_replayed_at_their_precision(
+    db: Database, pinned_version: str, challenger_time: str, candidate_time: str, recorded: str
 ) -> None:
     run_id = await _executed_relation_run(db)
     [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
         run_id, requesting_user_id=ACTOR
     )
-    pinned = {**output.case.manifest, "classifier_version": pinned_version}
+    pinned = {
+        **output.case.manifest,
+        "classifier_version": pinned_version,
+        "challenger": {**output.case.manifest["challenger"], "evidence_time": challenger_time},
+        "candidate": {**output.case.manifest["candidate"], "evidence_time": candidate_time},
+    }
 
-    replayed = await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
+    replayed = await MemoryRelationReplayExecutor(_UpdatesClient()).execute(
         replace(output.case, manifest=pinned),
         {"model": FIXTURE_MODEL},
     )
 
-    assert replayed["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    assert replayed["classifier_version"] == MEMORY_RELATION_CLASSIFIER_VERSION
+    assert (replayed["label"], replayed["classifier_label"]) == (recorded, "updates")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("challenger_time", "candidate_time", "recorded"),
     [
-        ("2026-03-25", "2026-03-01", "updates"),
-        ("2026-03-25", "2026-03-25", "contradicts"),
-        ("2026-03-25", None, "contradicts"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-01T10:00:00+00:00", "updates"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-25T08:30:00+00:00", "updates"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-25T10:00:00+00:00", "contradicts"),
+        ("2026-03-25T10:00:00+00:00", None, "contradicts"),
     ],
 )
 async def test_replay_scores_the_label_discovery_records(
@@ -486,7 +501,7 @@ async def test_replay_scores_the_label_discovery_records(
         "candidate": {**output.case.manifest["candidate"], "evidence_time": candidate_time},
     }
 
-    replayed = await CrossDocumentRelationReplayExecutor(_UpdatesClient()).execute(
+    replayed = await MemoryRelationReplayExecutor(_UpdatesClient()).execute(
         replace(output.case, manifest=manifest),
         {"model": FIXTURE_MODEL},
     )
@@ -528,8 +543,8 @@ async def test_case_outputs_route_returns_pinned_input_and_labels(
     assert confirmed["rubric"] == {"expected_label": "contradicts"}
     assert confirmed["manifest"]["challenger"]["evidence"] == ["Evidence for mem-a."]
     assert confirmed["result"]["output"] == {
-        "case_kind": AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION.value,
-        "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+        "case_kind": AgentEvaluationCaseKind.MEMORY_RELATION.value,
+        "classifier_version": MEMORY_RELATION_CLASSIFIER_VERSION,
         "label": "contradicts",
         "classifier_label": "contradicts",
     }

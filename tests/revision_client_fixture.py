@@ -21,12 +21,12 @@ from pydantic import BaseModel, Field
 
 from memforge.llm.structured import (
     ClaimRevisionDecision,
-    MemoryRelationAssessment,
+    SameUnitRelationAssessment,
     RevisionAssessment,
 )
 
 
-class FixtureRelationDecision(MemoryRelationAssessment):
+class FixtureRelationDecision(SameUnitRelationAssessment):
     """One scenario relation for an application-issued pair slot.
 
     It becomes a Sparse Relation row, and its classification alone answers a
@@ -270,7 +270,7 @@ class RevisionClientFixture:
             for old in group["candidates"]
         ]
         legacy_prompt = prompt.split(start, 1)[0] + start + json.dumps(groups) + end
-        relations = await self.classify_memory_relations(legacy_prompt, **kwargs)
+        relations = await self.classify_same_unit_pairs(legacy_prompt, **kwargs)
         proofs = {}
         requests = [
             pair
@@ -286,7 +286,7 @@ class RevisionClientFixture:
                 ClaimRevisionDecision(
                     pair_index=relation.pair_index,
                     status="resolved",
-                    relation=MemoryRelationAssessment.model_validate(relation.model_dump(exclude={"pair_index"})),
+                    relation=SameUnitRelationAssessment.model_validate(relation.model_dump(exclude={"pair_index"})),
                     revision_assessment=RevisionAssessment(
                         same_knowledge_item=proofs[relation.pair_index].same_memory_identity,
                         preserves_incumbent_truth=proofs[relation.pair_index].preserves_incumbent_truth,

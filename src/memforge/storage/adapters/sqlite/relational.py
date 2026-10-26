@@ -34,7 +34,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     LifecycleVectorTask,
 )
-from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
+from memforge.memory.memory_relation import MemoryRelationOutcome, CurrentMemoryRelation
 from memforge.memory.relation_discovery_contract import RelationDiscoveryWork, RelationDiscoveryWorkSelection
 from memforge.memory.review_decision import ReviewVectorTask
 from memforge.source_item_failures import SourceItemFailure
@@ -455,12 +455,12 @@ class SqliteRelationalStore:
     ) -> Mapping[str, tuple[MemorySourceRef, ...]]:
         return await self._db.get_memory_source_refs_many(memory_ids, scope)
 
-    async def list_cross_document_relations(
+    async def list_memory_relations(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
-        return await self._db.list_cross_document_relations(memory_ids, scope)
+    ) -> Mapping[str, tuple[CurrentMemoryRelation, ...]]:
+        return await self._db.list_memory_relations(memory_ids, scope)
 
     async def list_active_memories(
         self,
@@ -1086,14 +1086,14 @@ class SqliteRelationalStore:
         worker_id: str,
         lease_token: str,
         relation_run: RelationOutcomeBundle,
-        document_relations: CrossDocumentRelationOutcome,
+        memory_relations: MemoryRelationOutcome,
     ) -> None:
         await self._db.complete_relation_discovery_work(
             work_id,
             worker_id=worker_id,
             lease_token=lease_token,
             relation_run=relation_run,
-            document_relations=document_relations,
+            memory_relations=memory_relations,
         )
 
     async def fail_relation_discovery_work(
