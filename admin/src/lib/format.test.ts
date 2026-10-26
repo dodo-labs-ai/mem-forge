@@ -30,6 +30,7 @@ test("formatInterval", () => {
 
 test("formatSourceTime", () => {
   expect(formatSourceTime("2026-03-03")).toBe("Mar 3, 2026");
-  expect(formatSourceTime("2026-03-03T12:30:00+00:00")).toMatch(/^Mar 3, 2026, \d{1,2}:30\s(AM|PM)$/);
+  const localNoonThirty = new Date(2026, 2, 3, 12, 30).toISOString();
+  expect(formatSourceTime(localNoonThirty)).toMatch(/^Mar 3, 2026, 12:30\sPM$/);
   expect(formatSourceTime("not a time")).toBe("not a time");
 });
