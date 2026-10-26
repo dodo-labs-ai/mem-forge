@@ -74,7 +74,7 @@ def _package(connector: Connector, *, submitted_at: object = SUBMITTED_AT.isofor
         "space_or_project": "PAY",
         "version": version,
         "submitted_at": submitted_at,
-        "submitted_by": "andrew",
+        "submitted_by": "riley",
         **connector.package_fields,
     }
 
@@ -105,7 +105,7 @@ async def test_a_package_without_a_time_carries_its_submission_time_in_utc(conne
     assert item.item_id == f"{connector.name}-doc"
     assert item.last_modified == SUBMITTED_AT
     assert item.last_modified.tzinfo is timezone.utc
-    assert item.author == "andrew"
+    assert item.author == "riley"
     if source == "manifest":
         assert item.extra["package_uri"] == f"artifact://{connector.name}/doc"
         assert item.extra["input_sha256"] == "c" * 64

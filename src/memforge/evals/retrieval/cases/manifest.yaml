@@ -1,6 +1,6 @@
 case_schema_version: 3
 case_set_id: retrieval-core-v1
-case_set_sha: sha256:b6dae2a2dd0e0bdb3969207d8e8da4cc73efdc9c14fac22a64b71aa96b4e60cd
+case_set_sha: sha256:9f66b9d1cc30595d0dd602adb1a10e7e71c03e2d1dafe670d298fb7ac4853604
 case_files:
   - metadata_lexical.yaml
   - hybrid_fusion.yaml

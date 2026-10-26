@@ -48,13 +48,13 @@ def test_advanced_mode_without_since_keeps_user_order():
 def test_advanced_mode_preserves_complex_clauses_verbatim():
     user = (
         'project = PROJ AND type not in ("Test", "Test Plan") '
-        'AND ("Agile Team" = "Team Alpha") '
+        'AND ("Agile Team" = "Payroll-Team Alpha") '
         'AND (fixVersion != "GLO_PAUSE" OR fixVersion is EMPTY) ORDER BY Rank ASC'
     )
     jql = _build_jql({"query_mode": "advanced", "jql": user}, _delta())
     assert jql.startswith(
         '(project = PROJ AND type not in ("Test", "Test Plan") '
-        'AND ("Agile Team" = "Team Alpha") '
+        'AND ("Agile Team" = "Payroll-Team Alpha") '
         'AND (fixVersion != "GLO_PAUSE" OR fixVersion is EMPTY)) '
         "AND updated >= '2026-06-01 12:00'"
     )

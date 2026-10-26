@@ -53,9 +53,9 @@ assert.equal(
 assert.equal(
   github.connectionSummary({
     connection_mode: "local_push",
-    repo_url: "https://github.internal.example.com/org/repo",
+    repo_url: "https://github.example.com/org/repo",
   }),
-  "Local sync · github.internal.example.com",
+  "Local sync · github.example.com",
 );
 
 const pages = sourceSetupAdapterFor("github_pages");

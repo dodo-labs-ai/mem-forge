@@ -134,7 +134,7 @@ def test_a_base_url_pasted_with_a_request_path_is_read_without_it(provider, past
         ("ollama", "embedding", "nomic-embed-text", "ollama/nomic-embed-text"),
         ("openai_compatible", "generation", "local-model", "openai/local-model"),
         ("openai_compatible", "embedding", "BAAI/bge-m3", "openai/BAAI/bge-m3"),
-        ("litellm", "generation", "litellm_proxy/claude-sonnet", "litellm_proxy/claude-sonnet"),
+        ("litellm", "generation", "litellm_proxy/team-claude-sonnet", "litellm_proxy/team-claude-sonnet"),
         ("litellm", "embedding", " voyage/voyage-3 ", "voyage/voyage-3"),
     ],
 )
@@ -171,7 +171,7 @@ def test_an_unknown_provider_is_refused_by_code() -> None:
     [
         ("ollama/nomic-embed-text", True),
         ("openrouter/openai/text-embedding-3-small", True),
-        ("litellm_proxy/text-embedding-3-small", True),
+        ("litellm_proxy/team-text-embedding", True),
         ("text-embedding-3-small", False),
         ("BAAI/bge-m3", False),
         ("ollama/", False),
@@ -275,11 +275,11 @@ def test_an_ollama_generation_model_is_sent_on_its_own_route() -> None:
 
 
 def test_the_environment_strategy_passes_no_key_so_the_sdk_resolves_it() -> None:
-    binding = _binding("litellm", model_id="litellm_proxy/claude-sonnet", auth_strategy="environment")
+    binding = _binding("litellm", model_id="litellm_proxy/team-claude-sonnet", auth_strategy="environment")
 
     invocation = compile_binding(binding, None)
 
-    assert invocation == ResolvedInvocation(route="litellm_proxy/claude-sonnet", provider="litellm")
+    assert invocation == ResolvedInvocation(route="litellm_proxy/team-claude-sonnet", provider="litellm")
     assert invocation.request_kwargs() == {}
 
 
@@ -417,7 +417,7 @@ def test_a_route_without_an_endpoint_is_bound_to_the_provider_of_its_route() -> 
     assert _binding("litellm", model_id="voyage/voyage-3", kind="embedding").origin == "provider:voyage"
 
 
-@pytest.mark.parametrize("model_id", ["litellm_proxy/claude-sonnet", "litellm_proxy/gpt-5-mini"])
+@pytest.mark.parametrize("model_id", ["litellm_proxy/team-claude-sonnet", "litellm_proxy/team-gpt-mini"])
 def test_a_litellm_route_through_a_gateway_is_asked_for_nothing_about_reasoning(model_id) -> None:
     """A gateway may pass a request on to any provider, so no reasoning parameter is safe to send it."""
     descriptor = provider_descriptor("litellm")
@@ -438,7 +438,7 @@ def test_reasoning_off_parameters_are_a_fresh_value_for_every_request() -> None:
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "openrouter", "ollama", "openai_compatible", "litellm"])
 def test_a_compiled_invocation_names_the_descriptor_it_was_compiled_from(provider) -> None:
-    model_id = "litellm_proxy/claude-sonnet" if provider == "litellm" else "model-a"
+    model_id = "litellm_proxy/team-claude-sonnet" if provider == "litellm" else "model-a"
     endpoint = "https://models.example.test/v1" if provider == "openai_compatible" else None
     binding = _binding(provider, model_id=model_id, endpoint=endpoint, secret_ref="secret:one")
 

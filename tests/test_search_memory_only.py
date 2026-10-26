@@ -47,7 +47,7 @@ async def db(tmp_path):
 
 def _config(tmp_path: Path) -> AppConfig:
     cfg = AppConfig(base_dir=tmp_path / "mem")
-    cfg.llm.embedding_base_url = "http://localhost:6655/openai/v1"
+    cfg.llm.embedding_base_url = "http://localhost:4000/openai/v1"
     cfg.llm.embedding_api_key = "test-key"
     cfg.server.jwt_secret = "test-secret"
     return cfg
