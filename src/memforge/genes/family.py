@@ -27,7 +27,7 @@ class CollectionFamilyKind(str, Enum):
 
 
 def gene_family(gene_cls: type[Gene]) -> CollectionFamilyKind | None:
-    """The family of ``gene_cls``, or ``None`` for a Gene of neither family, which no source type has."""
+    """The family of ``gene_cls``, or ``None`` for a class of neither family, which the source-type contract refuses."""
 
     if issubclass(gene_cls, DocumentGene):
         return CollectionFamilyKind.DOCUMENT
