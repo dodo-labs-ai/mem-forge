@@ -18,7 +18,7 @@ interface RelatedMemoriesCardProps {
 }
 
 /**
- * The current relations of one Memory to Memories in other documents, and
+ * The current relations of one Memory to other Memories, and
  * the dismissals a person can undo. A relation is a hint for readers;
  * dismissing it changes no Memory.
  */
@@ -30,7 +30,7 @@ export function RelatedMemoriesCard({ memory, typeLabels }: RelatedMemoriesCardP
   if (relations.length === 0 && dismissed.length === 0) return null;
 
   return (
-    <DetailCard title="Related memories in other documents" meta={`${relations.length} current`}>
+    <DetailCard title="Related memories" meta={`${relations.length} current`}>
       <div className="flex flex-col gap-2">
         {relations.map((relation) => (
           <div key={`${relation.label}:${relation.counterpart.memory_id}`} className="flex flex-col gap-2 rounded-lg border px-3.5 py-3">

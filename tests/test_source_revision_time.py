@@ -22,7 +22,7 @@ from memforge.genes.teams_gene import TeamsGene
 from tests.conversation_fixture import teams_unit_payload
 from memforge.local_adapter import submit_local_markdown_document
 from memforge.local_agent.teams_contract import MILLISECONDS_PER_SECOND
-from memforge.memory.cross_document_relation import load_relation_subjects
+from memforge.memory.memory_relation import load_relation_subjects
 from memforge.models import ContentItem, Memory, NormalizedContent, RawContent
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.source_artifacts import StoredSourceArtifact
@@ -644,4 +644,4 @@ async def test_a_github_file_commit_time_reaches_the_relation_classifier(db: Dat
 
     assert before.evidence_time is None
     # The next sync records the commit time on the same revision; the Evidence stays anchored.
-    assert after.evidence_time == "2026-05-01"
+    assert after.evidence_time == "2026-05-01T10:00:00+00:00"

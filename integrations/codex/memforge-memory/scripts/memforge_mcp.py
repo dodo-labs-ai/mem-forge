@@ -486,7 +486,7 @@ TOOLS: list[dict[str, Any]] = [
             "Primary/Required/Context roles, document and Artifact resource locators, "
             "and readable Evidence text. Read Primary and Required together; neither "
             "role alone determines support. Use the pinned resource for the full source block. "
-            "entity links, lifecycle metadata, and cross-document relations[] with relation_notice: "
+            "entity links, lifecycle metadata, and memory relations[] with relation_notice: "
             "contradicts means both statements cannot hold, so weigh both and their sources; updates "
             "means the knowledge changed over time and role older marks the outdated statement; "
             "equivalent means another source states the same. Relations never retire or hide a "
@@ -621,7 +621,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "dismiss_memory_relation",
         "description": (
-            "Dismiss a cross-document relation the user says is wrong (not a conflict, not an update, "
+            "Dismiss a memory relation the user says is wrong (not a conflict, not an update, "
             "not the same). It only hides that relation until either Memory changes; it retires, "
             "corrects or hides no Memory. Users need not name this tool. First fetch the Memory with "
             "get_memory, show both statements and the relation label, then get explicit confirmation "

@@ -42,7 +42,7 @@ async def test_projected_incumbent_loading_keeps_complete_large_coverage_batched
     memory_ids = tuple(f"mem-{index:03d}" for index in range(501))
     store = _IncumbentStore(memory_ids)
     engine = MemoryEngine(
-        cross_document_candidates=object(),
+        relation_candidates=object(),
         db=store,
         memory_store=object(),
         structured_llm_client=None,

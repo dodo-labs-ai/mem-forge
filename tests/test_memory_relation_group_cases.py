@@ -11,26 +11,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.evals.cross_document_relation_cases import (
+from memforge.evals.memory_relation_cases import (
     RelationCaseSkip,
     RelationGroupLabels,
-    seed_cross_document_relation_group_cases,
+    seed_memory_relation_group_cases,
 )
 from memforge.evals.offline_evaluation import (
     RELATION_LABEL_CRITERION,
     UNLABELLED_RELATION_CRITERION,
     AgentEvaluationCaseKind,
-    CrossDocumentRelationGroupReplayExecutor,
-    CrossDocumentRelationReplayExecutor,
+    MemoryRelationGroupReplayExecutor,
+    MemoryRelationReplayExecutor,
     OfflineAgentEvaluation,
     agent_evaluation_report_public_payload,
 )
 from memforge.evals.offline_runtime import build_offline_evaluation_for_run
 from memforge.evals.offline_worker import OfflineEvaluationWorker
-from memforge.llm.structured import CrossDocumentRelationResponse
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CrossDocumentRelationLabel,
+from memforge.llm.structured import RelationCandidateResponse
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MemoryRelationLabel,
 )
 from memforge.models import Memory, content_hash
 from memforge.storage.database import Database
@@ -53,7 +53,7 @@ CANDIDATE_MANIFEST = {
     "code_revision": "test",
     "prompt_hash": "test",
     "schema_version": "1",
-    "contract_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+    "contract_version": MEMORY_RELATION_CLASSIFIER_VERSION,
     "model": FIXTURE_MODEL,
     "replay_harness_version": "1",
 }
@@ -63,7 +63,7 @@ STATEMENTS = {
     "mem-subject": "Payroll runs weekly.",
     "mem-monthly": "Payroll runs monthly.",
     "mem-earlier": "Payroll ran fortnightly until March.",
-    "mem-same-day": "Payroll runs every second week.",
+    "mem-same-time": "Payroll runs every second week.",
     "mem-repeat-1": REPEATED_STATEMENT,
     "mem-repeat-2": REPEATED_STATEMENT,
     "mem-other": "The export job writes CSV files.",
@@ -97,7 +97,7 @@ def _labelled_hashes(*memory_ids: str) -> dict[str, str]:
 def _group(
     challenger_memory_id: str,
     candidate_memory_ids: tuple[str, ...],
-    labels: dict[str, CrossDocumentRelationLabel],
+    labels: dict[str, MemoryRelationLabel],
 ) -> RelationGroupLabels:
     return RelationGroupLabels(
         challenger_memory_id=challenger_memory_id,
@@ -182,15 +182,15 @@ def _payroll_group(**overrides) -> RelationGroupLabels:
             "mem-repeat-1",
             "mem-earlier",
             "mem-repeat-2",
-            "mem-same-day",
+            "mem-same-time",
             "mem-other",
         ),
         "labels": {
-            "mem-monthly": CrossDocumentRelationLabel.CONTRADICTS,
-            "mem-earlier": CrossDocumentRelationLabel.UPDATES,
-            "mem-same-day": CrossDocumentRelationLabel.UPDATES,
-            "mem-repeat-1": CrossDocumentRelationLabel.NONE,
-            "mem-repeat-2": CrossDocumentRelationLabel.NONE,
+            "mem-monthly": MemoryRelationLabel.CONTRADICTS,
+            "mem-earlier": MemoryRelationLabel.UPDATES,
+            "mem-same-time": MemoryRelationLabel.UPDATES,
+            "mem-repeat-1": MemoryRelationLabel.NONE,
+            "mem-repeat-2": MemoryRelationLabel.NONE,
         },
         **overrides,
     }
@@ -201,12 +201,12 @@ def _second_group() -> RelationGroupLabels:
     return _group(
         "mem-second",
         ("mem-second-candidate",),
-        {"mem-second-candidate": CrossDocumentRelationLabel.CONTRADICTS},
+        {"mem-second-candidate": MemoryRelationLabel.CONTRADICTS},
     )
 
 
 async def _seed(db: Database, store: _GroupStore, groups: list[RelationGroupLabels]):
-    return await seed_cross_document_relation_group_cases(
+    return await seed_memory_relation_group_cases(
         store,
         OfflineAgentEvaluation(db, executors={}),
         groups=groups,
@@ -235,10 +235,10 @@ class _RecordingClient:
         statement = question["candidate"]["statement"]
         return "contradicts" if "monthly" in statement else "none"
 
-    async def classify_cross_document_relations(self, prompt, *, model=None):
+    async def classify_relation_candidates(self, prompt, *, model=None):
         self.prompts.append(prompt)
         questions = _questions(prompt)
-        return CrossDocumentRelationResponse(
+        return RelationCandidateResponse(
             decisions=[
                 {"pair_index": question["pair_index"], "label": self.label_for(question, questions)}
                 for question in questions
@@ -282,7 +282,7 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
     assert report.pinned_group_count == 2
     assert report.candidate_count == 7
     assert report.labelled_pair_count == 6
-    # mem-same-day shares its Evidence date with the subject, so its updates
+    # mem-same-time shares its Evidence time with the subject, so its updates
     # label is recorded as contradicts.
     assert report.label_counts == {"none": 2, "equivalent": 0, "updates": 1, "contradicts": 3}
     assert report.skipped == {reason.value: 0 for reason in RelationCaseSkip}
@@ -295,22 +295,22 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
         ground_truth = await db.get_accepted_ground_truth_revision(item.ground_truth_revision_id)
         cases[case.manifest["challenger"]["memory_id"]] = (case, ground_truth.rubric)
     case, rubric = cases["mem-subject"]
-    assert case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP
+    assert case.case_kind is AgentEvaluationCaseKind.MEMORY_RELATION_GROUP
     assert case.source_id == SOURCE_ID
     assert case.source_unit_id == "unit-mem-subject"
-    assert case.manifest["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    assert case.manifest["classifier_version"] == MEMORY_RELATION_CLASSIFIER_VERSION
     assert case.manifest["origin"] == {"labelled_by": LABELLED_BY}
     assert case.manifest["challenger"]["evidence"] == ["Evidence for mem-subject."]
     assert [candidate["memory_id"] for candidate in case.manifest["candidates"]] == list(
         _payroll_group().candidate_memory_ids
     )
-    assert case.manifest["candidates"][2]["evidence_time"] == "2026-03-01"
+    assert case.manifest["candidates"][2]["evidence_time"] == "2026-03-01T10:00:00+00:00"
     assert case.manifest["candidates"][0]["document_title"] == "Title doc-mem-monthly"
     assert rubric == {
         "expected_labels": {
             "mem-monthly": "contradicts",
             "mem-earlier": "updates",
-            "mem-same-day": "contradicts",
+            "mem-same-time": "contradicts",
             "mem-repeat-1": "none",
             "mem-repeat-2": "none",
         }
@@ -375,7 +375,7 @@ async def test_seed_skips_a_whole_group_it_cannot_show_and_pins_the_rest(
     ("groups", "message"),
     [
         (
-            lambda: [_payroll_group(labels={"mem-unlisted": CrossDocumentRelationLabel.NONE})],
+            lambda: [_payroll_group(labels={"mem-unlisted": MemoryRelationLabel.NONE})],
             "does not list",
         ),
         (lambda: [_payroll_group(), _payroll_group()], "one group"),
@@ -423,7 +423,7 @@ async def test_seed_reads_each_memory_once_across_groups(db: Database) -> None:
     shared_candidate = _group(
         "mem-second",
         ("mem-second-candidate", "mem-monthly"),
-        {"mem-monthly": CrossDocumentRelationLabel.NONE},
+        {"mem-monthly": MemoryRelationLabel.NONE},
     )
 
     report = await _seed(db, store, [_payroll_group(), shared_candidate])
@@ -441,7 +441,7 @@ async def test_replay_asks_about_every_candidate_of_a_group_in_one_request(db: D
     case = await db.get_agent_evaluation_case(cohort.items[0].case_id)
     client = _RecordingClient()
 
-    output = await CrossDocumentRelationGroupReplayExecutor(client).execute(case, {"model": FIXTURE_MODEL})
+    output = await MemoryRelationGroupReplayExecutor(client).execute(case, {"model": FIXTURE_MODEL})
 
     [prompt] = client.prompts
     assert prompt.count("Payroll runs weekly.") == 1
@@ -454,7 +454,7 @@ async def test_replay_asks_about_every_candidate_of_a_group_in_one_request(db: D
         ("mem-repeat-1", "none"),
         ("mem-earlier", "none"),
         ("mem-repeat-2", "none"),
-        ("mem-same-day", "none"),
+        ("mem-same-time", "none"),
         ("mem-other", "none"),
     ]
 
@@ -463,7 +463,7 @@ async def _run(db: Database, cohort_id: str, client: _RecordingClient):
     evaluation = OfflineAgentEvaluation(
         db,
         executors={
-            AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP: CrossDocumentRelationGroupReplayExecutor(client)
+            AgentEvaluationCaseKind.MEMORY_RELATION_GROUP: MemoryRelationGroupReplayExecutor(client)
         },
     )
     return await evaluation.execute_run(
@@ -502,7 +502,7 @@ async def test_a_group_run_scores_labelled_candidates_and_counts_unlabelled_rela
         "none:none/mem-repeat-1",
         "updates:none/mem-earlier",
         "none:none/mem-repeat-2",
-        "contradicts:none/mem-same-day",
+        "contradicts:none/mem-same-time",
         "contradicts:none/mem-second-candidate",
     }
     [unlabelled] = [check for check in code_checks if check.criterion == UNLABELLED_RELATION_CRITERION]
@@ -549,7 +549,7 @@ async def test_a_group_run_reports_candidates_judged_by_each_other_as_false_rela
             "candidate": case.manifest["candidates"][1],
         },
     )
-    single = await CrossDocumentRelationReplayExecutor(_ContaminatedClient()).execute(alone, {"model": FIXTURE_MODEL})
+    single = await MemoryRelationReplayExecutor(_ContaminatedClient()).execute(alone, {"model": FIXTURE_MODEL})
     assert single["label"] == "none"
 
 

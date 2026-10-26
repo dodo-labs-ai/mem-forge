@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+- Admin: a related Memory shows when its source recorded it as a readable
+  date and time, such as "Mar 3, 2026, 12:30 PM", or as a date alone for a
+  relation decided from dates, instead of the raw stored value. The card on a
+  Memory's page is titled "Related memories", since a relation can connect
+  Memories of one document.
+
+- Relations between memories are named memory relations throughout, since
+  they connect memories of one document as well as of different ones. The
+  modules are `memforge.memory.memory_relation`,
+  `memforge.memory.memory_relation_reader` and
+  `memforge.evals.memory_relation_cases`; the types are `MemoryRelation*`
+  (`MemoryRelationLabel`, `MemoryRelationOutcome`, `CurrentMemoryRelation`,
+  `MemoryRelationDismissal`, `StructuredMemoryRelationClassifier` and the
+  rest), the candidate retriever is `RelationCandidateRetriever` (the
+  `MemoryEngine` argument `relation_candidates`), and the structured client
+  method is `classify_relation_candidates`. The storage protocol methods are
+  `list_memory_relations`, `list_current_memory_relations`,
+  `record_memory_relation_dismissal`, `restore_memory_relation_dismissals` and
+  `list_active_memory_relation_dismissals`, and
+  `complete_relation_discovery_work` takes `memory_relations`. The admin API's label schema is
+  `MemoryRelationLabel`, and the MCP tool descriptions say memory relations.
+  The same-Unit Relation that reconciliation judges keeps its own names:
+  `SameUnitRelationType`, `SameUnitRelationAssessment`, `SameUnitPairDecision`,
+  `SameUnitPairResponse` and the structured client method
+  `classify_same_unit_pairs`.
+  Stored tables, contract versions, audit events, error codes, the LLM call
+  operation names in runtime events and metrics (`cross_document_relation`,
+  `memory_relation`) and HTTP and MCP field names are unchanged, so no
+  migration runs. Cloud: the HANA adapter, the
+  core-integration `WorkspaceDatabase` and the runtime provider take the new
+  names with the pin.
+
+- Relation discovery now orders two statements recorded on the same day by
+  the exact time their sources recorded them, for example two comments of one
+  Jira issue, two messages of one Teams chat, or two pages modified the same
+  day. Such a pair is recorded as `updates`, the later one first in search,
+  where it used to be recorded as `contradicts` because only the date was
+  compared. A pair is still `contradicts` when either source records no time
+  or both give the same time. The classifier now sees each statement's source
+  time in UTC instead of its date, so its contract is
+  `cross-document-relation-v6`. Relation evaluation cases pinned under `v2` to
+  `v5` hold dates and are still replayed: the classifier sees the pinned date,
+  and a pinned pair of one day is still expected as `contradicts`. Relations
+  already recorded keep the dates they were decided on until discovery judges
+  the pair again; to judge them now, re-run completed discovery work from the
+  relation discovery work admin action
+  (`POST /api/v1/relation-discovery/work/rerun` with state `completed` and no
+  classifier version, or once for each version before
+  `cross-document-relation-v6`). Cloud: arrives with the pin; HANA reads the
+  Evidence time through the same shared function, and its relation time
+  columns already hold a full time, so it needs no change.
+
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
   as a memory's main evidence, extraction asks it to correct the selection,

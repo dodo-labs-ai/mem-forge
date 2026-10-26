@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { formatInterval, formatRelative, formatUntil, pluralize } from "./format";
+import { formatInterval, formatRelative, formatSourceTime, formatUntil, pluralize } from "./format";
 
 const NOW = new Date("2026-09-29T12:00:00Z");
 
@@ -26,4 +26,11 @@ test("formatInterval", () => {
   expect(formatInterval(360)).toBe("Every 6 h");
   expect(formatInterval(1440)).toBe("Daily");
   expect(formatInterval(4320)).toBe("Every 3 days");
+});
+
+test("formatSourceTime", () => {
+  expect(formatSourceTime("2026-03-03")).toBe("Mar 3, 2026");
+  const localNoonThirty = new Date(2026, 2, 3, 12, 30).toISOString();
+  expect(formatSourceTime(localNoonThirty)).toMatch(/^Mar 3, 2026, 12:30\sPM$/);
+  expect(formatSourceTime("not a time")).toBe("not a time");
 });

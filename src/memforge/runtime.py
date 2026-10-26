@@ -44,7 +44,7 @@ from memforge.source_projection_config import (
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.health import MemoryIndexHealthChecker, MemoryIndexHealthReport
-from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.relation_candidate_retrieval import RelationCandidateRetriever
 from memforge.memory.store import MemoryStore
 from memforge.models import SourceSyncRun, SyncState
 from memforge.genes.base import SourceConfigurationError
@@ -908,7 +908,7 @@ def _build_default_sync_runtime(
         audit_logger=MemoryAuditLogger(db, default_context=AuditContext(actor_type="sync")),
     )
     memory_engine = MemoryEngine(
-        cross_document_candidates=CrossDocumentCandidateRetriever(
+        relation_candidates=RelationCandidateRetriever(
             relational=adapters.relational,
             keyword=adapters.keyword,
             vector=adapters.vector,
@@ -927,7 +927,7 @@ def _build_default_sync_runtime(
 
         relation_discovery = RelationDiscovery(
             store=adapters.relational,
-            candidate_retriever=memory_engine.cross_document_candidates,
+            candidate_retriever=memory_engine.relation_candidates,
             pair_classifier=memory_engine.pair_classifier,
         )
 

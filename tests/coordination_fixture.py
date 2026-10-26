@@ -59,7 +59,7 @@ class ScriptedClient(RevisionClientFixture):
         self.impact = impact
         self.support_requests: list[dict] = []
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         groups = json.loads(prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0])
         decisions = []
         for group in groups:
@@ -101,7 +101,7 @@ class ScriptedClient(RevisionClientFixture):
 
 def coordination_engine(db: Database, client, memory_store=None) -> MemoryEngine:
     return MemoryEngine(
-        cross_document_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
+        relation_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
         db=db,
         memory_store=memory_store or _AuditedOutboxDrainer(db),
         structured_llm_client=client,

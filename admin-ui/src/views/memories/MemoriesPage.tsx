@@ -636,7 +636,7 @@ export function MemoriesPage() {
 
 
 /**
- * Current Cross-Document Relations, newest decision first. A view of hints for
+ * Current Memory Relations, newest decision first. A view of hints for
  * readers, not a work queue: nothing here waits for a decision.
  */
 function RelationPairList({

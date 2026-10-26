@@ -412,7 +412,7 @@ async def reprocess_preview(
     when the Unit has Supports, and one whole-Unit reading per Support
     (Supports can share a request). It leaves out requests split for capacity,
     Support readings that take several steps, extraction corrections, entity
-    resolution and cross-document relation classification.
+    resolution and memory relation classification.
     """
 
     from memforge.pipeline.memory_extractor import ExtractionReading

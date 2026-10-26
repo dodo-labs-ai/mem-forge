@@ -86,9 +86,9 @@ from memforge.genes.toolkit.config import (
 from memforge.genes.toolkit.github_api import BROWSE_TREE_REQUEST_BUDGET, GitHubTreeBudgetExceeded
 from memforge.github_repo_utils import github_extension_allowed, github_include_extensions
 from memforge.memory.audit import AuditContext
-from memforge.memory.cross_document_relation import (
+from memforge.memory.memory_relation import (
     MAX_RELATIONS_PER_MEMORY,
-    CrossDocumentRelationLabel,
+    MemoryRelationLabel,
     RelationDismissalConflict,
 )
 from memforge.memory.cross_source_conflict_reviews import ReviewLabelOverrideError
@@ -108,7 +108,7 @@ from memforge.memory.relation_discovery_contract import (
     RelationDiscoveryWorkSelection,
     RelationDiscoveryWorkState,
 )
-from memforge.memory.cross_document_relation_reader import (
+from memforge.memory.memory_relation_reader import (
     dismiss_relation,
     dismissed_relation_views,
     list_relation_pairs,
@@ -1018,7 +1018,7 @@ class RelatedMemoryDetail(BaseModel):
 
 
 class MemoryRelationDetail(BaseModel):
-    """A current Cross-Document Relation read from this Memory."""
+    """A current Memory Relation read from this Memory."""
 
     label: RelationLabelLiteral
     role: Literal["newer", "older", "peer"]
@@ -1129,7 +1129,7 @@ class CrossSourceReviewLabelsRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    label_overrides: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
+    label_overrides: dict[str, MemoryRelationLabel] = Field(default_factory=dict)
 
 
 class RelationGroupLabelsRequest(BaseModel):
@@ -1143,7 +1143,7 @@ class RelationGroupLabelsRequest(BaseModel):
 
     challenger_memory_id: str = Field(min_length=1)
     candidate_memory_ids: list[str] = Field(min_length=1)
-    labels: dict[str, CrossDocumentRelationLabel] = Field(default_factory=dict)
+    labels: dict[str, MemoryRelationLabel] = Field(default_factory=dict)
     content_hashes: dict[str, str]
 
 
@@ -1237,7 +1237,7 @@ class CrossSourceReviewConversionReportResponse(BaseModel):
     report_id: str
     review_count: int
     # The relation each converted Review becomes, by Review id.
-    relation_labels: dict[str, CrossDocumentRelationLabel]
+    relation_labels: dict[str, MemoryRelationLabel]
     dismissal_review_ids: list[str]
     discarded_review_ids: list[str]
     rerun_review_ids: list[str]
@@ -1304,7 +1304,7 @@ class MemoryResponse(BaseModel):
     origin_client: str | None = None
     # The Sources this Memory comes from that the caller may read.
     sources: list[MemorySourceRefDetail] = []
-    # The Cross-Document Relations current for the caller.
+    # The Memory Relations current for the caller.
     relations: list[MemoryRelationDetail] = []
     # The pending Review a Memory in ``pending_review`` waits for, so the
     # Memory opens straight into its decision.
@@ -6007,7 +6007,7 @@ def create_admin_app(
         views, total = await list_relation_pairs(
             db,
             _workspace_default_scope(request, include_private=True),
-            label=CrossDocumentRelationLabel(label) if label is not None else None,
+            label=MemoryRelationLabel(label) if label is not None else None,
             limit=limit,
             offset=offset,
         )
@@ -6037,7 +6037,7 @@ def create_admin_app(
                 db,
                 memory_id=memory_id,
                 counterpart_memory_id=counterpart_memory_id,
-                label=CrossDocumentRelationLabel(body.label),
+                label=MemoryRelationLabel(body.label),
                 expected_content_hash=body.expected_content_hash,
                 counterpart_expected_content_hash=body.counterpart_expected_content_hash,
                 actor=resolve_request_principal(request),
@@ -6071,7 +6071,7 @@ def create_admin_app(
 
         scope = _workspace_default_scope(request, include_private=True)
         await _require_visible_relation_pair(db, memory_id, counterpart_memory_id, scope)
-        restored = await db.restore_cross_document_relation_dismissals(
+        restored = await db.restore_memory_relation_dismissals(
             memory_id=memory_id,
             counterpart_memory_id=counterpart_memory_id,
             actor=resolve_request_principal(request),
@@ -6186,7 +6186,7 @@ def create_admin_app(
         dismissed = await dismissed_relation_views(
             db,
             memory_id,
-            await db.list_active_cross_document_relation_dismissals(
+            await db.list_active_memory_relation_dismissals(
                 memory_id,
                 scope,
                 limit=MAX_RELATIONS_PER_MEMORY,
@@ -6490,7 +6490,7 @@ def create_admin_app(
     ):
         """Delete the Review rows of a complete conversion after the evaluation set is frozen."""
 
-        from memforge.evals.cross_document_relation_cases import RELATION_CASE_POLICY_VERSION
+        from memforge.evals.memory_relation_cases import RELATION_CASE_POLICY_VERSION
 
         actor = _require_maintenance_operator(request)
         cohort = await db.get_agent_evaluation_cohort(body.cohort_id)
@@ -7668,12 +7668,12 @@ def create_admin_app(
     ):
         """Pin decided Cross-Source Conflict Reviews as labeled cases and freeze their cohort."""
 
-        from memforge.evals.cross_document_relation_cases import seed_cross_document_relation_cases
+        from memforge.evals.memory_relation_cases import seed_memory_relation_cases
         from memforge.evals.offline_evaluation import OfflineAgentEvaluation
 
         actor = _require_maintenance_operator(request)
         try:
-            report = await seed_cross_document_relation_cases(
+            report = await seed_memory_relation_cases(
                 db,
                 OfflineAgentEvaluation(db, executors={}),
                 actor=actor,
@@ -7703,15 +7703,15 @@ def create_admin_app(
         were made for only.
         """
 
-        from memforge.evals.cross_document_relation_cases import (
+        from memforge.evals.memory_relation_cases import (
             RelationGroupLabels,
-            seed_cross_document_relation_group_cases,
+            seed_memory_relation_group_cases,
         )
         from memforge.evals.offline_evaluation import OfflineAgentEvaluation
 
         actor = _require_maintenance_operator(request)
         try:
-            report = await seed_cross_document_relation_group_cases(
+            report = await seed_memory_relation_group_cases(
                 db,
                 OfflineAgentEvaluation(db, executors={}),
                 groups=[

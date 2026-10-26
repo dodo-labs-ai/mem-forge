@@ -3281,18 +3281,13 @@ export interface components {
             type: string;
         };
         /**
-         * CrossDocumentRelationLabel
-         * @enum {string}
-         */
-        CrossDocumentRelationLabel: "none" | "equivalent" | "updates" | "contradicts";
-        /**
          * CrossSourceReviewConversionApplyRequest
          * @description Apply a report with the relabels it was made with.
          */
         CrossSourceReviewConversionApplyRequest: {
             /** Label Overrides */
             label_overrides?: {
-                [key: string]: components["schemas"]["CrossDocumentRelationLabel"];
+                [key: string]: components["schemas"]["MemoryRelationLabel"];
             };
             /** Report Id */
             report_id: string;
@@ -3334,7 +3329,7 @@ export interface components {
             };
             /** Relation Labels */
             relation_labels: {
-                [key: string]: components["schemas"]["CrossDocumentRelationLabel"];
+                [key: string]: components["schemas"]["MemoryRelationLabel"];
             };
             /** Report Id */
             report_id: string;
@@ -3367,7 +3362,7 @@ export interface components {
         CrossSourceReviewLabelsRequest: {
             /** Label Overrides */
             label_overrides?: {
-                [key: string]: components["schemas"]["CrossDocumentRelationLabel"];
+                [key: string]: components["schemas"]["MemoryRelationLabel"];
             };
         };
         /**
@@ -4770,7 +4765,7 @@ export interface components {
         };
         /**
          * MemoryRelationDetail
-         * @description A current Cross-Document Relation read from this Memory.
+         * @description A current Memory Relation read from this Memory.
          */
         MemoryRelationDetail: {
             counterpart: components["schemas"]["RelatedMemoryDetail"];
@@ -4790,6 +4785,11 @@ export interface components {
              */
             role: "newer" | "older" | "peer";
         };
+        /**
+         * MemoryRelationLabel
+         * @enum {string}
+         */
+        MemoryRelationLabel: "none" | "equivalent" | "updates" | "contradicts";
         /** MemoryResponse */
         MemoryResponse: {
             /** Content */
@@ -6024,7 +6024,7 @@ export interface components {
             };
             /** Labels */
             labels?: {
-                [key: string]: components["schemas"]["CrossDocumentRelationLabel"];
+                [key: string]: components["schemas"]["MemoryRelationLabel"];
             };
         };
         /** RelationListResponse */

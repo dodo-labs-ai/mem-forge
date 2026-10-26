@@ -398,7 +398,7 @@ class CandidateAdmissionResponse(StructuredResponseModel):
     decisions: list[CandidateAdmissionDecision]
 
 
-class MemoryRelationAssessment(StructuredResponseModel):
+class SameUnitRelationAssessment(StructuredResponseModel):
     """A semantic relationship with its applicable direction and conflict proof."""
 
     model_config = ConfigDict(extra="ignore")
@@ -430,8 +430,8 @@ class MemoryRelationAssessment(StructuredResponseModel):
         return None
 
 
-class MemoryRelationDecision(StructuredResponseModel):
-    """One memory relation label for one application-issued pair slot."""
+class SameUnitPairDecision(StructuredResponseModel):
+    """One same-Unit relation label for one application-issued pair slot."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -439,13 +439,13 @@ class MemoryRelationDecision(StructuredResponseModel):
     classification: Literal["equivalent", "refines", "contradicts", "unrelated"]
 
 
-class MemoryRelationResponse(StructuredResponseModel):
+class SameUnitPairResponse(StructuredResponseModel):
     """Schema for a complete batch of exact Memory-pair decisions."""
 
     model_config = ConfigDict(extra="ignore")
     direct_answer = True
 
-    decisions: list[MemoryRelationDecision]
+    decisions: list[SameUnitPairDecision]
 
 
 class RefinementVerificationDecision(StructuredResponseModel):
@@ -466,7 +466,7 @@ class RefinementVerificationResponse(StructuredResponseModel):
     decisions: list[RefinementVerificationDecision]
 
 
-class CrossDocumentRelationDecision(StructuredResponseModel):
+class RelationCandidateDecision(StructuredResponseModel):
     """One closed relation label for one application-issued pair slot."""
 
     model_config = ConfigDict(extra="forbid")
@@ -475,13 +475,13 @@ class CrossDocumentRelationDecision(StructuredResponseModel):
     label: Literal["none", "equivalent", "updates", "contradicts"]
 
 
-class CrossDocumentRelationResponse(StructuredResponseModel):
-    """Exactly one decision for every cross-document pair in the request."""
+class RelationCandidateResponse(StructuredResponseModel):
+    """Exactly one decision for every candidate pair in the request."""
 
     model_config = ConfigDict(extra="forbid")
     direct_answer = True
 
-    decisions: list[CrossDocumentRelationDecision]
+    decisions: list[RelationCandidateDecision]
 
 
 class RevisionAssessment(StructuredResponseModel):
@@ -508,7 +508,7 @@ class ClaimRevisionDecision(StructuredResponseModel):
 
     pair_index: int = Field(ge=0)
     status: Literal["resolved", "insufficient"]
-    relation: MemoryRelationAssessment | None = None
+    relation: SameUnitRelationAssessment | None = None
     revision_assessment: RevisionAssessment | None = None
     reason: str = Field(default="", max_length=1000)
 
@@ -556,7 +556,7 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         return ClaimRevisionDecision(
             pair_index=0, status="resolved", reason=self.reason,
             revision_assessment=self.revision_assessment,
-            relation=MemoryRelationAssessment(
+            relation=SameUnitRelationAssessment(
                 classification="refines" if refinement else self.relation,
                 direction=self.relation.removeprefix("refines_") if refinement else "symmetric",
                 same_subject_and_scope=self.contradiction is not None,
@@ -1447,6 +1447,10 @@ def _schema_operation_name(response_format: type[BaseModel]) -> str:
         return "support_assessment"
     if response_format is ChangeImpactWireResponse:
         return "change_impact"
+    if response_format is RelationCandidateResponse:
+        return "cross_document_relation"
+    if response_format is SameUnitPairResponse:
+        return "memory_relation"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
@@ -1745,7 +1749,7 @@ _REFUSAL_FINISH_REASONS = frozenset({"content_filter", "refusal"})
 # refused reply must fail instead.
 _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     ClaimRevisionWireResponse: "claim_response_incomplete",
-    CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
+    RelationCandidateResponse: "cross_document_relation_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
     ChangeImpactWireResponse: "change_impact_response_incomplete",
 }
@@ -2020,23 +2024,23 @@ class LiteLlmStructuredClient:
     ) -> RefinementVerificationResponse:
         return await self._call_schema(prompt=prompt, response_format=RefinementVerificationResponse, model=model)
 
-    async def classify_memory_relations(
+    async def classify_same_unit_pairs(
         self,
         prompt: str,
         *,
         model: str | None = None,
-    ) -> MemoryRelationResponse:
+    ) -> SameUnitPairResponse:
         return await self._call_schema(
             prompt=prompt,
-            response_format=MemoryRelationResponse,
+            response_format=SameUnitPairResponse,
             model=model,
         )
 
-    async def classify_cross_document_relations(
+    async def classify_relation_candidates(
         self, prompt: str, *, model: str | None = None,
-    ) -> CrossDocumentRelationResponse:
+    ) -> RelationCandidateResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=CrossDocumentRelationResponse, model=model,
+            prompt=prompt, response_format=RelationCandidateResponse, model=model,
         )
 
     async def validate_entity_batch(
