@@ -127,8 +127,8 @@ After the update:
   ignored. The `memforge-setup` skill reports it and can remove it.
 - Memories captured from earlier sessions belong to the Codex Session
   Source. A MemForge server on a release after 0.2.0b2 retires that Source
-  and its Memories when it upgrades. On a server still on 0.2.0b2, delete the
-  Source in the admin UI to retire them.
+  when it upgrades, with the Memories no other Source supports. On a server
+  still on 0.2.0b2, delete the Source in the admin UI to retire it the same way.
 
 ## Troubleshooting
 
