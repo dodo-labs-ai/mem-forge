@@ -1222,7 +1222,7 @@ class ReconciliationCaseRequest(BaseModel):
     """One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by
     ``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the
     ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels
-    incumbents ``kept``, ``review``, ``revised`` or ``retired``."""
+    incumbents ``kept``, ``revised`` or ``retired``."""
 
     model_config = ConfigDict(extra="forbid")
 

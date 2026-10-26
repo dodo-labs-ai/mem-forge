@@ -82,14 +82,11 @@ def test_an_incomplete_fact_keeps_the_old_memory(operation, support, relation_co
     assert validation.kept == {"mem-1": reason}
 
 
-def test_proposals_and_non_destructive_decisions_are_not_validated() -> None:
-    review = ReconcileOperation(
-        action=ReconcileAction.DELETE, memory_id="mem-1", reason="protected", flag_for_review=True,
-    )
+def test_non_destructive_decisions_are_not_validated() -> None:
     add = ReconcileOperation(action=ReconcileAction.ADD, memory=REPLACEMENT)
     keep = ReconcileOperation(action=ReconcileAction.NOOP, memory_id="mem-2", memory=CLAIM)
 
-    validation = validate_destructive_operations((review, add, keep), supports={}, relation_complete=False)
+    validation = validate_destructive_operations((add, keep), supports={}, relation_complete=False)
 
-    assert validation.operations == (review, add, keep)
+    assert validation.operations == (add, keep)
     assert validation.kept == {}

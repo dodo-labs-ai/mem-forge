@@ -136,7 +136,7 @@ async def test_an_unsupported_incumbent_keeps_its_result_and_its_equivalent_cand
     assert [(op.action, op.memory_id) for op in result.operations] == [
         (ReconcileAction.ADD, None), (ReconcileAction.DELETE, "memory"),
     ]
-    assert not any(op.flag_for_review or op.support_revalidation_skipped for op in result.operations)
+    assert not any(op.support_revalidation_skipped for op in result.operations)
     assert client.calls == 1
 
 

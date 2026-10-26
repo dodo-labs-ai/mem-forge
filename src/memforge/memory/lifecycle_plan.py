@@ -240,6 +240,21 @@ DESTRUCTIVE_MUTATIONS = frozenset(
 )
 
 
+def plan_supersedes_memory(plan: "LifecyclePlan", memory_id: str) -> bool:
+    """Return whether this Plan supersedes the Memory.
+
+    A replacement of a Memory another Unit also supports removes only this
+    Unit's Support and adds the replacement beside it, so the old Memory stays
+    Active and is not superseded.
+    """
+
+    return any(
+        mutation.mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY
+        and mutation.memory_id == memory_id
+        for mutation in plan.mutations
+    )
+
+
 def plan_requires_complete_current_support(
     plan: "LifecyclePlan",
     memory_id: str,
@@ -494,8 +509,12 @@ class LifecyclePlan:
 
 
 @dataclass(frozen=True, slots=True)
-class ContestedSupportEdge:
-    """One exact Support edge intentionally retained by a pending Review."""
+class RetainedSupportEdge:
+    """One exact Support edge a committed decision keeps on its earlier revision.
+
+    A pending Review retains the incumbent edges it staged for removal; a
+    skipped KEEP retains the old Support it could not revalidate.
+    """
 
     memory_id: str
     source_id: str
@@ -509,7 +528,7 @@ def contested_supports_from_staged_evidence(
     source_id: str,
     source_unit_id: str,
     staged_evidence: Mapping[str, object],
-) -> frozenset[ContestedSupportEdge]:
+) -> frozenset[RetainedSupportEdge]:
     """Parse exact incumbent Support edges intentionally held for Review.
 
     A pending Review may keep an incumbent active on its previous revision
@@ -518,7 +537,7 @@ def contested_supports_from_staged_evidence(
     weaken validation for any other Memory or edge.
     """
 
-    contested: set[ContestedSupportEdge] = set()
+    contested: set[RetainedSupportEdge] = set()
     proposed = staged_evidence.get("proposed_mutations")
     if not isinstance(proposed, Sequence) or isinstance(proposed, (str, bytes)):
         raise ValueError("create_review mutation requires proposed_mutations")
@@ -537,7 +556,7 @@ def contested_supports_from_staged_evidence(
         ):
             raise ValueError("create_review remove_support requires stable Evidence Unit ids")
         contested.update(
-            ContestedSupportEdge(
+            RetainedSupportEdge(
                 memory_id=incumbent_memory_id,
                 source_id=source_id,
                 source_unit_id=source_unit_id,
@@ -550,10 +569,10 @@ def contested_supports_from_staged_evidence(
 
 def pending_review_contested_supports(
     plan: LifecyclePlan,
-) -> frozenset[ContestedSupportEdge]:
+) -> frozenset[RetainedSupportEdge]:
     """Return exact contested edges staged by Reviews in the current Plan."""
 
-    contested: set[ContestedSupportEdge] = set()
+    contested: set[RetainedSupportEdge] = set()
     for review_mutation in plan.mutations:
         if review_mutation.mutation_type is not LifecycleMutationType.CREATE_REVIEW:
             continue
@@ -569,6 +588,57 @@ def pending_review_contested_supports(
             )
         )
     return frozenset(contested)
+
+
+def skipped_supports_by_memory_from_plan_payload(
+    payload: Mapping[str, object],
+    *,
+    source_id: str,
+    source_unit_id: str,
+) -> dict[str, frozenset[RetainedSupportEdge]]:
+    """Map each Memory an applied Plan decided to the old Support its KEEP skipped.
+
+    A KEEP whose Support could not be revalidated, because the assessment was
+    unresolved or the model cannot read the Evidence, leaves that Unit's exact
+    old Support on its earlier revision. When the Plan committed the Unit's
+    current revision, those edges are the Unit's settled state rather than a
+    revision still waiting to commit. Every decided Memory is a key, with an
+    empty set when its decision skipped nothing, so a later Plan on the same
+    revision that decides the Memory again replaces what an earlier one kept.
+    """
+
+    proof = payload.get("coverage_proof")
+    if not isinstance(proof, Mapping):
+        raise ValueError("lifecycle plan payload requires coverage_proof")
+    decisions = proof.get("incumbent_decisions")
+    if not isinstance(decisions, Sequence) or isinstance(decisions, (str, bytes)):
+        raise ValueError("lifecycle plan payload requires incumbent_decisions")
+    skipped_by_memory: dict[str, frozenset[RetainedSupportEdge]] = {}
+    for raw_decision in decisions:
+        if not isinstance(raw_decision, Mapping):
+            raise ValueError("lifecycle plan incumbent decision must be an object")
+        memory_id = raw_decision.get("memory_id")
+        if not isinstance(memory_id, str) or not memory_id:
+            raise ValueError("lifecycle plan incumbent decision requires memory_id")
+        support_ids = raw_decision.get("skipped_support_ids")
+        if support_ids and (
+            not isinstance(support_ids, Sequence)
+            or isinstance(support_ids, (str, bytes))
+            or not all(isinstance(item, str) and item for item in support_ids)
+            or raw_decision.get("disposition") != IncumbentDisposition.KEEP.value
+            or "authority" in raw_decision
+        ):
+            raise ValueError("skipped Support revalidation requires Source-scoped KEEP")
+        skipped_by_memory[memory_id] = frozenset(
+            RetainedSupportEdge(
+                memory_id=memory_id,
+                source_id=source_id,
+                source_unit_id=source_unit_id,
+                evidence_unit_id=support_id,
+            )
+            for support_id in support_ids or ()
+        )
+    return skipped_by_memory
 
 
 @runtime_checkable

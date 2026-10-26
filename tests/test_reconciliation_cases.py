@@ -228,6 +228,10 @@ async def test_an_unknown_document_or_an_invalid_situation_is_not_imported(db) -
         await _import(db, ReconciliationCaseRequest(
             input=situation("Anything."), rubric={"expected_incumbents": {"monday": "kept"}}, doc_id=DOCUMENT.doc_id,
         ))
+    with pytest.raises(ValueError, match="one of kept, revised, retired"):
+        await _import(db, ReconciliationCaseRequest(
+            input=situation("Anything."), rubric={"expected_incumbents": {"friday": "review"}}, doc_id=DOCUMENT.doc_id,
+        ))
 
 
 

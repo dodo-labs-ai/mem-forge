@@ -25,8 +25,7 @@ last Active Support's removal retire a Memory.
 
 A decision that fails is kept: the old Memory stays with its Support and its
 validation baseline, and a replacing Candidate is consumed without an ADD, like
-a local unresolved relationship. Decisions held for Review are proposals and
-are validated when approved, by their stale guard.
+a local unresolved relationship.
 """
 
 from __future__ import annotations
@@ -70,7 +69,7 @@ def validate_destructive_operations(
     kept: dict[str, KeptReason] = {}
     for operation in operations:
         memory_id = operation.memory_id
-        if operation.action not in _DESTRUCTIVE or memory_id is None or operation.flag_for_review:
+        if operation.action not in _DESTRUCTIVE or memory_id is None:
             validated.append(operation)
             continue
         reason = _failed_check(operation, supports.get(memory_id), relation_complete)

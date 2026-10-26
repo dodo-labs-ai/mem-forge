@@ -148,7 +148,7 @@ from memforge.memory.evidence import (
     validate_evidence_references,
 )
 from memforge.memory.lifecycle_plan import (
-    ContestedSupportEdge,
+    RetainedSupportEdge,
     contested_supports_from_staged_evidence,
     LifecycleGate,
     LifecycleGateState,
@@ -171,6 +171,7 @@ from memforge.memory.lifecycle_plan import (
     pending_review_contested_supports,
     plan_requires_complete_current_support,
     plan_skips_support_revalidation,
+    skipped_supports_by_memory_from_plan_payload,
 )
 from memforge.memory.origin import references_source_row
 from memforge.memory.cross_document_relation import (
@@ -10996,8 +10997,11 @@ class Database:
         that contract. An insufficient assessment may also preserve the exact
         old Support recorded on this Plan's KEEP decision. Unrelated historical
         Support cannot block a non-destructive write; a destructive write that
-        depends on stale Support in another Source Unit is deferred. Newly
-        activated Memories and new attachments still need current Unit support.
+        depends on stale Support in another Source Unit is deferred until that
+        Unit's revision commits. Stale Support that the Plan of the other
+        Unit's current revision kept by a skipped KEEP is that Unit's settled
+        state and does not defer. Newly activated Memories and new attachments
+        still need current Unit support.
         """
 
         created_ids = {
@@ -11090,7 +11094,7 @@ class Database:
                 )
                 if current and support["source_lineage_id"] == plan.scope.source_unit_id:
                     current_scope_count += 1
-                contested_edge = ContestedSupportEdge(
+                contested_edge = RetainedSupportEdge(
                     memory_id=memory_id,
                     source_id=plan.scope.source_id,
                     source_unit_id=str(support["source_lineage_id"]),
@@ -11137,17 +11141,80 @@ class Database:
             if deferred_blockers:
                 all_deferred_blockers.extend(deferred_blockers)
         if all_deferred_blockers:
+            settled = await self._current_revision_skipped_supports_unlocked(
+                source_id=plan.scope.source_id,
+                source_unit_ids={
+                    blocker.source_unit_id for blocker in all_deferred_blockers
+                },
+            )
+            all_deferred_blockers = [
+                blocker
+                for blocker in all_deferred_blockers
+                if RetainedSupportEdge(
+                    memory_id=blocker.memory_id,
+                    source_id=plan.scope.source_id,
+                    source_unit_id=blocker.source_unit_id,
+                    evidence_unit_id=blocker.evidence_unit_id,
+                )
+                not in settled
+            ]
+        if all_deferred_blockers:
             raise ProjectedLifecycleDeferredError(
                 "projected lifecycle depends on stale cross-Unit Support",
                 all_deferred_blockers,
             )
+
+    async def _current_revision_skipped_supports_unlocked(
+        self,
+        *,
+        source_id: str,
+        source_unit_ids: set[str],
+    ) -> frozenset[RetainedSupportEdge]:
+        """Load the old Support each Memory's latest current-revision decision kept skipped.
+
+        Every applied Plan on a Unit's current revision, including a Review's
+        approval or refresh Plan that decides one incumbent, is folded in apply
+        order, so each Memory keeps only the skipped Support of its latest
+        decision.
+        """
+
+        ordered_unit_ids = sorted(source_unit_ids)
+        if not ordered_unit_ids:
+            return frozenset()
+        placeholders = ", ".join("?" for _ in ordered_unit_ids)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT lp.source_unit_id, lp.payload_json
+                  FROM lifecycle_plans lp
+                  JOIN source_units su ON su.id = lp.source_unit_id
+                 WHERE lp.status = 'applied'
+                   AND lp.source_id = ?
+                   AND su.source_id = lp.source_id
+                   AND lp.target_unit_revision_id = su.current_revision_id
+                   AND lp.source_unit_id IN ({placeholders})
+                 ORDER BY lp.applied_at, lp.id""",
+            (source_id, *ordered_unit_ids),
+        )
+        latest: dict[tuple[str, str], frozenset[RetainedSupportEdge]] = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if not isinstance(payload, Mapping):
+                raise ValueError("applied lifecycle plan requires a payload object")
+            source_unit_id = str(row["source_unit_id"])
+            decided = skipped_supports_by_memory_from_plan_payload(
+                payload,
+                source_id=source_id,
+                source_unit_id=source_unit_id,
+            )
+            for memory_id, skipped in decided.items():
+                latest[(source_unit_id, memory_id)] = skipped
+        return frozenset(edge for skipped in latest.values() for edge in skipped)
 
     async def _durable_pending_review_contested_supports_unlocked(
         self,
         *,
         source_id: str,
         memory_ids: set[str],
-    ) -> frozenset[ContestedSupportEdge]:
+    ) -> frozenset[RetainedSupportEdge]:
         """Load exact contested edges from previously applied pending Reviews."""
 
         ordered_memory_ids = sorted(memory_ids)
@@ -11170,7 +11237,7 @@ class Database:
                    AND lr.incumbent_memory_id IN ({placeholders})""",
             (source_id, *ordered_memory_ids),
         )
-        contested: set[ContestedSupportEdge] = set()
+        contested: set[RetainedSupportEdge] = set()
         for row in rows:
             staged = json.loads(row["staged_evidence_json"] or "{}")
             if not isinstance(staged, Mapping):

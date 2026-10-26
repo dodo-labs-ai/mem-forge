@@ -51,6 +51,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutationType,
     LifecyclePlan,
     ReconciliationScope,
+    plan_supersedes_memory,
 )
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
@@ -1530,7 +1531,11 @@ class AgentKnowledgeBundleService:
         relation_outcome = self._relation_outcome_bundle(
             unit=unit,
             relation_run_id=relation_run_id,
-            lifecycle_action=lifecycle.action,
+            lifecycle_action=(
+                LifecycleAction.SUPERSEDE_MEMORY
+                if plan_supersedes_memory(plan, old_memory_id)
+                else LifecycleAction.CREATE_MEMORY
+            ),
             review_case=None,
             memory_id=new_memory_id,
             candidates=universe.candidates,

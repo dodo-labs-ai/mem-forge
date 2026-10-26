@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests.evidence_display_fixture import evidence_displays
+from tests.lifecycle_review_fixture import hold_for_review
 
 import asyncio
 import hashlib
@@ -1192,7 +1193,7 @@ class _TextOnlyClient(_UnexpectedReconciliationClient):
     ],
     ids=["ineligible_artifact", "text_only_model"],
 )
-async def test_an_artifact_the_model_cannot_read_preserves_incumbent_support(
+async def test_an_artifact_the_model_cannot_read_keeps_its_memory_unchanged(
     db: Database, inference_eligible, client, reason
 ) -> None:
     first = _projection_with_artifact(
@@ -1245,6 +1246,7 @@ async def test_an_artifact_the_model_cannot_read_preserves_incumbent_support(
     )
     assert artifact_observation_id in observation_ids[incumbent.id]
     assert page_observation_id in observation_ids[incumbent.id]
+    before = (await db.get_active_memory_support_evidence_many((incumbent.id,), source_id="src-1"))[incumbent.id]
 
     second = _projection_with_artifact(
         run_id="projection-artifact-invalid",
@@ -1275,17 +1277,124 @@ async def test_an_artifact_the_model_cannot_read_preserves_incumbent_support(
         protected_source_observation_ids=(artifact_observation_id,),
     )
 
+    # The Evidence is unreadable, not gone: the Memory is kept as it is, like an
+    # unresolved Support, and no Review is raised.
     current = await db.get_memory(incumbent.id)
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current is not None and current.status == "active"
-    assert stats["pending_review"] == 1
-    [review] = await db.list_lifecycle_reviews("src-1", status=LifecycleReviewStatus.PENDING)
-    assert review.incumbent_memory_id == incumbent.id
-    assert review.reason == reason
+    assert stats["pending_review"] == 0 and stats["deleted"] == 0 and stats["noop"] == 1
+    assert stats["support_revalidation_skipped_memory_count"] == 1
+    assert stats["support_revalidation_unreadable_memory_count"] == 1
+    assert await db.list_lifecycle_reviews("src-1") == []
     assert current_support == previous_support
+    after = (await db.get_active_memory_support_evidence_many((incumbent.id,), source_id="src-1"))[incumbent.id]
+    assert [(item.evidence_unit_id, item.validation_plan_id, item.validation_unit_revision_id) for item in after] == [
+        (item.evidence_unit_id, item.validation_plan_id, item.validation_unit_revision_id) for item in before
+    ]
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )
+    [plan_row] = await db.db.execute_fetchall(
+        "SELECT payload_json FROM lifecycle_plans WHERE target_unit_revision_id = ?",
+        (second.source_unit_revisions[0].id,),
+    )
+    [decision] = json.loads(str(plan_row["payload_json"]))["coverage_proof"]["incumbent_decisions"]
+    assert (decision["memory_id"], decision["disposition"], decision["reason"]) == (incumbent.id, "keep", reason)
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_page_keeps_only_the_memory_whose_image_the_model_cannot_read(db: Database) -> None:
+    first = _projection_with_artifact(
+        run_id="projection-artifact-before-empty",
+        payload=b"valid-image-revision",
+        provider_revision="1",
+        inference_eligible=True,
+        body="# Page\n\nA7 is removed.",
+    )
+    artifact_observation_id = next(
+        observation.id for observation in first.observations if observation.observation_type == "binary_artifact"
+    )
+    page_observation_id = next(
+        observation.id for observation in first.observations if observation.observation_type == "page_body"
+    )
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        document_store=SimpleNamespace(read_artifact=lambda uri: b"valid-image-revision"),
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    )
+    await engine.prepare_and_commit_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=_selected(first, [
+            RawMemory(
+                content="The architecture diagram establishes that A7 remains enabled.",
+                memory_type="decision",
+                evidence_quote="# Page",
+                evidence_anchor="projection_batch",
+                source_observation_id=page_observation_id,
+                required_source_observation_ids=(artifact_observation_id,),
+            ),
+            RawMemory(
+                content="A7 is removed.",
+                memory_type="decision",
+                evidence_quote="A7 is removed.",
+                evidence_anchor="projection_batch",
+                source_observation_id=page_observation_id,
+            ),
+        ]),
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="# Page\n\nA7 is removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    memories = {memory.content: memory for memory in await db.list_memories()}
+    image_backed = memories["The architecture diagram establishes that A7 remains enabled."]
+    text_only = memories["A7 is removed."]
+    image_backed_support = await db.get_active_memory_support_unit_ids(image_backed.id)
+    await db.enable_lifecycle_gate("src-1")
+
+    second = _projection_with_artifact(
+        run_id="projection-artifact-emptied",
+        payload=b"valid-image-revision",
+        provider_revision="1",
+        inference_eligible=True,
+        body="",
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    stats = await MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_TextOnlyClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="",
+        update_mode="diff_guided",
+        changed_hunks="page text removed",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        protected_source_observation_ids=(artifact_observation_id,),
+    )
+
+    assert stats["deleted"] == 1 and stats["noop"] == 1 and stats["pending_review"] == 0
+    assert stats["support_revalidation_unreadable_memory_count"] == 1
+    assert (await db.get_memory(text_only.id)).status == "retired"  # type: ignore[union-attr]
+    assert (await db.get_memory(image_backed.id)).status == "active"  # type: ignore[union-attr]
+    assert await db.get_active_memory_support_unit_ids(image_backed.id) == image_backed_support
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
@@ -3894,7 +4003,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
         base_unit_revision_id=delta.previous_unit_revision_id,
         target_unit_revision_id=delta.current_unit_revision_id,
     )
-    plan = build_lifecycle_plan(
+    direct = build_lifecycle_plan(
         plan_id="plan-review-support-exemption",
         scope=scope,
         gate_state=LifecycleGateState.ENABLED,
@@ -3903,7 +4012,6 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
                 action=ReconcileAction.DELETE,
                 memory_id=reviewed.id,
                 reason="the source now disputes this claim",
-                flag_for_review=True,
             ),
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
@@ -3935,6 +4043,7 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             access_context_hash="workspace-eng",
         ),
     )
+    plan = hold_for_review(direct, reviewed.id, action=ReconcileAction.DELETE)
 
     with pytest.raises(ValueError, match="stale or incomplete Unit support"):
         await db.apply_source_projection_lifecycle(second, plan)
@@ -3971,7 +4080,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         base_unit_revision_id=delta.previous_unit_revision_id,
         target_unit_revision_id=delta.current_unit_revision_id,
     )
-    plan = build_lifecycle_plan(
+    direct = build_lifecycle_plan(
         plan_id="plan-reviewed-support",
         scope=scope,
         gate_state=LifecycleGateState.ENABLED,
@@ -3980,7 +4089,6 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
                 action=ReconcileAction.DELETE,
                 memory_id=incumbent.id,
                 reason="the source now disputes this claim",
-                flag_for_review=True,
             ),
         ),
         incumbents={incumbent.id: incumbent},
@@ -3999,6 +4107,7 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         ),
     )
 
+    plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
     await db.apply_source_projection_lifecycle(second, plan)
 
     current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
@@ -4032,7 +4141,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
         prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
     )
     changed_delta = changed.deltas[0]
-    review_plan = build_lifecycle_plan(
+    direct = build_lifecycle_plan(
         plan_id="plan-durable-review",
         scope=ReconciliationScope(
             id="scope-durable-review",
@@ -4047,7 +4156,6 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
                 action=ReconcileAction.DELETE,
                 memory_id=incumbent.id,
                 reason="the source now disputes this claim",
-                flag_for_review=True,
             ),
         ),
         incumbents={incumbent.id: incumbent},
@@ -4065,6 +4173,7 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             access_context_hash="workspace-eng",
         ),
     )
+    review_plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
     await db.apply_source_projection_lifecycle(changed, review_plan)
 
     later = _projection(
@@ -6474,6 +6583,419 @@ async def test_destructive_commit_defers_on_stale_cross_unit_support(
     )
     assert current is not None
     assert current.id == scenario.first.source_unit_revisions[0].id
+
+
+async def _revise_shared_memory(db: Database, *, prefix: str, alternative_moved: bool):
+    """Revise this Unit's claim that another Source Unit's Support also holds."""
+    access_context_hash = lifecycle_access_context_hash(
+        visibility="workspace",
+        owner_user_id=None,
+        project_key="ENG",
+        repo_identifier=None,
+    )
+    first = _projection(run_id=f"{prefix}-1", body="A7 is removed.")
+    await db.record_source_projection(first)
+    incumbent = await _seed_incumbent_support(db, projection=first, access_context_hash=access_context_hash)
+    alternative = _projection(
+        run_id=f"{prefix}-alternative-1",
+        body="A7 is removed.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    alternative_unit_id = await _add_independent_support_alternative(
+        db,
+        incumbent=incumbent,
+        projection=alternative,
+        doc_id="confluence-456",
+        access_context_hash=access_context_hash,
+    )
+    await db.enable_lifecycle_gate("src-1")
+    if alternative_moved:
+        await db.record_source_projection(_projection(
+            run_id=f"{prefix}-alternative-2",
+            body="A7 is excluded in the current release.",
+            item_id="confluence-456",
+            page_id="456",
+            prior=alternative.source_unit_revisions[0],
+            prior_observations=_revisions_by_observation(alternative),
+        ))
+    second = _projection(
+        run_id=f"{prefix}-2",
+        body="A7 is retained and marked as reduced retro chain.",
+        prior=first.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(first),
+    )
+    [raw] = _selected(second, [
+        RawMemory(
+            content="A7 is retained and marked as reduced retro chain.",
+            memory_type="decision",
+            entity_refs=["A7"],
+            evidence_quote="A7 is retained and marked as reduced retro chain.",
+        )
+    ])
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_ReplacementClient(incumbent.id),
+    )
+    commit = engine.prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[raw],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=raw.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    return first, incumbent, alternative_unit_id, commit
+
+
+@pytest.mark.asyncio
+async def test_revising_a_memory_another_unit_supports_keeps_it_on_that_support(db: Database) -> None:
+    first, incumbent, alternative_unit_id, commit = await _revise_shared_memory(
+        db, prefix="projection-shared-revision", alternative_moved=False,
+    )
+
+    stats = await commit
+
+    # This Unit removes only its own Support; the other Unit keeps the old claim
+    # and the Candidate becomes its own Memory, related by relation discovery.
+    assert stats["pending_review"] == 0 and stats["superseded"] == 0 and stats["updated"] == 0
+    assert stats["added"] == 1 and stats["relation_discovery_enqueued"] == 1
+    assert await db.list_lifecycle_reviews("src-1") == []
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "active" and old.superseded_by is None
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == (alternative_unit_id,)
+    [revised] = [memory for memory in await db.list_memories() if memory.id != incumbent.id]
+    assert revised.status == "active" and revised.content == "A7 is retained and marked as reduced retro chain."
+    revised_support = await db.get_active_memory_support_unit_ids(revised.id)
+    assert revised_support and alternative_unit_id not in revised_support
+    [work] = await db.db.execute_fetchall("SELECT memory_id FROM relation_discovery_work")
+    assert work["memory_id"] == revised.id
+    current = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current is not None and current.id != first.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_revising_a_memory_whose_other_unit_support_is_stale_defers(db: Database) -> None:
+    first, incumbent, _, commit = await _revise_shared_memory(
+        db, prefix="projection-shared-revision-stale", alternative_moved=True,
+    )
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+
+    with pytest.raises(ProjectedLifecycleDeferredError):
+        await commit
+
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
+    assert await db.list_lifecycle_reviews("src-1") == []
+    current = await db.get_current_source_unit_revision(first.source_units[0].id)
+    assert current is not None and current.id == first.source_unit_revisions[0].id
+
+
+async def _keep_unreadable_shared_memory(db: Database, *, prefix: str):
+    """Keep a Memory another Unit also supports on Evidence the model cannot read."""
+    first = _projection_with_artifact(
+        run_id=f"{prefix}-1",
+        payload=b"valid-image-revision",
+        provider_revision="1",
+        inference_eligible=True,
+        body="A7 is removed.",
+    )
+    artifact_observation_id = next(
+        observation.id for observation in first.observations if observation.observation_type == "binary_artifact"
+    )
+    page_observation_id = next(
+        observation.id for observation in first.observations if observation.observation_type == "page_body"
+    )
+    adapters = build_sqlite_adapters(db, object())
+    await MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        document_store=SimpleNamespace(read_artifact=lambda uri: b"valid-image-revision"),
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=_selected(first, [
+            RawMemory(
+                content="A7 is removed.",
+                memory_type="decision",
+                evidence_quote="A7 is removed.",
+                evidence_anchor="projection_batch",
+                source_observation_id=page_observation_id,
+                required_source_observation_ids=(artifact_observation_id,),
+            )
+        ]),
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="A7 is removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    [incumbent] = await db.list_memories()
+    unreadable_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    alternative = _projection(
+        run_id=f"{prefix}-alternative-1",
+        body="A7 is removed.",
+        item_id="confluence-456",
+        page_id="456",
+    )
+    alternative_unit_id = await _add_independent_support_alternative(
+        db,
+        incumbent=incumbent,
+        projection=alternative,
+        doc_id="confluence-456",
+        access_context_hash=lifecycle_access_context_hash(
+            visibility="workspace",
+            owner_user_id=None,
+            project_key="ENG",
+            repo_identifier=None,
+        ),
+    )
+    await db.enable_lifecycle_gate("src-1")
+    second = _projection_with_artifact(
+        run_id=f"{prefix}-2",
+        payload=b"valid-image-revision-2",
+        provider_revision="2",
+        inference_eligible=True,
+        body="A7 is removed.",
+        prior=first.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(first),
+    )
+    stats = await MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_TextOnlyClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="A7 is removed.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        protected_source_observation_ids=(artifact_observation_id,),
+    )
+    assert stats["support_revalidation_unreadable_memory_count"] == 1
+    assert set(await db.get_active_memory_support_unit_ids(incumbent.id)) == {
+        *unreadable_support,
+        alternative_unit_id,
+    }
+    return second, incumbent, unreadable_support, alternative
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revises", [False, True], ids=["removes_its_support", "revises_the_memory"])
+async def test_another_unit_changes_a_memory_kept_on_unreadable_evidence(db: Database, revises: bool) -> None:
+    _, incumbent, unreadable_support, alternative = await _keep_unreadable_shared_memory(
+        db, prefix=f"projection-unreadable-shared-{revises}",
+    )
+    body = "A7 is retained and marked as reduced retro chain." if revises else ""
+    target = _projection(
+        run_id=f"projection-unreadable-shared-{revises}-alternative-2",
+        body=body,
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(alternative),
+    )
+    raw_memories = _selected(target, [
+        RawMemory(content=body, memory_type="decision", entity_refs=["A7"], evidence_quote=body)
+    ]) if revises else []
+    adapters = build_sqlite_adapters(db, object())
+    stats = await MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_ReplacementClient(incumbent.id) if revises else AdmittingClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=target,
+        doc_id="confluence-456",
+        raw_memories=raw_memories,
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=body,
+        update_mode="full_document" if revises else "diff_guided",
+        changed_hunks=None if revises else "A7 is removed. -> empty",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    # The other Unit's current revision already kept its Support unread, so this
+    # removal does not wait for it: the Memory stays Active on that Support alone.
+    assert stats["added"] == (1 if revises else 0) and stats["pending_review"] == 0
+    old = await db.get_memory(incumbent.id)
+    assert old is not None and old.status == "active" and old.superseded_by is None
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == unreadable_support
+    current = await db.get_current_source_unit_revision(alternative.source_units[0].id)
+    assert current is not None and current.id == target.source_unit_revisions[0].id
+
+
+async def _apply_later_plan_on_current_revision(db: Database, projection, *, decided_memory_id: str) -> None:
+    """Record a Review-shaped Plan that decides one incumbent on the Unit's current revision.
+
+    A Review approval or refresh Plan copies the creating Plan's scope, so it
+    lands later on the same Unit revision with a decision for its one incumbent.
+    """
+    revision_id = projection.source_unit_revisions[0].id
+    [row] = await db.db.execute_fetchall(
+        "SELECT payload_json, applied_at FROM lifecycle_plans"
+        " WHERE target_unit_revision_id = ? AND status = 'applied'",
+        (revision_id,),
+    )
+    payload = json.loads(row["payload_json"])
+    plan_id = f"lifecycle-review-approval-{decided_memory_id}"
+    payload["id"] = plan_id
+    payload["scope"]["id"] = f"{payload['scope']['id']}:review:{decided_memory_id}"
+    payload["coverage_proof"] = {
+        "mandatory_incumbent_ids": [decided_memory_id],
+        "incumbent_decisions": [
+            {"memory_id": decided_memory_id, "disposition": "keep", "reason": "approved lifecycle review"}
+        ],
+        "batch_ids": [f"{payload['scope']['id']}:batch:0"],
+        "completed_batch_ids": [f"{payload['scope']['id']}:batch:0"],
+    }
+    payload["mutations"] = []
+    payload_json = json.dumps(payload, sort_keys=True)
+    applied_at = (datetime.fromisoformat(row["applied_at"]) + timedelta(seconds=1)).isoformat()
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+            id, reconciliation_scope_id, source_id, source_unit_id,
+            target_unit_revision_id, status, payload_json, payload_hash,
+            created_at, applied_at
+        ) VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?)""",
+        (
+            plan_id,
+            payload["scope"]["id"],
+            payload["scope"]["source_id"],
+            payload["scope"]["source_unit_id"],
+            revision_id,
+            payload_json,
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            applied_at,
+            applied_at,
+        ),
+    )
+    await db.db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decides_kept_memory", [False, True], ids=["another_incumbent", "the_kept_memory"])
+async def test_a_later_plan_on_the_unreadable_revision_settles_only_the_memories_it_decides(
+    db: Database, decides_kept_memory: bool,
+) -> None:
+    second, incumbent, unreadable_support, alternative = await _keep_unreadable_shared_memory(
+        db, prefix=f"projection-unreadable-later-{decides_kept_memory}",
+    )
+    await _apply_later_plan_on_current_revision(
+        db,
+        second,
+        decided_memory_id=incumbent.id if decides_kept_memory else "mem-another-incumbent",
+    )
+    target = _projection(
+        run_id=f"projection-unreadable-later-{decides_kept_memory}-alternative-2",
+        body="",
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(alternative),
+    )
+    adapters = build_sqlite_adapters(db, object())
+    commit = MemoryEngine(
+        cross_document_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=target,
+        doc_id="confluence-456",
+        raw_memories=[],
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="",
+        update_mode="diff_guided",
+        changed_hunks="A7 is removed. -> empty",
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    if decides_kept_memory:
+        # The kept Memory's latest decision skipped nothing, so its old Support
+        # is again a revision waiting to commit.
+        with pytest.raises(ProjectedLifecycleDeferredError) as raised:
+            await commit
+        assert raised.value.blocking_evidence_unit_ids == unreadable_support
+        return
+    await commit
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == unreadable_support
+    current = await db.get_current_source_unit_revision(alternative.source_units[0].id)
+    assert current is not None and current.id == target.source_unit_revisions[0].id
+
+
+@pytest.mark.asyncio
+async def test_a_newer_revision_of_the_unreadable_unit_defers_another_units_removal(db: Database) -> None:
+    second, incumbent, unreadable_support, alternative = await _keep_unreadable_shared_memory(
+        db, prefix="projection-unreadable-moved",
+    )
+    await db.record_source_projection(_projection_with_artifact(
+        run_id="projection-unreadable-moved-3",
+        payload=b"valid-image-revision-3",
+        provider_revision="3",
+        inference_eligible=True,
+        body="A7 is removed in release 3.",
+        prior=second.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(second),
+    ))
+    target = _projection(
+        run_id="projection-unreadable-moved-alternative-2",
+        body="",
+        item_id="confluence-456",
+        page_id="456",
+        prior=alternative.source_unit_revisions[0],
+        prior_observations=_revisions_by_observation(alternative),
+    )
+    adapters = build_sqlite_adapters(db, object())
+    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+
+    with pytest.raises(ProjectedLifecycleDeferredError) as raised:
+        await MemoryEngine(
+            cross_document_candidates=_candidate_retriever(adapters),
+            db=db,
+            memory_store=_OutboxDrainer(db),
+            structured_llm_client=AdmittingClient(),
+        ).prepare_and_commit_projected_lifecycle(
+            projection=target,
+            doc_id="confluence-456",
+            raw_memories=[],
+            doc_type="design-doc",
+            project_key="ENG",
+            repo_identifier=None,
+            document_content="",
+            update_mode="diff_guided",
+            changed_hunks="A7 is removed. -> empty",
+            update_plan_stats=None,
+            source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+
+    assert raised.value.blocking_evidence_unit_ids == unreadable_support
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
 
 
 @pytest.mark.asyncio

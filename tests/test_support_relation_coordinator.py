@@ -233,7 +233,6 @@ def test_an_unsupported_claim_contradicted_by_one_candidate_is_superseded() -> N
     }).operations
 
     assert operation.action is ReconcileAction.SUPERSEDE and operation.memory is contradicting
-    assert not operation.flag_for_review
 
 
 def test_an_unsupported_claim_without_relation_loses_this_sources_support() -> None:

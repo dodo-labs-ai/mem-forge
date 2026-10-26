@@ -10,7 +10,13 @@ from memforge.agent_knowledge import (
     AgentKnowledgeBundleService,
     AgentKnowledgePatchProposal,
 )
-from memforge.memory.evidence import CandidateBucket, LifecycleAction, RelationType
+from memforge.memory.evidence import (
+    CandidateBucket,
+    LifecycleAction,
+    MemoryUnitSupportAssertion,
+    RelationType,
+    memory_unit_support_assertion_id,
+)
 from memforge.memory.lifecycle_service import MemoryLifecycleService
 from memforge.memory.store import MemoryStore
 from memforge.models import Memory, Visibility, content_hash
@@ -1098,6 +1104,89 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     assert evidence_unit.client == "codex"
     assert await _support_evidence_unit_ids(db, updated.memory_id) == {evidence_unit.id}
     assert await _stale_support_part_count(db, updated.memory_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_update_of_a_claim_memory_another_unit_supports_adds_the_replacement_beside_it(
+    bundle_stack, monkeypatch,
+):
+    db, store, _collection = bundle_stack
+    service = AgentKnowledgeBundleService(db=db, memory_store=store)
+    request = {
+        "owner_user_id": "u-andrew",
+        "source_id": "src-agent-sessions-codex",
+        "client": "codex",
+        "workspace": "/workspace/memforge-cloud",
+        "repo_identifier": "github.example.com/acme/memforge-cloud",
+        "project_key": "UNSORTED",
+        "source_updated_at": None,
+    }
+    created = await service.apply_patch_proposal(proposal=_proposal(), session_id="sess-1", **request)
+    other = await service.apply_patch_proposal(
+        proposal=_proposal(
+            title="Worker queue ownership",
+            claim_text="The worker process owns the lifecycle outbox drain.",
+            durable_claim=_durable("The worker process owns the lifecycle outbox drain."),
+        ),
+        session_id="sess-other",
+        **request,
+    )
+    [other_unit_id] = await db.get_active_memory_support_unit_ids(other.memory_id)
+    other_unit = await db.get_evidence_unit(other_unit_id)
+    assert other_unit is not None
+    access_context_hash = other_unit.access_context_hash or ""
+    await db.add_memory_source(
+        created.memory_id,
+        other_unit.doc_id,
+        other_unit.source_type,
+        other_unit.excerpt,
+        source_updated_at=None,
+    )
+    await db.upsert_memory_unit_support_assertion(
+        MemoryUnitSupportAssertion(
+            id=memory_unit_support_assertion_id(
+                memory_id=created.memory_id,
+                evidence_unit_id=other_unit_id,
+                source_id=other_unit.source_id,
+                access_context_hash=access_context_hash,
+            ),
+            memory_id=created.memory_id,
+            evidence_unit_id=other_unit_id,
+            source_id=other_unit.source_id,
+            access_context_hash=access_context_hash,
+        )
+    )
+    emitted: list[str] = []
+
+    async def record_event(event_type, status, **fields):
+        emitted.append(event_type)
+
+    monkeypatch.setattr(store, "_emit", record_event)
+
+    updated = await service.apply_patch_proposal(
+        proposal=_proposal(
+            action="update_existing_claim",
+            concept_id=created.concept_id,
+            claim_id=created.claim_id,
+            claim_text="Workspace source schedulers advance next_run_at after a successful claim.",
+            durable_claim=_durable("Workspace source schedulers advance next_run_at after a successful claim."),
+            reason="New evidence refines the scheduler lifecycle claim.",
+        ),
+        session_id="sess-2",
+        **request,
+    )
+
+    # The other concept's Unit still supports the old Memory, so it stays
+    # Active on that Support and the replacement is a Memory of its own.
+    assert updated.memory_id != created.memory_id
+    old_memory = await db.get_memory(created.memory_id)
+    assert old_memory is not None
+    assert old_memory.status == "active" and old_memory.superseded_by is None
+    assert await db.get_active_memory_support_unit_ids(created.memory_id) == (other_unit_id,)
+    relation_runs = await _relation_runs_for_memory(db, updated.memory_id)
+    assert relation_runs[-1]["lifecycle_action"] == LifecycleAction.CREATE_MEMORY.value
+    assert "memory_insert_committed" in emitted
+    assert not {"memory_supersede_attempted", "memory_supersede_committed"}.intersection(emitted)
 
 
 @pytest.mark.asyncio

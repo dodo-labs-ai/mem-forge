@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from memforge.models import MemoryStatus, ReconcileAction, ReconcileOperation
+from memforge.models import MemoryStatus
 
 RETIRED_REASONS = {
     "source_deleted",
@@ -27,10 +27,3 @@ def normalize_memory_status(status: str | MemoryStatus) -> str:
 def allowed_search_statuses(include_superseded: bool = False) -> tuple[str, ...]:
     """Statuses visible to normal agent retrieval."""
     return ("active", "superseded") if include_superseded else ("active",)
-
-
-def requires_human_review(op: ReconcileOperation, corroboration_count: int = 0) -> bool:
-    """Whether a reconciliation operation is too risky to apply automatically."""
-    if op.action not in (ReconcileAction.SUPERSEDE, ReconcileAction.DELETE):
-        return False
-    return bool(op.flag_for_review) or corroboration_count >= 3
