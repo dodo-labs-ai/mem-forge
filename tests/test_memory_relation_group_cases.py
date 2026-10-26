@@ -63,7 +63,7 @@ STATEMENTS = {
     "mem-subject": "Payroll runs weekly.",
     "mem-monthly": "Payroll runs monthly.",
     "mem-earlier": "Payroll ran fortnightly until March.",
-    "mem-same-day": "Payroll runs every second week.",
+    "mem-same-time": "Payroll runs every second week.",
     "mem-repeat-1": REPEATED_STATEMENT,
     "mem-repeat-2": REPEATED_STATEMENT,
     "mem-other": "The export job writes CSV files.",
@@ -182,13 +182,13 @@ def _payroll_group(**overrides) -> RelationGroupLabels:
             "mem-repeat-1",
             "mem-earlier",
             "mem-repeat-2",
-            "mem-same-day",
+            "mem-same-time",
             "mem-other",
         ),
         "labels": {
             "mem-monthly": MemoryRelationLabel.CONTRADICTS,
             "mem-earlier": MemoryRelationLabel.UPDATES,
-            "mem-same-day": MemoryRelationLabel.UPDATES,
+            "mem-same-time": MemoryRelationLabel.UPDATES,
             "mem-repeat-1": MemoryRelationLabel.NONE,
             "mem-repeat-2": MemoryRelationLabel.NONE,
         },
@@ -282,7 +282,7 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
     assert report.pinned_group_count == 2
     assert report.candidate_count == 7
     assert report.labelled_pair_count == 6
-    # mem-same-day shares its Evidence date with the subject, so its updates
+    # mem-same-time shares its Evidence time with the subject, so its updates
     # label is recorded as contradicts.
     assert report.label_counts == {"none": 2, "equivalent": 0, "updates": 1, "contradicts": 3}
     assert report.skipped == {reason.value: 0 for reason in RelationCaseSkip}
@@ -310,7 +310,7 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
         "expected_labels": {
             "mem-monthly": "contradicts",
             "mem-earlier": "updates",
-            "mem-same-day": "contradicts",
+            "mem-same-time": "contradicts",
             "mem-repeat-1": "none",
             "mem-repeat-2": "none",
         }
@@ -454,7 +454,7 @@ async def test_replay_asks_about_every_candidate_of_a_group_in_one_request(db: D
         ("mem-repeat-1", "none"),
         ("mem-earlier", "none"),
         ("mem-repeat-2", "none"),
-        ("mem-same-day", "none"),
+        ("mem-same-time", "none"),
         ("mem-other", "none"),
     ]
 
@@ -502,7 +502,7 @@ async def test_a_group_run_scores_labelled_candidates_and_counts_unlabelled_rela
         "none:none/mem-repeat-1",
         "updates:none/mem-earlier",
         "none:none/mem-repeat-2",
-        "contradicts:none/mem-same-day",
+        "contradicts:none/mem-same-time",
         "contradicts:none/mem-second-candidate",
     }
     [unlabelled] = [check for check in code_checks if check.criterion == UNLABELLED_RELATION_CRITERION]

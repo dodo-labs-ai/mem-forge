@@ -975,8 +975,9 @@ def _enabled_source_visibility_condition(
 
 # Memory relations between two Memories, bound to both contents, and
 # the dismissals people record for them. A pair is stored lower Memory id first.
-# Each side keeps the Evidence time (a UTC date) the relation was decided on;
-# an updates pair is stored only when those dates order it. A classifier
+# Each side keeps the Evidence time the relation was decided on, as the
+# classifier saw it: a UTC instant, or a UTC date under a contract that read
+# dates. An updates pair is stored only when those times order it. A classifier
 # relation names the discovery work that recorded it, and that work's next
 # completed run replaces it.
 _MEMORY_RELATION_DDL = """

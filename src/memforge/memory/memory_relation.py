@@ -55,8 +55,18 @@ MEMORY_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v6"
 # Classifier contracts that read the current ``RelationSubject`` input. An
 # evaluation case pinned under any of them holds the input this contract reads
 # and is replayed under it; a contract that changes the input is evaluated on a
-# set seeded again under it.
-MEMORY_RELATION_INPUT_VERSIONS = frozenset({MEMORY_RELATION_CLASSIFIER_VERSION})
+# set seeded again under it. Contracts before v6 pinned each Evidence time as
+# its UTC date, a coarser value of the same field: replay shows the classifier
+# that date and records the label at the precision the pinned times hold.
+MEMORY_RELATION_INPUT_VERSIONS = frozenset(
+    {
+        "cross-document-relation-v2",
+        "cross-document-relation-v3",
+        "cross-document-relation-v4",
+        "cross-document-relation-v5",
+        MEMORY_RELATION_CLASSIFIER_VERSION,
+    }
+)
 MEMORY_RELATION_TASK = DecisionTask("cross_document_relation", MEMORY_RELATION_CLASSIFIER_VERSION)
 
 

@@ -296,9 +296,9 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
         assert sentence in framing
 
 
-def test_the_contract_is_v6_and_replays_only_cases_pinned_with_evidence_instants() -> None:
+def test_the_contract_is_v6_and_replays_cases_pinned_since_v2() -> None:
     assert MEMORY_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v6"
-    assert MEMORY_RELATION_INPUT_VERSIONS == {"cross-document-relation-v6"}
+    assert MEMORY_RELATION_INPUT_VERSIONS == {f"cross-document-relation-v{n}" for n in range(2, 7)}
     rules = " ".join(MEMORY_RELATION_CLASSIFIER_RULES.split())
     assert rules.startswith("Each pair holds two statements, taken from the same document or from different ones.")
     assert "evidence_time (the UTC time at which its source recorded the Evidence, null when unknown)" in rules

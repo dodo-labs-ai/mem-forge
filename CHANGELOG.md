@@ -30,14 +30,15 @@
   compared. A pair is still `contradicts` when either source records no time
   or both give the same time. The classifier now sees each statement's source
   time in UTC instead of its date, so its contract is
-  `cross-document-relation-v6`; evaluation cases pinned under an earlier
-  contract hold dates and are not replayed, so seed the relation evaluation
-  sets again before evaluating it on workspace data. Relations already
-  recorded keep the dates they were decided on until discovery judges the pair
-  again; to judge them now, re-run completed discovery work from the relation
-  discovery work admin action (`POST /api/v1/relation-discovery/work/rerun`
-  with state `completed` and classifier version
-  `cross-document-relation-v5`). Cloud: arrives with the pin; HANA reads the
+  `cross-document-relation-v6`. Relation evaluation cases pinned under `v2` to
+  `v5` hold dates and are still replayed: the classifier sees the pinned date,
+  and a pinned pair of one day is still expected as `contradicts`. Relations
+  already recorded keep the dates they were decided on until discovery judges
+  the pair again; to judge them now, re-run completed discovery work from the
+  relation discovery work admin action
+  (`POST /api/v1/relation-discovery/work/rerun` with state `completed` and no
+  classifier version, or once for each version before
+  `cross-document-relation-v6`). Cloud: arrives with the pin; HANA reads the
   Evidence time through the same shared function, and its relation time
   columns already hold a full time, so it needs no change.
 
