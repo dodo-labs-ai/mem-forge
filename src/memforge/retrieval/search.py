@@ -24,7 +24,7 @@ from memforge.config import DEFAULT_RANK_WINDOW_SIZE, DEFAULT_RRF_K, DEFAULT_SEA
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, embed_query_for_index
 from memforge.llm.structured import RerankResponse
-from memforge.memory.cross_document_relation_reader import (
+from memforge.memory.memory_relation_reader import (
     RelationGraph,
     load_relation_graph,
     order_by_relations,
@@ -739,7 +739,7 @@ class SearchEngine:
         # ----- 6b. Optional cross-encoder rerank -----
         ranked = await self._rerank_with_llm(query, ranked, top_k)
 
-        # ----- 7. Apply cross-document relations to the window, then page -----
+        # ----- 7. Apply memory relations to the window, then page -----
         relation_graph = await load_relation_graph(
             self._relational,
             [c.memory_id for c in ranked],

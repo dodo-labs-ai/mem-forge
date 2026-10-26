@@ -50,7 +50,7 @@ from enum import Enum
 from types import MappingProxyType
 
 from memforge.memory.evidence import RelationDirection
-from memforge.memory.relation_classifier import MemoryRelationType
+from memforge.memory.relation_classifier import SameUnitRelationType
 from memforge.models import (
     Memory,
     RawMemory,
@@ -192,7 +192,7 @@ class RelationLedgerEntry:
 
     candidate_index: int
     incumbent_id: str
-    relation_type: MemoryRelationType | None
+    relation_type: SameUnitRelationType | None
     direction: RelationDirection
     reason: str = ""
 
@@ -260,11 +260,11 @@ class _Ledger:
     # Revisions whose Refinement verification found a fact of the old claim missing.
     unverified_revisions: frozenset[tuple[int, str]] = frozenset()
 
-    def edges(self, memory_id: str, relation_type: MemoryRelationType) -> list[RelationLedgerEntry]:
+    def edges(self, memory_id: str, relation_type: SameUnitRelationType) -> list[RelationLedgerEntry]:
         return [
             entry for entry in self.relations
             if entry.incumbent_id == memory_id and entry.relation_type is relation_type
-            and (relation_type is not MemoryRelationType.REFINES
+            and (relation_type is not SameUnitRelationType.REFINES
                  or entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE)
         ]
 
@@ -318,8 +318,8 @@ def plan_rechecks(
         support = ledger.supports[memory.id]
         if memory.id in unresolved or support.rechecked:
             continue
-        equivalents = ledger.edges(memory.id, MemoryRelationType.EQUIVALENT)
-        if support.result is SupportResult.UNAFFECTED and ledger.edges(memory.id, MemoryRelationType.CONTRADICTS):
+        equivalents = ledger.edges(memory.id, SameUnitRelationType.EQUIVALENT)
+        if support.result is SupportResult.UNAFFECTED and ledger.edges(memory.id, SameUnitRelationType.CONTRADICTS):
             requests.append(SupportRecheckRequest(memory.id, RecheckReading.NORMAL_ORDER))
         elif equivalents and support.result in {SupportResult.UNSUPPORTED, SupportResult.UNRESOLVED_PARTIAL_COVERAGE}:
             requests.append(SupportRecheckRequest(
@@ -353,9 +353,9 @@ def supported_refiners(
         if (
             entry.incumbent_id not in unresolved
             and ledger.supports[entry.incumbent_id].result in _KEEPS_SUPPORT
-            and entry.relation_type is MemoryRelationType.REFINES
+            and entry.relation_type is SameUnitRelationType.REFINES
             and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
-            and not ledger.edges(entry.incumbent_id, MemoryRelationType.CONTRADICTS)
+            and not ledger.edges(entry.incumbent_id, SameUnitRelationType.CONTRADICTS)
         ):
             grouped.setdefault(entry.incumbent_id, []).append(entry.candidate_index)
     return {memory_id: tuple(sorted(indices)) for memory_id, indices in grouped.items()}
@@ -385,11 +385,11 @@ def revisions_to_verify(
     _, unresolved = _unresolved_component(ledger, _seeds(ledger))
     pairs = []
     for memory in ledger.incumbents:
-        refiners = ledger.edges(memory.id, MemoryRelationType.REFINES)
+        refiners = ledger.edges(memory.id, SameUnitRelationType.REFINES)
         if (
             memory.id in unresolved
             or ledger.supports[memory.id].result not in _KEEPS_SUPPORT
-            or ledger.edges(memory.id, MemoryRelationType.CONTRADICTS)
+            or ledger.edges(memory.id, SameUnitRelationType.CONTRADICTS)
             or len(refiners) != 1
         ):
             continue
@@ -432,7 +432,7 @@ def coordinate(
     if divided:
         seeds |= {
             (entry.candidate_index, entry.incumbent_id) for entry in ledger.relations
-            if entry.candidate_index in divided and entry.relation_type is not MemoryRelationType.UNRELATED
+            if entry.candidate_index in divided and entry.relation_type is not SameUnitRelationType.UNRELATED
         }
     component_candidates, unresolved = _unresolved_component(ledger, seeds)
 
@@ -463,9 +463,9 @@ class _Decision:
 def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
     """One old Memory's row of the combination table."""
     support = ledger.supports[memory.id]
-    equivalents = ledger.edges(memory.id, MemoryRelationType.EQUIVALENT)
-    contradictions = ledger.edges(memory.id, MemoryRelationType.CONTRADICTS)
-    refiners = ledger.edges(memory.id, MemoryRelationType.REFINES)
+    equivalents = ledger.edges(memory.id, SameUnitRelationType.EQUIVALENT)
+    contradictions = ledger.edges(memory.id, SameUnitRelationType.CONTRADICTS)
+    refiners = ledger.edges(memory.id, SameUnitRelationType.REFINES)
     related = [entry for entry in ledger.relations if entry.incumbent_id == memory.id]
 
     def candidate(index: int) -> RawMemory:
@@ -558,13 +558,13 @@ def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:
     seeds = {(entry.candidate_index, entry.incumbent_id) for entry in ledger.relations if entry.relation_type is None}
     for entry in ledger.relations:
         result = ledger.supports[entry.incumbent_id].result
-        if entry.relation_type is MemoryRelationType.UNRELATED:
+        if entry.relation_type is SameUnitRelationType.UNRELATED:
             continue
         if result.unjudged:
             seeds.add((entry.candidate_index, entry.incumbent_id))
         elif (
             result is SupportResult.UNSUPPORTED
-            and entry.relation_type is MemoryRelationType.REFINES
+            and entry.relation_type is SameUnitRelationType.REFINES
             and entry.direction is RelationDirection.CHALLENGER_TO_CANDIDATE
             and (proof := ledger.proofs.get((entry.candidate_index, entry.incumbent_id))) is not None
             and proof.preserves_incumbent_truth
@@ -586,7 +586,7 @@ def _unresolved_component(ledger: _Ledger, seeds: set[tuple[int, str]]) -> tuple
     while True:
         size = len(candidates) + len(incumbents)
         for entry in relations:
-            if entry.relation_type is not MemoryRelationType.UNRELATED and (
+            if entry.relation_type is not SameUnitRelationType.UNRELATED and (
                 entry.candidate_index in candidates or entry.incumbent_id in incumbents
             ):
                 candidates.add(entry.candidate_index)

@@ -5,11 +5,11 @@ from dataclasses import replace
 
 import pytest
 
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CrossDocumentRelationClassification,
-    CrossDocumentRelationJudgment,
-    CrossDocumentRelationLabel,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MemoryRelationClassification,
+    MemoryRelationJudgment,
+    MemoryRelationLabel,
 )
 from memforge.memory.evidence import (
     CandidateMemory,
@@ -17,10 +17,10 @@ from memforge.memory.evidence import (
     EvidenceUnit,
     LifecycleAction,
 )
-from memforge.memory.cross_document_relation_reader import read_memory_relations
+from memforge.memory.memory_relation_reader import read_memory_relations
 from memforge.memory.relation_candidate_retrieval import (
-    CrossDocumentCandidateRetriever,
-    CrossDocumentCandidateSelection,
+    RelationCandidateRetriever,
+    RelationCandidateSelection,
     RetrievedRelationCandidate,
 )
 from memforge.memory.relation_classifier import MemoryPairClassificationError
@@ -73,7 +73,7 @@ def _memory(memory_id: str, content: str) -> Memory:
 class _Classifier:
     """Label every pair none unless its candidate has a label."""
 
-    def __init__(self, labels: dict[str, CrossDocumentRelationLabel] | None = None) -> None:
+    def __init__(self, labels: dict[str, MemoryRelationLabel] | None = None) -> None:
         self.labels = labels or {}
         self.pairs: tuple = ()
 
@@ -83,11 +83,11 @@ class _Classifier:
 
     async def classify(self, pairs):
         self.pairs = pairs
-        return CrossDocumentRelationClassification(
+        return MemoryRelationClassification(
             judgments=tuple(
-                CrossDocumentRelationJudgment(
+                MemoryRelationJudgment(
                     pair=pair,
-                    label=self.labels.get(pair.candidate.memory_id, CrossDocumentRelationLabel.NONE),
+                    label=self.labels.get(pair.candidate.memory_id, MemoryRelationLabel.NONE),
                 )
                 for pair in pairs
             ),
@@ -114,7 +114,7 @@ class _Candidates:
         del challenger, entity_ids, source_id
         self.actor_user_id = actor_user_id
         self.excluded_source_ids = tuple(excluded_source_ids)
-        return CrossDocumentCandidateSelection(
+        return RelationCandidateSelection(
             discovery=tuple(
                 RetrievedRelationCandidate(
                     memory=CandidateMemory(
@@ -256,7 +256,7 @@ class _Store:
     async def complete_relation_discovery_work(self, _work_id, **kwargs):
         self.completion_kwargs = kwargs
         self.completed_run = kwargs["relation_run"]
-        self.completed = kwargs["document_relations"]
+        self.completed = kwargs["memory_relations"]
 
     async def fail_relation_discovery_work(self, *_args, **_kwargs):
         pytest.fail("work should not fail")
@@ -372,9 +372,9 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
     store.observed_at = {"mem-m": "2026-04-02T09:00:00+00:00", "mem-y": "2026-03-01T09:00:00+00:00"}
     classifier = _Classifier(
         {
-            "mem-b": CrossDocumentRelationLabel.EQUIVALENT,
-            "mem-y": CrossDocumentRelationLabel.UPDATES,
-            "mem-z": CrossDocumentRelationLabel.CONTRADICTS,
+            "mem-b": MemoryRelationLabel.EQUIVALENT,
+            "mem-y": MemoryRelationLabel.UPDATES,
+            "mem-z": MemoryRelationLabel.CONTRADICTS,
         }
     )
 
@@ -382,7 +382,7 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
 
     assert result.completed_work == 1
     assert store.completion_kwargs is not None
-    assert set(store.completion_kwargs) == {"worker_id", "lease_token", "relation_run", "document_relations"}
+    assert set(store.completion_kwargs) == {"worker_id", "lease_token", "relation_run", "memory_relations"}
     bundle = store.completed_run
     assert bundle.relations == ()
     outcome = store.completed
@@ -391,24 +391,24 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
     assert outcome.judged_content_hashes == {candidate.id: candidate.content_hash for candidate in candidates}
     by_pair = {(record.memory_low_id, record.memory_high_id): record for record in outcome.relations}
     assert set(by_pair) == {("mem-b", "mem-m"), ("mem-m", "mem-y"), ("mem-m", "mem-z")}
-    assert by_pair["mem-b", "mem-m"].label is CrossDocumentRelationLabel.EQUIVALENT
+    assert by_pair["mem-b", "mem-m"].label is MemoryRelationLabel.EQUIVALENT
     assert by_pair["mem-b", "mem-m"].low_content_hash == candidates[1].content_hash
     assert by_pair["mem-b", "mem-m"].high_content_hash == challenger.content_hash
-    assert by_pair["mem-m", "mem-y"].label is CrossDocumentRelationLabel.UPDATES
+    assert by_pair["mem-m", "mem-y"].label is MemoryRelationLabel.UPDATES
     assert (by_pair["mem-m", "mem-y"].low_evidence_time, by_pair["mem-m", "mem-y"].high_evidence_time) == (
-        "2026-04-02",
-        "2026-03-01",
+        "2026-04-02T09:00:00+00:00",
+        "2026-03-01T09:00:00+00:00",
     )
-    assert by_pair["mem-m", "mem-z"].label is CrossDocumentRelationLabel.CONTRADICTS
+    assert by_pair["mem-m", "mem-z"].label is MemoryRelationLabel.CONTRADICTS
     for record in outcome.relations:
-        assert record.classifier_version == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+        assert record.classifier_version == MEMORY_RELATION_CLASSIFIER_VERSION
         assert record.relation_run_id == bundle.relation_run.id
         assert record.discovery_work_id == "work-1"
     run = bundle.relation_run
     assert run.lifecycle_action is LifecycleAction.NONE
     assert run.review_case is None
     assert run.status == "checked"
-    assert run.classifier_version == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    assert run.classifier_version == MEMORY_RELATION_CLASSIFIER_VERSION
     assert run.audit["labels"] == {
         "mem-a": "none",
         "mem-b": "equivalent",
@@ -420,22 +420,39 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
 @pytest.mark.asyncio
 async def test_relation_discovery_records_updates_as_contradicts_when_evidence_times_do_not_order_the_pair() -> None:
     challenger = _memory("mem-m", "Current claim")
-    same_day = _memory("mem-s", "Claim recorded the same day")
+    same_time = _memory("mem-s", "Claim recorded at the same instant")
     untimed = _memory("mem-u", "Claim without a source time")
-    store = _Store(challenger, (same_day, untimed))
+    store = _Store(challenger, (same_time, untimed))
     store.observed_at = {"mem-u": ""}
 
     await _discovery(
         store,
-        (same_day, untimed),
-        _Classifier({"mem-s": CrossDocumentRelationLabel.UPDATES, "mem-u": CrossDocumentRelationLabel.UPDATES}),
+        (same_time, untimed),
+        _Classifier({"mem-s": MemoryRelationLabel.UPDATES, "mem-u": MemoryRelationLabel.UPDATES}),
     ).process_slice(worker_id="worker-1")
 
     assert [record.label for record in store.completed.relations] == [
-        CrossDocumentRelationLabel.CONTRADICTS,
-        CrossDocumentRelationLabel.CONTRADICTS,
+        MemoryRelationLabel.CONTRADICTS,
+        MemoryRelationLabel.CONTRADICTS,
     ]
     assert store.completed_run.relation_run.audit["labels"] == {"mem-s": "updates", "mem-u": "updates"}
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_orders_an_updates_pair_of_one_day_by_its_evidence_instants() -> None:
+    challenger = _memory("mem-m", "Current claim")
+    earlier = _memory("mem-e", "Claim recorded earlier that day")
+    store = _Store(challenger, (earlier,))
+    store.observed_at = {"mem-m": "2026-03-25T16:30:00+00:00", "mem-e": "2026-03-25T09:15:00+00:00"}
+
+    await _discovery(
+        store, (earlier,), _Classifier({"mem-e": MemoryRelationLabel.UPDATES})
+    ).process_slice(worker_id="worker-1")
+
+    [record] = store.completed.relations
+    assert record.label is MemoryRelationLabel.UPDATES
+    assert (record.memory_low_id, record.low_evidence_time) == ("mem-e", "2026-03-25T09:15:00+00:00")
+    assert (record.memory_high_id, record.high_evidence_time) == ("mem-m", "2026-03-25T16:30:00+00:00")
 
 
 @pytest.mark.asyncio
@@ -447,12 +464,12 @@ async def test_relation_discovery_judges_other_units_of_the_same_source() -> Non
     await _discovery(
         store,
         (sibling,),
-        _Classifier({"sibling": CrossDocumentRelationLabel.CONTRADICTS}),
+        _Classifier({"sibling": MemoryRelationLabel.CONTRADICTS}),
         source_ids=("src-challenger",),
     ).process_slice(worker_id="worker-1")
 
     assert [record.label for record in store.completed.relations] == [
-        CrossDocumentRelationLabel.CONTRADICTS
+        MemoryRelationLabel.CONTRADICTS
     ]
 
 
@@ -469,7 +486,7 @@ async def test_relation_discovery_shows_the_classifier_statements_titles_time_an
     assert pair.challenger.statement == "Current claim"
     assert pair.candidate.document_title == "Title of doc-candidate"
     assert pair.candidate.evidence == ("Evidence for candidate.",)
-    assert pair.candidate.evidence_time == "2026-03-25"
+    assert pair.candidate.evidence_time == "2026-03-25T10:00:00+00:00"
     assert pair.candidate.source_type == "jira"
 
 
@@ -654,14 +671,14 @@ async def test_private_relation_discovery_without_explicit_actor_runs_as_the_own
     result = await RelationDiscovery(
         store=store,  # type: ignore[arg-type]
         candidate_retriever=candidates,  # type: ignore[arg-type]
-        pair_classifier=_Classifier({"incumbent": CrossDocumentRelationLabel.CONTRADICTS}),
+        pair_classifier=_Classifier({"incumbent": MemoryRelationLabel.CONTRADICTS}),
     ).process_slice(worker_id="worker-1")
 
     assert result.completed_work == 1
     assert store.disabled_lookup_user_id == "user-1"
     assert candidates.actor_user_id == "user-1"
     assert [record.label for record in store.completed.relations] == [
-        CrossDocumentRelationLabel.CONTRADICTS
+        MemoryRelationLabel.CONTRADICTS
     ]
 
 
@@ -718,9 +735,9 @@ class _RecordingUpdatesClassifier:
 
     async def classify(self, pairs):
         self.pairs.extend(pairs)
-        return CrossDocumentRelationClassification(
+        return MemoryRelationClassification(
             judgments=tuple(
-                CrossDocumentRelationJudgment(pair=pair, label=CrossDocumentRelationLabel.UPDATES) for pair in pairs
+                MemoryRelationJudgment(pair=pair, label=MemoryRelationLabel.UPDATES) for pair in pairs
             ),
             llm_calls=1 if pairs else 0,
             prompt_chars=10 * len(pairs),
@@ -728,13 +745,33 @@ class _RecordingUpdatesClassifier:
 
 
 @pytest.mark.asyncio
-async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_evidence_time(db: Database) -> None:
+@pytest.mark.parametrize(
+    ("older_time", "newer_time", "older_evidence_time", "newer_evidence_time"),
+    [
+        (
+            "2026-07-10T09:00:00.000+0000",
+            "2026-07-14T09:00:00.000+0000",
+            "2026-07-10T09:00:00+00:00",
+            "2026-07-14T09:00:00+00:00",
+        ),
+        # Two comments of one day are ordered by the times Jira gives them.
+        (
+            "2026-07-14T09:00:00.000+0000",
+            "2026-07-14T17:45:00.000+0200",
+            "2026-07-14T09:00:00+00:00",
+            "2026-07-14T15:45:00+00:00",
+        ),
+    ],
+)
+async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_evidence_time(
+    db: Database, older_time: str, newer_time: str, older_evidence_time: str, newer_evidence_time: str
+) -> None:
     older_claim = "Payroll approval needs two reviewers."
     newer_claim = "Payroll approval needs three reviewers."
     await _set_fixture_source_type(db, "jira")
     projection = _jira_issue_with_comments(
-        ("501", "2026-07-10T09:00:00.000+0000", older_claim),
-        ("502", "2026-07-14T09:00:00.000+0000", newer_claim),
+        ("501", older_time, older_claim),
+        ("502", newer_time, newer_claim),
     )
     await coordination_engine(db, ScriptedClient()).prepare_and_commit_projected_lifecycle(
         projection=projection,
@@ -770,7 +807,7 @@ async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_e
 
     result = await RelationDiscovery(
         store=db,
-        candidate_retriever=CrossDocumentCandidateRetriever(
+        candidate_retriever=RelationCandidateRetriever(
             relational=adapters.relational, keyword=adapters.keyword, vector=adapters.vector
         ),
         pair_classifier=classifier,
@@ -781,7 +818,7 @@ async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_e
     # Real retrieval selected the other Memory of the challenger's own Source Unit.
     [pair] = classifier.pairs_of(newer.id)
     assert pair.candidate.memory_id == older.id
-    assert (pair.challenger.evidence_time, pair.candidate.evidence_time) == ("2026-07-14", "2026-07-10")
+    assert (pair.challenger.evidence_time, pair.candidate.evidence_time) == (newer_evidence_time, older_evidence_time)
     scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
         include_private=True,
@@ -793,6 +830,6 @@ async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_e
     [newer_side] = relations[newer.id]
     [older_side] = relations[older.id]
     assert (newer_side.label, newer_side.role, newer_side.counterpart.memory_id) == ("updates", "newer", older.id)
-    assert newer_side.counterpart.evidence_time == "2026-07-10"
+    assert newer_side.counterpart.evidence_time == older_evidence_time
     assert (older_side.label, older_side.role, older_side.counterpart.memory_id) == ("updates", "older", newer.id)
-    assert older_side.counterpart.evidence_time == "2026-07-14"
+    assert older_side.counterpart.evidence_time == newer_evidence_time

@@ -1,6 +1,6 @@
 """Read a workspace's Cross-Source Conflict Reviews.
 
-Cross-document discovery records relations and creates no Review.
+Relation discovery records relations and creates no Review.
 The Cross-Source Conflict Reviews a workspace still holds are people's decisions
 on Memory pairs: they seed the relation evaluation set and are converted once
 into relations and Relation Dismissals.
@@ -17,7 +17,7 @@ from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Protocol
 
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel
+from memforge.memory.memory_relation import MemoryRelationLabel
 from memforge.models import Memory, MemoryReview, ReviewStatus
 
 CROSS_SOURCE_CONFLICT_REVIEW_KIND = "cross_source_conflict"
@@ -25,8 +25,8 @@ _PAGE_SIZE = 100
 
 # A person's decision on a Cross-Source Conflict Review, as a relation label.
 REVIEW_DECISION_LABELS = {
-    ReviewStatus.APPROVED.value: CrossDocumentRelationLabel.CONTRADICTS,
-    ReviewStatus.REJECTED.value: CrossDocumentRelationLabel.NONE,
+    ReviewStatus.APPROVED.value: MemoryRelationLabel.CONTRADICTS,
+    ReviewStatus.REJECTED.value: MemoryRelationLabel.NONE,
 }
 
 
@@ -66,8 +66,8 @@ async def list_cross_source_conflict_reviews(
 
 def decided_review_labels(
     reviews: Iterable[MemoryReview],
-    label_overrides: Mapping[str, CrossDocumentRelationLabel],
-) -> dict[str, CrossDocumentRelationLabel]:
+    label_overrides: Mapping[str, MemoryRelationLabel],
+) -> dict[str, MemoryRelationLabel]:
     """The relation label of every decided Review, by Review id.
 
     A decided Review takes its decision's label unless ``label_overrides``

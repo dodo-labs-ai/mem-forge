@@ -27,7 +27,7 @@ from memforge.llm.structured import (
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
     LiteLlmStructuredClient,
-    MemoryRelationResponse,
+    SameUnitPairResponse,
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
     RerankResponse,
@@ -771,9 +771,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "ClaimRevisionWireResponse": '{"results":[]}',
         "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "CandidateAdmissionResponse": '{"decisions":[]}',
-        "MemoryRelationResponse": '{"decisions":[]}',
+        "SameUnitPairResponse": '{"decisions":[]}',
         "RefinementVerificationResponse": '{"decisions":[]}',
-        "CrossDocumentRelationResponse": '{"decisions":[]}',
+        "RelationCandidateResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "RerankResponse": '{"ranking":[]}',
             "OfflineSemanticJudgeResponse": (
@@ -804,9 +804,9 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
         "admit_candidates": lambda: client.admit_candidates("prompt"),
-        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "classify_same_unit_pairs": lambda: client.classify_same_unit_pairs("prompt"),
         "verify_refinements": lambda: client.verify_refinements("prompt"),
-        "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
+        "classify_relation_candidates": lambda: client.classify_relation_candidates("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "judge_offline_semantics": lambda: client.judge_offline_semantics(
@@ -835,6 +835,31 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         for call in calls
     ] == list(payloads)
     assert all("output_config" not in call for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_relation_operations_keep_their_stored_telemetry_names(monkeypatch):
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        return CompletionResponse('{"decisions":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="gateway/structured-model",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+            native_schema_transport="json_schema_response_format",
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    await client.classify_relation_candidates("prompt")
+    await client.classify_same_unit_pairs("prompt")
+
+    assert [row.operation for row in telemetry] == ["cross_document_relation", "memory_relation"]
 
 
 @pytest.mark.asyncio
@@ -1102,7 +1127,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             return CompletionResponse(
                 '{"decisions":[{"mention":"acme","matched_id":7,"confidence":0.95}]}'
             )
-        if schema is MemoryRelationResponse:
+        if schema is SameUnitPairResponse:
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"refines"}]}'
             )
@@ -1122,24 +1147,24 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.admit_candidates("prompt")).decisions[0].verdict == "ADMITTED"
-    assert (await client.classify_memory_relations("prompt")).decisions[0].classification == "refines"
+    assert (await client.classify_same_unit_pairs("prompt")).decisions[0].classification == "refines"
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
         CandidateAdmissionResponse,
-        MemoryRelationResponse,
+        SameUnitPairResponse,
         EntityBatchValidationResponse,
         RerankResponse,
     ]
 
 
 def test_memory_relation_decision_holds_only_the_label() -> None:
-    response = MemoryRelationResponse.model_validate(
+    response = SameUnitPairResponse.model_validate(
         {"decisions": [{"pair_index": 0, "classification": "contradicts"}]}
     )
     assert response.decisions[0].classification == "contradicts"
-    assert set(MemoryRelationResponse.model_json_schema()["$defs"]["MemoryRelationDecision"]["properties"]) == {
+    assert set(SameUnitPairResponse.model_json_schema()["$defs"]["SameUnitPairDecision"]["properties"]) == {
         "pair_index", "classification",
     }
 
@@ -2154,7 +2179,7 @@ def test_a_mapped_gateway_route_is_sized_and_counted_as_its_metadata_model(monke
         ("refusal", "cross_document_relation_response_incomplete"),
     ],
 )
-async def test_cross_document_relations_reject_a_refused_empty_reply(
+async def test_memory_relations_reject_a_refused_empty_reply(
     monkeypatch, finish_reason, error_code,
 ):
     response = CompletionResponse('{"decisions":[]}')
@@ -2170,7 +2195,7 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
         timeout_s=1.0, num_retries=1,
     ))
     with pytest.raises(StructuredLlmError) as error:
-        await client.classify_cross_document_relations("prompt")
+        await client.classify_relation_candidates("prompt")
     assert error.value.error_code == error_code
 
 
@@ -2183,14 +2208,14 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
         {"pair_index": -1, "label": "none"},
     ],
 )
-def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision) -> None:
+def test_memory_relation_schema_accepts_only_the_closed_labels(decision) -> None:
     from pydantic import ValidationError
 
-    from memforge.llm.structured import CrossDocumentRelationResponse
+    from memforge.llm.structured import RelationCandidateResponse
 
     with pytest.raises(ValidationError):
-        CrossDocumentRelationResponse.model_validate({"decisions": [decision]})
-    assert CrossDocumentRelationResponse.model_validate(
+        RelationCandidateResponse.model_validate({"decisions": [decision]})
+    assert RelationCandidateResponse.model_validate(
         {"decisions": [{"pair_index": 0, "label": "updates"}]}
     ).decisions[0].label == "updates"
 

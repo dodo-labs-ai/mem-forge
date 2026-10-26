@@ -1,4 +1,4 @@
-"""Budgeted post-commit discovery of cross-document Memory relations.
+"""Budgeted post-commit discovery of Memory relations.
 
 Discovery labels each (challenger, candidate) pair and writes relations only.
 It creates no Review and changes neither Memory.
@@ -14,12 +14,12 @@ from hashlib import sha256
 
 from memforge.llm.structured import terminal_failure_retryable
 from memforge.llm.transport import provider_status_code
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CrossDocumentRelationClassification,
-    CrossDocumentRelationClassifier,
-    CrossDocumentRelationOutcome,
-    CrossDocumentRelationPair,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MemoryRelationClassification,
+    MemoryRelationClassifier,
+    MemoryRelationOutcome,
+    MemoryRelationPair,
     load_relation_subjects,
 )
 from memforge.memory.evidence import (
@@ -29,8 +29,8 @@ from memforge.memory.evidence import (
     build_candidate_universe,
 )
 from memforge.memory.relation_candidate_retrieval import (
-    CrossDocumentCandidateRetriever,
-    CrossDocumentCandidateSelection,
+    RelationCandidateRetriever,
+    RelationCandidateSelection,
 )
 from memforge.memory.relation_classifier import MemoryPairClassificationError
 from memforge.memory.relation_discovery_contract import (
@@ -99,8 +99,8 @@ class RelationDiscovery:
         self,
         *,
         store: RelationalStore,
-        candidate_retriever: CrossDocumentCandidateRetriever,
-        pair_classifier: CrossDocumentRelationClassifier,
+        candidate_retriever: RelationCandidateRetriever,
+        pair_classifier: MemoryRelationClassifier,
     ) -> None:
         self._store = store
         self._candidate_retriever = candidate_retriever
@@ -154,7 +154,7 @@ class RelationDiscovery:
                     )
                     obsolete += 1
                     continue
-                relation_run, document_relations, classification = outcome
+                relation_run, memory_relations, classification = outcome
                 checked_pairs += classification.pair_count
                 llm_calls += classification.llm_calls
                 prompt_chars += classification.prompt_chars
@@ -163,7 +163,7 @@ class RelationDiscovery:
                     worker_id=worker_id,
                     lease_token=_lease_token(work),
                     relation_run=relation_run,
-                    document_relations=document_relations,
+                    memory_relations=memory_relations,
                 )
                 completed += 1
             except Exception as error:
@@ -223,7 +223,7 @@ class RelationDiscovery:
     async def _process_work(
         self,
         work: RelationDiscoveryWork,
-    ) -> tuple[RelationOutcomeBundle, CrossDocumentRelationOutcome, _CompletedClassification] | None:
+    ) -> tuple[RelationOutcomeBundle, MemoryRelationOutcome, _CompletedClassification] | None:
         request = work.request
         challenger = await self._store.get_memory(request.memory_id)
         if (
@@ -272,14 +272,14 @@ class RelationDiscovery:
             evidence_unit_ids={challenger.id: evidence_unit.id},
         )
         pairs = tuple(
-            CrossDocumentRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id])
+            MemoryRelationPair(challenger=subjects[challenger.id], candidate=subjects[candidate.id])
             for candidate in candidates
         )
         try:
             classification = (
                 await self._pair_classifier.classify(pairs)
                 if pairs
-                else CrossDocumentRelationClassification(judgments=(), llm_calls=0, prompt_chars=0)
+                else MemoryRelationClassification(judgments=(), llm_calls=0, prompt_chars=0)
             )
         except MemoryPairClassificationError as error:
             raise _WorkProcessingError(
@@ -308,7 +308,7 @@ class RelationDiscovery:
                 classification=classification,
                 candidate_support_set_hashes=candidate_support_set_hashes,
             )
-            document_relations = CrossDocumentRelationOutcome.from_judgments(
+            memory_relations = MemoryRelationOutcome.from_judgments(
                 subjects[challenger.id],
                 classification.judgments,
                 relation_run_id=relation_run.relation_run.id,
@@ -323,7 +323,7 @@ class RelationDiscovery:
             ) from error
         return (
             relation_run,
-            document_relations,
+            memory_relations,
             _CompletedClassification(
                 pair_count=len(pairs),
                 llm_calls=classification.llm_calls,
@@ -337,8 +337,8 @@ class RelationDiscovery:
         work: RelationDiscoveryWork,
         challenger: Memory,
         evidence_unit,
-        selection: CrossDocumentCandidateSelection,
-        classification: CrossDocumentRelationClassification,
+        selection: RelationCandidateSelection,
+        classification: MemoryRelationClassification,
         candidate_support_set_hashes: dict[str, str],
     ) -> RelationOutcomeBundle:
         relation_run_id = _relation_run_id(work, selection)
@@ -357,7 +357,7 @@ class RelationDiscovery:
             mandatory_candidate_count=universe.mandatory_candidate_count,
             checked_candidate_count=universe.checked_candidate_count,
             incomplete_mandatory_buckets=universe.incomplete_mandatory_buckets,
-            classifier_version=CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            classifier_version=MEMORY_RELATION_CLASSIFIER_VERSION,
             lifecycle_action=LifecycleAction.NONE,
             review_case=None,
             status="checked",
@@ -456,7 +456,7 @@ def _repeats_on_every_attempt(error: BaseException) -> bool:
 
 def _relation_run_id(
     work: RelationDiscoveryWork,
-    selection: CrossDocumentCandidateSelection,
+    selection: RelationCandidateSelection,
 ) -> str:
     digest = sha256(
         "\x1f".join(
@@ -465,7 +465,7 @@ def _relation_run_id(
                 str(work.run_generation),
                 work.request.expected_content_hash,
                 selection.snapshot_identity,
-                CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+                MEMORY_RELATION_CLASSIFIER_VERSION,
             )
         ).encode("utf-8")
     ).hexdigest()[:20]

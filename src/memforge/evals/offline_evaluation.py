@@ -26,13 +26,13 @@ from memforge.evals.agent_evaluation import (
 from memforge.llm.batch_runner import ItemFailure, LlmBatchRunner, LlmRequest
 from memforge.llm.structured import OfflineSemanticJudgeResponse
 from memforge.llm.structured_images import StructuredLlmImage
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CROSS_DOCUMENT_RELATION_INPUT_VERSIONS,
-    CrossDocumentRelationLabel,
-    CrossDocumentRelationPair,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MEMORY_RELATION_INPUT_VERSIONS,
+    MemoryRelationLabel,
+    MemoryRelationPair,
     RelationSubject,
-    StructuredCrossDocumentRelationClassifier,
+    StructuredMemoryRelationClassifier,
 )
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
 from memforge.memory.text_view import TextEvidenceView
@@ -107,7 +107,7 @@ Evaluation input:
 SEMANTIC_JUDGE_PROMPT_HASH = hashlib.sha256(
     _SEMANTIC_JUDGE_PROMPT_TEMPLATE.encode("utf-8")
 ).hexdigest()
-# The deterministic criterion of a labelled cross-document relation pair; its
+# The deterministic criterion of a labelled memory relation pair; its
 # reason code is "expected:actual".
 RELATION_LABEL_CRITERION = "relation_label"
 # The criterion of an unlabelled candidate of a relation group that the
@@ -125,7 +125,7 @@ REQUIRED_TERMS_CRITERION = "required_terms"
 # "reason/item_id", so each stored assessment names the item it scores, such as
 # "none:equivalent/mem-1" for one candidate of a relation group.
 CHECK_ITEM_SEPARATOR = "/"
-_RELATION_LABELS = frozenset(label.value for label in CrossDocumentRelationLabel)
+_RELATION_LABELS = frozenset(label.value for label in MemoryRelationLabel)
 # What a maintainer expects of one pinned Memory's Support in the new revision.
 SUPPORT_LABELS = frozenset({"supported", "unsupported"})
 SUPPORT_LABEL_CRITERION = "support_label"
@@ -140,8 +140,8 @@ class AgentEvaluationCaseKind(str, Enum):
     SOURCE_UNIT_DERIVATION = "source_unit_derivation_v1"
     SOURCE_UNIT_SUPPORT = "source_unit_support_v1"
     SOURCE_UNIT_RECONCILIATION = "source_unit_reconciliation_v1"
-    CROSS_DOCUMENT_RELATION = "cross_document_relation_v1"
-    CROSS_DOCUMENT_RELATION_GROUP = "cross_document_relation_group_v1"
+    MEMORY_RELATION = "cross_document_relation_v1"
+    MEMORY_RELATION_GROUP = "cross_document_relation_group_v1"
 
 
 class AgentEvaluationPopulation(str, Enum):
@@ -670,7 +670,7 @@ class AgentEvaluationRunReport:
     error_result_count: int
     check_counts: Mapping[str, int]
     population_summaries: Mapping[str, Mapping[str, int]]
-    # Cross-document relation cases only: per-label counts and precision/recall
+    # Memory relation cases only: per-label counts and precision/recall
     # and "expected:actual" confusion counts over labelled pairs, and the
     # summary ``relation_run_summary`` gives.
     label_metrics: Mapping[str, Mapping[str, float | int | None]] = field(default_factory=dict)
@@ -1421,8 +1421,8 @@ def _support_part_from_payload(payload: Mapping[str, object]) -> ActiveSupportEv
     )
 
 
-class CrossDocumentRelationReplayExecutor:
-    """Label one pinned Memory pair with the production cross-document classifier.
+class MemoryRelationReplayExecutor:
+    """Label one pinned Memory pair with the production memory relation classifier.
 
     The scored ``label`` is the one discovery would record: an ``updates`` the
     pinned Evidence times do not order is recorded as ``contradicts``.
@@ -1440,24 +1440,24 @@ class CrossDocumentRelationReplayExecutor:
         candidate_manifest: Mapping[str, object],
     ) -> Mapping[str, object]:
         _require_relation_input_contract(case.manifest)
-        pair = CrossDocumentRelationPair(
+        pair = MemoryRelationPair(
             challenger=RelationSubject.from_manifest(_mapping(case.manifest, "challenger")),
             candidate=RelationSubject.from_manifest(_mapping(case.manifest, "candidate")),
         )
-        classification = await StructuredCrossDocumentRelationClassifier(
+        classification = await StructuredMemoryRelationClassifier(
             client=self._structured_llm_client,
             model=str(candidate_manifest["model"]),
         ).classify((pair,))
         judgment = classification.judgments[0]
         return {
             "case_kind": case.case_kind.value,
-            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "classifier_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "label": judgment.recorded_label.value,
             "classifier_label": judgment.label.value,
         }
 
 
-class CrossDocumentRelationGroupReplayExecutor:
+class MemoryRelationGroupReplayExecutor:
     """Classify one pinned challenger with all of its pinned candidates, as discovery does.
 
     Discovery asks about every candidate of one challenger through the
@@ -1481,16 +1481,16 @@ class CrossDocumentRelationGroupReplayExecutor:
         _require_relation_input_contract(case.manifest)
         challenger = RelationSubject.from_manifest(_mapping(case.manifest, "challenger"))
         pairs = tuple(
-            CrossDocumentRelationPair(challenger=challenger, candidate=RelationSubject.from_manifest(candidate))
+            MemoryRelationPair(challenger=challenger, candidate=RelationSubject.from_manifest(candidate))
             for candidate in _mapping_list(case.manifest, "candidates")
         )
-        classification = await StructuredCrossDocumentRelationClassifier(
+        classification = await StructuredMemoryRelationClassifier(
             client=self._structured_llm_client,
             model=str(candidate_manifest["model"]),
         ).classify(pairs)
         return {
             "case_kind": case.case_kind.value,
-            "classifier_version": CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
+            "classifier_version": MEMORY_RELATION_CLASSIFIER_VERSION,
             "llm_calls": classification.llm_calls,
             "judgments": [
                 {
@@ -2962,7 +2962,7 @@ def deterministic_checks(
             reason_code="typed_output_valid",
         )
     ]
-    if case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+    if case.case_kind is AgentEvaluationCaseKind.MEMORY_RELATION:
         expected = str(ground_truth.rubric.get("expected_label") or "")
         actual = str(output.get("label") or "")
         if actual not in _RELATION_LABELS:
@@ -2980,7 +2980,7 @@ def deterministic_checks(
                 reason_code=f"{expected}:{actual}",
             )
         )
-    elif case.case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+    elif case.case_kind is AgentEvaluationCaseKind.MEMORY_RELATION_GROUP:
         actual_labels = _group_judgment_labels(case, output)
         if actual_labels is None:
             return (
@@ -3002,7 +3002,7 @@ def deterministic_checks(
                         item_id=memory_id,
                     )
                 )
-            elif actual != CrossDocumentRelationLabel.NONE.value:
+            elif actual != MemoryRelationLabel.NONE.value:
                 checks.append(
                     DeterministicCheck(
                         criterion=UNLABELLED_RELATION_CRITERION,
@@ -3199,7 +3199,7 @@ def relation_run_summary(
     the classifier gave candidates of a group that carry no label yet.
     """
 
-    none = CrossDocumentRelationLabel.NONE.value
+    none = MemoryRelationLabel.NONE.value
     return {
         "labelled_pairs": sum(label_confusion.values()),
         "false_relations": sum(
@@ -3563,7 +3563,7 @@ def _validate_case_manifest(
     case_kind: AgentEvaluationCaseKind,
     manifest: Mapping[str, object],
 ) -> None:
-    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+    if case_kind is AgentEvaluationCaseKind.MEMORY_RELATION:
         _require_relation_input_contract(manifest)
         subjects = [
             RelationSubject.from_manifest(_mapping(manifest, side))
@@ -3574,7 +3574,7 @@ def _validate_case_manifest(
         origin = _mapping(manifest, "origin")
         if not origin.get("review_id"):
             raise ValueError("relation case origin requires review_id")
-    elif case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+    elif case_kind is AgentEvaluationCaseKind.MEMORY_RELATION_GROUP:
         _require_relation_input_contract(manifest)
         challenger = RelationSubject.from_manifest(_mapping(manifest, "challenger"))
         candidate_ids = [
@@ -3605,10 +3605,10 @@ def _validate_case_manifest(
 
 def _require_relation_input_contract(manifest: Mapping[str, object]) -> None:
     pinned = manifest.get("classifier_version")
-    if pinned not in CROSS_DOCUMENT_RELATION_INPUT_VERSIONS:
+    if pinned not in MEMORY_RELATION_INPUT_VERSIONS:
         raise ValueError(
             f"relation case is pinned for classifier {pinned!r}; "
-            f"{CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION} reads a different input"
+            f"{MEMORY_RELATION_CLASSIFIER_VERSION} reads a different input"
         )
 
 
@@ -3690,10 +3690,10 @@ def _validate_rubric(
     if "required_claims" in rubric and not isinstance(rubric["required_claims"], list):
         raise ValueError("required_claims must be a list")
     case_kind = case.case_kind
-    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION:
+    if case_kind is AgentEvaluationCaseKind.MEMORY_RELATION:
         if rubric.get("expected_label") not in _RELATION_LABELS:
             raise ValueError("relation rubric requires one expected_label of " + ", ".join(sorted(_RELATION_LABELS)))
-    if case_kind is AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION_GROUP:
+    if case_kind is AgentEvaluationCaseKind.MEMORY_RELATION_GROUP:
         expected_labels = _mapping(rubric, "expected_labels")
         candidate_ids = {str(candidate["memory_id"]) for candidate in _mapping_list(case.manifest, "candidates")}
         if not set(expected_labels) <= candidate_ids:

@@ -96,7 +96,7 @@ class StaleCandidateSelectionError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentCandidateSelection:
+class RelationCandidateSelection:
     discovery: tuple[RetrievedRelationCandidate, ...]
     audit: Mapping[str, Any]
     telemetry: Mapping[str, Any] = field(default_factory=dict)
@@ -133,13 +133,13 @@ class CrossDocumentCandidateSelection:
                         candidate.memory.memory_id: ("hybrid_discovery:" + ",".join(candidate.channels))
                         for candidate in self.discovery
                     },
-                    reason="bounded hybrid cross-document discovery",
+                    reason="bounded hybrid relation discovery",
                 )
             )
         return tuple(results)
 
 
-class CrossDocumentCandidateRetriever:
+class RelationCandidateRetriever:
     """Retrieve IDs in parallel, then resolve only lightweight provenance rows."""
 
     def __init__(
@@ -163,7 +163,7 @@ class CrossDocumentCandidateRetriever:
         actor_user_id: str | None,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
-    ) -> CrossDocumentCandidateSelection:
+    ) -> RelationCandidateSelection:
         started_at = time.perf_counter()
         scope = _candidate_scope(challenger, actor_user_id=actor_user_id)
         channels, channel_errors = await self._retrieve_channels(
@@ -197,7 +197,7 @@ class CrossDocumentCandidateRetriever:
             )
             for item in selected
         )
-        return CrossDocumentCandidateSelection(
+        return RelationCandidateSelection(
             discovery=discovery,
             audit={
                 "candidate_count_kind": "windowed",
@@ -221,12 +221,12 @@ class CrossDocumentCandidateRetriever:
 
     async def load_selected_memories(
         self,
-        selection: CrossDocumentCandidateSelection,
+        selection: RelationCandidateSelection,
         *,
         challenger: Memory,
         source_id: str,
         excluded_source_ids: Sequence[str] = (),
-    ) -> tuple[CrossDocumentCandidateSelection, Mapping[str, Memory]]:
+    ) -> tuple[RelationCandidateSelection, Mapping[str, Memory]]:
         """Materialize full rows, then recheck current provenance before use."""
 
         loaded = await self._relational.list_active_memories(selection.candidate_ids)
@@ -243,7 +243,7 @@ class CrossDocumentCandidateRetriever:
         )
         if missing_ids:
             raise StaleCandidateSelectionError("selected candidate could not be materialized with current access")
-        materialized_selection = CrossDocumentCandidateSelection(
+        materialized_selection = RelationCandidateSelection(
             discovery=selection.discovery,
             audit=selection.audit,
             telemetry={
@@ -255,7 +255,7 @@ class CrossDocumentCandidateRetriever:
 
     async def ensure_selection_current(
         self,
-        selection: CrossDocumentCandidateSelection,
+        selection: RelationCandidateSelection,
         *,
         challenger: Memory,
         source_id: str,

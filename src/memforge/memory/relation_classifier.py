@@ -1,7 +1,7 @@
 """Provider-neutral relationship rules and the same-Unit pair review.
 
 The pair review is a Decision: the program supplies two supported refinements
-of the same old Memory, and the model returns one memory relation label.
+of the same old Memory, and the model returns one same-Unit relation label.
 ``contradicts`` is the safe answer and the only label the program acts on: it
 turns the refinement uncertain and blocks the UPDATE.
 """
@@ -15,7 +15,7 @@ from typing import Any
 
 from memforge.llm.batch_runner import BatchStats, ItemFailure, ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.decision_model import DecisionTask, decision_task_model
-from memforge.llm.structured import MemoryRelationResponse, StructuredLlmError
+from memforge.llm.structured import SameUnitPairResponse, StructuredLlmError
 from memforge.models import Memory
 
 
@@ -43,7 +43,7 @@ class MemoryPairClassificationError(RuntimeError):
         self.status_code = status_code
 
 
-class MemoryRelationType(str, Enum):
+class SameUnitRelationType(str, Enum):
     EQUIVALENT = "equivalent"
     REFINES = "refines"
     CONTRADICTS = "contradicts"
@@ -70,7 +70,7 @@ class MemoryPair:
 @dataclass(frozen=True, slots=True)
 class MemoryPairDecision:
     pair: MemoryPair
-    relation_type: MemoryRelationType
+    relation_type: SameUnitRelationType
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +89,7 @@ class MemoryPairClassification:
     unjudged: tuple[UnjudgedPair, ...] = ()
 
 
-MEMORY_RELATION_RULES = """Use these definitions strictly:
+SAME_UNIT_RELATION_RULES = """Use these definitions strictly:
 - EQUIVALENT: the claims express one durable proposition with exactly the same truth conditions.
 - REFINES: one claim is compatible with the other but narrows it, adds a condition, or adds a material detail.
 - CONTRADICTS: the claims make mutually incompatible assertions about the same subject.
@@ -122,7 +122,7 @@ equivalent only when P is the durable knowledge and neither claim is about the
 recording act, its completeness, or its authority.
 """
 
-MEMORY_RELATION_PROMPT = "Classify the semantic relationship of every exact Memory pair.\n\n" + MEMORY_RELATION_RULES + """
+SAME_UNIT_PAIR_PROMPT = "Classify the semantic relationship of every exact Memory pair.\n\n" + SAME_UNIT_RELATION_RULES + """
 <memory_pair_groups>
 {groups_json}
 </memory_pair_groups>
@@ -252,10 +252,10 @@ class StructuredMemoryPairClassifier:
 
         def render(item_ids: tuple[str, ...], _context: tuple) -> LlmRequest:
             indexed_pairs = tuple((int(item_id), pairs[int(item_id)]) for item_id in item_ids)
-            prompt = MEMORY_RELATION_PROMPT.format(groups_json=_grouped_pair_payload(indexed_pairs))
-            return LlmRequest(prompt, MemoryRelationResponse)
+            prompt = SAME_UNIT_PAIR_PROMPT.format(groups_json=_grouped_pair_payload(indexed_pairs))
+            return LlmRequest(prompt, SameUnitPairResponse)
 
-        def decode(response: MemoryRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
+        def decode(response: SameUnitPairResponse, _item_ids: tuple[str, ...], _context: tuple):
             """Each decision names one supplied pair; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
@@ -264,13 +264,13 @@ class StructuredMemoryPairClassifier:
                 else:
                     yield str(pair_index), MemoryPairDecision(
                         pair=pairs[pair_index],
-                        relation_type=MemoryRelationType(decision.classification),
+                        relation_type=SameUnitRelationType(decision.classification),
                     )
 
         decisions, unjudged = await judge_pair_items(runner, ItemTask(
             item_ids=tuple(str(index) for index in range(len(pairs))), render=render, decode=decode,
-            call=self._client.classify_memory_relations, label=lambda item_id: f"pair_index {item_id}",
-        ), pairs, label="memory relation classification")
+            call=self._client.classify_same_unit_pairs, label=lambda item_id: f"pair_index {item_id}",
+        ), pairs, label="same-Unit pair review")
         return MemoryPairClassification(
             decisions=tuple(decisions), llm_calls=runner.stats.calls, prompt_chars=runner.stats.prompt_chars,
             unjudged=unjudged,
