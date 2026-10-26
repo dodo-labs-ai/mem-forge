@@ -1216,54 +1216,6 @@ async def test_candidate_memories_by_source_anchor_use_current_evidence_relation
 
 
 @pytest.mark.asyncio
-async def test_candidate_memories_by_agent_claim_use_claim_anchor_lineage(db: Database) -> None:
-    claim_unit = replace(
-        _unit(),
-        id="eu-claim",
-        source_type="agent_session",
-        source_anchor="u:repo:concept:claim",
-        source_lineage_id="u:repo:concept:claim",
-        source_metadata={"claim_anchor": "u:repo:concept:claim"},
-        visibility="private",
-        owner_user_id="u",
-        repo_identifier="repo",
-    )
-    await db.upsert_evidence_unit(claim_unit)
-    memory = _memory("mem-claim")
-    memory.visibility = "private"
-    memory.owner_user_id = "u"
-    memory.repo_identifier = "repo"
-    await db.insert_memory(memory)
-    await db.replace_evidence_relations(
-        "eu-claim",
-        [
-            EvidenceRelationRecord(
-                evidence_unit_id="eu-claim",
-                memory_id=memory.id,
-                relation_type=RelationType.SUPPORTS,
-                authority_case=AuthorityCase.SAME_AGENT_CLAIM,
-                is_authoritative_support=True,
-                source_lineage_id="u:repo:concept:claim",
-                confidence=0.9,
-                classifier_version="test-v1",
-                relation_run_id="rel-run-claim",
-                created_at="2026-06-22T12:00:00+00:00",
-            )
-        ],
-    )
-
-    candidates = await db.get_candidate_memories_by_agent_claim(
-        claim_anchor="u:repo:concept:claim",
-    )
-
-    assert len(candidates) == 1
-    assert candidates[0].memory_id == memory.id
-    assert candidates[0].visibility == "private"
-    assert candidates[0].owner_user_id == "u"
-    assert candidates[0].repo_identifier == "repo"
-
-
-@pytest.mark.asyncio
 async def test_candidate_memories_by_existing_relation_graph_are_active(db: Database) -> None:
     await db.upsert_evidence_unit(_unit())
     active = _memory("mem-existing-active")

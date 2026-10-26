@@ -134,7 +134,7 @@ class SourceTypeDescriptor:
 
     @property
     def family(self) -> CollectionFamilyKind | None:
-        """The collection family its Gene's base class names; ``None`` for managed capture."""
+        """The collection family its Gene's base class names; ``None`` for a Gene with no collection."""
 
         from memforge.genes.family import gene_family
 

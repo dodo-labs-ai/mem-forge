@@ -77,7 +77,7 @@ async def test_add_source_support_does_not_cross_private_owner(tmp_path):
         outcome = await store.add_source_support(
             memory_id="m-alice",
             doc_id="d-bob",
-            source_type="agent_session",
+            source_type="local_markdown",
             writer_visibility=Visibility.PRIVATE.value,
             writer_owner_user_id="u-bob",
             source_updated_at=None,

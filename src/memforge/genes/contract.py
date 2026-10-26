@@ -10,8 +10,8 @@ What each family requires:
 
 - **Every type with a collection** (a sync run on the server or a local-agent
   collection) has a Gene of exactly one family, and the Gene implements every
-  abstract method. Only a type without a collection, which is managed capture,
-  has a Gene of neither family.
+  abstract method. Only a type without a collection has a Gene of neither
+  family.
 - **A document Gene** declares ``listing_kinds`` and answers ``lists_scope``
   as a class method, because a scope change asks it before any Gene exists.
   Python lets an abstract class method be called on its class, so the

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Agent-session storage is removed. On upgrade, MemForge takes its recovery
+  point, retires every remaining agent-session Source as Source deletion does
+  (its Memories stop appearing in search and the vector index drops them;
+  history is kept), and drops the Agent Knowledge and agent-session receipt
+  tables (`agent_claim_citations`, `agent_claims`, `agent_concepts`,
+  `agent_session_receipts` and `agent_hook_receipts`). If an agent-session
+  Source still has open work, such as an access change that is queued,
+  running or failed, the upgrade stops and names the Source: restore
+  the recovery point with `memforge backup restore <id>`, resolve that work on
+  the previous release, delete the Source in the admin UI, then upgrade.
+  `POST /api/v1/agent-sessions/windows` and `POST /api/v1/hooks/receipts` now
+  answer `404`, and `source_filter.clients` is removed from the search API, so
+  a request that sends it gets `422`. Memory responses keep `origin_client`
+  for Memories a coding agent wrote with `create_memory`. Source list rows no
+  longer carry `client`, and `GET /api/v1/genes` no longer carries `managed`;
+  the admin UI offers every registered source type. For connector and adapter
+  authors: `agent_session` is no longer a registered source type, and the
+  storage protocol drops `apply_agent_claim_source_projection_lifecycle` and
+  the agent claim, concept and receipt methods. Cloud: drop the HANA store's
+  agent claim, concept and receipt methods and their protocol entries, the
+  `clients` facet, and the capture tables, retiring the remaining agent-session
+  Sources in the same migration.
+
 - The admin UI is served at `/`, and the previous admin UI (V1, `admin-ui/`)
   moves to `/v1/`. A link to a page under `/v2/`, where the admin UI ran beside
   V1, answers `301` to the same page at `/` with its query kept, so

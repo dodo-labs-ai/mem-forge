@@ -2335,9 +2335,9 @@ def test_local_adapter_push_requires_local_adapter_source(tmp_path):
     async def _seed_other_source() -> str:
         await database.upsert_source(
             id="src-other",
-            type="agent_session",
-            name="Agent Sessions",
-            config_json=json.dumps({"documents_dir": str(tmp_path / "as-inbox")}),
+            type="confluence",
+            name="Wiki",
+            config_json=json.dumps({"base_url": "https://wiki.example.test"}),
             access_policy="private",
             owner_user_id="dev",
         )

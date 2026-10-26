@@ -2,7 +2,6 @@ import json
 
 import pytest
 
-from memforge.genes.agent_session_gene import AgentSessionGene
 from memforge.memory.project_resolver import (
     binding_names_project,
     binding_without_project,
@@ -155,14 +154,6 @@ async def test_sync_pipeline_legacy_source_resolves_to_unsorted(db):
         workspace=None,
     )
     assert resolved == UNSORTED_PROJECT_KEY
-
-
-def test_agent_session_gene_declares_repo_as_project_field():
-    """The agent-session gene exposes `repo` as the field a `by_field`
-    binding reads, so the admin UI can scope the binding editor to fields
-    the gene actually populates."""
-    schema = AgentSessionGene.config_schema()
-    assert schema.project_field == "repo"
 
 
 @pytest.mark.parametrize(

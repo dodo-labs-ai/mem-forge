@@ -4,7 +4,7 @@ A source type's family follows from the base class of its Gene and from
 nothing else: a :class:`~memforge.genes.document_gene.DocumentGene` collects
 documents, and a :class:`~memforge.genes.conversation_gene.ConversationGene`
 collects conversations through the conversation layer. A Gene of neither
-family has no collection, as managed capture does.
+family has no collection.
 """
 
 from __future__ import annotations

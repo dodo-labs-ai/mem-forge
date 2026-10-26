@@ -125,7 +125,6 @@ def make_document(
     doc_id: str,
     *,
     source: str = "src-contract",
-    client: str | None = None,
     title: str | None = None,
     labels: list[str] | None = None,
 ) -> DocumentRecord:
@@ -143,7 +142,6 @@ def make_document(
         content_hash=f"hash-{doc_id}",
         token_count=1,
         last_synced=now,
-        client=client,
     )
 
 

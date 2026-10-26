@@ -607,7 +607,7 @@ async def test_record_fields_keep_each_array_item_together_and_skip_empty_values
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source_type", ["confluence", "github_repo", "local_markdown", "agent_session", "jira"])
+@pytest.mark.parametrize("source_type", ["confluence", "github_repo", "local_markdown", "jira"])
 @pytest.mark.parametrize(
     ("observed_at", "evidence_time"),
     [("2026-03-02T23:30:00-05:00", "2026-03-03T04:30:00+00:00"), (None, None)],

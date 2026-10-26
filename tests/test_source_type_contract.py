@@ -11,7 +11,6 @@ import pytest
 import memforge
 import memforge.genes.teams_provider as teams_provider
 import memforge.main as main
-from memforge.genes.agent_session_gene import AgentSessionGene
 from memforge.genes.contract import (
     SourceTypeContractError,
     validate_registered_source_types,
@@ -43,6 +42,7 @@ from memforge.source_types import (
     source_type_descriptor,
 )
 from tests.gene_fixture import FakeGene
+from tests.uncollected_gene import UncollectedGene
 from tests.source_type_fixture import register_test_source_type
 
 DEVICE = LocalAgentCollection(operation="test_sync", job_config_fields=frozenset())
@@ -64,10 +64,6 @@ class QueryGene(FakeGene):
         return {}
 
 
-class CapturedGene(AgentSessionGene):
-    """A Gene with no collection, as managed capture has."""
-
-
 def test_every_built_in_source_type_meets_its_contract() -> None:
     validate_registered_source_types()
 
@@ -78,11 +74,11 @@ def test_a_document_gene_with_its_contract_is_accepted() -> None:
 
 
 def test_a_gene_without_a_collection_needs_no_family() -> None:
-    validate_source_type(_descriptor(CapturedGene))
+    validate_source_type(_descriptor(UncollectedGene))
 
 
 def test_a_collecting_gene_of_neither_family_is_refused() -> None:
-    class Bare(AgentSessionGene):
+    class Bare(UncollectedGene):
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
@@ -302,14 +298,39 @@ def test_a_refused_built_in_fails_the_import(tmp_path) -> None:
     # descriptor before the genes package loads and validates every type.
     (tmp_path / "probe_gene.py").write_text(
         """
-from memforge.genes.agent_session_gene import AgentSessionGene
+from memforge.genes.base import Gene
+from memforge.models import GeneConfigSchema, GeneMetadata
 
 
-class Broken(AgentSessionGene):
+class Broken(Gene):
     @classmethod
     def metadata(cls):
-        meta = AgentSessionGene.metadata()
-        return type(meta)(**{**meta.__dict__, "execution_kinds": ("server",)})
+        return GeneMetadata(
+            name="probe",
+            display_name="Probe",
+            description="collects without a family",
+            default_sync_interval_minutes=60,
+            auth_method="none",
+            data_shape="document",
+            execution_kinds=("server",),
+        )
+
+    @classmethod
+    def config_schema(cls):
+        return GeneConfigSchema()
+
+    async def authenticate(self):
+        pass
+
+    async def discover(self, since=None):
+        return
+        yield
+
+    async def fetch(self, item):
+        raise NotImplementedError
+
+    async def normalize(self, raw):
+        raise NotImplementedError
 """
     )
     probe = f"""
@@ -317,7 +338,7 @@ import sys
 sys.path.insert(0, {str(tmp_path)!r})
 import memforge.source_types as source_types
 from memforge.source_types import SourceTypeDescriptor
-source_types._DESCRIPTORS["agent_session"] = SourceTypeDescriptor(source_type="agent_session", gene="probe_gene:Broken")
+source_types._DESCRIPTORS["probe"] = SourceTypeDescriptor(source_type="probe", gene="probe_gene:Broken")
 import memforge.genes
 """
     package_root = str(Path(memforge.__file__).parent.parent)
@@ -546,7 +567,6 @@ MODE_READERS = {
 
 # The least each built-in type needs before its hooks run.
 MINIMAL_CONFIGS = {
-    "agent_session": {},
     "confluence": {"base_url": "https://wiki.example.test", "pat": "wiki-pat"},
     "github_pages": {},
     "github_repo": {"repo_url": "https://github.example.test/org/repo"},

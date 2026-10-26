@@ -18,6 +18,7 @@ from memforge.models import (
 )
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.storage.database import Database
+from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_sync_bookkeeping import (
     ProjectionFragmentRecordingExtractor,
@@ -79,90 +80,6 @@ def test_exact_sync_receipt_read_preserves_state_and_source_visibility(tmp_path)
             assert asyncio.run(database.get_source_sync_run(run.run_id)) == before
         with TestClient(_app(tmp_path, database, workspace_id="another")) as other_workspace:
             assert other_workspace.get(url).status_code == 404
-    finally:
-        asyncio.run(database.close())
-
-
-async def _seed_agent_claim_memory(database: Database, *, source_id: str, owner_user_id: str) -> str:
-    """Store one agent-session claim and its Memory, as earlier releases did, and return the Memory id."""
-    from memforge.agent_knowledge import AgentKnowledgeBundleService
-    from memforge.memory.store import MemoryStore
-    from memforge.storage.adapters.sqlite import build_sqlite_adapters
-    from tests.embedding_fixture import unconfigured_embedding
-    from tests.test_agent_knowledge_bundle import RecordingCollection, _proposal
-
-    adapters = build_sqlite_adapters(database, RecordingCollection())
-    store = MemoryStore(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embedding=unconfigured_embedding(),
-    )
-
-    async def embed(_text: str) -> list[float]:
-        return [0.1]
-
-    store._embed = embed
-    result = await AgentKnowledgeBundleService(db=database, memory_store=store).apply_patch_proposal(
-        proposal=_proposal(),
-        owner_user_id=owner_user_id,
-        source_id=source_id,
-        client="codex",
-        session_id="sess-1",
-        workspace="/workspace/mem-forge",
-        repo_identifier="github.example.test/platform/mem-forge",
-        project_key="UNSORTED",
-        source_updated_at=None,
-    )
-    assert result.outcome == "applied"
-    return result.memory_id
-
-
-def test_agent_session_owner_can_delete_it_but_not_configure_or_sync_it(tmp_path, monkeypatch):
-    from memforge.memory.store import MemoryStore
-    from tests.agent_session_fixture import seed_agent_session_source
-
-    cascaded_sources: list[str] = []
-    delete_source_cascade = MemoryStore.delete_source_cascade
-
-    async def record_cascade(self, source_id, **kwargs):
-        cascaded_sources.append(source_id)
-        return await delete_source_cascade(self, source_id, **kwargs)
-
-    monkeypatch.setattr(MemoryStore, "delete_source_cascade", record_cascade)
-    database = _connect_database(tmp_path)
-    owner = {"x-test-user": "owner-user", "x-test-workspace-role": "member"}
-    admin = {"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"}
-    try:
-        source = asyncio.run(seed_agent_session_source(database, client="codex", owner_user_id="owner-user"))
-        memory_id = asyncio.run(
-            _seed_agent_claim_memory(database, source_id=source["id"], owner_user_id="owner-user")
-        )
-        url = f"/api/v1/sources/{source['id']}"
-        with TestClient(_app(tmp_path, database)) as client:
-            owner_rows = client.get("/api/v1/sources", headers=owner).json()["data"]
-            admin_rows = client.get("/api/v1/sources", headers=admin).json()["data"]
-            refused = client.delete(url, headers=admin)
-            deleted = client.delete(url, headers=owner)
-
-        [row] = [row for row in owner_rows if row["id"] == source["id"]]
-        assert row["capabilities"] == {
-            "can_subscribe": True,
-            "can_configure": False,
-            "can_configure_connection": False,
-            "can_sync": False,
-            "can_force_resync": False,
-            "can_delete": True,
-            "can_change_access": True,
-        }
-        assert all(row["id"] != source["id"] for row in admin_rows)
-        assert refused.status_code == 404, refused.text
-        assert deleted.status_code == 200, deleted.text
-        assert deleted.json() == {"ok": True, "deleted_source": source["id"]}
-        assert asyncio.run(database.get_source(source["id"]))["status"] == "retired"
-        assert cascaded_sources == [source["id"]]
-        memory = asyncio.run(database.get_memory(memory_id))
-        assert (memory.status, memory.retirement_reason) == ("retired", "source_deleted")
     finally:
         asyncio.run(database.close())
 
@@ -497,70 +414,6 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
         assert source["config"]["pat_configured"] is True
         assert "pat" not in source["config"]
         assert "pat_encrypted" not in source["config"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_agent_session_rejects_ordinary_sync_and_hides_historical_sync_failure(tmp_path):
-    database = _connect_database(tmp_path)
-    source_id = "src-agent-session-sync-policy"
-    owner_headers = {
-        "x-test-user": "owner-user",
-        "x-test-workspace-role": "member",
-    }
-    try:
-        asyncio.run(
-            database.upsert_source(
-                id=source_id,
-                type="agent_session",
-                name="Codex Session",
-                config_json='{"documents_dir":"/missing/local-only-path"}',
-                access_policy="private",
-                owner_user_id="owner-user",
-            )
-        )
-        asyncio.run(
-            database.insert_sync_history(
-                source=source_id,
-                status="failed",
-                docs_processed=0,
-                docs_updated=0,
-                docs_failed=0,
-                memories_extracted=0,
-                error_message="Agent session documents directory does not exist",
-                failed_docs=None,
-                started_at="2026-07-15T06:57:00+00:00",
-                finished_at="2026-07-15T06:57:01+00:00",
-            )
-        )
-
-        with TestClient(_app(tmp_path, database)) as client:
-            listed = client.get("/api/v1/sources", headers=owner_headers)
-            synced = client.post(
-                f"/api/v1/sources/{source_id}/sync",
-                headers=owner_headers,
-            )
-            force_synced = client.post(
-                f"/api/v1/sources/{source_id}/force-resync",
-                headers=owner_headers,
-            )
-            scheduled = client.put(
-                f"/api/v1/sources/{source_id}/schedule",
-                headers=owner_headers,
-                json={"enabled": True, "interval_minutes": 60},
-            )
-
-        assert listed.status_code == 200, listed.text
-        source = next(row for row in listed.json()["data"] if row["id"] == source_id)
-        assert source["capabilities"]["can_sync"] is False
-        assert source["capabilities"]["can_force_resync"] is False
-        assert source["sync"] is None
-        for response in (synced, force_synced, scheduled):
-            assert response.status_code == 409, response.text
-            assert response.json()["detail"] == "source_sync_not_supported"
-        assert asyncio.run(database.get_latest_source_sync_run(source_id=source_id)) is None
-        history = asyncio.run(database.get_sync_history(source=source_id, limit=1))
-        assert history[0]["status"] == "failed"
     finally:
         asyncio.run(database.close())
 
@@ -1823,6 +1676,7 @@ def test_source_execution_owner_migration_backfills_creator(tmp_path):
         "INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
         [(version, "already applied") for version in range(1, 35)],
     )
+    connection.executescript(CAPTURE_TABLES_SCHEMA)
     connection.commit()
     connection.close()
 

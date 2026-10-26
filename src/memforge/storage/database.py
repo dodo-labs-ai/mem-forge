@@ -26,10 +26,6 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Collection, Mapping, Seque
 import aiosqlite
 
 from memforge.derivation_work import DerivationWork
-from memforge.agent_session_contract import (
-    AGENT_SESSION_WINDOW_SOURCE_KIND,
-    successful_agent_session_activity_at,
-)
 from memforge.local_agent.snapshot_manifest import (
     ExcludedScopeListing,
     SnapshotConfirmation,
@@ -79,8 +75,6 @@ from memforge.storage.adapters.protocols import (
 )
 from memforge.memory.project_resolver import released_project_bindings
 from memforge.models import (
-    AgentHookReceipt,
-    AgentSessionReceipt,
     ChangelogEntry,
     ContentItem,
     DocumentRecord,
@@ -434,16 +428,6 @@ def _legacy_agent_session_client(source_id: str) -> str:
     return suffix.rsplit("-", 1)[0]
 
 
-# The three current outcomes an uploaded agent-session window can record.
-# Knowledge completeness ("how much was kept vs dropped as no_output") is read
-# from these. Older receipts used "package_created"; reads normalize that value
-# into knowledge_patched.
-AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED = "knowledge_patched"
-AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED = "package_created"
-AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
-AGENT_SESSION_OUTCOME_FAILED = "failed"
-
-
 def _current_memory_relation_sql(scope) -> tuple[str, list[Any]]:
     """FROM and WHERE for relations current for the caller, with the relation aliased ``r``.
 
@@ -582,11 +566,6 @@ def _with_empty_relation_snapshot_audit(run: RelationRunRecord) -> RelationRunRe
     return replace(run, audit=audit)
 
 
-AGENT_SESSION_OUTCOMES = (
-    AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED,
-    AGENT_SESSION_OUTCOME_NO_OUTPUT,
-    AGENT_SESSION_OUTCOME_FAILED,
-)
 _RELATION_SNAPSHOT_AUDIT_KEYS = frozenset(
     {
         "candidate_snapshot_hash",
@@ -1820,80 +1799,6 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     PRIMARY KEY (provider, origin)
 );
 
-CREATE TABLE IF NOT EXISTS agent_session_receipts (
-    doc_id                  TEXT PRIMARY KEY,
-    source_id               TEXT NOT NULL,
-    client                  TEXT NOT NULL,
-    session_id              TEXT NOT NULL,
-    trigger                 TEXT NOT NULL,
-    workspace               TEXT NOT NULL,
-    repo                    TEXT,
-    branch                  TEXT,
-    commit_sha              TEXT,
-    history_window_kind     TEXT NOT NULL,
-    history_window_start    TEXT,
-    history_window_end      TEXT,
-    submitted_at            TEXT NOT NULL,
-    document_hash           TEXT NOT NULL,
-    source_kind             TEXT NOT NULL,
-    document_uri            TEXT NOT NULL,
-    metadata                TEXT NOT NULL DEFAULT '{}',
-    updated_at              TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agent_hook_receipts (
-    receipt_id      TEXT PRIMARY KEY,
-    client          TEXT NOT NULL,
-    session_id      TEXT NOT NULL,
-    hook            TEXT NOT NULL,
-    workspace       TEXT NOT NULL,
-    repo            TEXT,
-    branch          TEXT,
-    commit_sha      TEXT,
-    submitted_at    TEXT NOT NULL,
-    metadata        TEXT NOT NULL DEFAULT '{}',
-    updated_at      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agent_concepts (
-    id                  TEXT PRIMARY KEY,
-    source_id           TEXT NOT NULL,
-    owner_user_id       TEXT NOT NULL,
-    visibility          TEXT NOT NULL DEFAULT 'private',
-    workspace           TEXT NOT NULL,
-    repo_identifier     TEXT,
-    concept_type        TEXT NOT NULL,
-    concept_path        TEXT NOT NULL,
-    title               TEXT NOT NULL,
-    markdown_body       TEXT NOT NULL,
-    frontmatter_json    TEXT NOT NULL DEFAULT '{}',
-    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    last_observed_at    TEXT NOT NULL,
-    CHECK (visibility IN ('private', 'workspace'))
-);
-
-CREATE TABLE IF NOT EXISTS agent_claims (
-    id                  TEXT PRIMARY KEY,
-    concept_id          TEXT NOT NULL REFERENCES agent_concepts(id),
-    display_anchor      TEXT NOT NULL,
-    claim_text          TEXT NOT NULL,
-    memory_type         TEXT NOT NULL,
-    tags                TEXT NOT NULL DEFAULT '[]',
-    memory_id           TEXT NOT NULL REFERENCES memories(id),
-    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
-    last_observed_at    TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agent_claim_citations (
-    claim_id        TEXT NOT NULL REFERENCES agent_claims(id),
-    citation_url    TEXT NOT NULL,
-    observed_at     TEXT NOT NULL,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (claim_id, citation_url)
-);
-
 CREATE TABLE IF NOT EXISTS sync_state (
     source              TEXT PRIMARY KEY,
     last_sync_at        TEXT,
@@ -2243,13 +2148,6 @@ CREATE INDEX IF NOT EXISTS idx_entity_aliases_compact ON entity_aliases(REPLACE(
 CREATE INDEX IF NOT EXISTS idx_entities_canonical_compact ON entities(REPLACE(canonical_name, ' ', ''));
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_status ON auth_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_source_subscriptions_user ON source_subscriptions(user_id);
-CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_session ON agent_session_receipts(session_id);
-CREATE INDEX IF NOT EXISTS idx_agent_session_receipts_source ON agent_session_receipts(source_id);
-CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_session ON agent_hook_receipts(session_id);
-CREATE INDEX IF NOT EXISTS idx_agent_hook_receipts_hook ON agent_hook_receipts(hook);
-CREATE INDEX IF NOT EXISTS idx_agent_concepts_owner_repo ON agent_concepts(owner_user_id, repo_identifier);
-CREATE INDEX IF NOT EXISTS idx_agent_claims_concept ON agent_claims(concept_id);
-CREATE INDEX IF NOT EXISTS idx_agent_claims_memory ON agent_claims(memory_id);
 CREATE INDEX IF NOT EXISTS idx_relation_runs_result_memory ON relation_runs(result_memory_id);
 -- ---------------------------------------------------------------
 -- Memory reviews - human-gated lifecycle decisions
@@ -5153,6 +5051,22 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # current-Support check and the Plan stale guards.
         ["DROP TABLE IF EXISTS source_lifecycle_gates"],
     ),
+    (
+        131,
+        "Remove agent-session capture storage",
+        # Coding agents write memory only through the confirmed create_memory
+        # tool. The data step first retires every remaining agent-session
+        # Source as Source deletion does; the Agent Knowledge and receipt
+        # tables then go, their indexes with them. Claims go before the
+        # concepts they name, and citations before their claims.
+        [
+            "DROP TABLE IF EXISTS agent_claim_citations",
+            "DROP TABLE IF EXISTS agent_claims",
+            "DROP TABLE IF EXISTS agent_concepts",
+            "DROP TABLE IF EXISTS agent_session_receipts",
+            "DROP TABLE IF EXISTS agent_hook_receipts",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5489,6 +5403,38 @@ class Database:
             if bounded is not None:
                 await self.db.execute("UPDATE sources SET config = ? WHERE id = ?", (json.dumps(bounded), row["id"]))
 
+    async def _retire_agent_session_sources_unlocked(self) -> None:
+        """Retire every agent-session Source that is not retired, as Source deletion does.
+
+        Each Source goes through the relational core of
+        ``delete_source_cascade``, so its Memories without other Support are
+        retired, history stays, and every retired Memory gets a
+        ``source_deletion_vector_outbox`` row the lifecycle vector worker
+        delivers once MemForge runs. A Source with open work, such as an access
+        change still queued, running or failed, stops the migration with an
+        error naming the Source and how to resolve it; the migration then
+        changes nothing.
+        """
+
+        rows = await self.db.execute_fetchall(
+            "SELECT id FROM sources WHERE type = 'agent_session' AND status != 'retired' ORDER BY id"
+        )
+        for row in rows:
+            source_id = str(row["id"])
+            try:
+                result = await self._retire_source_unlocked(source_id)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"agent-session Source {source_id} cannot be retired: {exc}. Restore the recovery "
+                    "point taken before this upgrade, resolve that work with the previous MemForge "
+                    "release, delete the Source in the admin UI, then upgrade again"
+                ) from exc
+            logger.info(
+                "Retired agent-session Source %s and %d of its Memories",
+                source_id,
+                len(result.retired_memory_ids),
+            )
+
     async def _migrate_agent_runtime_event_v3_unlocked(self) -> None:
         """Relax extraction-only lineage and preserve v2 events and assessments."""
 
@@ -5676,6 +5622,13 @@ class Database:
                 async with self.db.execute("SELECT id FROM memories WHERE memory_level = 'consolidated'") as cursor:
                     consolidated_memory_ids = [str(row[0]) async for row in cursor]
                 for memory_id in consolidated_memory_ids:
+                    # At this schema an Agent Knowledge claim may still name the Memory.
+                    await self.db.execute(
+                        """DELETE FROM agent_claim_citations
+                           WHERE claim_id IN (SELECT id FROM agent_claims WHERE memory_id = ?)""",
+                        (memory_id,),
+                    )
+                    await self.db.execute("DELETE FROM agent_claims WHERE memory_id = ?", (memory_id,))
                     await self._purge_memory_unlocked(memory_id)
         if version == 79:
             await self._migrate_agent_runtime_event_v3_unlocked()
@@ -5683,6 +5636,8 @@ class Database:
             await self._name_teams_units_as_conversation_units_unlocked()
         if version == 124:
             await self._bound_teams_initial_history_unlocked()
+        if version == 131:
+            await self._retire_agent_session_sources_unlocked()
         for sql in statements:
             try:
                 await self.db.execute(sql)
@@ -6639,7 +6594,6 @@ class Database:
         unique_doc_ids = list(dict.fromkeys(doc_ids))
         snapshots = {
             "changelog": [],
-            "agent_session_receipts": [],
             "sync_state": [],
             "sync_history": [],
         }
@@ -6653,26 +6607,9 @@ class Database:
 
         if unique_doc_ids:
             placeholders = ",".join("?" for _ in unique_doc_ids)
-            params = tuple(unique_doc_ids)
             snapshots["changelog"] = await fetch_rows(
                 f"SELECT * FROM changelog WHERE doc_id IN ({placeholders})",
-                params,
-            )
-            if source_id:
-                snapshots["agent_session_receipts"] = await fetch_rows(
-                    f"""SELECT * FROM agent_session_receipts
-                        WHERE source_id = ? OR doc_id IN ({placeholders})""",
-                    (source_id, *unique_doc_ids),
-                )
-            else:
-                snapshots["agent_session_receipts"] = await fetch_rows(
-                    f"SELECT * FROM agent_session_receipts WHERE doc_id IN ({placeholders})",
-                    params,
-                )
-        elif source_id:
-            snapshots["agent_session_receipts"] = await fetch_rows(
-                "SELECT * FROM agent_session_receipts WHERE source_id = ?",
-                (source_id,),
+                tuple(unique_doc_ids),
             )
 
         if source_id:
@@ -6692,7 +6629,6 @@ class Database:
         async with self._write_lock:
             for table in (
                 "changelog",
-                "agent_session_receipts",
                 "sync_state",
                 "sync_history",
             ):
@@ -7415,7 +7351,6 @@ class Database:
                             (doc_id,),
                         )
                         await self.db.execute("DELETE FROM changelog WHERE doc_id = ?", (doc_id,))
-                        await self.db.execute("DELETE FROM agent_session_receipts WHERE doc_id = ?", (doc_id,))
                         await self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
                 await self._assert_source_activity_fence_unlocked(
                     source_id,
@@ -10639,94 +10574,6 @@ class Database:
                     projection.source_id,
                     source_activity,
                 )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    async def apply_agent_claim_source_projection_lifecycle(
-        self,
-        projection: SourceProjection,
-        plan: LifecyclePlan,
-        *,
-        memory_id: str,
-        relation_outcome: RelationOutcomeBundle | None,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        citations: list[str] | None = None,
-        concept_projection: dict[str, Any] | None = None,
-        concept_markdown_body: str | None = None,
-        maintenance_receipt: MemoryAuditEvent | None = None,
-    ) -> None:
-        """Commit projected Memory lifecycle and the Agent Knowledge view atomically."""
-
-        plan.validate()
-        if projection.source_id != plan.scope.source_id or len(projection.deltas) != 1:
-            raise ValueError("agent projection and lifecycle plan scope mismatch")
-        delta = projection.deltas[0]
-        if (
-            delta.source_unit_id != plan.scope.source_unit_id
-            or delta.current_unit_revision_id != plan.scope.target_unit_revision_id
-        ):
-            raise ValueError("agent projection and lifecycle plan revision mismatch")
-        created_memory_ids = {
-            mutation.memory_id
-            for mutation in plan.mutations
-            if mutation.mutation_type is LifecycleMutationType.CREATE_MEMORY
-        }
-        retired_memory_ids = {
-            mutation.memory_id
-            for mutation in plan.mutations
-            if mutation.mutation_type is LifecycleMutationType.RETIRE_MEMORY
-        }
-        if memory_id not in created_memory_ids | retired_memory_ids:
-            raise ValueError("agent claim must reference a Memory created or retired by its Lifecycle Plan")
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            try:
-                await self.record_source_projection(
-                    projection,
-                    _manage_transaction=False,
-                )
-                await self._apply_lifecycle_plan(plan, _manage_transaction=False)
-                if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(
-                        relation_outcome,
-                    )
-                if concept_projection is not None:
-                    await self._upsert_agent_concept_unlocked(
-                        **concept_projection,
-                        observed=observed,
-                    )
-                await self._upsert_agent_claim_unlocked(
-                    claim_id=claim_id,
-                    concept_id=concept_id,
-                    display_anchor=display_anchor,
-                    claim_text=claim_text,
-                    memory_type=memory_type,
-                    memory_id=memory_id,
-                    observed=observed,
-                )
-                for citation_url in citations or ():
-                    await self._add_agent_claim_citation_unlocked(
-                        claim_id=claim_id,
-                        citation_url=citation_url,
-                        observed=observed,
-                    )
-                if concept_markdown_body is not None:
-                    await self._update_agent_concept_markdown_unlocked(
-                        concept_id=concept_id,
-                        markdown_body=concept_markdown_body,
-                        observed=observed,
-                    )
-                if maintenance_receipt is not None:
-                    await self._insert_memory_audit_event_unlocked(
-                        maintenance_receipt
-                    )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
@@ -14287,32 +14134,6 @@ class Database:
                 candidates.append(self._row_to_candidate_memory(row))
         return candidates
 
-    async def get_candidate_memories_by_agent_claim(
-        self,
-        *,
-        claim_anchor: str,
-    ) -> list[CandidateMemory]:
-        """Return complete private same-agent-claim candidates."""
-        candidates: list[CandidateMemory] = []
-        async with self.db.execute(
-            """SELECT DISTINCT
-                      m.id AS memory_id, m.visibility, m.owner_user_id,
-                      m.repo_identifier, eu.source_id, eu.doc_id,
-                      eu.doc_revision_id, eu.source_anchor,
-                      eu.source_lineage_id, eu.source_metadata_json
-                 FROM evidence_units eu
-                 JOIN evidence_relations er ON er.evidence_unit_id = eu.id
-                 JOIN memories m ON m.id = er.memory_id
-                WHERE eu.source_type = 'agent_session'
-                  AND eu.source_lineage_id = ?
-                  AND m.status = 'active'
-                ORDER BY m.id""",
-            (claim_anchor,),
-        ) as cursor:
-            async for row in cursor:
-                candidates.append(self._row_to_candidate_memory(row))
-        return candidates
-
     async def get_candidate_memories_by_existing_relation_graph(
         self,
         *,
@@ -14529,17 +14350,6 @@ class Database:
         )
         await self.db.execute(
             "DELETE FROM memories_fts WHERE memory_id = ?",
-            (memory_id,),
-        )
-        await self.db.execute(
-            """DELETE FROM agent_claim_citations
-               WHERE claim_id IN (
-                   SELECT id FROM agent_claims WHERE memory_id = ?
-               )""",
-            (memory_id,),
-        )
-        await self.db.execute(
-            "DELETE FROM agent_claims WHERE memory_id = ?",
             (memory_id,),
         )
         await self.db.execute(
@@ -15906,501 +15716,6 @@ class Database:
     # Agent Knowledge Bundle
     # ==================================================================
 
-    async def upsert_agent_concept(
-        self,
-        *,
-        concept_id: str,
-        source_id: str,
-        owner_user_id: str,
-        workspace: str,
-        repo_identifier: str | None,
-        concept_type: str,
-        concept_path: str,
-        title: str,
-        markdown_body: str,
-        frontmatter: dict[str, Any],
-        observed_at: datetime,
-    ) -> None:
-        """Insert or update a private agent-session concept."""
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            try:
-                await self._upsert_agent_concept_unlocked(
-                    concept_id=concept_id,
-                    source_id=source_id,
-                    owner_user_id=owner_user_id,
-                    workspace=workspace,
-                    repo_identifier=repo_identifier,
-                    concept_type=concept_type,
-                    concept_path=concept_path,
-                    title=title,
-                    markdown_body=markdown_body,
-                    frontmatter=frontmatter,
-                    observed=observed,
-                )
-                await self.db.commit()
-            except BaseException:
-                rollback_task = asyncio.create_task(self.db.rollback())
-                await _drain_task_despite_cancellation(rollback_task)
-                raise
-
-    async def _upsert_agent_concept_unlocked(
-        self,
-        *,
-        concept_id: str,
-        source_id: str,
-        owner_user_id: str,
-        workspace: str,
-        repo_identifier: str | None,
-        concept_type: str,
-        concept_path: str,
-        title: str,
-        markdown_body: str,
-        frontmatter: dict[str, Any],
-        observed: str,
-    ) -> None:
-        async with self.db.execute(
-            "SELECT access_policy, owner_user_id FROM sources WHERE id = ?",
-            (source_id,),
-        ) as cursor:
-            source_access = await cursor.fetchone()
-        if source_access is None:
-            raise ValueError(f"agent concept source does not exist: {source_id}")
-        if str(source_access["owner_user_id"]) != owner_user_id:
-            raise ValueError("agent concept owner must match source owner")
-        visibility = str(source_access["access_policy"])
-        await self.db.execute(
-            """INSERT INTO agent_concepts (
-                id, source_id, owner_user_id, visibility, workspace,
-                repo_identifier, concept_type, concept_path, title,
-                markdown_body, frontmatter_json, created_at, updated_at,
-                last_observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                source_id=excluded.source_id,
-                owner_user_id=excluded.owner_user_id,
-                visibility=excluded.visibility,
-                workspace=excluded.workspace,
-                repo_identifier=excluded.repo_identifier,
-                concept_type=excluded.concept_type,
-                concept_path=excluded.concept_path,
-                title=excluded.title,
-                markdown_body=excluded.markdown_body,
-                frontmatter_json=excluded.frontmatter_json,
-                updated_at=excluded.updated_at,
-                last_observed_at=excluded.last_observed_at""",
-            (
-                concept_id,
-                source_id,
-                owner_user_id,
-                visibility,
-                workspace,
-                repo_identifier,
-                concept_type,
-                concept_path,
-                title,
-                markdown_body,
-                json.dumps(frontmatter, sort_keys=True),
-                observed,
-                observed,
-                observed,
-            ),
-        )
-
-    async def get_agent_concept(self, concept_id: str) -> dict[str, Any] | None:
-        async with self.db.execute(
-            "SELECT * FROM agent_concepts WHERE id = ?",
-            (concept_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return dict(row) if row else None
-
-    async def list_agent_concepts(
-        self,
-        *,
-        viewer_user_id: str,
-        repo_identifier: str | None,
-        limit: int = 20,
-    ) -> list[dict[str, Any]]:
-        concepts: list[dict[str, Any]] = []
-        async with self.db.execute(
-            """SELECT c.* FROM agent_concepts c
-               JOIN sources s ON s.id = c.source_id
-               LEFT JOIN source_subscriptions ss
-                 ON ss.source_id = s.id AND ss.user_id = ?
-               WHERE (
-                   (s.access_state = 'active'
-                    AND (s.access_policy = 'workspace' OR s.owner_user_id = ?))
-                   OR (s.access_state = 'changing' AND s.owner_user_id = ?)
-               )
-                 AND COALESCE(ss.enabled, 1) = 1
-                 AND COALESCE(c.repo_identifier, '') = COALESCE(?, '')
-               ORDER BY c.updated_at DESC, c.id
-               LIMIT ?""",
-            (viewer_user_id, viewer_user_id, viewer_user_id, repo_identifier, limit),
-        ) as cursor:
-            async for row in cursor:
-                concepts.append(dict(row))
-        return concepts
-
-    async def update_agent_concept_markdown(
-        self,
-        *,
-        concept_id: str,
-        markdown_body: str,
-        observed_at: datetime,
-    ) -> None:
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            await self._update_agent_concept_markdown_unlocked(
-                concept_id=concept_id,
-                markdown_body=markdown_body,
-                observed=observed,
-            )
-            await self.db.commit()
-
-    async def _update_agent_concept_markdown_unlocked(
-        self,
-        *,
-        concept_id: str,
-        markdown_body: str,
-        observed: str,
-    ) -> None:
-        async with self.db.execute("SELECT 1 FROM agent_concepts WHERE id = ?", (concept_id,)) as cursor:
-            if await cursor.fetchone() is None:
-                raise RuntimeError(f"agent concept projection target missing: {concept_id}")
-        await self.db.execute(
-            """UPDATE agent_concepts SET
-                markdown_body = CASE
-                    WHEN updated_at IS NULL OR updated_at <= ? THEN ?
-                    ELSE markdown_body
-                END,
-                updated_at = CASE
-                    WHEN updated_at IS NULL OR updated_at <= ? THEN ?
-                    ELSE updated_at
-                END,
-                last_observed_at = CASE
-                    WHEN last_observed_at IS NULL OR last_observed_at <= ? THEN ?
-                    ELSE last_observed_at
-                END
-               WHERE id = ?""",
-            (observed, markdown_body, observed, observed, observed, observed, concept_id),
-        )
-
-    async def upsert_agent_claim(
-        self,
-        *,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        memory_id: str,
-        observed_at: datetime,
-    ) -> None:
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            await self._upsert_agent_claim_unlocked(
-                claim_id=claim_id,
-                concept_id=concept_id,
-                display_anchor=display_anchor,
-                claim_text=claim_text,
-                memory_type=memory_type,
-                memory_id=memory_id,
-                observed=observed,
-            )
-            await self.db.commit()
-
-    async def _upsert_agent_claim_unlocked(
-        self,
-        *,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        memory_id: str,
-        observed: str,
-    ) -> None:
-        await self.db.execute(
-            """INSERT INTO agent_claims (
-                id, concept_id, display_anchor, claim_text, memory_type,
-                memory_id, created_at, updated_at, last_observed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                concept_id=excluded.concept_id,
-                display_anchor=excluded.display_anchor,
-                claim_text=excluded.claim_text,
-                memory_type=excluded.memory_type,
-                memory_id=excluded.memory_id,
-                updated_at=excluded.updated_at,
-                last_observed_at=excluded.last_observed_at""",
-            (
-                claim_id,
-                concept_id,
-                display_anchor,
-                claim_text,
-                memory_type,
-                memory_id,
-                observed,
-                observed,
-                observed,
-            ),
-        )
-
-    async def supersede_memory_and_upsert_agent_claim(
-        self,
-        old_id: str,
-        new_memory: Memory,
-        *,
-        doc_id: str,
-        source_type: str,
-        excerpt: str | None,
-        carry_revision_sources: bool,
-        entity_ids: Sequence[int] | None = None,
-        replacement_reason: str | None,
-        replacement_kind: ReplacementKind,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        source_updated_at: datetime | None,
-        citations: list[str] | None = None,
-        concept_markdown_body: str | None = None,
-        relation_outcome: RelationOutcomeBundle | None = None,
-    ) -> None:
-        """Supersede a memory and move its agent-claim projection atomically."""
-        if old_id == new_memory.id:
-            raise ValueError("cannot supersede a memory with itself")
-        replacement_kind = _validate_replacement_kind(replacement_kind)
-        _validate_visibility(new_memory.visibility, new_memory.owner_user_id)
-        project_key = _normalize_project_key(new_memory.project_key)
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    "SELECT created_at FROM agent_claims WHERE id = ?",
-                    (claim_id,),
-                ) as cursor:
-                    existing_claim = await cursor.fetchone()
-                created_at = existing_claim["created_at"] if existing_claim else observed
-                now = _now_iso()
-                new_status = normalize_memory_status(new_memory.status)
-                await self.db.execute(
-                    """INSERT INTO memories (
-                    id, memory_type, content, content_hash, visibility, owner_user_id,
-                    project_key, repo_identifier,
-                    corroboration_count,
-                    valid_from, valid_until,
-                    superseded_by, status, retirement_reason, retired_at,
-                    superseded_at, replacement_reason, replacement_kind,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        new_memory.id,
-                        new_memory.memory_type,
-                        new_memory.content,
-                        new_memory.content_hash,
-                        new_memory.visibility,
-                        new_memory.owner_user_id,
-                        project_key,
-                        new_memory.repo_identifier,
-                        new_memory.corroboration_count,
-                        new_memory.valid_from.isoformat() if new_memory.valid_from else None,
-                        new_memory.valid_until.isoformat() if new_memory.valid_until else None,
-                        new_memory.superseded_by,
-                        new_status,
-                        new_memory.retirement_reason,
-                        new_memory.retired_at.isoformat() if new_memory.retired_at else None,
-                        new_memory.superseded_at.isoformat() if new_memory.superseded_at else None,
-                        new_memory.replacement_reason,
-                        new_memory.replacement_kind,
-                        new_memory.created_at.isoformat() if new_memory.created_at else now,
-                        now,
-                    ),
-                )
-                await self.db.execute(
-                    """UPDATE memories SET
-                    status = 'superseded', superseded_by = ?, valid_until = ?,
-                    superseded_at = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
-                   WHERE id = ?""",
-                    (new_memory.id, now, now, replacement_reason, replacement_kind, now, old_id),
-                )
-                await self._stale_pending_reviews_unlocked(
-                    (old_id,),
-                    now=now,
-                )
-                await self.db.execute(
-                    """INSERT INTO agent_claims (
-                    id, concept_id, display_anchor, claim_text, memory_type,
-                    memory_id, created_at, updated_at, last_observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    concept_id=excluded.concept_id,
-                    display_anchor=excluded.display_anchor,
-                    claim_text=excluded.claim_text,
-                    memory_type=excluded.memory_type,
-                    memory_id=excluded.memory_id,
-                    updated_at=excluded.updated_at,
-                    last_observed_at=excluded.last_observed_at""",
-                    (
-                        claim_id,
-                        concept_id,
-                        display_anchor,
-                        claim_text,
-                        memory_type,
-                        new_memory.id,
-                        created_at,
-                        observed,
-                        observed,
-                    ),
-                )
-                if carry_revision_sources:
-                    replacement_source_id = await self._resolve_memory_source_id_unlocked(
-                        doc_id,
-                        source_id=None,
-                    )
-                    async with self.db.execute(
-                        """SELECT * FROM memory_sources
-                           WHERE memory_id = ?
-                             AND NOT (source_id = ? AND doc_id = ?)""",
-                        (old_id, replacement_source_id, doc_id),
-                    ) as cursor:
-                        async for row in cursor:
-                            await self._add_memory_source_unlocked(
-                                new_memory.id,
-                                row["doc_id"],
-                                row["source_type"],
-                                row["excerpt"],
-                                source_id=row["source_id"],
-                                support_kind=row["support_kind"] or "extracted",
-                                source_updated_at=_parse_dt(row["source_updated_at"]),
-                            )
-                await self._add_memory_source_unlocked(
-                    new_memory.id,
-                    doc_id,
-                    source_type,
-                    excerpt,
-                    source_id=(
-                        replacement_source_id
-                        if carry_revision_sources
-                        else await self._resolve_memory_source_id_unlocked(doc_id, source_id=None)
-                    ),
-                    support_kind="extracted",
-                    source_updated_at=source_updated_at,
-                )
-                await self._link_memory_entities_unlocked(new_memory.id, entity_ids)
-                await self._rebuild_memory_fts_unlocked(
-                    new_memory.id,
-                    search_visible_statuses=set(allowed_search_statuses()),
-                )
-                for citation_url in citations or []:
-                    await self._add_agent_claim_citation_unlocked(
-                        claim_id=claim_id,
-                        citation_url=citation_url,
-                        observed=observed,
-                    )
-                if concept_markdown_body is not None:
-                    await self._update_agent_concept_markdown_unlocked(
-                        concept_id=concept_id,
-                        markdown_body=concept_markdown_body,
-                        observed=observed,
-                    )
-                if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(
-                        relation_outcome,
-                    )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    async def get_agent_claim(self, claim_id: str) -> dict[str, Any] | None:
-        async with self.db.execute(
-            "SELECT * FROM agent_claims WHERE id = ?",
-            (claim_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if not row:
-            return None
-        return self._row_to_agent_claim(row)
-
-    async def get_agent_claim_by_memory_id(self, memory_id: str) -> dict[str, Any] | None:
-        async with self.db.execute(
-            "SELECT * FROM agent_claims WHERE memory_id = ? ORDER BY updated_at DESC, id LIMIT 1",
-            (memory_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if not row:
-            return None
-        return self._row_to_agent_claim(row)
-
-    async def list_agent_claims(self, concept_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
-        claims: list[dict[str, Any]] = []
-        if include_inactive:
-            query = "SELECT ac.* FROM agent_claims ac WHERE ac.concept_id = ? ORDER BY ac.created_at, ac.id"
-            params = (concept_id,)
-        else:
-            query = """SELECT ac.* FROM agent_claims ac
-                       JOIN memories m ON m.id = ac.memory_id
-                       WHERE ac.concept_id = ? AND m.status = 'active'
-                       ORDER BY ac.created_at, ac.id"""
-            params = (concept_id,)
-        async with self.db.execute(query, params) as cursor:
-            async for row in cursor:
-                claims.append(self._row_to_agent_claim(row))
-        return claims
-
-    async def add_agent_claim_citation(
-        self,
-        *,
-        claim_id: str,
-        citation_url: str,
-        observed_at: datetime,
-    ) -> None:
-        observed = _utc_iso(observed_at)
-        async with self._write_lock:
-            await self._add_agent_claim_citation_unlocked(
-                claim_id=claim_id,
-                citation_url=citation_url,
-                observed=observed,
-            )
-            await self.db.commit()
-
-    async def _add_agent_claim_citation_unlocked(
-        self,
-        *,
-        claim_id: str,
-        citation_url: str,
-        observed: str,
-    ) -> None:
-        await self.db.execute(
-            """INSERT INTO agent_claim_citations (
-                claim_id, citation_url, observed_at, created_at
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT(claim_id, citation_url) DO UPDATE SET
-                observed_at=excluded.observed_at""",
-            (claim_id, citation_url, observed, observed),
-        )
-
-    async def list_agent_claim_citations(self, claim_id: str) -> list[dict[str, Any]]:
-        citations: list[dict[str, Any]] = []
-        async with self.db.execute(
-            """SELECT claim_id, citation_url, observed_at, created_at
-               FROM agent_claim_citations
-               WHERE claim_id = ?
-               ORDER BY created_at, citation_url""",
-            (claim_id,),
-        ) as cursor:
-            async for row in cursor:
-                citations.append(dict(row))
-        return citations
-
-    def _row_to_agent_claim(self, row) -> dict[str, Any]:
-        return dict(row)
-
     async def get_origin_source_pairs(
         self, memory_ids: list[str]
     ) -> dict[str, list[tuple[str, str | None, str | None]]]:
@@ -17546,13 +16861,6 @@ class Database:
                             (memory_id, source_id),
                         )
                         await self.db.execute(
-                            """UPDATE agent_claims SET memory_id = ?
-                               WHERE memory_id = ? AND concept_id IN (
-                                   SELECT id FROM agent_concepts WHERE source_id = ?
-                               )""",
-                            (original_memory_id, memory_id, source_id),
-                        )
-                        await self.db.execute(
                             """UPDATE relation_runs SET result_memory_id = ?
                                WHERE result_memory_id = ? AND evidence_unit_id IN (
                                    SELECT id FROM evidence_units WHERE source_id = ?
@@ -17644,13 +16952,6 @@ class Database:
                             (memory_id, source_id),
                         )
                         await self.db.execute(
-                            """UPDATE agent_claims SET memory_id = ?
-                               WHERE memory_id = ? AND concept_id IN (
-                                   SELECT id FROM agent_concepts WHERE source_id = ?
-                               )""",
-                            (target_memory_id, memory_id, source_id),
-                        )
-                        await self.db.execute(
                             """UPDATE relation_runs SET result_memory_id = ?
                                WHERE result_memory_id = ? AND evidence_unit_id IN (
                                    SELECT id FROM evidence_units WHERE source_id = ?
@@ -17681,12 +16982,6 @@ class Database:
                            updated_at = ?
                        WHERE source_id = ?""",
                     (target_visibility, target_owner, _now_iso(), source_id),
-                )
-                await self.db.execute(
-                    """UPDATE agent_concepts
-                       SET visibility = ?, updated_at = ?
-                       WHERE source_id = ?""",
-                    (target_visibility, _now_iso(), source_id),
                 )
                 unique_ids = list(dict.fromkeys(affected_ids))
                 for affected_id in unique_ids:
@@ -18989,233 +18284,6 @@ class Database:
     # ==================================================================
     # Agent session receipt lineage
     # ==================================================================
-
-    async def upsert_agent_session_receipt(self, receipt: AgentSessionReceipt) -> None:
-        """Insert or update the receipt for one agent-session window."""
-        activity_at = successful_agent_session_activity_at(receipt)
-        async with self._write_lock:
-            try:
-                await self.db.execute(
-                    """INSERT INTO agent_session_receipts (
-                        doc_id, source_id, client, session_id, trigger, workspace,
-                        repo, branch, commit_sha, history_window_kind,
-                        history_window_start, history_window_end, submitted_at,
-                        document_hash, source_kind, document_uri, metadata, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(doc_id) DO UPDATE SET
-                        source_id=excluded.source_id,
-                        client=excluded.client,
-                        session_id=excluded.session_id,
-                        trigger=excluded.trigger,
-                        workspace=excluded.workspace,
-                        repo=excluded.repo,
-                        branch=excluded.branch,
-                        commit_sha=excluded.commit_sha,
-                        history_window_kind=excluded.history_window_kind,
-                        history_window_start=excluded.history_window_start,
-                        history_window_end=excluded.history_window_end,
-                        submitted_at=excluded.submitted_at,
-                        document_hash=excluded.document_hash,
-                        source_kind=excluded.source_kind,
-                        document_uri=excluded.document_uri,
-                        metadata=excluded.metadata,
-                        updated_at=excluded.updated_at""",
-                    (
-                        receipt.doc_id,
-                        receipt.source_id,
-                        receipt.client,
-                        receipt.session_id,
-                        receipt.trigger,
-                        receipt.workspace,
-                        receipt.repo,
-                        receipt.branch,
-                        receipt.commit_sha,
-                        receipt.history_window_kind,
-                        receipt.history_window_start,
-                        receipt.history_window_end,
-                        receipt.submitted_at,
-                        receipt.document_hash,
-                        receipt.source_kind,
-                        receipt.document_uri,
-                        json.dumps(receipt.metadata),
-                        receipt.updated_at or _now_iso(),
-                    ),
-                )
-                if activity_at is not None:
-                    await self.db.execute(
-                        """UPDATE sources
-                           SET last_sync = CASE
-                               WHEN last_sync IS NULL OR last_sync < ? THEN ?
-                               ELSE last_sync
-                           END
-                           WHERE id = ?""",
-                        (activity_at, activity_at, receipt.source_id),
-                    )
-                await self.db.commit()
-            except BaseException:
-                rollback_task = asyncio.create_task(self.db.rollback())
-                await _drain_task_despite_cancellation(rollback_task)
-                raise
-
-    async def get_agent_session_receipt(self, doc_id: str) -> dict | None:
-        """Return the receipt for one agent-session window."""
-        async with self.db.execute(
-            "SELECT * FROM agent_session_receipts WHERE doc_id = ?",
-            (doc_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            return self._row_to_agent_session_receipt(row)
-
-    async def list_agent_session_receipts(
-        self,
-        source_id: str | None = None,
-        session_id: str | None = None,
-        limit: int = 100,
-    ) -> list[dict]:
-        """List agent-session window receipts."""
-        query = "SELECT * FROM agent_session_receipts WHERE 1=1"
-        params: list = []
-        if source_id:
-            query += " AND source_id = ?"
-            params.append(source_id)
-        if session_id:
-            query += " AND session_id = ?"
-            params.append(session_id)
-        query += " ORDER BY submitted_at DESC LIMIT ?"
-        params.append(limit)
-
-        results: list[dict] = []
-        async with self.db.execute(query, params) as cursor:
-            async for row in cursor:
-                results.append(self._row_to_agent_session_receipt(row))
-        return results
-
-    async def summarize_agent_session_outcomes(
-        self,
-        *,
-        session_id: str | None = None,
-        source_id: str | None = None,
-    ) -> dict:
-        """Return window outcome counts and the no_output fraction (completeness read).
-
-        A read-only, on-demand pass over agent_session_receipts. Capture
-        completeness is the client-side bookmark check; this is the other half,
-        knowledge completeness: of the windows that were processed, how many kept
-        a knowledge patch versus dropped everything as no_output. No stored verdict, no
-        threshold, no background job. Explicit-document receipts and receipts
-        without a recognized outcome are ignored so the fraction stays
-        well-defined.
-
-        When at least one failed receipt is present, ``latest_failure`` carries
-        ``count``, ``reason`` (latest), and ``last_seen_at`` so the admin UI can
-        surface an operational warning without a second query.
-        """
-        query = "SELECT metadata, updated_at FROM agent_session_receipts WHERE source_kind = ?"
-        params: list = [AGENT_SESSION_WINDOW_SOURCE_KIND]
-        if session_id:
-            query += " AND session_id = ?"
-            params.append(session_id)
-        if source_id:
-            query += " AND source_id = ?"
-            params.append(source_id)
-
-        counts = {outcome: 0 for outcome in AGENT_SESSION_OUTCOMES}
-        latest_failure_reason: str | None = None
-        latest_failure_seen_at: str | None = None
-        async with self.db.execute(query, params) as cursor:
-            async for row in cursor:
-                try:
-                    metadata = json.loads(row[0] or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    metadata = {}
-                outcome = metadata.get("outcome") if isinstance(metadata, dict) else None
-                if outcome == AGENT_SESSION_OUTCOME_LEGACY_PACKAGE_CREATED:
-                    outcome = AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED
-                if outcome in counts:
-                    counts[outcome] += 1
-                if outcome == AGENT_SESSION_OUTCOME_FAILED:
-                    seen_at = row[1]
-                    if seen_at and (latest_failure_seen_at is None or seen_at > latest_failure_seen_at):
-                        latest_failure_seen_at = seen_at
-                        reason = metadata.get("reason") if isinstance(metadata, dict) else None
-                        latest_failure_reason = reason if isinstance(reason, str) else None
-
-        total = sum(counts.values())
-        processed_total = counts[AGENT_SESSION_OUTCOME_KNOWLEDGE_PATCHED] + counts[AGENT_SESSION_OUTCOME_NO_OUTPUT]
-        no_output_fraction = counts[AGENT_SESSION_OUTCOME_NO_OUTPUT] / processed_total if processed_total else 0.0
-        latest_failure: dict | None = None
-        if counts[AGENT_SESSION_OUTCOME_FAILED]:
-            latest_failure = {
-                "count": counts[AGENT_SESSION_OUTCOME_FAILED],
-                "reason": latest_failure_reason,
-                "last_seen_at": latest_failure_seen_at,
-            }
-        return {
-            "session_id": session_id,
-            "source_id": source_id,
-            "total": total,
-            "processed_total": processed_total,
-            "counts": counts,
-            "no_output_fraction": no_output_fraction,
-            "latest_failure": latest_failure,
-        }
-
-    async def upsert_agent_hook_receipt(self, receipt: AgentHookReceipt) -> None:
-        """Insert or update lineage for a coding-agent lifecycle hook event."""
-        async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO agent_hook_receipts (
-                    receipt_id, client, session_id, hook, workspace, repo, branch,
-                    commit_sha, submitted_at, metadata, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(receipt_id) DO UPDATE SET
-                    client=excluded.client,
-                    session_id=excluded.session_id,
-                    hook=excluded.hook,
-                    workspace=excluded.workspace,
-                    repo=excluded.repo,
-                    branch=excluded.branch,
-                    commit_sha=excluded.commit_sha,
-                    submitted_at=excluded.submitted_at,
-                    metadata=excluded.metadata,
-                    updated_at=excluded.updated_at""",
-                (
-                    receipt.receipt_id,
-                    receipt.client,
-                    receipt.session_id,
-                    receipt.hook,
-                    receipt.workspace,
-                    receipt.repo,
-                    receipt.branch,
-                    receipt.commit_sha,
-                    receipt.submitted_at,
-                    json.dumps(receipt.metadata),
-                    receipt.updated_at or _now_iso(),
-                ),
-            )
-            await self.db.commit()
-
-    async def list_agent_hook_receipts(
-        self,
-        session_id: str | None = None,
-        limit: int = 100,
-    ) -> list[dict]:
-        """List coding-agent lifecycle hook receipts."""
-        query = "SELECT * FROM agent_hook_receipts WHERE 1=1"
-        params: list = []
-        if session_id:
-            query += " AND session_id = ?"
-            params.append(session_id)
-        query += " ORDER BY submitted_at DESC LIMIT ?"
-        params.append(limit)
-
-        results: list[dict] = []
-        async with self.db.execute(query, params) as cursor:
-            async for row in cursor:
-                results.append(self._row_to_agent_hook_receipt(row))
-        return results
 
     # ==================================================================
     # Sync
@@ -24137,20 +23205,3 @@ class Database:
             completed_at=d.get("completed_at"),
         )
 
-    def _row_to_agent_session_receipt(self, row) -> dict:
-        d = dict(row)
-        try:
-            metadata = json.loads(d.get("metadata") or "{}")
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-        d["metadata"] = metadata
-        return d
-
-    def _row_to_agent_hook_receipt(self, row) -> dict:
-        d = dict(row)
-        try:
-            metadata = json.loads(d.get("metadata") or "{}")
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-        d["metadata"] = metadata
-        return d

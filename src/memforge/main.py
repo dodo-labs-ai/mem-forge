@@ -2133,7 +2133,7 @@ def sync(ctx, source: str | None):
             if descriptor is not None and family is None:
                 console.print(
                     f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
-                    "it receives content as it is captured and has no sync run."
+                    "its type collects nothing, so it has no sync run."
                 )
                 continue
 

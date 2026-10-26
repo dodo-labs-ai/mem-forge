@@ -6,6 +6,7 @@ import pytest
 
 from memforge.models import Memory
 from memforge.storage.database import Database
+from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 
 
 @pytest.mark.asyncio
@@ -51,6 +52,7 @@ async def test_upgrade_purges_old_consolidated_rows_and_drops_curator_schema(tmp
             "UPDATE memories SET memory_level = 'consolidated', curation_cluster_id = 'old-family' "
             "WHERE id = 'mem-old-consolidated'"
         )
+        legacy.executescript(CAPTURE_TABLES_SCHEMA)
         legacy.execute("DELETE FROM schema_migrations WHERE version = 53")
 
     upgraded = Database(str(db_path))

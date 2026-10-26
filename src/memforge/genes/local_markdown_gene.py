@@ -2,8 +2,7 @@
 
 The gene treats a durable per-source raw package manifest as the unit of sync.
 The local daemon uploads one JSON package per file through the admin API; the
-server-side pipeline discovers, fetches, and normalizes those packages exactly
-the way the agent-session gene handles client-generated session summaries.
+server-side pipeline discovers, fetches, and normalizes those packages.
 """
 
 from __future__ import annotations

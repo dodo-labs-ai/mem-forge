@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from memforge.server.admin_api import MemorySearchRequest, RecentMemoryListRequest
 
@@ -82,13 +83,12 @@ def test_queryless_compatibility_rejects_ranked_retrieval_intent():
         )
 
 
-def test_source_filter_accepts_exact_agent_session_facets():
+def test_source_filter_accepts_exact_repository_facets():
     req = MemorySearchRequest(
         query="agent memory last week",
         include_private=True,
         active_repo_identifier="github.example.com/acme/memforge-cloud",
         source_filter={
-            "clients": ["codex"],
             "repo_identifiers": ["github.example.com/acme/memforge-cloud"],
         },
     )
@@ -96,7 +96,6 @@ def test_source_filter_accepts_exact_agent_session_facets():
     assert req.include_private is True
     assert req.active_repo_identifier == "github.example.com/acme/memforge-cloud"
     assert req.source_filter is not None
-    assert req.source_filter.clients == ["codex"]
     assert req.source_filter.repo_identifiers == ["github.example.com/acme/memforge-cloud"]
 
 
@@ -154,11 +153,11 @@ def test_source_filter_rejects_source_type_selector():
         )
 
 
-def test_source_filter_rejects_unknown_client():
-    with pytest.raises(Exception):
+def test_source_filter_rejects_the_removed_clients_facet():
+    with pytest.raises(ValidationError, match="clients"):
         MemorySearchRequest(
             query="agent memory last week",
-            source_filter={"clients": ["claude"]},
+            source_filter={"clients": ["codex"]},
         )
 
 

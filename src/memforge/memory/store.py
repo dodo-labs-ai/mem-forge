@@ -12,7 +12,7 @@ from hashlib import sha256
 from typing import Any, Awaitable, Callable, Sequence
 
 from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, embed_documents_for_index
-from memforge.memory.audit import AuditContext, MemoryAuditEvent, MemoryAuditLogger
+from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.evidence import (
     AuthorityCase,
     CandidateBucket,
@@ -34,11 +34,9 @@ from memforge.memory.index_payloads import (
 )
 from memforge.memory.lifecycle import allowed_search_statuses
 from memforge.memory.lifecycle_plan import (
-    LifecyclePlan,
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
     LifecycleVectorOperation,
-    plan_supersedes_memory,
 )
 from memforge.models import (
     DocumentRecord,
@@ -52,7 +50,6 @@ from memforge.models import (
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
 from memforge.source_activity import SourceActivityConflict, SourceActivityLease
-from memforge.source_projection import SourceProjection
 from memforge.vector_index_errors import NoVectorIndex
 
 logger = logging.getLogger(__name__)
@@ -60,8 +57,6 @@ logger = logging.getLogger(__name__)
 __all__ = ["MemoryStore"]
 
 DEDUP_CANDIDATE_LIMIT = 10
-AGENT_CLAIM_RECONCILE_LIMIT = 10
-AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR = 0.85
 LIFECYCLE_VECTOR_DELIVERY_BATCH_SIZE = 100
 LIFECYCLE_VECTOR_DELIVERY_MAX_ATTEMPTS = 5
 LIFECYCLE_VECTOR_RETRY_BASE_SECONDS = 5.0
@@ -525,49 +520,6 @@ class MemoryStore:
     # -------------------------------------------------------------------
     # Core: Deduplicate and Insert
     # -------------------------------------------------------------------
-
-    async def find_agent_claim_memory_candidates(
-        self,
-        memory: Memory,
-        *,
-        source_id: str,
-        owner_user_id: str,
-        repo_identifier: str | None,
-        limit: int = AGENT_CLAIM_RECONCILE_LIMIT,
-    ) -> list[tuple[Memory, float]]:
-        """Return active private same-user same-repo agent-session memory candidates."""
-        embedding_text = await self._canonical_memory_embedding_text(memory)
-        embedding = await self._embed(embedding_text)
-        scope = AccessScope(
-            user_id=owner_user_id,
-            include_private=True,
-            allowed_statuses=(MemoryStatus.ACTIVE.value,),
-            active_project=memory.project_key,
-            scope_mode="project-first",
-            active_repo_identifier=repo_identifier,
-        )
-        hits = await self.vector.query(embedding, scope, None, limit)
-        candidates: list[tuple[Memory, float]] = []
-        for memory_id, score in hits:
-            if score < AGENT_CLAIM_RECONCILE_SIMILARITY_FLOOR:
-                continue
-            existing = await self.db.get_memory(memory_id)
-            if (
-                existing is None
-                or existing.status != MemoryStatus.ACTIVE.value
-                or existing.visibility != Visibility.PRIVATE.value
-                or existing.owner_user_id != owner_user_id
-                or (existing.repo_identifier or None) != (repo_identifier or None)
-            ):
-                continue
-            sources = await self.db.get_memory_sources(existing.id)
-            if not any(
-                source.source_type == "agent_session" and source.source_id == source_id
-                for source in sources
-            ):
-                continue
-            candidates.append((existing, score))
-        return candidates
 
     async def deduplicate_and_insert(
         self,
@@ -1324,299 +1276,6 @@ class MemoryStore:
             new_memory.id,
             new_memory.memory_type,
         )
-
-    async def insert_agent_claim_memory(
-        self,
-        memory: Memory,
-        projection: SourceProjection,
-        lifecycle_plan: LifecyclePlan,
-        doc_id: str,
-        source_type: str,
-        *,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        source_updated_at: datetime | None,
-        citations: list[str] | None = None,
-        concept_projection: dict[str, Any] | None = None,
-        concept_markdown_body: str | None = None,
-        entity_ids: list[int] | None = None,
-        excerpt: str | None = None,
-        relation_outcome: RelationOutcomeBundle | None = None,
-    ) -> None:
-        """Commit Agent Knowledge through the common projected-lifecycle seam."""
-        context = self._operation_context(doc_id=doc_id)
-        try:
-            await self.relational.apply_agent_claim_source_projection_lifecycle(
-                projection,
-                lifecycle_plan,
-                memory_id=memory.id,
-                relation_outcome=relation_outcome,
-                claim_id=claim_id,
-                concept_id=concept_id,
-                display_anchor=display_anchor,
-                claim_text=claim_text,
-                memory_type=memory_type,
-                observed_at=observed_at,
-                citations=citations,
-                concept_projection=concept_projection,
-                concept_markdown_body=concept_markdown_body,
-            )
-            await self.attempt_lifecycle_vector_delivery(lifecycle_plan.id)
-            await self._emit(
-                "memory_insert_committed",
-                "committed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                support_kind="extracted",
-                reason="agent claim memory inserted",
-                payload={"content_hash": memory.content_hash, "memory_type": memory.memory_type},
-            )
-        except Exception as exc:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                error=str(exc),
-                payload={"operation": "agent_claim_projected_lifecycle"},
-            )
-            raise
-
-    async def supersede_agent_claim_memory(
-        self,
-        old_memory_id: str,
-        new_memory: Memory,
-        projection: SourceProjection,
-        lifecycle_plan: LifecyclePlan,
-        doc_id: str,
-        source_type: str,
-        *,
-        replacement_kind: ReplacementKind,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        source_updated_at: datetime | None,
-        citations: list[str] | None = None,
-        concept_markdown_body: str | None = None,
-        entity_ids: list[int] | None = None,
-        excerpt: str | None = None,
-        replacement_reason: str | None = None,
-        relation_outcome: RelationOutcomeBundle | None = None,
-    ) -> None:
-        """Commit Agent Knowledge replacement through projected lifecycle.
-
-        When another Unit still supports the old Memory, the Plan keeps it
-        Active and adds the replacement beside it, which commits as an insert.
-        """
-        if not plan_supersedes_memory(lifecycle_plan, old_memory_id):
-            await self.insert_agent_claim_memory(
-                new_memory,
-                projection,
-                lifecycle_plan,
-                doc_id,
-                source_type,
-                claim_id=claim_id,
-                concept_id=concept_id,
-                display_anchor=display_anchor,
-                claim_text=claim_text,
-                memory_type=memory_type,
-                observed_at=observed_at,
-                source_updated_at=source_updated_at,
-                citations=citations,
-                concept_markdown_body=concept_markdown_body,
-                entity_ids=entity_ids,
-                excerpt=excerpt,
-                relation_outcome=relation_outcome,
-            )
-            return
-        del source_type, replacement_kind, entity_ids, excerpt, source_updated_at
-        context = self._operation_context(doc_id=doc_id)
-        await self._emit(
-            "memory_supersede_attempted",
-            "attempted",
-            context=context,
-            memory_id=old_memory_id,
-            candidate_id=new_memory.id,
-            reason=replacement_reason,
-        )
-        try:
-            await self.relational.apply_agent_claim_source_projection_lifecycle(
-                projection,
-                lifecycle_plan,
-                memory_id=new_memory.id,
-                relation_outcome=relation_outcome,
-                claim_id=claim_id,
-                concept_id=concept_id,
-                display_anchor=display_anchor,
-                claim_text=claim_text,
-                memory_type=memory_type,
-                observed_at=observed_at,
-                citations=citations,
-                concept_markdown_body=concept_markdown_body,
-            )
-            await self.attempt_lifecycle_vector_delivery(lifecycle_plan.id)
-            await self._emit(
-                "memory_supersede_committed",
-                "committed",
-                context=context,
-                memory_id=old_memory_id,
-                candidate_id=new_memory.id,
-                doc_id=doc_id,
-                reason=replacement_reason,
-                payload={"old_memory_id": old_memory_id, "new_memory_id": new_memory.id},
-            )
-        except Exception as exc:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                memory_id=new_memory.id,
-                doc_id=doc_id,
-                error=str(exc),
-                payload={"operation": "agent_claim_projected_lifecycle_supersede"},
-            )
-            raise
-
-        logger.info(
-            "Agent claim memory superseded: %s -> %s (%s)",
-            old_memory_id,
-            new_memory.id,
-            new_memory.memory_type,
-        )
-
-    async def retire_agent_claim_memory(
-        self,
-        *,
-        old_memory_id: str,
-        projection: SourceProjection,
-        plan: LifecyclePlan,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        concept_markdown_body: str,
-        maintenance_receipt: MemoryAuditEvent | None = None,
-    ) -> None:
-        """Atomically retire an Agent claim and update its canonical concept."""
-
-        context = self._operation_context(doc_id=concept_id)
-        try:
-            await self.relational.apply_agent_claim_source_projection_lifecycle(
-                projection,
-                plan,
-                memory_id=old_memory_id,
-                relation_outcome=None,
-                claim_id=claim_id,
-                concept_id=concept_id,
-                display_anchor=display_anchor,
-                claim_text=claim_text,
-                memory_type=memory_type,
-                observed_at=observed_at,
-                concept_markdown_body=concept_markdown_body,
-                maintenance_receipt=maintenance_receipt,
-            )
-            await self.attempt_lifecycle_vector_delivery(plan.id)
-            await self._emit(
-                "memory_retire_committed",
-                "committed",
-                context=context,
-                memory_id=old_memory_id,
-                reason="managed_agent_claim_retirement",
-            )
-        except Exception as exc:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                memory_id=old_memory_id,
-                error=str(exc),
-                payload={"operation": "agent_claim_projected_lifecycle_retire"},
-            )
-            raise
-
-    async def ensure_agent_claim_memory_projection(
-        self,
-        memory: Memory,
-        doc_id: str,
-        source_type: str,
-        *,
-        excerpt: str | None = None,
-        source_updated_at: datetime | None,
-    ) -> None:
-        """Converge a committed agent-claim memory with its searchable projections.
-
-        Agent claim replacement IDs are deterministic, so a retry can discover
-        that the durable DB lifecycle already committed. The retry must still
-        make the committed memory searchable before returning: SQLite source and
-        FTS rows are idempotent DB projections, while the vector index is the
-        external projection that can legitimately need a second write.
-        """
-        context = self._operation_context(doc_id=doc_id)
-        await self.db.add_memory_source(
-            memory.id,
-            doc_id,
-            source_type,
-            excerpt,
-            source_updated_at=source_updated_at,
-        )
-        await self.db.rebuild_memory_fts(
-            memory.id,
-            search_visible_statuses=set(allowed_search_statuses()),
-        )
-        if memory.status not in set(allowed_search_statuses()):
-            return
-        try:
-            embedding_text = await self._canonical_memory_embedding_text(memory)
-            embedding = await self._embed(embedding_text)
-            await self._emit(
-                "chroma_upsert_attempted",
-                "attempted",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "agent_claim_projection_repair"},
-            )
-            await self.vector.upsert(
-                ids=[memory.id],
-                embeddings=[embedding],
-                metadatas=[
-                    _memory_metadata(
-                        memory,
-                        embedding_text_hash=embedding_text_hash(embedding_text),
-                        extra={"source_doc_id": doc_id},
-                    )
-                ],
-            )
-            await self._emit(
-                "chroma_upsert_committed",
-                "committed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                payload={"operation": "agent_claim_projection_repair"},
-            )
-        except Exception as exc:
-            await self._emit(
-                "index_operation_failed",
-                "failed",
-                context=context,
-                memory_id=memory.id,
-                doc_id=doc_id,
-                error=str(exc),
-                payload={"index": "chroma", "operation": "agent_claim_projection_repair"},
-            )
-            raise
 
     async def reindex_memory_access(self, memory_id: str) -> None:
         """Converge relational and vector search projections after an access move."""

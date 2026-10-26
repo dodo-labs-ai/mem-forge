@@ -12,7 +12,6 @@ class MemoryOriginKind(str, Enum):
 
     DIRECT_USER = "direct_user"
     CONFIGURED_SOURCE = "configured_source"
-    MANAGED_CAPTURE = "managed_capture"
 
 
 def classify_memory_origin(source_type: str) -> MemoryOriginKind:
@@ -20,13 +19,11 @@ def classify_memory_origin(source_type: str) -> MemoryOriginKind:
 
     if source_type in VIRTUAL_DOCUMENT_SOURCE_IDS:
         return MemoryOriginKind.DIRECT_USER
-    if source_type == "agent_session":
-        return MemoryOriginKind.MANAGED_CAPTURE
     return MemoryOriginKind.CONFIGURED_SOURCE
 
 
 def references_source_row(source_id: str | None) -> bool:
-    """Whether a provenance reference names a configured or managed Source row.
+    """Whether a provenance reference names a configured Source row.
 
     Direct User document namespaces are provenance, not Source identities. All
     other non-null identifiers remain Source dependencies, even if unresolved.

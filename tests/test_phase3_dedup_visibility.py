@@ -98,7 +98,7 @@ async def test_private_write_does_not_corroborate_workspace(db, monkeypatch):
     result = await store.deduplicate_and_insert(
         private,
         doc_id="d-1",
-        source_type="agent_session",
+        source_type="local_markdown",
         source_updated_at=None,
     )
     assert result == "inserted"  # NOT "corroborated"
@@ -150,7 +150,7 @@ async def test_same_user_private_dedup_still_works(db, monkeypatch):
     result = await store.deduplicate_and_insert(
         duplicate,
         doc_id="d-3",
-        source_type="agent_session",
+        source_type="local_markdown",
         source_updated_at=None,
     )
     assert result in {"corroborated", "skipped"}
@@ -204,7 +204,7 @@ async def test_private_write_does_not_corroborate_other_users_private(db, monkey
     result = await store.deduplicate_and_insert(
         alice,
         doc_id="d-alice",
-        source_type="agent_session",
+        source_type="local_markdown",
         source_updated_at=None,
     )
     assert result == "inserted"

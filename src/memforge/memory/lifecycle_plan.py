@@ -224,21 +224,6 @@ DESTRUCTIVE_MUTATIONS = frozenset(
 )
 
 
-def plan_supersedes_memory(plan: "LifecyclePlan", memory_id: str) -> bool:
-    """Return whether this Plan supersedes the Memory.
-
-    A replacement of a Memory another Unit also supports removes only this
-    Unit's Support and adds the replacement beside it, so the old Memory stays
-    Active and is not superseded.
-    """
-
-    return any(
-        mutation.mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY
-        and mutation.memory_id == memory_id
-        for mutation in plan.mutations
-    )
-
-
 def plan_requires_complete_current_support(
     plan: "LifecyclePlan",
     memory_id: str,

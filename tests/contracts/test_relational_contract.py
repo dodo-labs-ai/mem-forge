@@ -486,50 +486,50 @@ class RelationalStoreContract:
 
     # -- Source facets ------------------------------------------------------
 
-    async def test_filter_ids_by_source_and_time_matches_client_and_repo(self, adapters: ContractAdapters) -> None:
+    async def test_filter_ids_by_source_and_time_matches_source_and_repo(self, adapters: ContractAdapters) -> None:
         store = adapters.relational
         await store.insert_memory(
             make_memory(
-                "m-agent-target",
+                "m-notes-target",
                 repo_identifier="github.example.com/acme/memforge-cloud",
             )
         )
         await store.insert_memory(
             make_memory(
-                "m-agent-other-repo",
+                "m-notes-other-repo",
                 repo_identifier="github.example.com/acme/other",
             )
         )
-        await store.insert_memory(make_memory("m-jira"))
-        await store.upsert_document(make_document("doc-agent-target", client="codex"))
-        await store.upsert_document(make_document("doc-agent-other-repo", client="codex"))
+        await store.insert_memory(make_memory("m-jira", repo_identifier="github.example.com/acme/memforge-cloud"))
+        await store.upsert_document(make_document("doc-notes-target", source="src-notes"))
+        await store.upsert_document(make_document("doc-notes-other-repo", source="src-notes"))
         await store.upsert_document(make_document("doc-jira"))
         await store.add_memory_source(
-            "m-agent-target",
-            "doc-agent-target",
-            "agent_session",
+            "m-notes-target",
+            "doc-notes-target",
+            "local_markdown",
             None,
             source_updated_at=None,
         )
         await store.add_memory_source(
-            "m-agent-other-repo",
-            "doc-agent-other-repo",
-            "agent_session",
+            "m-notes-other-repo",
+            "doc-notes-other-repo",
+            "local_markdown",
             None,
             source_updated_at=None,
         )
         await store.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
 
         matched = await store.filter_ids_by_source_and_time(
-            ["m-agent-target", "m-agent-other-repo", "m-jira"],
+            ["m-notes-target", "m-notes-other-repo", "m-jira"],
             MemorySourceFilter(
-                clients=("codex",),
+                source_ids=("src-notes",),
                 repo_identifiers=("github.example.com/acme/memforge-cloud",),
             ),
             None,
         )
 
-        assert matched == {"m-agent-target"}
+        assert matched == {"m-notes-target"}
 
     async def test_filter_ids_by_source_and_time_supports_source_and_memory_dates(
         self, adapters: ContractAdapters

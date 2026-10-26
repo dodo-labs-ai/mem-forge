@@ -33,7 +33,6 @@ __all__ = [
 ]
 
 _BUILTIN_SOURCE_TYPES = (
-    "agent_session",
     "confluence",
     "github_pages",
     "github_repo",

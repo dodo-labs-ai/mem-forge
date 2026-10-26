@@ -10,7 +10,8 @@ from click.testing import CliRunner
 import memforge
 import memforge.main as main
 import memforge.runtime as runtime_module
-from memforge.genes.agent_session_gene import AgentSessionGene
+import memforge.source_types as source_types
+from memforge.source_types import SourceTypeDescriptor
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.teams_gene import TeamsGene
 from memforge.main import cli
@@ -23,6 +24,7 @@ from memforge.pipeline.collection_family import (
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
 from tests.gene_fixture import FakeGene
+from tests.uncollected_gene import UncollectedGene
 
 FAMILY_CLASSES = {"ConversationGene", "DocumentGene"}
 TEAMS_CONFIG = {"conversation_ids": ["19:chat@thread.v2"], "initial_history_days": 30}
@@ -49,7 +51,7 @@ async def test_a_run_takes_the_family_of_its_gene(db, tmp_path) -> None:
 
 async def test_a_gene_of_neither_family_has_no_sync_run(db, tmp_path) -> None:
     with pytest.raises(ValueError, match="no collection family"):
-        _family(AgentSessionGene({}, "src-1"), db, tmp_path)
+        _family(UncollectedGene({}, "src-1"), db, tmp_path)
 
 
 async def test_a_conversation_run_needs_its_collection_attempt(db, tmp_path) -> None:
@@ -112,7 +114,7 @@ def test_only_the_family_module_asks_a_gene_class_for_its_family() -> None:
 
 def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> None:
     sources = [
-        {"id": "src-capture", "name": "Captured", "type": "agent_session", "status": "active"},
+        {"id": "src-uncollected", "name": "Uncollected", "type": "uncollected", "status": "active"},
         {"id": "src-chat", "name": "Chat", "type": "teams", "status": "active"},
         {"id": "src-wiki", "name": "Wiki", "type": "confluence", "status": "active"},
     ]
@@ -143,6 +145,11 @@ def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> No
             error_message=None,
         )
 
+    monkeypatch.setitem(
+        source_types._DESCRIPTORS,
+        "uncollected",
+        SourceTypeDescriptor(source_type="uncollected", gene=UncollectedGene),
+    )
     monkeypatch.setattr(main, "_get_db", fake_get_db)
     monkeypatch.setattr(runtime_module, "build_sync_runtime", fake_build_sync_runtime)
     monkeypatch.setattr(runtime_module, "run_source_sync", fake_run_source_sync)
@@ -151,7 +158,7 @@ def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> No
 
     assert result.exit_code == 0, result.output
     assert synced == ["src-wiki"]
-    assert "Skipping Captured" in result.output
+    assert "Skipping Uncollected" in result.output
     assert "Skipping Chat" in result.output
 
 

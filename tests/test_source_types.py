@@ -17,7 +17,6 @@ from memforge.source_types import (
 )
 
 BUILTIN_SOURCE_TYPES = {
-    "agent_session",
     "confluence",
     "github_pages",
     "github_repo",
@@ -79,7 +78,6 @@ def test_a_reference_that_cannot_load_fails_loudly() -> None:
 
 
 BUILTIN_FAMILIES = {
-    "agent_session": None,
     "confluence": CollectionFamilyKind.DOCUMENT,
     "github_pages": CollectionFamilyKind.DOCUMENT,
     "github_repo": CollectionFamilyKind.DOCUMENT,
@@ -130,5 +128,4 @@ def test_listing_and_rediscovery_belong_to_document_genes_only() -> None:
 def test_only_a_document_source_rediscovers_documents() -> None:
     assert source_rediscovers_documents("jira", {"base_url": "https://jira.example"})
     assert not source_rediscovers_documents("teams", {})
-    assert not source_rediscovers_documents("agent_session", {})
     assert not source_rediscovers_documents("outlook", {})

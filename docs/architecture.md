@@ -79,9 +79,8 @@ the source and how it learns that something is gone:
   connector supplies a provider that implements the port in
   `conversations/port.py`. Teams works this way.
 
-A Gene of neither family has no sync run. The agent-session type is the only
-one: it holds the private Sources that earlier releases filled from coding
-sessions, and MemForge creates no new ones.
+A Gene of neither family has no sync run; every built-in type belongs to one
+of the two.
 
 **Write the descriptor.** A `SourceTypeDescriptor` (`source_types/descriptor.py`)
 holds every fact shared code needs about the type: its Gene, the configuration

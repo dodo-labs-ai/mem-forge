@@ -140,10 +140,6 @@ def _append_metadata_source_time_predicates(
         placeholders = ",".join("?" for _ in source_filter.source_ids)
         conditions.append(f"f.source_id IN ({placeholders})")
         params.extend(source_filter.source_ids)
-    if source_filter.clients:
-        placeholders = ",".join("?" for _ in source_filter.clients)
-        conditions.append(f"d.client IN ({placeholders})")
-        params.extend(source_filter.clients)
     if source_filter.repo_identifiers:
         placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
         conditions.append(f"m.repo_identifier IN ({placeholders})")

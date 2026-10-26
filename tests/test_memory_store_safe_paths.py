@@ -269,33 +269,6 @@ async def _insert_doc_side_tables(db: Database, doc_id: str, source: str = "src-
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (doc_id, "created", None, "1", "created", now, doc_id, source),
     )
-    await db.db.execute(
-        """INSERT INTO agent_session_receipts
-           (doc_id, source_id, client, session_id, trigger, workspace, repo, branch, commit_sha,
-            history_window_kind, history_window_start, history_window_end, submitted_at,
-            document_hash, source_kind, document_uri, metadata, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            doc_id,
-            source,
-            "codex",
-            "session-1",
-            "manual",
-            "/repo",
-            "repo",
-            "main",
-            "abc",
-            "recent",
-            None,
-            None,
-            now,
-            f"hash-{doc_id}",
-            "agent_session",
-            f"file:///{doc_id}.md",
-            "{}",
-            now,
-        ),
-    )
     await db.db.commit()
 
 
@@ -507,7 +480,7 @@ async def test_restore_memory_source_snapshot_rejects_naive_source_updated_at(db
             MemorySource(
                 memory_id=memory.id,
                 doc_id="doc-1",
-                source_type="agent_session",
+                source_type="confluence",
                 source_id="src-1",
                 excerpt="source excerpt",
                 support_kind="extracted",
@@ -1105,7 +1078,7 @@ async def test_promoted_challenger_preserves_staged_source_updated_at(db: Databa
     await store.insert_memory(
         memory=challenger,
         doc_id="doc-review",
-        source_type="agent_session",
+        source_type="user_memory",
         excerpt="Review challenger excerpt",
         source_updated_at=source_updated_at,
     )
@@ -1119,7 +1092,7 @@ async def test_promoted_challenger_preserves_staged_source_updated_at(db: Databa
 
     sources = await db.get_memory_sources(challenger.id)
     assert [(source.doc_id, source.source_type, source.source_updated_at) for source in sources] == [
-        ("doc-review", "agent_session", source_updated_at)
+        ("doc-review", "user_memory", source_updated_at)
     ]
 
 

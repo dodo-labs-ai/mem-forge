@@ -18,7 +18,7 @@ import aiosqlite
 
 from memforge.derivation_work import DerivationWork
 from memforge.evals.agent_evaluation import AgentRuntimeBundle
-from memforge.memory.audit import MemoryAuditEvent, MemoryAuditLogger
+from memforge.memory.audit import MemoryAuditLogger
 from memforge.memory.evidence import (
     ActiveSupportEvidence,
     CandidateMemory,
@@ -307,26 +307,17 @@ def _append_source_time_predicates(
     """
 
     has_time_filter = time_range is not None and not time_range.is_empty()
-    needs_source_join = (
-        bool(source_filter.source_ids)
-        or bool(source_filter.clients)
-        or (has_time_filter and time_range is not None and time_range.date_type == "source_updated_at")
+    needs_source_join = bool(source_filter.source_ids) or (
+        has_time_filter and time_range is not None and time_range.date_type == "source_updated_at"
     )
-    needs_document_join = bool(source_filter.clients)
 
     if needs_source_join:
         joins.append("JOIN memory_sources ms ON m.id = ms.memory_id")
-    if needs_document_join:
-        joins.append("LEFT JOIN documents d ON ms.doc_id = d.doc_id")
 
     if source_filter.source_ids:
         placeholders = ",".join("?" for _ in source_filter.source_ids)
         clauses.append(f"ms.source_id IN ({placeholders})")
         params.extend(source_filter.source_ids)
-    if source_filter.clients:
-        placeholders = ",".join("?" for _ in source_filter.clients)
-        clauses.append(f"d.client IN ({placeholders})")
-        params.extend(source_filter.clients)
     if source_filter.repo_identifiers:
         placeholders = ",".join("?" for _ in source_filter.repo_identifiers)
         clauses.append(f"m.repo_identifier IN ({placeholders})")
@@ -494,15 +485,6 @@ class SqliteRelationalStore:
         return await self._db.get_candidate_memories_by_source_anchor(
             source_id=source_id,
             source_anchor=source_anchor,
-        )
-
-    async def get_candidate_memories_by_agent_claim(
-        self,
-        *,
-        claim_anchor: str,
-    ) -> list[CandidateMemory]:
-        return await self._db.get_candidate_memories_by_agent_claim(
-            claim_anchor=claim_anchor,
         )
 
     async def get_candidate_memories_by_existing_relation_graph(
@@ -863,41 +845,6 @@ class SqliteRelationalStore:
             source_activity=source_activity,
             runtime_bundle=runtime_bundle,
             scope_transition_id=scope_transition_id,
-        )
-
-    async def apply_agent_claim_source_projection_lifecycle(
-        self,
-        projection: SourceProjection,
-        plan: LifecyclePlan,
-        *,
-        memory_id: str,
-        relation_outcome: RelationOutcomeBundle | None,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        citations: list[str] | None = None,
-        concept_projection: Mapping[str, object] | None = None,
-        concept_markdown_body: str | None = None,
-        maintenance_receipt: MemoryAuditEvent | None = None,
-    ) -> None:
-        await self._db.apply_agent_claim_source_projection_lifecycle(
-            projection,
-            plan,
-            memory_id=memory_id,
-            relation_outcome=relation_outcome,
-            claim_id=claim_id,
-            concept_id=concept_id,
-            display_anchor=display_anchor,
-            claim_text=claim_text,
-            memory_type=memory_type,
-            observed_at=observed_at,
-            citations=citations,
-            concept_projection=dict(concept_projection) if concept_projection is not None else None,
-            concept_markdown_body=concept_markdown_body,
-            maintenance_receipt=maintenance_receipt,
         )
 
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None:

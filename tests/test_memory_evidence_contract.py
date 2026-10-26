@@ -181,7 +181,6 @@ def test_relation_run_id_includes_classifier_action_and_candidate_contract() -> 
     [
         CandidateBucket.EXACT_SOURCE_ANCHOR,
         CandidateBucket.SAME_DOC_LINEAGE,
-        CandidateBucket.SAME_AGENT_CLAIM,
         CandidateBucket.EXISTING_RELATION_GRAPH,
         CandidateBucket.SAME_MEMORY_SOURCE_AUTHORITY,
     ],
@@ -456,19 +455,13 @@ async def test_mandatory_candidate_bucket_loader_uses_complete_seed_order() -> N
             assert (doc_id, support_kind) == ("doc-1", None)
             return [_candidate(memory_id="mem-anchor"), _candidate(memory_id="mem-doc")]
 
-        async def get_candidate_memories_by_agent_claim(self, *, claim_anchor: str):
-            assert claim_anchor == "u:repo:concept:claim"
-            return [_candidate(memory_id="mem-claim", source_anchor=claim_anchor)]
-
         async def get_candidate_memories_by_existing_relation_graph(self, *, evidence_unit_id: str):
             assert evidence_unit_id == "eu-1"
             return [_candidate(memory_id="mem-existing")]
 
     buckets = await build_mandatory_candidate_bucket_results(
         store=Store(),
-        unit=_unit(
-            source_metadata={"claim_anchor": "u:repo:concept:claim"},
-        ),
+        unit=_unit(),
         access_context=_access(),
     )
     universe = build_candidate_universe(
@@ -480,17 +473,15 @@ async def test_mandatory_candidate_bucket_loader_uses_complete_seed_order() -> N
     assert [bucket.bucket for bucket in buckets] == [
         CandidateBucket.EXACT_SOURCE_ANCHOR,
         CandidateBucket.SAME_DOC_LINEAGE,
-        CandidateBucket.SAME_AGENT_CLAIM,
         CandidateBucket.EXISTING_RELATION_GRAPH,
     ]
     assert all(bucket.complete for bucket in buckets)
     assert [candidate.memory_id for candidate in universe.candidates] == [
         "mem-anchor",
         "mem-doc",
-        "mem-claim",
         "mem-existing",
     ]
-    assert universe.mandatory_candidate_count == 4
+    assert universe.mandatory_candidate_count == 3
 
 
 @pytest.mark.asyncio
@@ -508,9 +499,6 @@ async def test_mandatory_candidate_bucket_loader_filters_cross_scope_candidates(
             ]
 
         async def get_candidate_memories_by_source_doc(self, *, doc_id: str, support_kind: str | None = None):
-            return []
-
-        async def get_candidate_memories_by_agent_claim(self, *, claim_anchor: str):
             return []
 
         async def get_candidate_memories_by_existing_relation_graph(self, *, evidence_unit_id: str):

@@ -39,6 +39,8 @@ class RelationDirection(str, Enum):
 class AuthorityCase(str, Enum):
     SAME_DOCUMENT_REVISION = "same_document_revision"
     SAME_SOURCE_LINEAGE = "same_source_lineage"
+    # Stored on relations recorded for Agent Knowledge claims. It stays
+    # readable as their history; nothing records new relations with it.
     SAME_AGENT_CLAIM = "same_agent_claim"
     SAME_PRIVATE_REPO_SCOPE = "same_private_repo_scope"
     INDEPENDENT_SUPPORT = "independent_support"
@@ -51,6 +53,8 @@ class AuthorityCase(str, Enum):
 class CandidateBucket(str, Enum):
     EXACT_SOURCE_ANCHOR = "exact_source_anchor"
     SAME_DOC_LINEAGE = "same_doc_lineage"
+    # Stored on relation candidates recorded for Agent Knowledge claims. It
+    # stays readable as their history; no bucket is loaded under it.
     SAME_AGENT_CLAIM = "same_agent_claim"
     EXISTING_RELATION_GRAPH = "existing_relation_graph"
     SAME_MEMORY_SOURCE_AUTHORITY = "same_memory_source_authority"
@@ -487,7 +491,6 @@ MANDATORY_CANDIDATE_BUCKETS = frozenset(
     {
         CandidateBucket.EXACT_SOURCE_ANCHOR,
         CandidateBucket.SAME_DOC_LINEAGE,
-        CandidateBucket.SAME_AGENT_CLAIM,
         CandidateBucket.EXISTING_RELATION_GRAPH,
         CandidateBucket.SAME_MEMORY_SOURCE_AUTHORITY,
     }
@@ -497,7 +500,6 @@ DESTRUCTIVE_AUTHORITY_CASES = frozenset(
     {
         AuthorityCase.SAME_DOCUMENT_REVISION,
         AuthorityCase.SAME_SOURCE_LINEAGE,
-        AuthorityCase.SAME_AGENT_CLAIM,
     }
 )
 
@@ -825,12 +827,6 @@ class MandatoryCandidateStore(Protocol):
         support_kind: str | None = None,
     ) -> list[CandidateMemory]: ...
 
-    async def get_candidate_memories_by_agent_claim(
-        self,
-        *,
-        claim_anchor: str,
-    ) -> list[CandidateMemory]: ...
-
     async def get_candidate_memories_by_existing_relation_graph(
         self,
         *,
@@ -847,9 +843,9 @@ async def build_mandatory_candidate_bucket_results(
     """Load complete mandatory candidate buckets for one Evidence Unit.
 
     The order is part of the contract: exact source anchor, same document
-    lineage, then same agent claim. Later recall-aid buckets can be appended
-    by callers, but these mandatory buckets must not be capped or skipped when
-    their anchor inputs are present.
+    lineage, then the existing relation graph. Later recall-aid buckets can be
+    appended by callers, but these mandatory buckets must not be capped or
+    skipped when their anchor inputs are present.
     """
     buckets: list[CandidateBucketResult] = []
 
@@ -891,25 +887,10 @@ async def build_mandatory_candidate_bucket_results(
                 reason="same source document",
             )
         )
-    claim_anchor = unit.source_metadata.get("claim_anchor")
-    if isinstance(claim_anchor, str) and claim_anchor:
-        buckets.append(
-            CandidateBucketResult(
-                bucket=CandidateBucket.SAME_AGENT_CLAIM,
-                bucket_rank=2,
-                complete=True,
-                candidates=allowed(
-                    await store.get_candidate_memories_by_agent_claim(
-                        claim_anchor=claim_anchor,
-                    )
-                ),
-                reason="same private agent claim",
-            )
-        )
     buckets.append(
         CandidateBucketResult(
             bucket=CandidateBucket.EXISTING_RELATION_GRAPH,
-            bucket_rank=3,
+            bucket_rank=2,
             complete=True,
             candidates=allowed(
                 await store.get_candidate_memories_by_existing_relation_graph(
@@ -1101,7 +1082,6 @@ class MemoryRelationApplyService:
             in {
                 AuthorityCase.SAME_DOCUMENT_REVISION,
                 AuthorityCase.SAME_SOURCE_LINEAGE,
-                AuthorityCase.SAME_AGENT_CLAIM,
                 AuthorityCase.SAME_PRIVATE_REPO_SCOPE,
                 AuthorityCase.INDEPENDENT_SUPPORT,
                 AuthorityCase.INDEPENDENT_REFINEMENT,

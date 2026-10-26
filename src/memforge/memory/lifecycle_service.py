@@ -14,10 +14,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
-from memforge.agent_knowledge import (
-    AgentClaimLifecycleConflict,
-    AgentKnowledgeBundleService,
-)
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.correction_authority import CorrectionAuthority
 from memforge.memory.store import MemoryStore
@@ -78,7 +74,7 @@ class MaintenanceClosureReport:
 
     @property
     def ready_count(self) -> int:
-        return sum(item.disposition in {"ready", "already_closed"} for item in self.entries)
+        return sum(item.disposition == "already_closed" for item in self.entries)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,11 +106,8 @@ class ProposeMemoryCorrectionResult:
 async def is_source_backed(db: Database, memory_id: str) -> bool:
     """Whether active Source Units support the Memory, so retiring it directly is refused.
 
-    Such a Memory changes with its Sources or through a correction. A Managed
-    Capture claim retires through its own claim, whatever supports it.
+    Such a Memory changes with its Sources or through a correction.
     """
-    if await db.get_agent_claim_by_memory_id(memory_id) is not None:
-        return False
     support_state = (await db.get_active_memory_support_states((memory_id,)))[memory_id]
     return bool(support_state.unit_ids)
 
@@ -204,20 +197,6 @@ class MemoryLifecycleService:
             raise MemoryLifecycleConflict("memory_owner_authority_required")
         if await is_source_backed(self.db, memory.id):
             raise MemoryLifecycleConflict("source_backed_memory_requires_lifecycle_review")
-        if await self.db.get_agent_claim_by_memory_id(memory.id) is not None:
-            try:
-                await AgentKnowledgeBundleService(
-                    db=self.db,
-                    memory_store=self.memory_store,
-                ).retire_claim_from_user_request(
-                    old_memory_id=memory.id,
-                    reason=reason,
-                    observed_at=datetime.now(timezone.utc),
-                    actor_user_id=actor_user_id,
-                )
-            except AgentClaimLifecycleConflict as exc:
-                raise MemoryLifecycleConflict(exc.code) from exc
-            return RetireMemoryResult(memory_id=memory.id, status="retired")
         try:
             await self.memory_store.retire_memory(memory.id, reason=reason)
         except ValueError as exc:
@@ -255,7 +234,6 @@ class MemoryLifecycleService:
         entries: list[MaintenanceClosureReportEntry] = []
         for item in normalized:
             memory = await self.db.get_memory(item.memory_id)
-            disposition = "ready"
             if memory is None:
                 disposition = "not_found"
             elif memory.content_hash != item.expected_content_hash:
@@ -287,20 +265,7 @@ class MemoryLifecycleService:
                 disposition = "not_private"
             else:
                 support_state = (await self.db.get_active_memory_support_states((memory.id,)))[memory.id]
-                if support_state.unit_ids:
-                    disposition = "active_support"
-                else:
-                    try:
-                        await AgentKnowledgeBundleService(
-                            db=self.db,
-                            memory_store=self.memory_store,
-                        ).validate_maintenance_retirement(memory.id)
-                    except AgentClaimLifecycleConflict as exc:
-                        disposition = (
-                            "lifecycle_plan_unavailable"
-                            if exc.code == "source_backed_memory_lineage_incomplete"
-                            else exc.code
-                        )
+                disposition = "active_support" if support_state.unit_ids else "lifecycle_plan_unavailable"
             entries.append(
                 MaintenanceClosureReportEntry(
                     memory_id=item.memory_id,
@@ -329,59 +294,19 @@ class MemoryLifecycleService:
         )
         if report.id != expected_report_id:
             raise MemoryLifecycleConflict("maintenance_closure_report_mismatch")
-        blocked = [item for item in report.entries if item.disposition not in {"ready", "already_closed"}]
+        blocked = [item for item in report.entries if item.disposition != "already_closed"]
         if blocked:
             raise MemoryLifecycleConflict("maintenance_closure_manifest_not_ready")
 
         receipts: list[MaintenanceClosureReceipt] = []
-        report_by_id = {item.memory_id: item for item in report.entries}
         for item in normalized:
-            status = "already_retired"
             receipt_id = self._maintenance_receipt_id(report.id, item.memory_id)
-            if report_by_id[item.memory_id].disposition == "ready":
-                memory = await self._active_target(
-                    item.memory_id,
-                    expected_content_hash=item.expected_content_hash,
-                )
-                claim = await self.db.get_agent_claim_by_memory_id(memory.id)
-                if claim is not None:
-                    receipt_event = MemoryAuditEvent(
-                        event_id=receipt_id,
-                        event_type="maintenance_memory_closure_committed",
-                        status="committed",
-                        actor_type="maintenance_operator",
-                        actor_id=operator_actor_id,
-                        memory_id=item.memory_id,
-                        reason=item.reason,
-                        payload={
-                            "authority": "maintenance_operator",
-                            "report_id": report.id,
-                            "receipt_id": receipt_id,
-                            "result": "retired",
-                        },
-                    )
-                    try:
-                        await AgentKnowledgeBundleService(
-                            db=self.db,
-                            memory_store=self.memory_store,
-                        ).retire_claim_from_maintenance_operator(
-                            old_memory_id=memory.id,
-                            reason=item.reason,
-                            observed_at=datetime.now(timezone.utc),
-                            operator_actor_id=operator_actor_id,
-                            maintenance_receipt=receipt_event,
-                        )
-                    except AgentClaimLifecycleConflict as exc:
-                        raise MemoryLifecycleConflict(exc.code) from exc
-                else:
-                    raise MemoryLifecycleConflict("maintenance_closure_lifecycle_plan_required")
-                status = "retired"
             receipts.append(
                 MaintenanceClosureReceipt(
                     id=receipt_id,
                     report_id=report.id,
                     memory_id=item.memory_id,
-                    status=status,
+                    status="already_retired",
                     authority="maintenance_operator",
                     operator_actor_id=operator_actor_id,
                 )
@@ -443,32 +368,6 @@ class MemoryLifecycleService:
             )
         return tuple(normalized)
 
-    async def _replace_agent_claim_memory(
-        self,
-        old: Memory,
-        *,
-        replacement_content: str,
-        provenance: str,
-        reason: str,
-        replacement_kind: ReplacementKind,
-    ) -> str:
-        """Replace a Managed Capture claim through its projection-owned path."""
-
-        try:
-            return await AgentKnowledgeBundleService(
-                db=self.db,
-                memory_store=self.memory_store,
-            ).replace_claim_from_user_correction(
-                old_memory_id=old.id,
-                replacement_content=replacement_content,
-                provenance=provenance,
-                reason=reason,
-                replacement_kind=replacement_kind,
-                observed_at=datetime.now(timezone.utc),
-            )
-        except AgentClaimLifecycleConflict as exc:
-            raise MemoryLifecycleConflict(exc.code) from exc
-
     async def propose_memory_correction(
         self,
         memory_id: str,
@@ -485,8 +384,7 @@ class MemoryLifecycleService:
         Every ordinary correction first becomes a hidden challenger plus a
         stale-guarded supersede Review.  A caller with authority over the full
         active Support Set resolves that Review immediately; other visible
-        callers leave the same Review pending for a Source manager.  Managed
-        Capture claims keep using their projection-owned correction path.
+        callers leave the same Review pending for a Source manager.
         """
 
         replacement_kind = self._validate_replacement_kind(replacement_kind)
@@ -504,26 +402,6 @@ class MemoryLifecycleService:
             raise MemoryLifecycleConflict("actor_user_id_required")
 
         old = await self._active_target(memory_id, expected_content_hash=expected_content_hash)
-        claim = await self.db.get_agent_claim_by_memory_id(old.id)
-        if claim is not None:
-            if old.owner_user_id != actor_user_id:
-                raise MemoryLifecycleNotFound("memory_not_found")
-            replacement_memory_id = await self._replace_agent_claim_memory(
-                old,
-                replacement_content=replacement_content,
-                provenance=provenance,
-                reason=reason,
-                replacement_kind=replacement_kind,
-            )
-            return ProposeMemoryCorrectionResult(
-                memory_id=old.id,
-                replacement_memory_id=replacement_memory_id,
-                outcome="applied",
-                status="superseded",
-                replacement_kind=replacement_kind,
-                review_id="",
-            )
-
         support_state = (await self.db.get_active_memory_support_states((old.id,)))[old.id]
         expected_support_set_hash = support_state.support_set_hash if support_state.unit_ids else None
         legacy_configured_source_ids: tuple[str, ...] = ()

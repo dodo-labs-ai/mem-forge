@@ -219,7 +219,7 @@ class RetrievalCase:
             _reject_unknown_fields(
                 "case.source_filter",
                 data["source_filter"],
-                {"source_ids", "clients", "repo_identifiers"},
+                {"source_ids", "repo_identifiers"},
             )
         if data.get("time_range") is not None:
             _require_mapping("case.time_range", data["time_range"])

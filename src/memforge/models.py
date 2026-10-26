@@ -280,47 +280,6 @@ class MemorySource:
     has_unit_support: bool = False
 
 
-@dataclass
-class AgentSessionReceipt:
-    """Lineage and outcome for one uploaded agent-session window."""
-
-    doc_id: str
-    source_id: str
-    client: str
-    session_id: str
-    trigger: str
-    workspace: str
-    repo: str | None
-    branch: str | None
-    commit_sha: str | None
-    history_window_kind: str
-    history_window_start: str | None
-    history_window_end: str | None
-    submitted_at: str
-    document_hash: str
-    source_kind: str
-    document_uri: str
-    metadata: dict = field(default_factory=dict)
-    updated_at: str | None = None
-
-
-@dataclass
-class AgentHookReceipt:
-    """Lineage for a coding-agent lifecycle hook event."""
-
-    receipt_id: str
-    client: str
-    session_id: str
-    hook: str
-    workspace: str
-    repo: str | None
-    branch: str | None
-    commit_sha: str | None
-    submitted_at: str
-    metadata: dict = field(default_factory=dict)
-    updated_at: str | None = None
-
-
 # ---------------------------------------------------------------------------
 # Document models
 # ---------------------------------------------------------------------------
@@ -768,8 +727,7 @@ class GeneConfigSchema:
     """Dynamic config schema a gene declares for UI rendering.
 
     `project_field` names the field a `by_field` project_binding reads on
-    each item this gene produces. Doc-shaped genes typically expose
-    `space_or_project`; the agent-session gene exposes `repo`. The admin
+    each item this gene produces, for example `space_or_project`. The admin
     UI uses this to scope the binding editor to fields the gene actually
     populates.
     """
