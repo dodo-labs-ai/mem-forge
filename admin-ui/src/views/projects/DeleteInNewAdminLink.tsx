@@ -1,8 +1,8 @@
 import { ExternalLink } from "lucide-react";
 import type { Project } from "@/api/types";
 
-/** Where the image serves the new admin UI, beside this one at `/`. */
-const NEW_ADMIN_BASE_PATH = "/v2/";
+/** Where the image serves the new admin UI, beside this one at `/v1/`. */
+const NEW_ADMIN_BASE_PATH = "/";
 
 /**
  * @deprecated admin-ui-v1: projects are deleted in the new admin UI, which

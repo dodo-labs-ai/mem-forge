@@ -1,7 +1,7 @@
 # MemForge admin UI
 
-The admin UI that replaces `admin-ui/` (the V1 admin UI). Both run side by side
-until V1 is removed.
+The MemForge admin UI, served at `/`. The V1 admin UI (`admin-ui/`) is served
+at `/v1/` beside it for one release, then removed.
 
 ## Run
 
@@ -10,9 +10,8 @@ uv run memforge api          # the Admin API on :8765
 cd admin && npm ci && npm run dev
 ```
 
-Open http://localhost:5175/v2/. Adding and configuring a source still happens
-on the V1 Sources page, so run `npm run dev` in `admin-ui/` too if you follow
-those links.
+Open http://localhost:5175. The dev server forwards `/v1/` to the V1 dev server
+on port 5174, so run `npm run dev` in `admin-ui/` too if you want V1 there.
 
 | Command | What it does |
 |---|---|

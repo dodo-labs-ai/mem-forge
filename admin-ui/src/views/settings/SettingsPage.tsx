@@ -8,8 +8,8 @@ import { EmptyState } from "@/components/admin/EmptyState";
 import { PageHeader } from "@/components/admin/PageHeader";
 import { Badge } from "@/components/ui/badge";
 
-/** Where the image serves the new admin UI's Settings page, beside this one at `/`. */
-const NEW_ADMIN_SETTINGS_PATH = "/v2/settings";
+/** Where the image serves the new admin UI's Settings page, beside this one at `/v1/`. */
+const NEW_ADMIN_SETTINGS_PATH = "/settings";
 
 const KINDS: Array<{ kind: ModelKind; title: string; description: string }> = [
   { kind: "generation", title: "Generation model", description: "Reads source content and writes memories." },

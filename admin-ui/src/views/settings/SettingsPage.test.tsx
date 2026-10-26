@@ -62,7 +62,7 @@ it("shows the models in use and where they are changed, with nothing to edit", a
   expect(within(generation).getByText("Ready")).toBeTruthy();
   expect(within(screen.getByRole("region", { name: "Embedding model" })).getByText("Not set up")).toBeTruthy();
 
-  expect(screen.getByRole("link", { name: "Settings in the new admin" }).getAttribute("href")).toBe("/v2/settings");
+  expect(screen.getByRole("link", { name: "Settings in the new admin" }).getAttribute("href")).toBe("/settings");
   expect(screen.queryByRole("textbox")).toBeNull();
   expect(screen.queryByRole("button")).toBeNull();
 });
