@@ -20,9 +20,10 @@
   for Memories a coding agent wrote with `create_memory`. Source list rows no
   longer carry `client`, and `GET /api/v1/genes` no longer carries `managed`;
   the admin UI offers every registered source type. For connector and adapter
-  authors: `agent_session` is no longer a registered source type, and the
-  storage protocol drops `apply_agent_claim_source_projection_lifecycle` and
-  the agent claim, concept and receipt methods. Cloud: drop the HANA store's
+  authors: `agent_session` is no longer a registered source type, the storage
+  protocols drop `apply_agent_claim_source_projection_lifecycle` and
+  `get_candidate_memories_by_agent_claim`, and `Database` drops its agent
+  claim, concept and receipt methods. Cloud: drop the HANA store's
   agent claim, concept and receipt methods and their protocol entries, the
   `clients` facet, and the capture tables, retiring the remaining agent-session
   Sources in the same migration.
