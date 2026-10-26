@@ -31,7 +31,7 @@ function renderPicker(localSync: "online" | "offline" = "online") {
   );
 }
 
-test("lists configurable types and hides managed ones", async () => {
+test("lists every registered type", async () => {
   renderPicker();
 
   const types = await screen.findByRole("list", { name: "Source types" });
@@ -40,7 +40,6 @@ test("lists configurable types and hides managed ones", async () => {
     .map((link) => link.textContent);
   expect(names.some((name) => name?.includes("Confluence"))).toBe(true);
   expect(names.some((name) => name?.includes("Microsoft Teams"))).toBe(true);
-  expect(within(types).queryByText("Agent Session")).not.toBeInTheDocument();
 
   await userEvent.click(within(types).getByRole("link", { name: /GitHub Pages/ }));
   expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent("/sources/new/github_pages");

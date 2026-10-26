@@ -20,8 +20,8 @@ import {
  * | Basics | Always | `name` |
  * | Each group, by `order` | Always | `config` |
  * | Access | Create only, in a shared workspace | `access_policy` |
- * | Project | Always; the only step of a managed type | `project_binding` |
- * | Schedule | For configurable types | `sync_schedule` |
+ * | Project | Always | `project_binding` |
+ * | Schedule | Always | `sync_schedule` |
  *
  * A group step is keyed by the group's key, so `?step=connection` opens the
  * connection group and `?step=project` the Project step.
