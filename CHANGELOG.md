@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `Database.insert_memory_and_upsert_agent_claim`, which nothing called, is
+  removed. Cloud: remove the HANA store's `insert_memory_and_upsert_agent_claim`
+  and its protocol entry.
+
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
   as a memory's main evidence, extraction asks it to correct the selection,
