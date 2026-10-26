@@ -11,6 +11,7 @@ import pytest
 import memforge
 import memforge.genes.teams_provider as teams_provider
 import memforge.main as main
+from memforge.genes.base import Gene
 from memforge.genes.contract import (
     SourceTypeContractError,
     validate_registered_source_types,
@@ -42,7 +43,6 @@ from memforge.source_types import (
     source_type_descriptor,
 )
 from tests.gene_fixture import FakeGene
-from tests.uncollected_gene import UncollectedGene
 from tests.source_type_fixture import register_test_source_type
 
 DEVICE = LocalAgentCollection(operation="test_sync", job_config_fields=frozenset())
@@ -73,22 +73,36 @@ def test_a_document_gene_with_its_contract_is_accepted() -> None:
     validate_source_type(_descriptor(QueryGene))
 
 
-def test_a_gene_without_a_collection_needs_no_family() -> None:
-    validate_source_type(_descriptor(UncollectedGene))
-
-
-def test_a_collecting_gene_of_neither_family_is_refused() -> None:
-    class Bare(UncollectedGene):
+def test_a_gene_of_neither_family_is_refused() -> None:
+    class Bare(Gene):
         @classmethod
         def metadata(cls) -> GeneMetadata:
             return GeneMetadata(
                 name="bare",
                 display_name="Bare",
-                description="collects without a family",
-                default_sync_interval_minutes=60,
+                description="belongs to no family",
+                default_sync_interval_minutes=0,
                 auth_method="none",
                 data_shape="document",
+                execution_kinds=(),
             )
+
+        @classmethod
+        def config_schema(cls) -> GeneConfigSchema:
+            return GeneConfigSchema()
+
+        async def authenticate(self) -> None:
+            pass
+
+        async def discover(self, since=None):
+            return
+            yield
+
+        async def fetch(self, item):
+            raise NotImplementedError
+
+        async def normalize(self, raw):
+            raise NotImplementedError
 
     _refused(Bare, "must subclass DocumentGene or ConversationGene")
 

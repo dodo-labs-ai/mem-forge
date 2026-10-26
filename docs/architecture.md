@@ -79,8 +79,8 @@ the source and how it learns that something is gone:
   connector supplies a provider that implements the port in
   `conversations/port.py`. Teams works this way.
 
-A Gene of neither family has no sync run; every built-in type belongs to one
-of the two.
+Every source type has a Gene of exactly one of the two; startup refuses a
+type whose Gene subclasses neither.
 
 **Write the descriptor.** A `SourceTypeDescriptor` (`source_types/descriptor.py`)
 holds every fact shared code needs about the type: its Gene, the configuration

@@ -3,8 +3,9 @@
 A source type's family follows from the base class of its Gene and from
 nothing else: a :class:`~memforge.genes.document_gene.DocumentGene` collects
 documents, and a :class:`~memforge.genes.conversation_gene.ConversationGene`
-collects conversations through the conversation layer. A Gene of neither
-family has no collection.
+collects conversations through the conversation layer. Every registered
+source type has a Gene of one of the two; the source-type contract
+(:mod:`memforge.genes.contract`) refuses any other.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ class CollectionFamilyKind(str, Enum):
 
 
 def gene_family(gene_cls: type[Gene]) -> CollectionFamilyKind | None:
-    """The family of ``gene_cls``, or ``None`` for a Gene with no collection."""
+    """The family of ``gene_cls``, or ``None`` for a Gene of neither family, which no source type has."""
 
     if issubclass(gene_cls, DocumentGene):
         return CollectionFamilyKind.DOCUMENT

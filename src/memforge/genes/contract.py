@@ -8,10 +8,8 @@ registry.
 
 What each family requires:
 
-- **Every type with a collection** (a sync run on the server or a local-agent
-  collection) has a Gene of exactly one family, and the Gene implements every
-  abstract method. Only a type without a collection has a Gene of neither
-  family.
+- **Every type** has a Gene of exactly one family, and the Gene implements
+  every abstract method.
 - **A document Gene** declares ``listing_kinds`` and answers ``lists_scope``
   as a class method, because a scope change asks it before any Gene exists.
   Python lets an abstract class method be called on its class, so the
@@ -78,15 +76,10 @@ def validate_source_type(descriptor: SourceTypeDescriptor) -> None:
         raise SourceTypeContractError(f"{name}: {gene_cls.__name__} does not implement {missing}")
     _validate_config_schema(name, gene_cls.config_schema())
     families = [base for base in (DocumentGene, ConversationGene) if issubclass(gene_cls, base)]
-    collected = bool(gene_cls.metadata().execution_kinds) or descriptor.local_agent is not None
     if len(families) > 1:
         raise SourceTypeContractError(f"{name}: {gene_cls.__name__} subclasses both DocumentGene and ConversationGene")
     if not families:
-        if collected:
-            raise SourceTypeContractError(
-                f"{name}: {gene_cls.__name__} collects content, so it must subclass DocumentGene or ConversationGene"
-            )
-        return
+        raise SourceTypeContractError(f"{name}: {gene_cls.__name__} must subclass DocumentGene or ConversationGene")
     if families[0] is DocumentGene:
         _validate_document_gene(descriptor, gene_cls)
     else:

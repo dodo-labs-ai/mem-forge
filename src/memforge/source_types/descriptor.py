@@ -134,7 +134,7 @@ class SourceTypeDescriptor:
 
     @property
     def family(self) -> CollectionFamilyKind | None:
-        """The collection family its Gene's base class names; ``None`` for a Gene with no collection."""
+        """The collection family its Gene's base class names; ``None`` only for a Gene the contract refuses."""
 
         from memforge.genes.family import gene_family
 

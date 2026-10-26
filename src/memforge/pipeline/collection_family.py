@@ -1034,7 +1034,7 @@ def collection_family(
     doc_store: DocumentStore,
     source_id: str,
 ) -> CollectionFamily:
-    """The family of a sync run's Gene; a Gene of neither family has no sync run."""
+    """The family of a sync run's Gene; the source-type contract gives every registered Gene one."""
 
     kind = gene_family(type(gene))
     if kind is CollectionFamilyKind.DOCUMENT:
