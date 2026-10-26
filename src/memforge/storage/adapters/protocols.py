@@ -38,7 +38,6 @@ from memforge.memory.evidence import (
 from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.cross_document_relation import CrossDocumentRelationOutcome, CurrentCrossDocumentRelation
 from memforge.memory.lifecycle_plan import (
-    LifecycleGate,
     LifecyclePlan,
     LifecycleReview,
     LifecycleReviewStatus,
@@ -550,18 +549,6 @@ class RelationalStore(Protocol):
     ) -> tuple[str, ...]:
         """The Documents committed under the transition, in doc id order; empty once it is closed."""
         ...
-    async def count_active_source_memories_without_support(self, source_id: str) -> int: ...
-    async def count_active_supported_memories_without_source_provenance(
-        self,
-        source_id: str,
-    ) -> int: ...
-    async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate: ...
-    async def enable_lifecycle_gate(
-        self,
-        source_id: str,
-        *,
-        source_activity: SourceActivityLease | None = None,
-    ) -> LifecycleGate: ...
     async def renew_source_activity(
         self,
         *,

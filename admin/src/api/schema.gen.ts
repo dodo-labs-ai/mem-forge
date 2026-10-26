@@ -2255,35 +2255,11 @@ export interface paths {
         };
         /**
          * Get Source Memory Lifecycle
-         * @description Return independent scope, gate, review, and delivery axes.
+         * @description Return independent scope transition, review, and delivery axes.
          */
         get: operations["get_source_memory_lifecycle_api_v1_sources__source_id__memory_lifecycle_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/memory-lifecycle/gate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Enable Source Memory Lifecycle Gate
-         * @description Enable destructive lifecycle once every active Memory has complete Support.
-         *
-         *     Sources created by this version start enabled. A Source recorded before
-         *     lifecycle gates existed stays gated, and its destructive Reviews cannot
-         *     be approved, until this check passes.
-         */
-        post: operations["enable_source_memory_lifecycle_gate_api_v1_sources__source_id__memory_lifecycle_gate_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2301,7 +2277,7 @@ export interface paths {
         put?: never;
         /**
          * Approve Source Lifecycle Review
-         * @description Use the latest state after gate and stale-guard checks.
+         * @description Use the latest state after the stale-guard checks.
          */
         post: operations["approve_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__approve_post"];
         delete?: never;
@@ -11085,37 +11061,6 @@ export interface operations {
         };
     };
     get_source_memory_lifecycle_api_v1_sources__source_id__memory_lifecycle_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    enable_source_memory_lifecycle_gate_api_v1_sources__source_id__memory_lifecycle_gate_post: {
         parameters: {
             query?: never;
             header?: never;

@@ -17,7 +17,6 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
-    LifecycleGateState,
     IncumbentDecision,
     IncumbentDisposition,
     LifecycleMutation,
@@ -100,7 +99,7 @@ def _unit() -> EvidenceUnit:
     return EvidenceUnit(
         id="eu-1",
         source_id="src-1",
-        doc_id="gate-doc",
+        doc_id="source-doc",
         doc_revision_id="unitrev-page-1-v2",
         source_type="confluence",
         source_anchor="obs-page-1-body",
@@ -116,14 +115,7 @@ def _unit() -> EvidenceUnit:
     )
 
 
-@pytest.mark.asyncio
-async def test_new_source_is_destructive_lifecycle_gated_by_default(db: Database) -> None:
-    gate = await db.get_lifecycle_gate("src-1")
-
-    assert gate.state is LifecycleGateState.GATED
-
-
-async def _attach_source_document(db: Database, doc_id: str = "gate-doc") -> None:
+async def _attach_source_document(db: Database, doc_id: str = "source-doc") -> None:
     """Record ``doc_id`` as Source provenance of the fixture Memory."""
 
     now = "2026-07-15T00:00:00+00:00"
@@ -154,100 +146,55 @@ async def _attach_source_document(db: Database, doc_id: str = "gate-doc") -> Non
 
 
 @pytest.mark.asyncio
-async def test_gate_requires_validated_support_for_active_source_backed_memory(db: Database) -> None:
-    await _attach_source_document(db)
-
-    with pytest.raises(ValueError, match="source-backed Memory lacks validated support lineage"):
-        await db.enable_lifecycle_gate("src-1")
-
-
-@pytest.mark.asyncio
-async def test_gate_rejects_active_support_without_matching_source_provenance(
-    db: Database,
-) -> None:
-    await _attach_source_document(db)
-    await _persist_exact_support_and_provenance(db)
-    await db.db.execute(
-        "DELETE FROM memory_sources WHERE memory_id = ? AND source_id = ?",
-        ("mem-1", "src-1"),
-    )
-    await db.db.commit()
-
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 1
-    with pytest.raises(ValueError, match="active support lacks source provenance"):
-        await db.enable_lifecycle_gate("src-1")
-
-
-@pytest.mark.asyncio
-async def test_gate_rejects_source_provenance_without_exact_document_support(
-    db: Database,
-) -> None:
-    await _attach_source_document(db)
-    await _persist_exact_support_and_provenance(db)
-    await _attach_source_document(db, doc_id="wrong-support-doc")
-
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
-    assert await db.count_active_source_memories_without_support("src-1") == 1
-    with pytest.raises(ValueError, match="source-backed Memory lacks validated support lineage"):
-        await db.enable_lifecycle_gate("src-1")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "corrupt_statement, corrupt_params",
-    (
-        ("DELETE FROM evidence_units WHERE id = ?", ("eu-1",)),
-        ("UPDATE evidence_units SET doc_id = NULL WHERE id = ?", ("eu-1",)),
-    ),
-    ids=("missing-evidence-unit", "null-document"),
-)
-async def test_reverse_support_projection_audit_fails_closed_for_corrupt_evidence_chain(
-    db: Database,
-    corrupt_statement: str,
-    corrupt_params: tuple[str, ...],
-) -> None:
-    await _attach_source_document(db)
-    await _persist_exact_support_and_provenance(db)
-    await db.db.commit()
-    await db.db.execute("PRAGMA foreign_keys = OFF")
-    await db.db.execute(corrupt_statement, corrupt_params)
-    await db.db.commit()
-    await db.db.execute("PRAGMA foreign_keys = ON")
-
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 1
-
-
-@pytest.mark.asyncio
-async def test_gate_ignores_inactive_historical_memory_without_support(db: Database) -> None:
-    await _attach_source_document(db)
-    await db.db.execute("UPDATE memories SET status = 'retired' WHERE id = ?", ("mem-1",))
-    await db.db.commit()
-
-    gate = await db.enable_lifecycle_gate("src-1")
-
-    assert gate.state is LifecycleGateState.ENABLED
-
-
-@pytest.mark.asyncio
-async def test_gate_route_enables_a_gated_source_only_when_support_is_complete(
-    db: Database,
-    tmp_path,
-) -> None:
-    await _attach_source_document(db)
+async def test_sources_have_no_lifecycle_gate_route(db: Database, tmp_path) -> None:
     config = AppConfig(base_dir=tmp_path / "memforge")
     config.sync.worker_enabled = False
     app = create_admin_app(db=db, config=config, principal_resolver=lambda request: "owner-1")
 
     with TestClient(app) as client:
-        refused = client.post("/api/v1/sources/src-1/memory-lifecycle/gate")
-        await _persist_exact_support_and_provenance(db)
-        enabled = client.post("/api/v1/sources/src-1/memory-lifecycle/gate")
+        gate = client.post("/api/v1/sources/src-1/memory-lifecycle/gate")
+        lifecycle = client.get("/api/v1/sources/src-1/memory-lifecycle")
 
-    assert refused.status_code == 409
-    assert refused.json()["detail"] == "source-backed Memory lacks validated support lineage"
-    assert enabled.status_code == 200, enabled.text
-    assert enabled.json()["gate"]["state"] == LifecycleGateState.ENABLED.value
-    assert (await db.get_lifecycle_gate("src-1")).state is LifecycleGateState.ENABLED
+    assert gate.status_code in {404, 405}
+    assert lifecycle.status_code == 200, lifecycle.text
+    assert set(lifecycle.json()) == {"source_id", "scope_transitions", "reviews", "vector_outbox"}
+
+
+@pytest.mark.asyncio
+async def test_upgrade_drops_the_lifecycle_gate_table_and_keeps_reviews_and_plans(db: Database) -> None:
+    unit_id = await _persist_exact_support_and_provenance(db)
+    incumbent = await db.get_memory("mem-1")
+    assert incumbent is not None
+    held = _held_retirement_plan(
+        unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-before-upgrade",
+    )
+    await db.apply_lifecycle_plan(held)
+    [review] = await db.list_lifecycle_reviews("src-1")
+    plan_payload = await db.get_lifecycle_plan_payload(held.id)
+    await db.db.executescript(
+        """CREATE TABLE source_lifecycle_gates (
+               source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+               state TEXT NOT NULL CHECK (state IN ('gated', 'enabled')),
+               reason TEXT,
+               audited_at TEXT,
+               enabled_at TEXT,
+               updated_at TEXT NOT NULL
+           );
+           INSERT INTO source_lifecycle_gates (source_id, state, updated_at)
+           VALUES ('src-1', 'gated', '2026-07-15T00:00:00+00:00');
+           DELETE FROM schema_migrations WHERE version = 130;"""
+    )
+    await db.db.commit()
+    await db.close()
+
+    await db.connect()
+
+    tables = await db.db.execute_fetchall(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'source_lifecycle_gates'"
+    )
+    assert tables == []
+    assert await db.list_lifecycle_reviews("src-1") == [review]
+    assert await db.get_lifecycle_plan_payload(held.id) == plan_payload
 
 
 async def _persist_exact_support_and_provenance(db: Database) -> str:
@@ -352,7 +299,6 @@ def _overlapping_support_plan(
             base_unit_revision_id="unitrev-page-1-v1-source-2",
             target_unit_revision_id="unitrev-page-1-v2-source-2",
         ),
-        gate_state=(LifecycleGateState.ENABLED if removing else LifecycleGateState.GATED),
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
@@ -381,7 +327,7 @@ def _overlapping_support_plan(
                 evidence_unit_ids=(evidence_unit.id,),
                 payload={
                     "access_context_hash": "workspace",
-                    "document_id": "gate-doc",
+                    "document_id": "source-doc",
                 },
             ),
         ),
@@ -503,7 +449,6 @@ async def _attach_same_source_incarnation_support(
             ),
         ),
     )
-    await db.enable_lifecycle_gate("src-1")
     return first_unit_id, second_evidence_unit.id
 
 
@@ -525,7 +470,6 @@ def _remove_support_plan(
             base_unit_revision_id=None,
             target_unit_revision_id=target_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
@@ -548,7 +492,7 @@ def _remove_support_plan(
                 memory_id="mem-1",
                 source_id="src-1",
                 evidence_unit_ids=(evidence_unit_id,),
-                payload={"document_id": "gate-doc"},
+                payload={"document_id": "source-doc"},
             ),
         ),
     )
@@ -572,9 +516,8 @@ async def test_remove_support_preserves_shared_same_source_document_projection(
 
     assert await db.get_active_memory_support_unit_ids("mem-1") == (second_unit_id,)
     assert [(source.source_id, source.doc_id) for source in await db.get_memory_sources("mem-1")] == [
-        ("src-1", "gate-doc")
+        ("src-1", "source-doc")
     ]
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
 
 
 @pytest.mark.asyncio
@@ -589,13 +532,10 @@ async def test_overlapping_configured_sources_keep_independent_support_projectio
     rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-1", "gate-doc"),
+        ("mem-1", "source-doc"),
     )
     assert [row["source_id"] for row in rows] == ["src-1", "src-2"]
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
-    assert await db.count_active_supported_memories_without_source_provenance("src-2") == 0
 
-    await db.enable_lifecycle_gate("src-2")
     await db.apply_lifecycle_plan(
         _overlapping_support_plan(
             plan_id="plan-overlapping-remove",
@@ -608,14 +548,13 @@ async def test_overlapping_configured_sources_keep_independent_support_projectio
     rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-1", "gate-doc"),
+        ("mem-1", "source-doc"),
     )
     assert [row["source_id"] for row in rows] == ["src-1"]
-    assert await db.count_active_supported_memories_without_source_provenance("src-1") == 0
     metadata_rows = await db.db.execute_fetchall(
         """SELECT source_id FROM memory_search_metadata_trigram
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-1", "gate-doc"),
+        ("mem-1", "source-doc"),
     )
     assert [row["source_id"] for row in metadata_rows] == ["src-1"]
 
@@ -631,7 +570,7 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
 
     outcome = await db.corroborate_memory(
         "mem-1",
-        "gate-doc",
+        "source-doc",
         "confluence",
         "longer owner source excerpt",
         support_kind="extracted",
@@ -642,7 +581,7 @@ async def test_document_owned_corroboration_preserves_an_overlapping_source_proj
     rows = await db.db.execute_fetchall(
         """SELECT source_id, excerpt FROM memory_sources
              WHERE memory_id = ? AND doc_id = ? ORDER BY source_id""",
-        ("mem-1", "gate-doc"),
+        ("mem-1", "source-doc"),
     )
     assert [(row["source_id"], row["excerpt"]) for row in rows] == [
         ("src-1", "longer owner source excerpt"),
@@ -662,12 +601,12 @@ async def test_delete_source_preserves_a_document_projected_by_another_configure
     result = await db.delete_source_cascade("src-1")
 
     assert result.retired_memory_ids == ()
-    document = await db.get_document("gate-doc")
+    document = await db.get_document("source-doc")
     assert document is not None
     assert document.source == "src-2"
     sources = await db.get_memory_sources("mem-1")
     assert [(source.source_id, source.doc_id) for source in sources] == [
-        ("src-2", "gate-doc"),
+        ("src-2", "source-doc"),
     ]
     assert await db.get_active_memory_support_unit_ids("mem-1") == (overlapping_unit.id,)
     memory = await db.get_memory("mem-1")
@@ -687,12 +626,12 @@ async def test_delete_non_owner_source_removes_its_exact_shared_document_project
     result = await db.delete_source_cascade("src-2")
 
     assert result.retired_memory_ids == ()
-    document = await db.get_document("gate-doc")
+    document = await db.get_document("source-doc")
     assert document is not None
     assert document.source == "src-1"
     sources = await db.get_memory_sources("mem-1")
     assert [(source.source_id, source.doc_id) for source in sources] == [
-        ("src-1", "gate-doc"),
+        ("src-1", "source-doc"),
     ]
     assert await db.get_active_memory_support_unit_ids("mem-1") == ("eu-1",)
     memory = await db.get_memory("mem-1")
@@ -710,7 +649,6 @@ def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
             base_unit_revision_id="unitrev-page-1-v1",
             target_unit_revision_id="unitrev-page-1-v2",
         ),
-        gate_state=LifecycleGateState.ENABLED,
         coverage_proof=CoverageProof(
             mandatory_incumbent_ids=("mem-1",),
             incumbent_decisions=(
@@ -743,7 +681,7 @@ def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
     )
 
 
-def _gated_retirement_plan(
+def _held_retirement_plan(
     evidence_unit_id: str,
     incumbent: Memory,
     support_hash: str,
@@ -751,7 +689,9 @@ def _gated_retirement_plan(
     plan_id: str,
     scope_id: str | None = None,
 ) -> LifecyclePlan:
-    return build_lifecycle_plan(
+    """A Plan that holds the retirement of ``incumbent`` for Review."""
+
+    direct = build_lifecycle_plan(
         plan_id=plan_id,
         scope=ReconciliationScope(
             id=scope_id or f"scope-{plan_id}",
@@ -760,7 +700,6 @@ def _gated_retirement_plan(
             base_unit_revision_id="unitrev-page-1-v1",
             target_unit_revision_id="unitrev-page-1-v2",
         ),
-        gate_state=LifecycleGateState.GATED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -778,30 +717,17 @@ def _gated_retirement_plan(
             owner_user_id=None,
             project_key=None,
             repo_identifier=None,
-            doc_id="gate-doc",
+            doc_id="source-doc",
             source_type="confluence",
             access_context_hash="workspace",
         ),
     )
+    return hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
 
-
-
-def test_each_plan_names_its_own_review_of_one_incumbent() -> None:
-    incumbent = Memory(id="mem-1", content="claim", content_hash=content_hash("claim"), memory_type="fact")
-
-    def review_id(plan_id: str) -> str:
-        plan = _gated_retirement_plan("unit-1", incumbent, "hash", plan_id=plan_id, scope_id="scope:run-1")
-        [create] = [item for item in plan.mutations if item.mutation_type is LifecycleMutationType.CREATE_REVIEW]
-        return create.payload["review_id"]
-
-    # Two Plans of one run share a scope; only a retry of the same Plan names the same Review.
-    assert review_id("plan-a") != review_id("plan-b")
-    assert review_id("plan-a") == review_id("plan-a")
 
 @pytest.mark.asyncio
 async def test_lifecycle_plan_applies_support_removal_and_retirement_atomically(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
     plan = _retirement_plan(unit_id, await db.get_memory_support_set_hash("mem-1"))
     other = Database(db.db_path)
     await other.connect()
@@ -852,7 +778,7 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
-    review_plan = _gated_retirement_plan(
+    review_plan = _held_retirement_plan(
         unit_id,
         incumbent,
         support_hash,
@@ -864,7 +790,6 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
         status=LifecycleReviewStatus.PENDING,
     )
     assert len(lifecycle_reviews) == 1
-    await db.enable_lifecycle_gate("src-1")
     plan = replace(
         _retirement_plan(unit_id, support_hash),
         id="plan-terminal-retire",
@@ -883,18 +808,18 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
 
 
 @pytest.mark.asyncio
-async def test_gated_review_approval_applies_proposal_and_resolves_review_atomically(
+async def test_review_approval_applies_proposal_and_resolves_review_atomically(
     db: Database,
 ) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
-    original = _gated_retirement_plan(
+    original = _held_retirement_plan(
         unit_id,
         incumbent,
         support_hash,
-        plan_id="plan-gated-delete",
+        plan_id="plan-held-delete",
     )
 
     await db.apply_lifecycle_plan(original)
@@ -905,7 +830,6 @@ async def test_gated_review_approval_applies_proposal_and_resolves_review_atomic
     assert len(reviews) == 1
     assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
-    await db.enable_lifecycle_gate("src-1")
     payload = await db.get_lifecycle_plan_payload(original.id)
     assert payload is not None
     approval = build_lifecycle_review_approval_plan(reviews[0], payload)
@@ -928,7 +852,6 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
         db,
         plan_id="plan-review-refresh-other-source",
     )
-    await db.enable_lifecycle_gate("src-1")
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
@@ -941,7 +864,6 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
             base_unit_revision_id="unitrev-page-1-v1",
             target_unit_revision_id="unitrev-page-1-v2",
         ),
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -959,7 +881,7 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
             owner_user_id=None,
             project_key=None,
             repo_identifier=None,
-            doc_id="gate-doc",
+            doc_id="source-doc",
             source_type="confluence",
             access_context_hash="workspace",
         ),
@@ -994,7 +916,6 @@ async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
     refreshed_plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
         await db.get_lifecycle_review(stale_review.id),  # type: ignore[arg-type]
         payload,
-        gate_state=LifecycleGateState.ENABLED,
         current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
         current_memory_version=lifecycle_memory_version(incumbent),
     )
@@ -1052,7 +973,6 @@ async def test_failed_vector_tasks_rotate_without_starving_new_pending_cleanup(
 @pytest.mark.asyncio
 async def test_stale_lifecycle_plan_rolls_back_without_partial_mutation(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
     stale = _retirement_plan(unit_id, "not-the-current-support-hash")
 
     with pytest.raises(ValueError, match="support stale guard"):
@@ -1066,7 +986,6 @@ async def test_stale_lifecycle_plan_rolls_back_without_partial_mutation(db: Data
 @pytest.mark.asyncio
 async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
     staged_unit, staged_references = await complete_unit_parts(
         db,
         replace(_unit(), id="eu-staged-rollback"),
@@ -1110,7 +1029,6 @@ async def test_mutation_failure_rolls_back_staged_evidence_with_the_plan(db: Dat
 @pytest.mark.asyncio
 async def test_mutation_failure_rolls_back_source_projection_with_the_plan(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
     previous = _projection()
     observation_revision = replace(
         previous.observation_revisions[0],
@@ -1182,7 +1100,6 @@ async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     db: Database,
 ) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
-    await db.enable_lifecycle_gate("src-1")
     plan = _retirement_plan(
         unit_id,
         await db.get_memory_support_set_hash("mem-1"),
@@ -1201,19 +1118,6 @@ async def test_memory_version_stale_guard_rejects_concurrent_incumbent_change(
     memory = await db.get_memory("mem-1")
     assert memory is not None and memory.status == "active"
     assert await db.get_lifecycle_plan_status(plan.id) is None
-
-
-@pytest.mark.asyncio
-async def test_lifecycle_gate_rejects_an_expired_activity_lease(
-    db: Database,
-) -> None:
-    activity = await _expired_sync_activity(db, "sqlite-gate-stale-fence")
-    gate_before = await db.get_lifecycle_gate("src-1")
-
-    with pytest.raises(SourceActivityConflict, match="source activity"):
-        await db.enable_lifecycle_gate("src-1", source_activity=activity)
-
-    assert await db.get_lifecycle_gate("src-1") == gate_before
 
 
 @pytest.mark.asyncio
@@ -1288,8 +1192,8 @@ async def test_review_mutations_refuse_an_existing_review_id_and_an_unknown_reso
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
-    raising = _gated_retirement_plan(
-        unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-gated-raise",
+    raising = _held_retirement_plan(
+        unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-held-raise",
     )
     [create] = [item for item in raising.mutations if item.mutation_type is LifecycleMutationType.CREATE_REVIEW]
     # A row that already holds the Review ID; only its identity matters here.
@@ -1309,7 +1213,6 @@ async def test_review_mutations_refuse_an_existing_review_id_and_an_unknown_reso
 
     await db.apply_lifecycle_plan(raising)
     [pending] = await db.list_lifecycle_reviews("src-1", status=LifecycleReviewStatus.PENDING)
-    await db.enable_lifecycle_gate("src-1")
     approval = build_lifecycle_review_approval_plan(pending, await db.get_lifecycle_plan_payload(raising.id))
     unknown = replace(approval, mutations=tuple(
         replace(item, payload={**item.payload, "status": LifecycleReviewStatus.PENDING.value})

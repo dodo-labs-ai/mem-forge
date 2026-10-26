@@ -152,7 +152,6 @@ class Page:
 
 async def seeded_page(db: Database, *paragraphs: str, claim: str = TWO):
     """A page whose first revision states ``paragraphs`` and commits one Memory of ``claim``."""
-    await db.enable_lifecycle_gate(SOURCE_ID)
     page = Page(db)
     await page.commit(ScriptedClient(), page.next(*paragraphs), claim)
     [memory] = await db.list_memories()
@@ -170,7 +169,6 @@ async def support_texts(db: Database, memory_id: str) -> set[str | None]:
 async def seed_jira_issue(db: Database, *, run_id: str, description: str, claims: Sequence[RawMemory]):
     """Commit an issue whose description and comment 501 ("Decision: retain A7") carry ``claims``."""
     await _set_fixture_source_type(db, "jira")
-    await db.enable_lifecycle_gate(SOURCE_ID)
     first = _jira_projection(
         run_id=run_id, description=description, comment_id="501", comment_body="Decision: retain A7",
     )

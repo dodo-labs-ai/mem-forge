@@ -8,10 +8,6 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.evals.agent_evaluation import QualitySignal, bind_quality_signals, evaluate_runtime_events
-from memforge.memory.lifecycle_plan import (
-    LifecycleGate,
-    LifecycleGateState,
-)
 from memforge.server.admin_api import ONLINE_EVALUATION_ROW_LIMIT, create_admin_app
 from memforge.source_item_failures import SourceItemFailure
 
@@ -956,10 +952,6 @@ def test_source_memory_lifecycle_route_exposes_durable_operator_axes(tmp_path):
                 "owner_user_id": "user-a",
             }
 
-        async def get_lifecycle_gate(self, source_id: str) -> LifecycleGate:
-            assert source_id == "src-neutral"
-            return LifecycleGate(source_id=source_id, state=LifecycleGateState.ENABLED)
-
         async def list_lifecycle_reviews(self, source_id: str | None = None, **kwargs) -> list:
             assert source_id == "src-neutral"
             return []
@@ -985,12 +977,6 @@ def test_source_memory_lifecycle_route_exposes_durable_operator_axes(tmp_path):
     assert status.json() == {
         "source_id": "src-neutral",
         "scope_transitions": [],
-        "gate": {
-            "state": "enabled",
-            "reason": None,
-            "audited_at": None,
-            "enabled_at": None,
-        },
         "reviews": [],
         "vector_outbox": [],
     }

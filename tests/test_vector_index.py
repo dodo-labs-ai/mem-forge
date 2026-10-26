@@ -92,13 +92,13 @@ def _memory(memory_id: str, content: str) -> Memory:
 
 
 async def _write_memory(db: Database, config: AppConfig, memory_id: str, content: str) -> None:
-    """Write one Memory and its vector the way a sync does."""
+    """Write one Memory on its own user-memory Document, with its vector."""
     now = datetime.now(timezone.utc)
     await db.upsert_source("src-index", "confluence", "Index", "{}", access_policy="workspace", owner_user_id="dev")
     await db.upsert_document(
         DocumentRecord(
             doc_id=f"doc-{memory_id}",
-            source="src-index",
+            source="user_memory",
             source_url=f"https://docs.example.test/{memory_id}",
             title=memory_id,
             space_or_project="PAY",

@@ -17647,7 +17647,7 @@
     },
     "/api/v1/sources/{source_id}/memory-lifecycle": {
       "get": {
-        "description": "Return independent scope, gate, review, and delivery axes.",
+        "description": "Return independent scope transition, review, and delivery axes.",
         "operationId": "get_source_memory_lifecycle_api_v1_sources__source_id__memory_lifecycle_get",
         "parameters": [
           {
@@ -17686,50 +17686,9 @@
         ]
       }
     },
-    "/api/v1/sources/{source_id}/memory-lifecycle/gate": {
-      "post": {
-        "description": "Enable destructive lifecycle once every active Memory has complete Support.\n\nSources created by this version start enabled. A Source recorded before\nlifecycle gates existed stays gated, and its destructive Reviews cannot\nbe approved, until this check passes.",
-        "operationId": "enable_source_memory_lifecycle_gate_api_v1_sources__source_id__memory_lifecycle_gate_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "source_id",
-            "required": true,
-            "schema": {
-              "title": "Source Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Enable Source Memory Lifecycle Gate",
-        "tags": [
-          "sources"
-        ]
-      }
-    },
     "/api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/approve": {
       "post": {
-        "description": "Use the latest state after gate and stale-guard checks.",
+        "description": "Use the latest state after the stale-guard checks.",
         "operationId": "approve_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__approve_post",
         "parameters": [
           {

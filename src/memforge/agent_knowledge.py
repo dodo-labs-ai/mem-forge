@@ -47,7 +47,6 @@ from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.lifecycle_plan import (
     IncumbentAuthority,
     IncumbentAuthorityGrant,
-    LifecycleGateState,
     LifecycleMutationType,
     LifecyclePlan,
     ReconciliationScope,
@@ -719,9 +718,6 @@ class AgentKnowledgeBundleService:
             )
         if support.unit_ids:
             raise AgentClaimLifecycleConflict("maintenance_closure_active_support")
-        gate = await self.db.get_lifecycle_gate(source_id)
-        if gate.state is not LifecycleGateState.ENABLED:
-            raise AgentClaimLifecycleConflict("maintenance_closure_gate_not_enabled")
 
     async def _retire_claim(
         self,
@@ -779,7 +775,7 @@ class AgentKnowledgeBundleService:
             and mutation.memory_id == old_memory_id
             for mutation in plan.mutations
         ):
-            raise ValueError("agent claim retirement requires an enabled lifecycle gate")
+            raise ValueError("agent claim retirement plan does not retire the claim Memory")
         await self.memory_store.retire_agent_claim_memory(
             old_memory_id=old_memory_id,
             projection=projection,
@@ -1290,11 +1286,9 @@ class AgentKnowledgeBundleService:
             memory_id: await self.db.get_memory_support_set_hash(memory_id)
             for memory_id in incumbents
         }
-        gate = await self.db.get_lifecycle_gate(source_id)
         plan = build_lifecycle_plan(
             plan_id=lifecycle_plan_id(scope),
             scope=scope,
-            gate_state=gate.state,
             operations=tuple(operations),
             incumbents=incumbents,
             source_support_unit_ids=source_support,

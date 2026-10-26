@@ -3,7 +3,8 @@ from dataclasses import replace
 import pytest
 
 from tests.test_evidence_unit_support import db as db, _seed_complete_unit_support
-from tests.unit_support_fixture import active_support_evidence, withdraw_lifecycle_gate
+from tests.lifecycle_review_fixture import hold_for_review
+from tests.unit_support_fixture import active_support_evidence
 
 
 @pytest.mark.asyncio
@@ -74,7 +75,6 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
             id=plan_id, source_id=unit.source_id, source_unit_id=unit.source_lineage_id,
             base_unit_revision_id=unit.doc_revision_id, target_unit_revision_id=unit.doc_revision_id,
         ),
-        gate_state=(await db.get_lifecycle_gate(unit.source_id)).state,
         operations=(ReconcileOperation(
             action=action, memory_id=memory_id,
             memory=RawMemory(content=memory.content, memory_type=memory.memory_type)
@@ -94,15 +94,14 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
 
 
 @pytest.mark.asyncio
-async def test_gated_review_retains_last_successful_support_plan(db):
+async def test_a_pending_review_retains_last_successful_support_plan(db):
     from memforge.models import ReconcileAction
 
     memory_id, unit_id, source_id, _ = await _seed_complete_unit_support(db)
-    await db.enable_lifecycle_gate(source_id)
     for plan_id, action in (("verified-plan", ReconcileAction.NOOP), ("review-plan", ReconcileAction.DELETE)):
-        if action is ReconcileAction.DELETE:
-            await withdraw_lifecycle_gate(db, source_id)
         plan = await _support_plan(db, memory_id, unit_id, plan_id=plan_id, action=action)
+        if action is ReconcileAction.DELETE:
+            plan = hold_for_review(plan, memory_id, action=action)
         await db.apply_lifecycle_plan(plan)
         support = await active_support_evidence(db, memory_id, source_id=source_id)
         assert {item.validation_plan_id for item in support} == {"verified-plan"}
@@ -117,7 +116,6 @@ async def test_shared_evidence_keeps_each_memory_validation_baseline_independent
     from memforge.models import MemorySource, ReconcileAction, content_hash
 
     memory_id, unit_id, source_id, access_hash = await _seed_complete_unit_support(db)
-    await db.enable_lifecycle_gate(source_id)
     memory = await db.get_memory(memory_id)
     unit = await db.get_evidence_unit(unit_id)
     other = replace(memory, id="mem-other", content="Other fixed claim", content_hash=content_hash("Other fixed claim"))

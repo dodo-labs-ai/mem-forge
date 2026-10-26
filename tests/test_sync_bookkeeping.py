@@ -45,7 +45,6 @@ from memforge.memory.lifecycle_planner import (
 from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
-    LifecycleGateState,
     LifecyclePlan,
     ReconciliationScope,
     StaleGuard,
@@ -2780,7 +2779,6 @@ class NoopMemoryEngine:
                 base_unit_revision_id=delta.previous_unit_revision_id,
                 target_unit_revision_id=delta.current_unit_revision_id,
             ),
-            gate_state=LifecycleGateState.GATED,
             coverage_proof=CoverageProof(
                 mandatory_incumbent_ids=(),
                 incumbent_decisions=(),
@@ -2855,7 +2853,7 @@ class NoopMemoryEngine:
         return {"added": 0, "updated": 0, "superseded": 0, "deleted": 0, "noop": 0}
 
     async def apply_projected_tombstone(self, **kwargs):
-        return {"retired": 0, "pending_review": 0, "can_delete_document": True}
+        return {"retired": 0, "can_delete_document": True}
 
 
 class FailingDocumentDeleteMemoryStore(OrchestratorMemoryStore):
@@ -9998,7 +9996,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         access_policy="workspace",
         owner_user_id="dev",
     )
-    await db.enable_lifecycle_gate(source_id)
     adapters = build_sqlite_adapters(db, object())
     memory_store = ReplayMemoryStore(db)
     extractor = OneClaimExtractor()

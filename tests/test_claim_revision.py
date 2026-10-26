@@ -204,7 +204,6 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         candidates=[candidate()],
         incumbents=[memory()],
         support_hashes={"memory": "support"},
-        gate_state="enabled",
         update_mode="incremental",
         changed_hunks=None,
         update_plan_stats=None,
@@ -230,7 +229,7 @@ def test_semantic_assessment_contract_change_invalidates_operation_reuse(monkeyp
         "challenger_is_complete_current_claim",
     ],
 )
-async def test_revision_conditions_map_independently_to_the_lifecycle_gate(condition):
+async def test_each_failed_revision_condition_keeps_the_old_memory(condition):
     client = Client("refines", "challenger_to_candidate")
     original = client.assess_claim_revisions
 

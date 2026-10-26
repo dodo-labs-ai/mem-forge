@@ -51,7 +51,6 @@ async def test_mandatory_provider_failure_preserves_support_and_revision_without
     first = _projection(run_id="diagnostics-before", body="A7 is removed.")
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     support_before = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="diagnostics-after",

@@ -3989,8 +3989,8 @@ class GeneSyncOrchestrator:
         """Remove the held Documents this run proved removable.
 
         For each document, persist an explicit Source Unit tombstone carrying
-        its removal reason, apply a gate-checked complete lifecycle ledger, and
-        only then remove document storage when no review is required. The
+        its removal reason, commit the Unit's complete lifecycle Plan, and then
+        remove document storage unless other document support remains. The
         deletion context records the reason and the evidence that allowed it.
 
         Returns the count, failures, and Source Units whose tombstones committed.
@@ -4113,10 +4113,8 @@ class GeneSyncOrchestrator:
                     )
                 else:
                     logger.warning(
-                        "Retained removed document %s while lifecycle review or "
-                        "document support remains (pending_reviews=%d)",
+                        "Retained removed document %s while other document support remains",
                         doc_id,
-                        lifecycle_result["pending_review"],
                     )
 
                 logger.info("Reconciled removed document %s (%s)", doc_id, title)

@@ -23,7 +23,6 @@ from tests.unit_support_fixture import (
     active_support_evidence,
     primary_reference,
     record_unit_support,
-    withdraw_lifecycle_gate,
 )
 from tests.revision_client_fixture import (
     FixtureRelationDecision,
@@ -86,7 +85,6 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.lifecycle_plan import (
     AuthorityPlanStaleError,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     ProjectedLifecycleDeferredError,
@@ -792,7 +790,7 @@ async def test_lifecycle_commit_rejection_returns_failure_bundle_without_success
 
 
 @pytest.mark.asyncio
-async def test_a_contradiction_of_a_supported_claim_keeps_both_and_gates_the_rebind(
+async def test_a_contradiction_of_a_supported_claim_keeps_both_and_rebinds_the_incumbent(
     db: Database,
 ) -> None:
     first = _projection(
@@ -868,20 +866,15 @@ async def test_a_contradiction_of_a_supported_claim_keeps_both_and_gates_the_reb
     event_window_end = datetime.now(timezone.utc) + timedelta(seconds=1)
 
     # Both claims keep Support: the contradicting Candidate is added beside the kept incumbent.
-    assert (stats["added"], stats["pending_review"]) == (1, 1)
+    assert (stats["added"], stats["pending_review"]) == (1, 0)
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == previous_support
+    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current_support and current_support != previous_support
     memories = {memory.content: memory for memory in await db.list_memories()}
     assert set(memories) == {"Service uses PostgreSQL 15.", "Service uses PostgreSQL 16."}
     assert all(memory.status == "active" for memory in memories.values())
-    # The gated Source holds only the incumbent's rebind to current Evidence for a Review.
-    [review] = await db.list_lifecycle_reviews(
-        "src-1",
-        status=LifecycleReviewStatus.PENDING,
-    )
-    assert review.incumbent_memory_id == incumbent.id
-    assert review.staged_evidence["proposed_disposition"] == "keep"
+    assert await db.list_lifecycle_reviews("src-1") == []
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )
@@ -935,7 +928,6 @@ async def test_additive_refinement_commits_revision_with_candidate_local_evidenc
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    await db.enable_lifecycle_gate("src-1")
 
     second_text = "The client timeout is 30 seconds and is configurable with CLIENT_TIMEOUT."
     second = _projection(
@@ -1025,7 +1017,6 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     incumbents = await db.list_memories()
-    await db.enable_lifecycle_gate("src-1")
 
     current_procedure = (
         "Diagnose an invalid process map from its actual HTTP error, then follow the status-specific recovery path."
@@ -1121,7 +1112,6 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     incumbents = await db.list_memories()
-    await db.enable_lifecycle_gate("src-1")
 
     canonical_procedure = (
         "Diagnose an invalid process map from its actual HTTP error, then follow exactly one "
@@ -1358,7 +1348,6 @@ async def test_an_emptied_page_keeps_only_the_memory_whose_image_the_model_canno
     image_backed = memories["The architecture diagram establishes that A7 remains enabled."]
     text_only = memories["A7 is removed."]
     image_backed_support = await db.get_active_memory_support_unit_ids(image_backed.id)
-    await db.enable_lifecycle_gate("src-1")
 
     second = _projection_with_artifact(
         run_id="projection-artifact-emptied",
@@ -1457,7 +1446,7 @@ async def test_context_artifact_does_not_become_active_support_dependency(
 
 
 @pytest.mark.asyncio
-async def test_removed_artifact_dependency_commits_projection_with_pending_review(
+async def test_removed_artifact_dependency_commits_projection_and_retires_the_memory(
     db: Database,
 ) -> None:
     first = _projection_with_artifact(
@@ -1502,7 +1491,6 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
         source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
     )
     [incumbent] = await db.list_memories()
-    previous_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-artifact-removed",
         body="# Page",
@@ -1536,10 +1524,9 @@ async def test_removed_artifact_dependency_commits_projection_with_pending_revie
     )
 
     current = await db.get_memory(incumbent.id)
-    current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
-    assert current is not None and current.status == "active"
-    assert stats["pending_review"] == 1
-    assert current_support == previous_support
+    assert current is not None and current.status == "retired"
+    assert stats["pending_review"] == 0
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == ()
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
     )
@@ -1595,7 +1582,6 @@ async def test_duplicate_growth_preserves_independent_work_and_atomic_support(
         update_mode="full_document",
     )
     [incumbent] = await db.list_memories()
-    await db.enable_lifecycle_gate("src-1")
     body = f"{incumbent_claim}\n\n{incumbent_claim}\n\n{new_claim}"
     second = _projection(
         run_id="duplicate-target", body=body, prior=first.source_unit_revisions[0],
@@ -2561,7 +2547,6 @@ async def _seed_stale_cross_unit_scenario(
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     alternative_current = _projection(
         run_id=f"{prefix}-alternative-2",
         body="A7 is excluded in the current release.",
@@ -2635,7 +2620,6 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
     incumbent = await _seed_incumbent_support(db, projection=first)
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
 
     second = _projection(
@@ -2678,7 +2662,6 @@ async def test_noop_rebinds_support_to_current_source_revision(db: Database) -> 
     plan = build_lifecycle_plan(
         plan_id="plan-noop-rebind",
         scope=scope,
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
@@ -2779,7 +2762,6 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
     plan = build_lifecycle_plan(
         plan_id="plan-derivation-atomic",
         scope=scope,
-        gate_state=LifecycleGateState.GATED,
         operations=(),
         incumbents={},
         source_support_unit_ids={},
@@ -3078,7 +3060,6 @@ async def test_atomic_projection_lifecycle_fences_other_sqlite_writers_before_ba
             base_unit_revision_id=delta.previous_unit_revision_id,
             target_unit_revision_id=delta.current_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.GATED,
         operations=(),
         incumbents={},
         source_support_unit_ids={},
@@ -3865,7 +3846,6 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
     seeded = await _seed_incumbent_support(db, projection=first)
     incumbent = await db.get_memory(seeded.id)
     assert incumbent is not None
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     original_document = await db.get_document("confluence-123")
     assert original_document is not None
@@ -3886,7 +3866,6 @@ async def test_noop_preserves_stale_support_only_with_explicit_unresolved_skip(
     plan = build_lifecycle_plan(
         plan_id="plan-stale-noop",
         scope=scope,
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
@@ -3987,7 +3966,6 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
     assert unrelated is not None
     reviewed_support = await db.get_active_memory_support_unit_ids(reviewed.id)
     unrelated_support = await db.get_active_memory_support_unit_ids(unrelated.id)
-    await db.enable_lifecycle_gate("src-1")
 
     second = _projection(
         run_id="projection-review-scope-2",
@@ -4006,7 +3984,6 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
     direct = build_lifecycle_plan(
         plan_id="plan-review-support-exemption",
         scope=scope,
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -4064,7 +4041,6 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
-    await db.enable_lifecycle_gate("src-1")
 
     second = _projection(
         run_id="projection-reviewed-support-2",
@@ -4083,7 +4059,6 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
     direct = build_lifecycle_plan(
         plan_id="plan-reviewed-support",
         scope=scope,
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -4132,7 +4107,6 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
     incumbent = await db.get_memory(incumbent.id)
     assert incumbent is not None
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
-    await db.enable_lifecycle_gate("src-1")
 
     changed = _projection(
         run_id="projection-durable-review-2",
@@ -4150,7 +4124,6 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             base_unit_revision_id=changed_delta.previous_unit_revision_id,
             target_unit_revision_id=changed_delta.current_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -4192,7 +4165,6 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             base_unit_revision_id=later_delta.previous_unit_revision_id,
             target_unit_revision_id=later_delta.current_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
@@ -4563,7 +4535,6 @@ async def test_incremental_noop_rebinds_exact_unchanged_claim_without_new_extrac
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-incremental-keep-2",
@@ -4624,7 +4595,6 @@ async def test_incremental_noop_rebinds_complete_unit_to_current_revision(
             repo_identifier=None,
         ),
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     historical_context = "\n\n".join(
         f"Unchanged historical paragraph {index}: " + ("x" * 180)
@@ -4714,7 +4684,6 @@ async def test_noop_rebind_preserves_independent_support_alternative(
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     original_unit_id = f"eu-{incumbent.id}"
     assert set(await db.get_active_memory_support_unit_ids(incumbent.id)) == {
         original_unit_id,
@@ -4787,7 +4756,6 @@ async def test_noop_assesses_each_same_unit_alternative(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     original_unit_id = f"eu-{incumbent.id}"
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert set(old_support) == {original_unit_id, alternative_unit_id}
@@ -4864,7 +4832,6 @@ async def test_noop_postcondition_failure_rolls_back_and_is_non_retryable(
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     await db.db.execute(
         "DELETE FROM memory_sources WHERE memory_id = ? AND doc_id = ?",
@@ -4923,7 +4890,6 @@ async def test_incremental_noop_revalidates_reworded_primary_evidence(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     current_quote = "The A7 slot remains excluded."
     second = _projection(
@@ -4980,7 +4946,6 @@ async def test_incremental_noop_repairs_one_invalid_fragment_selection_in_place(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-primary-selection-repair-2",
         body="The A7 slot remains excluded.",
@@ -5039,7 +5004,6 @@ async def test_noop_revalidation_uses_bounded_fragment_refs_for_large_revision(
         memory_id="mem-b8",
         memory_content="B8 requires approval.",
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = {
         first_memory.id: await db.get_active_memory_support_unit_ids(first_memory.id),
         second_memory.id: await db.get_active_memory_support_unit_ids(second_memory.id),
@@ -5101,7 +5065,6 @@ async def test_incremental_noop_support_selection_that_stays_invalid_is_unresolv
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-primary-bad-quote-2",
         body="The A7 slot remains excluded.",
@@ -5160,7 +5123,6 @@ async def test_incremental_noop_unavailable_support_validation_is_retryable_with
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-primary-validation-unavailable-2",
         body="The A7 slot remains excluded.",
@@ -5205,7 +5167,7 @@ async def test_incremental_noop_unavailable_support_validation_is_retryable_with
 
 
 @pytest.mark.asyncio
-async def test_incremental_noop_invalidated_primary_creates_review(
+async def test_incremental_noop_invalidated_primary_retires_the_memory(
     db: Database,
 ) -> None:
     first = _projection(
@@ -5214,7 +5176,6 @@ async def test_incremental_noop_invalidated_primary_creates_review(
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await withdraw_lifecycle_gate(db, "src-1")
     second = _projection(
         run_id="projection-primary-invalid-2",
         body="A7 is now retained.",
@@ -5246,10 +5207,10 @@ async def test_incremental_noop_invalidated_primary_creates_review(
         source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 1
+    assert stats["pending_review"] == 0
     current = await db.get_memory(incumbent.id)
-    assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current is not None and current.status == "retired"
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
@@ -5262,7 +5223,6 @@ async def test_persistent_incomplete_incumbent_audit_fails_closed_without_mutati
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-indexless-replacement-2",
         body="A7 is now retained.",
@@ -5320,7 +5280,6 @@ async def test_explicit_empty_revision_deterministically_removes_incumbent_suppo
     )
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-empty-2",
         body="",
@@ -5476,7 +5435,6 @@ async def test_partial_jira_projection_assesses_changes_outside_old_evidence(
         observation_index=1,
         source_type="jira",
     )
-    await db.enable_lifecycle_gate("src-1")
     await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-jira-partial-fence-2",
@@ -5550,7 +5508,6 @@ async def test_partial_jira_projection_keeps_support_on_an_unreturned_comment_wi
         observation_index=1,
         source_type="jira",
     )
-    await db.enable_lifecycle_gate("src-1")
     [before] = (await db.get_active_memory_support_evidence_many((incumbent.id,), source_id="src-1"))[incumbent.id]
     # The provider returns a newer comment page that leaves out the comment holding the old Evidence.
     second = _jira_projection(
@@ -5605,7 +5562,6 @@ async def test_partial_jira_projection_keeps_support_on_an_unreturned_comment_wi
 @pytest.mark.asyncio
 async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturned_comment(db: Database) -> None:
     await _set_fixture_source_type(db, "jira")
-    await db.enable_lifecycle_gate("src-1")
     claim, evidence = "A7 is retained for regular payroll.", "Decision: retain A7"
     first = _jira_projection(
         run_id="projection-jira-validated-1",
@@ -5699,7 +5655,6 @@ async def test_only_admitted_candidates_reach_relation_and_rejections_add_nothin
         observation_index=1,
         source_type="jira",
     )
-    await db.enable_lifecycle_gate("src-1")
     description_text = "Payroll validation requires approval before release."
     second = _jira_projection(
         run_id="projection-jira-admission-2",
@@ -5777,7 +5732,6 @@ async def test_new_candidate_keeps_disjoint_incumbent_in_semantic_reconciliation
         observation_index=1,
         source_type="jira",
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _jira_projection(
         run_id="projection-jira-new-candidate-2",
         description="Payroll validation requires approval before release.",
@@ -5886,7 +5840,6 @@ async def test_partial_jira_projection_admits_directly_affected_incumbent_delete
         observation_index=0,
         source_type="jira",
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _jira_projection(
         run_id="projection-jira-partial-affected-2",
         description="A7 is removed.",
@@ -5932,7 +5885,6 @@ async def test_noop_revalidates_revised_required_jira_description(db: Database) 
     )
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     revisions = {item.observation_id: item for item in first.observation_revisions}
     second = _jira_projection(
@@ -6008,7 +5960,6 @@ async def test_noop_duplicate_required_refs_preserve_prior_support_as_unresolved
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
     old_evidence = await active_support_evidence(db, incumbent.id, source_id="src-1")
-    await db.enable_lifecycle_gate("src-1")
     second = _jira_projection(
         run_id="projection-jira-duplicate-selector-2",
         description="A7 remains limited to regular payroll runs.",
@@ -6056,7 +6007,6 @@ async def test_corrupt_pinned_support_aborts_revision_without_mutating_history(d
     first = _projection(run_id="integrity-support-1", body="A7 is removed.\nEdition 1.")
     await db.record_source_projection(first)
     incumbent = await _seed_incumbent_support(db, projection=first)
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="integrity-support-2", body="A7 is removed.\nEdition 2.",
         prior=first.source_unit_revisions[0], prior_observations=_revisions_by_observation(first),
@@ -6107,7 +6057,6 @@ async def test_noop_revalidates_revised_required_jira_description_in_partial_pro
         first,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-v2-jira-required-2",
@@ -6204,7 +6153,6 @@ async def test_noop_commits_support_on_a_member_the_partial_projection_carried(d
         db, projection=first, memory_id="mem-carried-primary", memory_content="A7 is retained for regular payroll.",
         source_type="jira", access_context_hash=_WORKSPACE_ACCESS_CONTEXT_HASH,
     )
-    await db.enable_lifecycle_gate("src-1")
     # The description changed; the comment stating the decision was not returned and is carried unchanged.
     second = _jira_projection(
         run_id="carried-primary-2", description="A7 applies only to regular payroll runs.",
@@ -6260,7 +6208,6 @@ async def test_noop_uses_canonical_field_type_to_resolve_duplicate_text(
         first,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-v2-jira-ambiguous-required-2",
@@ -6321,7 +6268,6 @@ async def test_noop_model_selects_exact_ref_among_repeated_text(
         memory_id="mem-indistinguishable",
         memory_content=claim,
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-v2-indistinguishable-2",
@@ -6360,7 +6306,7 @@ async def test_noop_model_selects_exact_ref_among_repeated_text(
 
 
 @pytest.mark.asyncio
-async def test_noop_semantically_unsupported_current_fragment_stages_review(
+async def test_noop_semantically_unsupported_current_fragment_retires_the_memory(
     db: Database,
 ) -> None:
     access_context_hash = lifecycle_access_context_hash(
@@ -6379,8 +6325,6 @@ async def test_noop_semantically_unsupported_current_fragment_stages_review(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    await withdraw_lifecycle_gate(db, "src-1")
-    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _projection(
         run_id="projection-v2-unpresentable-2",
         body="<!-- no selectable current claim -->",
@@ -6412,66 +6356,11 @@ async def test_noop_semantically_unsupported_current_fragment_stages_review(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 1
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    [review] = await db.list_lifecycle_reviews("src-1")
-    assert review.status is LifecycleReviewStatus.PENDING
-    assert review.status is LifecycleReviewStatus.PENDING
-
-
-@pytest.mark.asyncio
-async def test_pending_review_ignores_unrelated_stale_cross_unit_support(
-    db: Database,
-) -> None:
-    scenario = await _seed_stale_cross_unit_scenario(
-        db,
-        prefix="projection-v2-causal-review",
-    )
-    await withdraw_lifecycle_gate(db, "src-1")
-    second = _projection(
-        run_id="projection-v2-causal-review-2",
-        body="<!-- no selectable current claim -->",
-        prior=scenario.first.source_unit_revisions[0],
-        prior_observations=_revisions_by_observation(scenario.first),
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_OutboxDrainer(db),
-        structured_llm_client=_SupportValidatingNoopClient(
-            scenario.incumbent.id,
-            supported=False,
-        ),
-    )
-
-    stats = await engine.prepare_and_commit_projected_lifecycle(
-        projection=second,
-        doc_id="confluence-123",
-        raw_memories=[],
-        doc_type="design-doc",
-        project_key="ENG",
-        repo_identifier=None,
-        document_content=_body_revision(second).content,
-        update_mode="diff_guided",
-        changed_hunks="supporting claim removed from selectable content",
-        update_plan_stats=None,
-        source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
-    )
-
-    assert stats["pending_review"] == 1
-    assert (
-        scenario.alternative_unit_id
-        in await db.get_active_memory_support_unit_ids(scenario.incumbent.id)
-    )
-    current = await db.get_current_source_unit_revision(
-        scenario.first.source_units[0].id
-    )
-    assert current is not None
-    assert current.id == second.source_unit_revisions[0].id
-    [review] = await db.list_lifecycle_reviews("src-1")
-    assert review.status is LifecycleReviewStatus.PENDING
-    assert review.status is LifecycleReviewStatus.PENDING
+    assert stats["pending_review"] == 0
+    current = await db.get_memory(incumbent.id)
+    assert current is not None and current.status == "retired"
+    assert await db.list_lifecycle_reviews("src-1") == []
+    assert await db.get_active_memory_support_unit_ids(incumbent.id) == ()
 
 
 @pytest.mark.asyncio
@@ -6609,7 +6498,6 @@ async def _revise_shared_memory(db: Database, *, prefix: str, alternative_moved:
         doc_id="confluence-456",
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     if alternative_moved:
         await db.record_source_projection(_projection(
             run_id=f"{prefix}-alternative-2",
@@ -6762,7 +6650,6 @@ async def _keep_unreadable_shared_memory(db: Database, *, prefix: str):
             repo_identifier=None,
         ),
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _projection_with_artifact(
         run_id=f"{prefix}-2",
         payload=b"valid-image-revision-2",
@@ -7043,7 +6930,6 @@ async def test_deferred_plan_rolls_back_every_memory_in_source_unit(
         )
         for memory in (first_memory, second_memory)
     }
-    await db.enable_lifecycle_gate("src-1")
     memory_ids = (first_memory.id, second_memory.id)
     old_support = {
         memory_id: await db.get_active_memory_support_unit_ids(memory_id)
@@ -7088,7 +6974,6 @@ async def test_deferred_plan_rolls_back_every_memory_in_source_unit(
             base_unit_revision_id=first.source_unit_revisions[0].id,
             target_unit_revision_id=target.source_unit_revisions[0].id,
         ),
-        gate_state=LifecycleGateState.ENABLED,
         operations=tuple(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -7206,23 +7091,6 @@ async def test_deferred_commit_rematerializes_without_semantic_replay(
         (scenario.incumbent.repo_identifier, scenario.incumbent.id),
     )
     await db.db.commit()
-    await db.db.execute(
-        "UPDATE source_lifecycle_gates SET state = 'gated' WHERE source_id = ?",
-        ("src-1",),
-    )
-    await db.db.commit()
-    with pytest.raises(
-        ProjectedSupportInvariantError,
-        match="gate changed before commit",
-    ):
-        await engine.retry_deferred_projected_lifecycle(
-            raised.value.handle,
-            eligible_same_run_source_unit_ids={scenario.alternative.source_units[0].id},
-        )
-    await db.db.execute(
-        "UPDATE source_lifecycle_gates SET state = 'enabled' WHERE source_id = ?",
-        ("src-1",),
-    )
     await db.db.execute(
         "UPDATE sources SET access_policy = 'private' WHERE id = ?",
         ("src-1",),
@@ -7371,7 +7239,6 @@ async def test_noop_preserves_multiple_required_parts_in_one_observation(
             "Payroll",
         ),
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     second = _jira_projection(
         run_id="projection-v2-jira-multi-required-2",
@@ -7454,7 +7321,6 @@ async def test_noop_resolves_decoded_canonical_quotes_to_raw_json_ranges(
         primary_excerpt=old_primary,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     new_primary = 'Decision "A7"\n仍然保留。'
     new_required = 'Policy "A7"\n仅适用于常规工资。'
@@ -7545,7 +7411,6 @@ async def test_noop_propagates_representation_compiler_contract_failure(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id="projection-v2-compiler-contract-2",
         body="A7 is removed.\nNew deployment note.",
@@ -7632,7 +7497,6 @@ async def test_noop_propagates_bounded_revalidation_operational_limitation(
         projection=first,
         access_context_hash=access_context_hash,
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _projection(
         run_id=f"projection-v2-{limitation_code.value}-2",
         body="A7 is removed.\nNew deployment note.",
@@ -7714,7 +7578,6 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
         primary_provenance=EvidenceContentProvenance.SOURCE_ARTIFACT,
         source_type="confluence",
     )
-    await db.enable_lifecycle_gate("src-1")
     second = _projection_with_artifact(
         run_id="projection-artifact-primary-2",
         payload=b"stable-diagram",
@@ -7770,7 +7633,7 @@ async def test_noop_revalidates_revised_required_with_artifact_primary(
 
 
 @pytest.mark.asyncio
-async def test_noop_with_invalidated_required_evidence_creates_review(db: Database) -> None:
+async def test_noop_with_invalidated_required_evidence_retires_the_memory(db: Database) -> None:
     await _set_fixture_source_type(db, "jira")
     first = _jira_projection(
         run_id="projection-jira-invalid-required-1",
@@ -7778,7 +7641,6 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
     )
     await db.record_source_projection(first)
     incumbent = await _seed_jira_required_incumbent(db, first)
-    await withdraw_lifecycle_gate(db, "src-1")
     second = _jira_projection(
         run_id="projection-jira-invalid-required-2",
         description="A7 now applies only to off-cycle payroll.",
@@ -7810,10 +7672,10 @@ async def test_noop_with_invalidated_required_evidence_creates_review(db: Databa
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 1
+    assert stats["pending_review"] == 0
     current = await db.get_memory(incumbent.id)
-    assert current is not None and current.status == "active"
-    assert await db.get_active_memory_support_unit_ids(incumbent.id)
+    assert current is not None and current.status == "retired"
+    assert await db.list_lifecycle_reviews("src-1") == []
 
 
 @pytest.mark.asyncio
@@ -9318,8 +9180,7 @@ async def test_new_projected_memory_commit_survives_vector_outbox_delivery_failu
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_gated_direct_source_memory_write_is_rejected(db: Database) -> None:
-    await db.enable_lifecycle_gate("src-1")
+async def test_direct_memory_write_to_a_configured_sources_document_is_rejected(db: Database) -> None:
     memory = Memory(
         id="mem-direct-bypass",
         memory_type="fact",
@@ -9339,6 +9200,45 @@ async def test_lifecycle_gated_direct_source_memory_write_is_rejected(db: Databa
         )
 
     assert await db.get_memory(memory.id) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_memory_write_to_a_user_memory_document_is_allowed(db: Database) -> None:
+    now = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    await db.upsert_document(
+        DocumentRecord(
+            doc_id="user-memory-direct",
+            source="user_memory",
+            source_url="memforge://user-memory/user-memory-direct",
+            title="User memory",
+            space_or_project="UNSORTED",
+            author="owner-1",
+            last_modified=now,
+            labels=["user_memory"],
+            version="1",
+            content_hash="user-memory-direct-hash",
+            token_count=3,
+            last_synced=now,
+        )
+    )
+    memory = Memory(
+        id="mem-user-direct",
+        memory_type="fact",
+        content="The owner wrote this memory directly.",
+        content_hash=content_hash("The owner wrote this memory directly."),
+    )
+
+    await db.insert_memory_with_source_and_relation(
+        memory,
+        doc_id="user-memory-direct",
+        source_type="user_memory",
+        excerpt=memory.content,
+        entity_ids=None,
+        relation_outcome=None,
+        source_updated_at=None,
+    )
+
+    assert await db.get_memory(memory.id) is not None
 
 
 @pytest.mark.asyncio
@@ -9378,7 +9278,7 @@ async def test_direct_terminal_transition_rejects_active_source_support(db: Data
 
 
 @pytest.mark.asyncio
-async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Database) -> None:
+async def test_source_revision_supersedes_incumbent_in_one_atomic_plan(db: Database) -> None:
     first = _projection(
         run_id="projection-1",
         body="A7 is removed.",
@@ -9448,7 +9348,6 @@ async def test_enabled_source_supersedes_incumbent_in_one_atomic_plan(db: Databa
             ),
         ),
     )
-    await db.enable_lifecycle_gate("src-1")
 
     entity_id = await db.upsert_entity("A7", "A7")
     await db.upsert_source(
@@ -9756,11 +9655,10 @@ async def test_exact_replay_schema_is_removed(db: Database) -> None:
 
 
 @pytest.mark.asyncio
-async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Database) -> None:
+async def test_tombstone_retires_last_supported_incumbent(db: Database) -> None:
     initial = _projection(run_id="projection-before-delete", body="A7 is removed.")
     await db.record_source_projection(initial)
     incumbent = await _seed_incumbent_support(db, projection=initial)
-    await db.enable_lifecycle_gate("src-1")
     tombstone = project_source_unit_tombstone(
         source_type="confluence",
         run_id="projection-delete",
@@ -9786,7 +9684,7 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
 
     retired = await db.get_memory(incumbent.id)
     assert retired is not None and retired.status == "retired"
-    assert result == {"retired": 1, "pending_review": 0, "can_delete_document": True}
+    assert result == {"retired": 1, "can_delete_document": True}
     assert await db.list_lifecycle_vector_tasks() == []
 
     await db.delete_projected_document("confluence-123", source_id=initial.source_id)
@@ -9795,41 +9693,6 @@ async def test_enabled_source_tombstone_retires_last_supported_incumbent(db: Dat
     assert await db.get_memory_sources(incumbent.id) == []
     assert await db.get_evidence_unit(f"eu-{incumbent.id}") is not None
     assert await db.get_source_projection(initial.run_id) == initial
-
-
-@pytest.mark.asyncio
-async def test_gated_source_tombstone_only_opens_review(db: Database) -> None:
-    initial = _projection(run_id="projection-before-gated-delete", body="A7 is removed.")
-    await db.record_source_projection(initial)
-    incumbent = await _seed_incumbent_support(db, projection=initial)
-    tombstone = project_source_unit_tombstone(
-        source_type="confluence",
-        run_id="projection-gated-delete",
-        source_unit=initial.source_units[0],
-        prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={revision.observation_id: revision for revision in initial.observation_revisions},
-        reason="not_returned_by_authoritative_snapshot",
-    )
-    adapters = build_sqlite_adapters(db, object())
-    engine = MemoryEngine(
-        cross_document_candidates=_candidate_retriever(adapters),
-        db=db,
-        memory_store=_OutboxDrainer(db),
-        structured_llm_client=AdmittingClient(),
-    )
-
-    result = await engine.apply_projected_tombstone(
-        projection=tombstone,
-        doc_id="confluence-123",
-        reason="not_returned_by_authoritative_snapshot",
-        lifecycle_cycle_id="gated-source-removal",
-    )
-
-    active = await db.get_memory(incumbent.id)
-    assert active is not None and active.status == "active"
-    assert result == {"retired": 0, "pending_review": 1, "can_delete_document": False}
-    with pytest.raises(ValueError, match="active document support remains"):
-        await db.delete_projected_document("confluence-123", source_id=initial.source_id)
 
 
 @pytest.mark.asyncio
@@ -9874,11 +9737,7 @@ async def test_tombstone_retains_document_when_unmapped_provenance_remains(
         lifecycle_cycle_id="unmapped-source-removal",
     )
 
-    assert result == {
-        "retired": 0,
-        "pending_review": 0,
-        "can_delete_document": False,
-    }
+    assert result == {"retired": 0, "can_delete_document": False}
     assert await db.get_document("confluence-123") is not None
     assert [source.doc_id for source in await db.get_memory_sources(memory.id)] == ["confluence-123"]
 
@@ -9899,7 +9758,6 @@ async def test_reused_evidence_advances_only_support_validation_plan_across_revi
     incumbent = await _seed_exact_incumbent_support(
         db, projection=first, memory_id="mem-baseline", memory_content="A7 remains excluded.",
     )
-    await db.enable_lifecycle_gate("src-1")
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(
         cross_document_candidates=_candidate_retriever(adapters), db=db,
@@ -10049,7 +9907,6 @@ async def test_an_undecided_claim_keeps_what_was_verified_and_resumes_after_sour
     continued = await _seed_exact_incumbent_support(
         db, projection=first, memory_id="mem-continued", memory_content=continued_claim,
     )
-    await db.enable_lifecycle_gate("src-1")
     adapters = build_sqlite_adapters(db, object())
     client = SelectiveSupportClient()
     client.assessments = []
@@ -10194,7 +10051,6 @@ async def _exact_support_engine(
     """Seed legacy Support on ``first`` and return an engine; the first advance records exact digests."""
     await db.record_source_projection(first)
     incumbent = await _seed_exact_incumbent_support(db, projection=first, memory_id=memory_id, memory_content=claim)
-    await db.enable_lifecycle_gate("src-1")
     client = client_type(incumbent.id)
     adapters = build_sqlite_adapters(db, object())
     engine = MemoryEngine(

@@ -19,7 +19,6 @@ from fastapi import Request
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.memory.lifecycle_plan import LifecycleGateState
 from memforge.models import (
     Memory,
     SHARED_PROJECT_KEY,
@@ -666,16 +665,9 @@ def test_create_source_round_trips_project_binding(tmp_path):
             assert resp.status_code == 200, resp.text
             source_id = resp.json()["id"]
 
-        async def _read():
-            return (
-                await database.get_source(source_id),
-                await database.get_lifecycle_gate(source_id),
-            )
-
-        stored, gate = asyncio.run(_read())
+        stored = asyncio.run(database.get_source(source_id))
         assert stored is not None
         assert stored["project_binding"] == binding
-        assert gate.state is LifecycleGateState.ENABLED
     finally:
         asyncio.run(database.close())
 

@@ -7,7 +7,6 @@ import pytest
 from memforge.memory.lifecycle_plan import (
     IncumbentAuthority,
     IncumbentAuthorityGrant,
-    LifecycleGateState,
     LifecycleMutation,
     LifecycleMutationType,
     LifecycleReview,
@@ -70,12 +69,11 @@ def _defaults() -> NewMemoryDefaults:
     )
 
 
-def _build(*, gate: LifecycleGateState, all_support=("eu-old",), defaults=None):
+def _build(*, all_support=("eu-old",), defaults=None):
     old = _memory()
     return build_lifecycle_plan(
         plan_id="plan-1",
         scope=_scope(),
-        gate_state=gate,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.SUPERSEDE,
@@ -94,25 +92,17 @@ def _build(*, gate: LifecycleGateState, all_support=("eu-old",), defaults=None):
     )
 
 
-def test_gated_replacement_stages_review_without_mutating_incumbent() -> None:
-    plan = _build(gate=LifecycleGateState.GATED)
-
-    assert [item.mutation_type for item in plan.mutations] == [
-        LifecycleMutationType.CREATE_REVIEW,
-    ]
-    assert plan.coverage_proof.incumbent_decisions[0].disposition.value == "review"
-    staged = plan.mutations[0].payload["staged_evidence"]
-    assert [item["mutation_type"] for item in staged["proposed_mutations"]] == [
-        "create_memory",
-        "attach_support",
-        "remove_support",
-        "supersede_memory",
-    ]
-    create_payload = staged["proposed_mutations"][0]["payload"]["memory"]
-    assert create_payload["document_source"]["excerpt"] == "A7 is retained"
-    assert "authority" not in lifecycle_plan_to_payload(plan)["coverage_proof"][
-        "incumbent_decisions"
-    ][0]
+def _review_plan():
+    """A Review holding the local replacement of the old Memory."""
+    direct = _build()
+    [request] = direct.relation_discovery_requests
+    return hold_for_review(
+        direct,
+        "mem-old",
+        action=ReconcileAction.SUPERSEDE,
+        candidate=_replacement(),
+        replacement_memory_id=request.memory_id,
+    )
 
 
 def test_unsupported_destructive_incumbent_still_fails_without_explicit_owner_authority() -> None:
@@ -125,7 +115,6 @@ def test_unsupported_destructive_incumbent_still_fails_without_explicit_owner_au
         build_lifecycle_plan(
             plan_id="plan-unsupported-ordinary",
             scope=_scope(),
-            gate_state=LifecycleGateState.ENABLED,
             operations=(
                 ReconcileOperation(
                     action=ReconcileAction.SUPERSEDE,
@@ -150,7 +139,6 @@ def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support()
     plan = build_lifecycle_plan(
         plan_id="plan-unsupported-owner",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.SUPERSEDE,
@@ -187,7 +175,7 @@ def test_explicit_owner_managed_claim_authority_does_not_fabricate_old_support()
     )
 
 
-def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -> None:
+def test_noop_evidence_rebind_moves_this_units_support_and_keeps_the_memory() -> None:
     old = _memory()
     candidate = RawMemory(
         content=old.content,
@@ -199,7 +187,6 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
     plan = build_lifecycle_plan(
         plan_id="plan-noop-rebind",
         scope=_scope(),
-        gate_state=LifecycleGateState.GATED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.NOOP,
@@ -218,27 +205,24 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
     )
 
     assert [item.mutation_type for item in plan.mutations] == [
-        LifecycleMutationType.CREATE_REVIEW,
+        LifecycleMutationType.REMOVE_SUPPORT,
+        LifecycleMutationType.ATTACH_SUPPORT,
     ]
-    assert plan.coverage_proof.incumbent_decisions[0].disposition.value == "review"
-    proposed = plan.mutations[0].payload["staged_evidence"]["proposed_mutations"]
-    assert [item["mutation_type"] for item in proposed] == [
-        "remove_support",
-        "attach_support",
-    ]
-    assert proposed[0]["evidence_unit_ids"] == ["eu-old"]
-    assert proposed[1]["evidence_unit_ids"] == ["eu-new"]
+    assert plan.mutations[0].evidence_unit_ids == ("eu-old",)
+    assert plan.mutations[1].evidence_unit_ids == ("eu-new",)
+    assert plan.coverage_proof.incumbent_decisions[0].disposition.value == "keep"
 
-    mutation = plan.mutations[0]
+    held = hold_for_review(plan, old.id, action=ReconcileAction.NOOP, candidate=candidate)
+    [mutation] = held.mutations
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
-        lifecycle_plan_id=plan.id,
+        lifecycle_plan_id=held.id,
         incumbent_memory_id=mutation.memory_id,
         status=LifecycleReviewStatus.PENDING,
         staged_evidence=mutation.payload["staged_evidence"],
         reason=str(mutation.payload["reason"]),
     )
-    approval = build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(plan))
+    approval = build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(held))
 
     assert [item.mutation_type for item in approval.mutations] == [
         LifecycleMutationType.RESOLVE_REVIEW,
@@ -249,7 +233,7 @@ def test_gated_noop_evidence_rebind_stages_review_without_mutating_incumbent() -
 
 
 def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
-    original = _build(gate=LifecycleGateState.GATED)
+    original = _review_plan()
     mutation = original.mutations[0]
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
@@ -262,7 +246,6 @@ def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
 
     approval = build_lifecycle_review_approval_plan(review, lifecycle_plan_to_payload(original))
 
-    assert approval.gate_state is LifecycleGateState.ENABLED
     assert approval.coverage_proof.mandatory_incumbent_ids == ("mem-old",)
     assert [item.mutation_type for item in approval.mutations] == [
         LifecycleMutationType.RESOLVE_REVIEW,
@@ -291,7 +274,7 @@ def test_pending_review_builds_fresh_atomic_approval_plan() -> None:
 
 
 def test_review_proposing_support_without_evidence_units_fails_its_stale_guard() -> None:
-    original = _build(gate=LifecycleGateState.GATED)
+    original = _review_plan()
     mutation = original.mutations[0]
     staged_evidence = dict(mutation.payload["staged_evidence"])
     staged_evidence["proposed_mutations"] = [
@@ -316,7 +299,7 @@ def test_review_proposing_support_without_evidence_units_fails_its_stale_guard()
 
 
 def test_review_proposing_a_retired_mutation_type_fails_its_stale_guard() -> None:
-    original = _build(gate=LifecycleGateState.GATED)
+    original = _review_plan()
     mutation = original.mutations[0]
     staged_evidence = dict(mutation.payload["staged_evidence"])
     staged_evidence["proposed_mutations"] = [
@@ -338,10 +321,9 @@ def test_review_proposing_a_retired_mutation_type_fails_its_stale_guard() -> Non
 
 def test_pending_review_without_activation_does_not_enqueue_relation_discovery() -> None:
     old = _memory()
-    original = build_lifecycle_plan(
+    direct = build_lifecycle_plan(
         plan_id="plan-delete-review",
         scope=_scope(),
-        gate_state=LifecycleGateState.GATED,
         operations=(
             ReconcileOperation(
                 action=ReconcileAction.DELETE,
@@ -357,7 +339,8 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
         new_evidence_unit_ids=(),
         defaults=_defaults(),
     )
-    mutation = original.mutations[0]
+    original = hold_for_review(direct, old.id, action=ReconcileAction.DELETE)
+    [mutation] = original.mutations
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
         lifecycle_plan_id=original.id,
@@ -377,10 +360,7 @@ def test_pending_review_without_activation_does_not_enqueue_relation_discovery()
 
 def _shared_support_review_plan():
     """A Review holding the revision of an old Memory that another Source Unit also supports."""
-    direct = _build(
-        gate=LifecycleGateState.ENABLED,
-        all_support=("eu-old", "eu-other-source"),
-    )
+    direct = _build(all_support=("eu-old", "eu-other-source"))
     [request] = direct.relation_discovery_requests
     return hold_for_review(
         direct,
@@ -407,14 +387,12 @@ def test_stale_review_refresh_creates_only_a_new_pending_decision() -> None:
     refreshed, refreshed_review_id = build_lifecycle_review_refresh_plan(
         review,
         lifecycle_plan_to_payload(original),
-        gate_state=LifecycleGateState.ENABLED,
         current_support_set_hash="current-support-hash",
         current_memory_version=lifecycle_memory_version(_memory()),
     )
     retried, retried_review_id = build_lifecycle_review_refresh_plan(
         review,
         lifecycle_plan_to_payload(original),
-        gate_state=LifecycleGateState.ENABLED,
         current_support_set_hash="current-support-hash",
         current_memory_version=lifecycle_memory_version(_memory()),
     )
@@ -449,14 +427,13 @@ def test_refresh_rejects_a_non_stale_lifecycle_review() -> None:
         build_lifecycle_review_refresh_plan(
             review,
             lifecycle_plan_to_payload(original),
-            gate_state=LifecycleGateState.ENABLED,
             current_support_set_hash="current-support-hash",
             current_memory_version=lifecycle_memory_version(_memory()),
         )
 
 
 def test_refresh_rejects_a_terminal_proposal_that_needs_replanning() -> None:
-    original = _build(gate=LifecycleGateState.GATED)
+    original = _review_plan()
     mutation = original.mutations[0]
     review = LifecycleReview(
         id=str(mutation.payload["review_id"]),
@@ -472,14 +449,13 @@ def test_refresh_rejects_a_terminal_proposal_that_needs_replanning() -> None:
         build_lifecycle_review_refresh_plan(
             review,
             lifecycle_plan_to_payload(original),
-            gate_state=LifecycleGateState.ENABLED,
             current_support_set_hash="changed-support-hash",
             current_memory_version=lifecycle_memory_version(_memory()),
         )
 
 
-def test_enabled_local_replacement_is_create_attach_remove_supersede() -> None:
-    plan = _build(gate=LifecycleGateState.ENABLED)
+def test_local_replacement_is_create_attach_remove_supersede() -> None:
+    plan = _build()
 
     assert [item.mutation_type for item in plan.mutations] == [
         LifecycleMutationType.CREATE_MEMORY,
@@ -495,7 +471,6 @@ def test_enabled_local_replacement_is_create_attach_remove_supersede() -> None:
 
 def test_private_lifecycle_plan_persists_owner_as_relation_discovery_actor() -> None:
     plan = _build(
-        gate=LifecycleGateState.ENABLED,
         defaults=replace(
             _defaults(),
             visibility="private",
@@ -510,7 +485,6 @@ def test_private_lifecycle_plan_persists_owner_as_relation_discovery_actor() -> 
 
 def test_revising_a_memory_another_unit_supports_removes_only_this_units_support() -> None:
     plan = _build(
-        gate=LifecycleGateState.ENABLED,
         all_support=("eu-old", "eu-other-source"),
     )
 
@@ -535,7 +509,6 @@ def test_planner_rejects_incomplete_incumbent_ledger() -> None:
         build_lifecycle_plan(
             plan_id="plan-1",
             scope=_scope(),
-            gate_state=LifecycleGateState.ENABLED,
             operations=(),
             incumbents={old.id: old},
             source_support_unit_ids={old.id: ("eu-old",)},
@@ -553,7 +526,6 @@ def test_an_add_restating_a_kept_old_memory_creates_its_own_memory() -> None:
     plan = build_lifecycle_plan(
         plan_id="plan-restated",
         scope=_scope(),
-        gate_state=LifecycleGateState.ENABLED,
         operations=(
             ReconcileOperation(action=ReconcileAction.ADD, memory=candidate),
             ReconcileOperation(action=ReconcileAction.NOOP, memory_id=old.id),
@@ -577,7 +549,7 @@ def test_an_add_restating_a_kept_old_memory_creates_its_own_memory() -> None:
 
 
 def test_plan_rejects_a_support_attachment_outside_its_incumbents_and_creations() -> None:
-    plan = _build(gate=LifecycleGateState.ENABLED)
+    plan = _build()
     outside = LifecycleMutation(
         LifecycleMutationType.ATTACH_SUPPORT,
         memory_id="mem-other-unit",

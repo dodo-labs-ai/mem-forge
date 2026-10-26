@@ -11,7 +11,6 @@ import pytest_asyncio
 
 from memforge.memory.lifecycle_plan import (
     CoverageProof,
-    LifecycleGateState,
     LifecyclePlan,
     ReconciliationScope,
     StaleGuard,
@@ -359,7 +358,6 @@ async def test_projected_lifecycle_rejects_a_superseded_sync_attempt(
             base_unit_revision_id=None,
             target_unit_revision_id=delta.current_unit_revision_id,
         ),
-        gate_state=LifecycleGateState.GATED,
         coverage_proof=CoverageProof((), (), (), ()),
         stale_guard=StaleGuard((), {}),
         mutations=(),
