@@ -406,7 +406,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
                 {
                     "id": "src-paused",
                     "source_id": "src-paused",
-                    "name": "TeamAlpha Defects",
+                    "name": "Alpha Defects",
                     "type": "jira",
                     "status": "paused",
                     "doc_count": 68,
@@ -447,7 +447,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
             "data": [
                 {
                     "source_id": "src-alpha",
-                    "name": "TeamAlpha Defects",
+                    "name": "Alpha Defects",
                     "type": "jira",
                     "status": "active",
                     "doc_count": 68,

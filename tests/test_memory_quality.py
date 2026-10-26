@@ -1760,7 +1760,7 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 
     await db.upsert_source(
-        "src-alpha", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev"
+        "src-alpha", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev"
     )
 
     calls = []

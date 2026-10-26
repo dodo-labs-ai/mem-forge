@@ -390,7 +390,7 @@ async def test_search_path_uses_entity_linker_not_legacy_query_analysis(db, monk
 async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "PAYR-179397",
@@ -421,7 +421,7 @@ async def test_search_recalls_memory_from_source_title_metadata(db, monkeypatch)
         "matched_fields": ["metadata_any"],
         "matched_text": [
             "PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment | "
-            "PAYR-179397 | PAY | TeamAlpha Defects | https://x/PAYR-179397"
+            "PAYR-179397 | PAY | Alpha Defects | https://x/PAYR-179397"
         ],
         "matched_terms": ["create", "blocker", "hint"],
         "term_coverage": 1.0,
@@ -564,7 +564,7 @@ async def test_exact_quoted_title_is_an_anchor_without_requested_known_item(
 async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "PAYR-179397",
@@ -596,7 +596,7 @@ async def test_search_recalls_compound_query_from_metadata_trigram(db, monkeypat
 async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeypatch):
     shared = _memory("m-shared", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(shared)
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.upsert_source(
         "src-wiki", "confluence", "Payroll Wiki", "{}", access_policy="workspace", owner_user_id="dev"
     )
@@ -640,7 +640,7 @@ async def test_source_filter_prevents_non_matching_metadata_evidence(db, monkeyp
 async def test_rerank_prompt_includes_metadata_evidence_for_metadata_hits(db, monkeypatch):
     target = _memory("m-blocker", "Lifecycle assignment skips person assignment creation")
     await db.insert_memory(target)
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _document(
         db,
         "PAYR-179397",

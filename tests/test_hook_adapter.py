@@ -1721,7 +1721,7 @@ def test_mcp_proxy_forwards_list_sources_to_searchable_sources(monkeypatch):
 
         def read(self, _size=-1):
             return (
-                b'{"data":[{"source_id":"src-alpha","name":"TeamAlpha Defects",'
+                b'{"data":[{"source_id":"src-alpha","name":"Alpha Defects",'
                 b'"type":"jira","status":"active","doc_count":68,"memory_count":199,'
                 b'"last_synced_at":"2026-06-27T00:00:00Z"}]}'
             )

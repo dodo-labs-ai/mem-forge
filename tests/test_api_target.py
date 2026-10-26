@@ -50,7 +50,7 @@ def test_unified_v1_target_adds_explicit_workspace_as_query_parameter():
         workspace_id="team alpha/blue",
     ) == (
         "https://self.example/api/v1/memories/search"
-        "?include_private=true&workspace_id=mount+tai%2Fblue"
+        "?include_private=true&workspace_id=team+alpha%2Fblue"
     )
 
 
