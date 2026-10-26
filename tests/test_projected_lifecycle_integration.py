@@ -534,7 +534,7 @@ class _ReplacementClient(RevisionClientFixture):
     def __init__(self, incumbent_id: str) -> None:
         self.incumbent_id = incumbent_id
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         return _uniform_relation_response(
             prompt,
@@ -553,7 +553,7 @@ class _ReplacementClient(RevisionClientFixture):
 
 
 class _ConflictingReplacementClient(RevisionClientFixture):
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         return _uniform_relation_response(
             prompt,
@@ -572,7 +572,7 @@ class _ConflictingReplacementClient(RevisionClientFixture):
 
 
 class _AdditiveRevisionClient(RevisionClientFixture):
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
             "\n</memory_pair_groups>",
@@ -617,7 +617,7 @@ class _AdditiveRevisionClient(RevisionClientFixture):
 
 
 class _RunbookComponentFallbackClient(RevisionClientFixture):
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         groups_json = prompt.split("<memory_pair_groups>\n", 1)[1].split(
             "\n</memory_pair_groups>",
@@ -711,7 +711,7 @@ class _DeleteClient(RevisionClientFixture):
 
 
 class _UnexpectedReconciliationClient(RevisionClientFixture):
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del prompt, kwargs
         raise AssertionError("proven-disjoint incumbent must not require LLM reconciliation")
 
@@ -1537,7 +1537,7 @@ class _RecordingAddClient(RevisionClientFixture):
         self.incumbent_id = incumbent_id
         self.prompts: list[str] = []
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         self.prompts.append(prompt)
         return _uniform_relation_response(
@@ -2098,7 +2098,7 @@ class _SemanticEquivalentClient(RevisionClientFixture):
         del prompt, kwargs
         return _audit_response(SupportJudgment(supported=True, reason="still supported"))
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         self.relation_calls += 1
         groups = prompt.split("<memory_pair_groups>\n", 1)[1].split(
@@ -9857,7 +9857,7 @@ async def test_an_undecided_claim_keeps_what_was_verified_and_resumes_after_sour
                     return False
             return super().request_fits(prompt, **kwargs)
 
-        async def classify_memory_relations(self, prompt, **kwargs):
+        async def classify_same_unit_pairs(self, prompt, **kwargs):
             return _uniform_relation_response(
                 prompt, classification="unrelated", reason="A7 exclusion and B8 approval are distinct rules",
             )
@@ -10216,7 +10216,7 @@ class _CorrectingReprocessClient(_WholeUnitReadingClient):
             supported=self.supported, reason="The page states the claim." if self.supported else "Another issue.",
         ))
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         del kwargs
         return _uniform_relation_response(prompt, classification="contradicts", reason="The Candidate names PAY-1.")
 
@@ -10327,7 +10327,7 @@ async def test_transient_support_failure_leaves_revision_uncommitted_and_retry_c
                 )
             return await super().evaluate_revision_work(prompt, response_format=response_format, **kwargs)
 
-        async def classify_memory_relations(self, prompt, **kwargs):
+        async def classify_same_unit_pairs(self, prompt, **kwargs):
             return _uniform_relation_response(prompt, classification="unrelated", reason="Distinct approval rules")
 
     claim = "B8 requires approval."

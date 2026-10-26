@@ -27,7 +27,7 @@ from memforge.llm.structured import (
     EntityBatchValidationDecision,
     EntityBatchValidationResponse,
     LiteLlmStructuredClient,
-    MemoryRelationResponse,
+    SameUnitPairResponse,
     OfflineSemanticJudgeResponse,
     ProjectionFragmentMemoryExtractionResponse,
     RerankResponse,
@@ -771,7 +771,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "ClaimRevisionWireResponse": '{"results":[]}',
         "ProjectionFragmentMemoryExtractionResponse": '{"memories":[]}',
         "CandidateAdmissionResponse": '{"decisions":[]}',
-        "MemoryRelationResponse": '{"decisions":[]}',
+        "SameUnitPairResponse": '{"decisions":[]}',
         "RefinementVerificationResponse": '{"decisions":[]}',
         "RelationCandidateResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
@@ -804,7 +804,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
         "admit_candidates": lambda: client.admit_candidates("prompt"),
-        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "classify_same_unit_pairs": lambda: client.classify_same_unit_pairs("prompt"),
         "verify_refinements": lambda: client.verify_refinements("prompt"),
         "classify_relation_candidates": lambda: client.classify_relation_candidates("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
@@ -1102,7 +1102,7 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
             return CompletionResponse(
                 '{"decisions":[{"mention":"acme","matched_id":7,"confidence":0.95}]}'
             )
-        if schema is MemoryRelationResponse:
+        if schema is SameUnitPairResponse:
             return CompletionResponse(
                 '{"decisions":[{"pair_index":0,"classification":"refines"}]}'
             )
@@ -1122,24 +1122,24 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     )
 
     assert (await client.admit_candidates("prompt")).decisions[0].verdict == "ADMITTED"
-    assert (await client.classify_memory_relations("prompt")).decisions[0].classification == "refines"
+    assert (await client.classify_same_unit_pairs("prompt")).decisions[0].classification == "refines"
     assert (await client.validate_entity_batch("prompt")).decisions[0].matched_id == 7
     assert (await client.rerank_memories("prompt")).ranking == [2, 0, 1]
 
     assert [call["response_format"] for call in calls] == [
         CandidateAdmissionResponse,
-        MemoryRelationResponse,
+        SameUnitPairResponse,
         EntityBatchValidationResponse,
         RerankResponse,
     ]
 
 
 def test_memory_relation_decision_holds_only_the_label() -> None:
-    response = MemoryRelationResponse.model_validate(
+    response = SameUnitPairResponse.model_validate(
         {"decisions": [{"pair_index": 0, "classification": "contradicts"}]}
     )
     assert response.decisions[0].classification == "contradicts"
-    assert set(MemoryRelationResponse.model_json_schema()["$defs"]["MemoryRelationDecision"]["properties"]) == {
+    assert set(SameUnitPairResponse.model_json_schema()["$defs"]["SameUnitPairDecision"]["properties"]) == {
         "pair_index", "classification",
     }
 

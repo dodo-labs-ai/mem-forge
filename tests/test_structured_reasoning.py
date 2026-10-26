@@ -108,7 +108,7 @@ def _recording(*responses):
 
 async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
     calls = {
-        "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
+        "classify_same_unit_pairs": lambda: client.classify_same_unit_pairs("prompt"),
         "classify_relation_candidates": lambda: client.classify_relation_candidates("prompt"),
         "change_impact": lambda: client.evaluate_revision_work(
             "prompt", response_format=ChangeImpactWireResponse),
@@ -129,7 +129,7 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
 
 
 DIRECT_ANSWER_OPERATIONS = (
-    "classify_memory_relations",
+    "classify_same_unit_pairs",
     "classify_relation_candidates",
     "change_impact",
     "admit_candidates",

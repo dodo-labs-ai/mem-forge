@@ -398,7 +398,7 @@ class CandidateAdmissionResponse(StructuredResponseModel):
     decisions: list[CandidateAdmissionDecision]
 
 
-class MemoryRelationAssessment(StructuredResponseModel):
+class SameUnitRelationAssessment(StructuredResponseModel):
     """A semantic relationship with its applicable direction and conflict proof."""
 
     model_config = ConfigDict(extra="ignore")
@@ -430,8 +430,8 @@ class MemoryRelationAssessment(StructuredResponseModel):
         return None
 
 
-class MemoryRelationDecision(StructuredResponseModel):
-    """One memory relation label for one application-issued pair slot."""
+class SameUnitPairDecision(StructuredResponseModel):
+    """One same-Unit relation label for one application-issued pair slot."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -439,13 +439,13 @@ class MemoryRelationDecision(StructuredResponseModel):
     classification: Literal["equivalent", "refines", "contradicts", "unrelated"]
 
 
-class MemoryRelationResponse(StructuredResponseModel):
+class SameUnitPairResponse(StructuredResponseModel):
     """Schema for a complete batch of exact Memory-pair decisions."""
 
     model_config = ConfigDict(extra="ignore")
     direct_answer = True
 
-    decisions: list[MemoryRelationDecision]
+    decisions: list[SameUnitPairDecision]
 
 
 class RefinementVerificationDecision(StructuredResponseModel):
@@ -508,7 +508,7 @@ class ClaimRevisionDecision(StructuredResponseModel):
 
     pair_index: int = Field(ge=0)
     status: Literal["resolved", "insufficient"]
-    relation: MemoryRelationAssessment | None = None
+    relation: SameUnitRelationAssessment | None = None
     revision_assessment: RevisionAssessment | None = None
     reason: str = Field(default="", max_length=1000)
 
@@ -556,7 +556,7 @@ class ClaimRevisionWireDecision(StructuredResponseModel):
         return ClaimRevisionDecision(
             pair_index=0, status="resolved", reason=self.reason,
             revision_assessment=self.revision_assessment,
-            relation=MemoryRelationAssessment(
+            relation=SameUnitRelationAssessment(
                 classification="refines" if refinement else self.relation,
                 direction=self.relation.removeprefix("refines_") if refinement else "symmetric",
                 same_subject_and_scope=self.contradiction is not None,
@@ -2020,15 +2020,15 @@ class LiteLlmStructuredClient:
     ) -> RefinementVerificationResponse:
         return await self._call_schema(prompt=prompt, response_format=RefinementVerificationResponse, model=model)
 
-    async def classify_memory_relations(
+    async def classify_same_unit_pairs(
         self,
         prompt: str,
         *,
         model: str | None = None,
-    ) -> MemoryRelationResponse:
+    ) -> SameUnitPairResponse:
         return await self._call_schema(
             prompt=prompt,
-            response_format=MemoryRelationResponse,
+            response_format=SameUnitPairResponse,
             model=model,
         )
 

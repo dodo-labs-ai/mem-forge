@@ -23,6 +23,10 @@
   `list_active_memory_relation_dismissals`, and
   `complete_relation_discovery_work` takes `memory_relations`. The admin API's label schema is
   `MemoryRelationLabel`, and the MCP tool descriptions say memory relations.
+  The same-Unit Relation that reconciliation judges keeps its own names:
+  `SameUnitRelationType`, `SameUnitRelationAssessment`, `SameUnitPairDecision`,
+  `SameUnitPairResponse` and the structured client method
+  `classify_same_unit_pairs`.
   Stored tables, contract versions, audit events, error codes and HTTP and MCP
   field names are unchanged, so no migration runs. Cloud: the HANA adapter, the
   core-integration `WorkspaceDatabase` and the runtime provider take the new

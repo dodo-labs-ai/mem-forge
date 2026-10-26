@@ -10444,7 +10444,7 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
 
     class AuditingEngine(NoopMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):
-            await client.classify_memory_relations("audit")
+            await client.classify_same_unit_pairs("audit")
             raise AssertionError("failed mandatory audit must not commit")
 
     orchestrator = GeneSyncOrchestrator(

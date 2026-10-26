@@ -59,7 +59,7 @@ class ScriptedClient(RevisionClientFixture):
         self.impact = impact
         self.support_requests: list[dict] = []
 
-    async def classify_memory_relations(self, prompt: str, **kwargs):
+    async def classify_same_unit_pairs(self, prompt: str, **kwargs):
         groups = json.loads(prompt.split("<memory_pair_groups>\n", 1)[1].split("\n</memory_pair_groups>", 1)[0])
         decisions = []
         for group in groups:

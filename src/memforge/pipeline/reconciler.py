@@ -28,7 +28,7 @@ from memforge.memory.relation_classifier import (
     MemoryPair,
     MemoryPairClassification,
     MemoryPairClassificationError,
-    MemoryRelationType,
+    SameUnitRelationType,
     StructuredMemoryPairClassifier,
 )
 from memforge.memory.refinement_verification import verify_refinements
@@ -195,7 +195,7 @@ async def assess_relations(
         assert relation is not None
         entries.append(RelationLedgerEntry(
             candidate_index=index, incumbent_id=incumbent_id,
-            relation_type=MemoryRelationType(relation.classification),
+            relation_type=SameUnitRelationType(relation.classification),
             direction=RelationDirection(relation.direction), reason=relation.reason,
         ))
         assessment = decision.revision_assessment
@@ -327,7 +327,7 @@ def _without_conflicting_refinements(
     """Refinements of one old Memory that contradict each other, or whose comparison cannot be judged, leave their edges uncertain."""
     conflicting_ids = {
         memory_id for decision in classification.decisions
-        if decision.relation_type is MemoryRelationType.CONTRADICTS
+        if decision.relation_type is SameUnitRelationType.CONTRADICTS
         for memory_id in decision.pair.key
     } | {memory_id for unjudged in classification.unjudged for memory_id in unjudged.pair.key}
     conflicting_candidates = {index for index, candidate in enumerate(transient_candidates)
@@ -335,7 +335,7 @@ def _without_conflicting_refinements(
     return [
         replace(entry, relation_type=None, reason="Current refinement candidates conflict")
         if entry.candidate_index in conflicting_candidates
-        and entry.relation_type is not MemoryRelationType.UNRELATED else entry
+        and entry.relation_type is not SameUnitRelationType.UNRELATED else entry
         for entry in entries
     ]
 
