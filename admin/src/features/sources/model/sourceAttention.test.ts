@@ -93,10 +93,7 @@ describe("sourceAttention", () => {
     ).toBeNull();
   });
 
-  test("a source without a project asks for one, except plugin sources", () => {
+  test("a source without a project asks for one", () => {
     expect(sourceAttention({ source: makeSource({ project_binding: null }), readiness: null, activity: undefined, now: NOW })?.reason).toBe("unmapped");
-    expect(
-      sourceAttention({ source: makeSource({ type: "agent_session", project_binding: null }), readiness: null, activity: undefined, now: NOW }),
-    ).toBeNull();
   });
 });

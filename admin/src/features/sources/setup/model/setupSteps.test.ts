@@ -29,10 +29,6 @@ test("the product steps surround the type's groups, and Access appears only when
   expect(setupSteps(teams, { mode: "edit", sharedWorkspace: false })[1]).toMatchObject({ label: "Teams session", kind: "group" });
 });
 
-test("a managed type has only its Project step", () => {
-  expect(stepKeys(sourceTypeSchema("agent_session"), { mode: "edit", sharedWorkspace: true, managed: true })).toEqual(["project"]);
-});
-
 test("a group's fields are drawn in their declared order", () => {
   expect(groupFields(sourceTypeSchema("jira"), "connection").map((field) => field.key)).toEqual(["base_url", "sync_mode", "auth_mode", "pat"]);
 });

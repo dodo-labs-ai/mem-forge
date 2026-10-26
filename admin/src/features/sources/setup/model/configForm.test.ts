@@ -48,7 +48,7 @@ describe("comparison string", () => {
 
 describe("config form", () => {
   test("renders only declared fields for every registered type", () => {
-    for (const gene of SOURCE_TYPE_FORMS.genes.filter((candidate) => !candidate.managed)) {
+    for (const gene of SOURCE_TYPE_FORMS.genes) {
       const schema = sourceTypeSchema(gene.name);
       const declared = schema.fields.map((candidate) => candidate.key).sort();
       const drawn = setupSteps(schema, { mode: "create", sharedWorkspace: true })

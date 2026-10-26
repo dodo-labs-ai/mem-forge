@@ -15,7 +15,6 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
   return {
     id: "src-wiki",
     type: "confluence",
-    client: null,
     name: "Payroll wiki",
     config: {},
     status: "active",

@@ -413,32 +413,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/agent-sessions/windows": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Refuse Agent Session Window
-         * @deprecated
-         * @description Refuse an automatic session-window upload from an earlier memory plugin.
-         *
-         *     MemForge no longer captures agent sessions. The route reads no body,
-         *     creates no Source, calls no model and takes no Source activity; it
-         *     answers ``410`` with ``agent_session_capture_removed`` so the upload
-         *     stops at the plugin. It is removed in the next release.
-         */
-        post: operations["refuse_agent_session_window_api_v1_agent_sessions_windows_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/auth/jira-origins": {
         parameters: {
             query?: never;
@@ -867,30 +841,6 @@ export interface paths {
          * @description Return compact memory context for Codex/Claude lifecycle hooks.
          */
         post: operations["build_hook_context_api_v1_hooks_context_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/hooks/receipts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Refuse Agent Hook Receipt
-         * @deprecated
-         * @description Refuse a turn-end hook receipt from an earlier memory plugin.
-         *
-         *     Same contract as ``POST /api/v1/agent-sessions/windows``: no body is
-         *     read and nothing is recorded. It is removed in the next release.
-         */
-        post: operations["refuse_agent_hook_receipt_api_v1_hooks_receipts_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2942,32 +2892,6 @@ export interface components {
             /** Workspace */
             workspace: string;
         };
-        /**
-         * AgentSessionCaptureRemovedDetail
-         * @description Why an automatic agent-session upload is refused, and what the user does next.
-         */
-        AgentSessionCaptureRemovedDetail: {
-            /**
-             * Code
-             * @constant
-             */
-            code: "agent_session_capture_removed";
-            /** Message */
-            message: string;
-        };
-        /**
-         * AgentSessionCaptureRemovedResponse
-         * @description The ``410 Gone`` body of the removed agent-session capture routes.
-         *
-         *     Example::
-         *
-         *         {"detail": {"code": "agent_session_capture_removed",
-         *                     "message": "MemForge no longer captures agent sessions automatically. "
-         *                                "Update the MemForge memory plugin."}}
-         */
-        AgentSessionCaptureRemovedResponse: {
-            detail: components["schemas"]["AgentSessionCaptureRemovedDetail"];
-        };
         /** ComponentHealth */
         ComponentHealth: {
             /** Detail */
@@ -3570,11 +3494,6 @@ export interface components {
             display_name: string;
             /** Execution Kinds */
             execution_kinds: ("server" | "local_agent")[];
-            /**
-             * Managed
-             * @description Managed capture, created by the service; the type picker leaves it out.
-             */
-            managed: boolean;
             /** Name */
             name: string;
         };
@@ -6229,8 +6148,6 @@ export interface components {
         };
         /** SourceFacetFilterRequest */
         SourceFacetFilterRequest: {
-            /** Clients */
-            clients?: string[] | null;
             /** Repo Identifiers */
             repo_identifiers?: string[] | null;
             /** Source Ids */
@@ -6415,11 +6332,6 @@ export interface components {
             access_state: "active" | "changing" | "orphaned_private";
             access_transition: components["schemas"]["SourceAccessTransitionResponse"] | null;
             capabilities: components["schemas"]["SourceCapabilitiesResponse"];
-            /**
-             * Client
-             * @description The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.
-             */
-            client: string | null;
             /**
              * Config
              * @description Redacted configuration; empty when the viewer cannot configure the Source.
@@ -7944,26 +7856,6 @@ export interface operations {
             };
         };
     };
-    refuse_agent_session_window_api_v1_agent_sessions_windows_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentSessionCaptureRemovedResponse"];
-                };
-            };
-        };
-    };
     list_jira_origins_api_v1_auth_jira_origins_get: {
         parameters: {
             query?: never;
@@ -8668,26 +8560,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    refuse_agent_hook_receipt_api_v1_hooks_receipts_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            410: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AgentSessionCaptureRemovedResponse"];
                 };
             };
         };

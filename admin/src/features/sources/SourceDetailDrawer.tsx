@@ -4,7 +4,6 @@ import { formatCount, formatDateTime, formatInterval, formatRelative, formatUnti
 import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBadge } from "@/patterns";
 import { Button } from "@/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/ui/dropdown-menu";
-import { isManagedSourceType } from "./model/managedSources";
 import { canChangeSourceAccess } from "./model/sourceAccess";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
@@ -58,7 +57,7 @@ export function SourceDetailDrawer({
       subtitle={typeLabel}
       leading={
         <span className="flex size-9 shrink-0 items-center justify-center rounded-md border bg-surface-subtle">
-          <SourceIcon type={source.type} client={source.client} className="size-5" />
+          <SourceIcon type={source.type} className="size-5" />
         </span>
       }
       actions={
@@ -125,51 +124,48 @@ export function SourceDetailDrawer({
 
       <SourceScopeTransitionSection source={source} activity={activity} />
 
-      {isManagedSourceType(source.type) ? null : (
-        // A managed source takes in no new content, so it has no sync runs or schedule.
-        <DrawerSection title="Sync">
-          <PropertyList
-            items={[
-              {
-                label: "Status",
-                value: presentation ? (
-                  <StatusBadge
-                    tone={
-                      activity?.state === "failed"
-                        ? "danger"
-                        : activity?.state === "success"
-                          ? "ok"
-                          : activity?.state === "stopped"
-                            ? "idle"
-                            : "live"
-                    }
-                  >
-                    {presentation.message}
-                  </StatusBadge>
-                ) : (
-                  "Not synced yet"
-                ),
-                // The attention card above already explains a problem in full.
-                hint: attention ? undefined : presentation?.detail,
-              },
-              {
-                label: "Last sync",
-                value: source.last_sync ? formatRelative(source.last_sync) : "Never",
-                hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
-              },
-              {
-                label: "Schedule",
-                value: schedule?.enabled ? formatInterval(schedule.interval_minutes) : "Manual only",
-                hint:
-                  schedule?.enabled && schedule.next_run_at && source.status === "active"
-                    ? `Next run ${formatUntil(schedule.next_run_at)}`
-                    : undefined,
-              },
-            ]}
-          />
-          {presentation?.notice ? <Notice tone="idle" icon={Info}>{presentation.notice}</Notice> : null}
-        </DrawerSection>
-      )}
+      <DrawerSection title="Sync">
+        <PropertyList
+          items={[
+            {
+              label: "Status",
+              value: presentation ? (
+                <StatusBadge
+                  tone={
+                    activity?.state === "failed"
+                      ? "danger"
+                      : activity?.state === "success"
+                        ? "ok"
+                        : activity?.state === "stopped"
+                          ? "idle"
+                          : "live"
+                  }
+                >
+                  {presentation.message}
+                </StatusBadge>
+              ) : (
+                "Not synced yet"
+              ),
+              // The attention card above already explains a problem in full.
+              hint: attention ? undefined : presentation?.detail,
+            },
+            {
+              label: "Last sync",
+              value: source.last_sync ? formatRelative(source.last_sync) : "Never",
+              hint: source.last_sync ? formatDateTime(source.last_sync) : undefined,
+            },
+            {
+              label: "Schedule",
+              value: schedule?.enabled ? formatInterval(schedule.interval_minutes) : "Manual only",
+              hint:
+                schedule?.enabled && schedule.next_run_at && source.status === "active"
+                  ? `Next run ${formatUntil(schedule.next_run_at)}`
+                  : undefined,
+            },
+          ]}
+        />
+        {presentation?.notice ? <Notice tone="idle" icon={Info}>{presentation.notice}</Notice> : null}
+      </DrawerSection>
 
       <DrawerSection title="Content">
         <PropertyList

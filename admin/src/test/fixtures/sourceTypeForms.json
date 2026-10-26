@@ -1,16 +1,6 @@
 {
   "genes": [
     {
-      "auth_method": "local_file",
-      "data_shape": "message",
-      "default_sync_interval_minutes": 0,
-      "description": "Private memories kept from earlier Codex or Claude Code sessions",
-      "display_name": "Agent Session",
-      "execution_kinds": [],
-      "managed": true,
-      "name": "agent_session"
-    },
-    {
       "auth_method": "pat",
       "data_shape": "document",
       "default_sync_interval_minutes": 1440,
@@ -19,7 +9,6 @@
       "execution_kinds": [
         "server"
       ],
-      "managed": false,
       "name": "confluence"
     },
     {
@@ -31,7 +20,6 @@
       "execution_kinds": [
         "server"
       ],
-      "managed": false,
       "name": "github_pages"
     },
     {
@@ -44,7 +32,6 @@
         "server",
         "local_agent"
       ],
-      "managed": false,
       "name": "github_repo"
     },
     {
@@ -57,7 +44,6 @@
         "server",
         "local_agent"
       ],
-      "managed": false,
       "name": "jira"
     },
     {
@@ -69,7 +55,6 @@
       "execution_kinds": [
         "local_agent"
       ],
-      "managed": false,
       "name": "local_markdown"
     },
     {
@@ -81,7 +66,6 @@
       "execution_kinds": [
         "server"
       ],
-      "managed": false,
       "name": "notion"
     },
     {
@@ -93,44 +77,10 @@
       "execution_kinds": [
         "local_agent"
       ],
-      "managed": false,
       "name": "teams"
     }
   ],
   "schemas": {
-    "agent_session": {
-      "fields": [
-        {
-          "advanced": false,
-          "choices": [],
-          "default": "",
-          "field_type": "string",
-          "fixed_after_create": false,
-          "group": "client",
-          "help_text": "Coding client whose memories this Source holds (e.g. 'codex', 'claude-code').",
-          "key": "client",
-          "label": "Client",
-          "options": [],
-          "order": 0,
-          "placeholder": "codex",
-          "required": false,
-          "scope": false,
-          "visible_when": [],
-          "widget": null
-        }
-      ],
-      "groups": [
-        {
-          "description": "",
-          "key": "client",
-          "label": "Client",
-          "order": 0,
-          "panels": [],
-          "purpose": "content"
-        }
-      ],
-      "project_field": "repo"
-    },
     "confluence": {
       "fields": [
         {

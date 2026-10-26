@@ -1,5 +1,4 @@
 import { pluralize } from "@/lib/format";
-import { isManagedSourceType } from "./managedSources";
 import { sourceProjectBinding } from "./projectBinding";
 import { failedItemsTitle, sourceFailedItems } from "./sourceFailedItems";
 import type { SourceReadiness } from "./sourceReadiness";
@@ -163,7 +162,7 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
     };
   }
 
-  if (!sourceProjectBinding(source) && !isManagedSourceType(source.type)) {
+  if (!sourceProjectBinding(source)) {
     return {
       reason: "unmapped",
       title: "No project",

@@ -1015,39 +1015,6 @@
         "title": "AgentHookContextRequest",
         "type": "object"
       },
-      "AgentSessionCaptureRemovedDetail": {
-        "description": "Why an automatic agent-session upload is refused, and what the user does next.",
-        "properties": {
-          "code": {
-            "const": "agent_session_capture_removed",
-            "title": "Code",
-            "type": "string"
-          },
-          "message": {
-            "title": "Message",
-            "type": "string"
-          }
-        },
-        "required": [
-          "code",
-          "message"
-        ],
-        "title": "AgentSessionCaptureRemovedDetail",
-        "type": "object"
-      },
-      "AgentSessionCaptureRemovedResponse": {
-        "description": "The ``410 Gone`` body of the removed agent-session capture routes.\n\nExample::\n\n    {\"detail\": {\"code\": \"agent_session_capture_removed\",\n                \"message\": \"MemForge no longer captures agent sessions automatically. \"\n                           \"Update the MemForge memory plugin.\"}}",
-        "properties": {
-          "detail": {
-            "$ref": "#/components/schemas/AgentSessionCaptureRemovedDetail"
-          }
-        },
-        "required": [
-          "detail"
-        ],
-        "title": "AgentSessionCaptureRemovedResponse",
-        "type": "object"
-      },
       "ComponentHealth": {
         "properties": {
           "detail": {
@@ -2439,11 +2406,6 @@
             "title": "Execution Kinds",
             "type": "array"
           },
-          "managed": {
-            "description": "Managed capture, created by the service; the type picker leaves it out.",
-            "title": "Managed",
-            "type": "boolean"
-          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2456,8 +2418,7 @@
           "default_sync_interval_minutes",
           "auth_method",
           "data_shape",
-          "execution_kinds",
-          "managed"
+          "execution_kinds"
         ],
         "title": "GeneMetadataResponse",
         "type": "object"
@@ -9519,20 +9480,6 @@
       "SourceFacetFilterRequest": {
         "additionalProperties": false,
         "properties": {
-          "clients": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Clients"
-          },
           "repo_identifiers": {
             "anyOf": [
               {
@@ -9964,18 +9911,6 @@
           "capabilities": {
             "$ref": "#/components/schemas/SourceCapabilitiesResponse"
           },
-          "client": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
-            "title": "Client"
-          },
           "config": {
             "additionalProperties": true,
             "description": "Redacted configuration; empty when the viewer cannot configure the Source.",
@@ -10135,7 +10070,6 @@
           "sync",
           "failed_items",
           "scope_transition",
-          "client",
           "ownership",
           "capabilities",
           "execution",
@@ -13005,29 +12939,6 @@
         ]
       }
     },
-    "/api/v1/agent-sessions/windows": {
-      "post": {
-        "deprecated": true,
-        "description": "Refuse an automatic session-window upload from an earlier memory plugin.\n\nMemForge no longer captures agent sessions. The route reads no body,\ncreates no Source, calls no model and takes no Source activity; it\nanswers ``410`` with ``agent_session_capture_removed`` so the upload\nstops at the plugin. It is removed in the next release.",
-        "operationId": "refuse_agent_session_window_api_v1_agent_sessions_windows_post",
-        "responses": {
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentSessionCaptureRemovedResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Refuse Agent Session Window",
-        "tags": [
-          "agent-sessions"
-        ]
-      }
-    },
     "/api/v1/auth/jira-origins": {
       "get": {
         "description": "Known Jira origins: authenticated sessions plus configured sources.",
@@ -14000,29 +13911,6 @@
           }
         },
         "summary": "Build Hook Context",
-        "tags": [
-          "hooks"
-        ]
-      }
-    },
-    "/api/v1/hooks/receipts": {
-      "post": {
-        "deprecated": true,
-        "description": "Refuse a turn-end hook receipt from an earlier memory plugin.\n\nSame contract as ``POST /api/v1/agent-sessions/windows``: no body is\nread and nothing is recorded. It is removed in the next release.",
-        "operationId": "refuse_agent_hook_receipt_api_v1_hooks_receipts_post",
-        "responses": {
-          "410": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentSessionCaptureRemovedResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Refuse Agent Hook Receipt",
         "tags": [
           "hooks"
         ]

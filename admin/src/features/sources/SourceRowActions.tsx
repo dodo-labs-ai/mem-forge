@@ -11,7 +11,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/ui/dropdown-menu";
-import { canConfigureSourceType } from "./model/managedSources";
 import { canChangeSourceAccess } from "./model/sourceAccess";
 import type { SourceRow } from "./model/sourceRows";
 import type { Source } from "./model/types";
@@ -128,33 +127,29 @@ export function SourceRowActions({
           <DropdownMenuItem onClick={() => actions.togglePinned(source)}>
             {source.pinned_for_me ? "Unpin" : "Pin to top"}
           </DropdownMenuItem>
-          {canConfigureSourceType(source.type) ? (
-            <>
-              <DropdownMenuItem
-                className="items-start"
-                // Pausing stops a sync, so it stays available during one; resuming waits for a sync or an access change to end.
-                disabled={
-                  !capabilities?.can_configure ||
-                  (source.status === "paused" && (syncIsLive || source.access_state === "changing"))
-                }
-                onClick={() => actions.togglePaused(source)}
-              >
-                {source.status === "paused" ? (
-                  "Resume syncing"
-                ) : (
-                  <span className="flex flex-col gap-0.5">
-                    <span>Pause syncing</span>
-                    <span className="text-xs text-muted-foreground">
-                      Stop any sync in progress and skip syncs until you resume.
-                    </span>
-                  </span>
-                )}
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => navigate(sourceSettingsPath(source.id))}>
-                Configure
-              </DropdownMenuItem>
-            </>
-          ) : null}
+          <DropdownMenuItem
+            className="items-start"
+            // Pausing stops a sync, so it stays available during one; resuming waits for a sync or an access change to end.
+            disabled={
+              !capabilities?.can_configure ||
+              (source.status === "paused" && (syncIsLive || source.access_state === "changing"))
+            }
+            onClick={() => actions.togglePaused(source)}
+          >
+            {source.status === "paused" ? (
+              "Resume syncing"
+            ) : (
+              <span className="flex flex-col gap-0.5">
+                <span>Pause syncing</span>
+                <span className="text-xs text-muted-foreground">
+                  Stop any sync in progress and skip syncs until you resume.
+                </span>
+              </span>
+            )}
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={!capabilities?.can_configure} onClick={() => navigate(sourceSettingsPath(source.id))}>
+            Configure
+          </DropdownMenuItem>
           {canChangeSourceAccess(source, sharedWorkspace) ? (
             <DropdownMenuItem onClick={() => onChangeAccess(source)}>Change who can use this source</DropdownMenuItem>
           ) : null}
