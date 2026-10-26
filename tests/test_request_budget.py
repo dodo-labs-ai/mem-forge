@@ -7,7 +7,7 @@ import logging
 import litellm
 import pytest
 
-from memforge.config import LlmConfig
+from memforge.config import AppConfig, LlmConfig
 from memforge.llm.request_budget import RequestBudget
 
 LOGGER = "memforge.llm.request_budget"
@@ -123,3 +123,37 @@ def test_identity_follows_the_limits_a_request_is_sized_by() -> None:
 
     assert first.identity == _budget(input_limit=1_000, context_limit=4_000, output_limit=500).identity
     assert first.identity != _budget(input_limit=1_000, context_limit=4_000, output_limit=600).identity
+
+
+def test_a_route_the_deployment_maps_takes_the_limits_of_the_model_it_names(monkeypatch) -> None:
+    looked_up: list[str] = []
+
+    def catalog(model: str) -> dict:
+        looked_up.append(model)
+        if model != "anthropic/claude-sonnet-4-6":
+            raise Exception(f"This model isn't mapped yet. model={model}")
+        return {"max_input_tokens": 1_000_000, "context_window": 1_000_000, "max_output_tokens": 64_000}
+
+    monkeypatch.setattr(litellm, "get_model_info", catalog)
+    monkeypatch.setenv("MEMFORGE_LLM_METADATA_MODELS", '{"gateway/claude-sonnet": "anthropic/claude-sonnet-4-6"}')
+
+    budget = RequestBudget.resolve("gateway/claude-sonnet", LlmConfig(max_output_tokens=32_000))
+    unmapped = RequestBudget.resolve("anthropic/claude-sonnet-4-6", LlmConfig())
+
+    assert looked_up == ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"]
+    assert budget.model == "gateway/claude-sonnet"
+    assert (budget.input_limit, budget.context_limit, budget.output_limit) == (1_000_000, 1_000_000, 32_000)
+    assert budget.metadata_source == "litellm_and_operator_caps"
+    assert unmapped.output_limit == 64_000
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not json", "{'gateway/claude-sonnet': 'anthropic/claude-sonnet-4-6'}", '["gateway/claude-sonnet"]', '{"gateway/claude-sonnet": ""}'],
+)
+def test_a_malformed_metadata_model_mapping_stops_config_load(monkeypatch, tmp_path, value) -> None:
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path))
+    monkeypatch.setenv("MEMFORGE_LLM_METADATA_MODELS", value)
+
+    with pytest.raises(ValueError, match="MEMFORGE_LLM_METADATA_MODELS"):
+        AppConfig()

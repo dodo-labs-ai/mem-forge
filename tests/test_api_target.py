@@ -30,15 +30,15 @@ def _clear_configured_target_cache():
 
 def test_unified_v1_target_does_not_require_a_configured_workspace():
     target = build_target(
-        origin="https://memforge.example.com",
+        origin="https://memforge-dev.example.com",
         edition=Edition.CLOUD,
     )
 
     assert target.api_base == (
-        "https://memforge.example.com/api/v1"
+        "https://memforge-dev.example.com/api/v1"
     )
     assert target.resource_url("/memories/search") == (
-        "https://memforge.example.com/api/v1/memories/search"
+        "https://memforge-dev.example.com/api/v1/memories/search"
     )
 
 
@@ -50,7 +50,7 @@ def test_unified_v1_target_adds_explicit_workspace_as_query_parameter():
         workspace_id="team alpha/blue",
     ) == (
         "https://self.example/api/v1/memories/search"
-        "?include_private=true&workspace_id=mount+tai%2Fblue"
+        "?include_private=true&workspace_id=team+alpha%2Fblue"
     )
 
 
@@ -66,7 +66,7 @@ def test_resource_url_rejects_an_embedded_workspace_selector():
     [
         ("https://self.example", Edition.OSS),
         (
-            "https://memforge.example.com",
+            "https://memforge-dev.example.com",
             Edition.CLOUD,
         ),
     ],
@@ -119,15 +119,15 @@ def test_discovery_uses_service_capability_instead_of_dns_suffix():
         "https://memory.example.com",
         fetcher=lambda url: capability_document(Edition.CLOUD),
     )
-    oss_on_hana_domain = discover_target(
-        "https://self-hosted.example.com",
+    oss_on_cloud_domain = discover_target(
+        "https://self-hosted.cloud.example.com",
         fetcher=lambda url: capability_document(Edition.OSS),
     )
 
     assert cloud_custom_domain.edition is Edition.CLOUD
     assert cloud_custom_domain.authentication_required is True
-    assert oss_on_hana_domain.edition is Edition.OSS
-    assert oss_on_hana_domain.authentication_required is False
+    assert oss_on_cloud_domain.edition is Edition.OSS
+    assert oss_on_cloud_domain.authentication_required is False
 
 
 def test_capability_parser_rejects_unsupported_or_drifted_contract():
@@ -193,7 +193,7 @@ def test_configured_target_reads_origin_but_ignores_obsolete_workspace_settings(
     )
     monkeypatch.setenv(
         "MEMFORGE_API_URL",
-        "https://memforge.example.com/",
+        "https://memforge-dev.example.com/",
     )
     monkeypatch.setenv("MEMFORGE_WORKSPACE_ID", "obsolete-process-workspace")
     monkeypatch.setenv("MEMFORGE_EDITION", "cloud")
@@ -203,7 +203,7 @@ def test_configured_target_reads_origin_but_ignores_obsolete_workspace_settings(
 
     target = configured_target()
     assert target.edition is Edition.CLOUD
-    assert target.origin == "https://memforge.example.com"
+    assert target.origin == "https://memforge-dev.example.com"
 
 
 def test_configured_target_preserves_zero_configuration_default(

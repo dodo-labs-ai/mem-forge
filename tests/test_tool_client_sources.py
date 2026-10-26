@@ -27,7 +27,7 @@ class _RecordingClient(ToolClient):
         super().__init__(
             target=build_target(
                 origin=origin,
-                edition="cloud" if origin.endswith("example.com") else "oss",
+                edition="cloud" if origin.endswith(".example.com") else "oss",
             ),
             api_token="tok",
         )
@@ -357,7 +357,7 @@ def test_start_source_processing_posts_snapshot_identity():
 
 def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch):
     client = ToolClient(
-        target=build_target(origin="https://memforge.example.com", edition="cloud"),
+        target=build_target(origin="https://memforge-dev.example.com", edition="cloud"),
         api_token="tok",
         workspace_id="team_alpha",
     )
@@ -375,7 +375,7 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
     assert calls == [
         (
             "POST",
-            "https://memforge.example.com/api/v1/sources/src-local/process?workspace_id=team_alpha",
+            "https://memforge-dev.example.com/api/v1/sources/src-local/process?workspace_id=team_alpha",
             {"force_full_sync": False},
         )
     ]

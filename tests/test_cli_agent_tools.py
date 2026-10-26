@@ -193,7 +193,7 @@ class FakeToolClient:
 def _cloud_test_client() -> FakeToolClient:
     return FakeToolClient(
         target=build_target(
-            origin="https://memforge.example.com",
+            origin="https://memforge-dev.example.com",
             edition="cloud",
         ),
         api_token="tok",
@@ -228,7 +228,7 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
             "--include-superseded",
         ],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -240,7 +240,7 @@ def test_search_cli_forwards_mcp_shape(monkeypatch):
         (
             "search",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "api_token": "token-1",
                 "query": "docker artifact provenance",
                 "top_k": 3,
@@ -269,7 +269,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
             "2026-06-26",
         ],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -280,7 +280,7 @@ def test_search_cli_forwards_exact_source_ids(monkeypatch):
         (
             "search",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "api_token": "token-1",
                 "query": "",
                 "top_k": 20,
@@ -305,7 +305,7 @@ def test_search_cli_includes_the_callers_own_private_memories(monkeypatch, comma
     result = CliRunner().invoke(
         cli,
         [*command.split(), "release process"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.com"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.example.com"},
     )
 
     assert result.exit_code == 0, result.output
@@ -321,7 +321,7 @@ def test_search_cli_rejects_legacy_source_name_filter(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["search", "jira defects", "--source", "Gamma Defects"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.com"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.example.com"},
     )
 
     assert result.exit_code != 0
@@ -406,7 +406,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
                 {
                     "id": "src-paused",
                     "source_id": "src-paused",
-                    "name": "TeamAlpha Defects",
+                    "name": "Alpha Defects",
                     "type": "jira",
                     "status": "paused",
                     "doc_count": 68,
@@ -422,7 +422,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
         cli,
         ["sources", "list"],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -435,7 +435,7 @@ def test_sources_list_cli_reads_configured_sources_from_active_api_target(monkey
     assert FakeToolClient.calls == [
         (
             "list_sources",
-            {"api_url": "https://memforge.example.com", "api_token": "token-1"},
+            {"api_url": "https://memforge-dev.example.com", "api_token": "token-1"},
         )
     ]
 
@@ -447,7 +447,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
             "data": [
                 {
                     "source_id": "src-alpha",
-                    "name": "TeamAlpha Defects",
+                    "name": "Alpha Defects",
                     "type": "jira",
                     "status": "active",
                     "doc_count": 68,
@@ -463,7 +463,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
         cli,
         ["sources", "searchable"],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -475,7 +475,7 @@ def test_sources_searchable_cli_reads_searchable_sources_from_active_api_target(
     assert FakeToolClient.calls == [
         (
             "list_searchable_sources",
-            {"api_url": "https://memforge.example.com", "api_token": "token-1"},
+            {"api_url": "https://memforge-dev.example.com", "api_token": "token-1"},
         )
     ]
 
@@ -488,7 +488,7 @@ def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
         cli,
         ["sources", "schedule", "src-1", "--every-minutes", "60"],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -500,7 +500,7 @@ def test_sources_schedule_cli_updates_active_api_target(monkeypatch):
         (
             "update_source_schedule",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "api_token": "token-1",
                 "source_id": "src-1",
                 "enabled": True,
@@ -518,7 +518,7 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
         cli,
         ["sources", "schedule-show", "src-1"],
         env={
-            "MEMFORGE_API_URL": "https://memforge.example.com",
+            "MEMFORGE_API_URL": "https://memforge-dev.example.com",
             "MEMFORGE_WORKSPACE_ID": "ws-from-cloud",
             "MEMFORGE_API_TOKEN": "token-1",
         },
@@ -530,7 +530,7 @@ def test_sources_schedule_show_cli_reads_active_api_target(monkeypatch):
         (
             "get_source_schedule",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "api_token": "token-1",
                 "source_id": "src-1",
             },
@@ -547,7 +547,7 @@ def test_sources_reprocess_cli_names_documents_on_the_active_api_target(monkeypa
         cli,
         ["sources", "reprocess", "src-1", "--document", "jira-PAY-1", "--document", "jira-PAY-2",
          *(["--dry-run"] if dry_run else [])],
-        env={"MEMFORGE_API_URL": "https://memforge.example.com", "MEMFORGE_API_TOKEN": "t"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.example.com", "MEMFORGE_API_TOKEN": "t"},
     )
 
     assert result.exit_code == 0, result.output
@@ -556,7 +556,7 @@ def test_sources_reprocess_cli_names_documents_on_the_active_api_target(monkeypa
         (
             "reprocess_source_documents",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "source_id": "src-1",
                 "document_ids": ["jira-PAY-1", "jira-PAY-2"],
                 "all_documents": False,
@@ -573,7 +573,7 @@ def test_sources_reprocess_cli_takes_every_document_with_all(monkeypatch):
     result = CliRunner().invoke(
         cli,
         ["sources", "reprocess", "src-1", "--all"],
-        env={"MEMFORGE_API_URL": "https://memforge.example.com", "MEMFORGE_API_TOKEN": "t"},
+        env={"MEMFORGE_API_URL": "https://memforge-dev.example.com", "MEMFORGE_API_TOKEN": "t"},
     )
 
     assert result.exit_code == 0, result.output
@@ -606,7 +606,7 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
             "add",
             "acme.prod",
             "--api-url",
-            "https://memforge.example.com",
+            "https://memforge-dev.example.com",
             "--token-env",
             "ACME_TOKEN",
         ],
@@ -616,7 +616,7 @@ def test_target_profile_sets_default_api_url(monkeypatch, tmp_path: Path):
     assert add_result.exit_code == 0, add_result.output
     assert check_result.exit_code == 0, check_result.output
     assert FakeToolClient.calls == [
-        ("health", {"api_url": "https://memforge.example.com", "api_token": "secret-token"})
+        ("health", {"api_url": "https://memforge-dev.example.com", "api_token": "secret-token"})
     ]
     assert 'edition = "cloud"' in cli_config.read_text(encoding="utf-8")
     assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
@@ -635,7 +635,7 @@ def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
             "add",
             "acme",
             "--api-url",
-            "https://memforge.example.com",
+            "https://memforge-dev.example.com",
             "--token-env",
             "ACME_TOKEN",
         ],
@@ -649,7 +649,7 @@ def test_target_profile_does_not_mix_global_token(monkeypatch, tmp_path: Path):
     assert add_result.exit_code == 0, add_result.output
     assert check_result.exit_code == 0, check_result.output
     assert FakeToolClient.calls == [
-        ("health", {"api_url": "https://memforge.example.com", "api_token": "target-token"})
+        ("health", {"api_url": "https://memforge-dev.example.com", "api_token": "target-token"})
     ]
 
 
@@ -666,7 +666,7 @@ def test_env_api_url_does_not_use_active_target_token(monkeypatch, tmp_path: Pat
             "add",
             "acme",
             "--api-url",
-            "https://memforge.example.com",
+            "https://memforge-dev.example.com",
             "--token-env",
             "ACME_TOKEN",
         ],
@@ -691,14 +691,14 @@ def test_target_add_accepts_cloud_origin_without_client_workspace_state(monkeypa
 
     result = CliRunner().invoke(
         cli,
-        ["target", "add", "invalid", "--api-url", "https://memforge.example.com"],
+        ["target", "add", "invalid", "--api-url", "https://memforge-dev.example.com"],
     )
 
     assert result.exit_code == 0, result.output
     assert "workspace_id" not in cli_config.read_text(encoding="utf-8")
 
 
-CLOUD_TEST_ORIGIN = "https://memforge.example.com"
+CLOUD_TEST_ORIGIN = "https://memforge-dev.example.com"
 
 
 class _WorkspaceRecordingClient(FakeToolClient):
@@ -1220,7 +1220,7 @@ def _github_file_commits_listing():
 
 def _fake_github_remote_run(cmd, *args, **kwargs):
     assert cmd[:2] == ["gh", "api"]
-    assert kwargs["env"]["GH_HOST"] == "github.internal.example.com"
+    assert kwargs["env"]["GH_HOST"] == "github.example.com"
     endpoint = cmd[2]
     if endpoint.endswith("/commits/main"):
         payload = {"sha": "commit-main", "commit": {"tree": {"sha": "tree-main"}}}
@@ -1260,7 +1260,7 @@ def test_local_agent_cloud_github_preview_tree_ignores_saved_scope(monkeypatch):
             "operation": "github_repo_preview_tree",
             "source_id": "src-gh",
             "payload": {
-                "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                "repo_url": "https://github.example.com/acme/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
                 "exclude_paths": ["Payroll Processing V2/Überblick.md"],
@@ -1295,7 +1295,7 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                "repo_url": "https://github.example.com/acme/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
                 "exclude_paths": ["Payroll Processing V2/Überblick.md"],
@@ -1322,7 +1322,7 @@ def test_local_agent_cloud_github_sync_pushes_remote_gh_scope(monkeypatch):
     kwargs = push_calls[0][1]
     assert kwargs["workspace_id"] == "ws-from-job-payload"
     assert kwargs["source_id"] == "src-from-cloud"
-    assert kwargs["repo_url"] == "https://github.internal.example.com/acme-gamma/architecture"
+    assert kwargs["repo_url"] == "https://github.example.com/acme/architecture"
     assert kwargs["relative_path"] == "Payroll Processing V2/README.md"
     assert "process_now" not in kwargs
     assert kwargs["submitted_by"] == "memforge-local-agent"
@@ -1385,7 +1385,7 @@ def test_local_agent_cloud_github_sync_streams_selected_image_as_artifact(monkey
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                "repo_url": "https://github.example.com/acme/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2/images"],
                 "include_extensions": ["png"],
@@ -1442,7 +1442,7 @@ def test_local_agent_cloud_github_rejects_oversized_image_before_blob_download(m
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/org/repo",
+                "repo_url": "https://github.example.com/org/repo",
                 "ref": "main",
                 "include_extensions": ["png"],
                 "limit": 1,
@@ -1491,7 +1491,7 @@ def test_local_agent_cloud_github_noop_uses_manifest_without_reading_or_uploadin
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/example/public-howtos",
+                "repo_url": "https://github.example.com/example/public-howtos",
                 "ref": "main",
                 "include_extensions": ["md"],
             },
@@ -1559,7 +1559,7 @@ def test_local_agent_cloud_github_sync_pins_tree_and_body_to_one_commit(monkeypa
             "operation": "github_repo_sync",
             "source_id": "src-github",
             "payload": {
-                "repo_url": "https://github.internal.example.com/example/public-howtos",
+                "repo_url": "https://github.example.com/example/public-howtos",
                 "ref": "main",
                 "include_extensions": ["md"],
             },
@@ -1759,7 +1759,7 @@ def test_local_agent_cloud_github_sync_rejects_unproven_tree_completeness(monkey
                 "operation": "github_repo_sync",
                 "source_id": "src-github",
                 "payload": {
-                    "repo_url": "https://github.internal.example.com/example/public-howtos",
+                    "repo_url": "https://github.example.com/example/public-howtos",
                     "ref": "main",
                 },
             },
@@ -1786,7 +1786,7 @@ def test_local_agent_cloud_github_sync_reports_failed_paths_for_retry_diagnostic
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/example/public-howtos",
+                "repo_url": "https://github.example.com/example/public-howtos",
                 "ref": "main",
                 "include_extensions": ["md"],
                 "limit": 2,
@@ -1829,7 +1829,7 @@ def test_local_agent_cloud_github_sync_stops_after_lease_rejection(monkeypatch):
                 "operation": "github_repo_sync",
                 "source_id": "src-from-cloud",
                 "payload": {
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "ref": "main",
                     "include_paths": ["Payroll Processing V2"],
                     "include_extensions": ["md"],
@@ -1854,7 +1854,7 @@ def test_local_agent_cloud_github_sync_requires_job_workspace(monkeypatch):
             "operation": "github_repo_sync",
             "source_id": "src-from-cloud",
             "payload": {
-                "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                "repo_url": "https://github.example.com/acme/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing V2"],
                 "include_extensions": ["md"],
@@ -2039,7 +2039,7 @@ def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypa
     process_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_processing"]
     assert process_calls == [
         {
-            "api_url": "https://memforge.example.com",
+            "api_url": "https://memforge-dev.example.com",
             "api_token": "tok",
             "workspace_id": "ws-from-cloud",
             "source_id": "src-local",
@@ -2218,7 +2218,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
                 content_type="application/json",
                 space_or_project="PAY",
                 version="v1",
-                author="Andrew",
+                author="Riley",
                 labels=["jira"],
                 extra={"issue_key": "PAY-1"},
             )
@@ -2312,7 +2312,7 @@ def test_local_agent_cloud_jira_sync_uses_gene_and_pushes_packages(monkeypatch):
         (
             "upload_jira_session",
             {
-                "api_url": "https://memforge.example.com",
+                "api_url": "https://memforge-dev.example.com",
                 "api_token": "tok",
                 "workspace_id": "ws-from-cloud",
                 "base_url": "https://jira.example.test",
@@ -2972,7 +2972,7 @@ def test_local_agent_cloud_jira_sync_does_not_publish_partial_snapshot(monkeypat
                     content_type="application/json",
                     space_or_project="PAY",
                     version="v1",
-                    author="Andrew",
+                    author="Riley",
                     labels=["jira"],
                     extra={"issue_key": key},
                 )

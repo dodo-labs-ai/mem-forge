@@ -548,7 +548,7 @@ def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, 
             1,
             stdout="",
             stderr=(
-                "error connecting to github.internal.example.com\n"
+                "error connecting to github.example.com\n"
                 "check your internet connection or https://githubstatus.com"
             ),
         )
@@ -570,7 +570,7 @@ def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, 
                     "workspace_id": "ws-test",
                     "attempt_count": 1,
                     "payload": {
-                        "repo_url": "https://github.internal.example.com/example/repository",
+                        "repo_url": "https://github.example.com/example/repository",
                         "ref": "main",
                     },
                 }
@@ -589,7 +589,7 @@ def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, 
             1,
             "failed",
             {"retryable": True},
-            "GitHub CLI request failed: error connecting to github.internal.example.com\n"
+            "GitHub CLI request failed: error connecting to github.example.com\n"
             "check your internet connection or https://githubstatus.com",
         )
     ]
@@ -989,7 +989,7 @@ def test_adapter_daemon_status_allows_cloud_target_without_global_workspace(monk
     monkeypatch.setenv("MEMFORGE_API_TOKEN", "daemon-token")
     (tmp_path / "cli.toml").write_text(
         'active = "cloud"\n\n[targets.cloud]\n'
-        'api_url = "https://memforge.example.com"\n'
+        'api_url = "https://memforge-dev.example.com"\n'
         'edition = "cloud"\n'
         'token_env = "MEMFORGE_API_TOKEN"\n',
         encoding="utf-8",

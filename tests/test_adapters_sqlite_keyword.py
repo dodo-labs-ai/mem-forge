@@ -89,7 +89,7 @@ async def test_search_filters_by_memory_type(db):
 async def test_metadata_title_tokens_recall_source_title(db):
     now = datetime.now(timezone.utc).isoformat()
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
@@ -137,7 +137,7 @@ async def test_metadata_ordinary_terms_use_shared_three_of_five_coverage(db):
     await db.upsert_source(
         "src-jira",
         "jira",
-        "TeamAlpha Defects",
+        "Alpha Defects",
         "{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -174,7 +174,7 @@ async def test_metadata_coverage_does_not_combine_different_support_rows(db):
     await db.upsert_source(
         "src-jira",
         "jira",
-        "TeamAlpha Defects",
+        "Alpha Defects",
         "{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -215,7 +215,7 @@ async def test_metadata_idf_ranks_rarer_matched_term_first_after_coverage_gate(d
     await db.upsert_source(
         "src-jira",
         "jira",
-        "TeamAlpha Defects",
+        "Alpha Defects",
         "{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -255,7 +255,7 @@ async def test_metadata_exact_anchor_qualifies_without_ordinary_term_coverage(db
     await db.upsert_source(
         "src-jira",
         "jira",
-        "TeamAlpha Defects",
+        "Alpha Defects",
         "{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -290,7 +290,7 @@ async def test_metadata_exact_anchor_qualifies_without_ordinary_term_coverage(db
 async def test_metadata_search_can_return_subchannel_hits_for_ranker(db):
     now = datetime.now(timezone.utc).isoformat()
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.db.execute(
         """INSERT INTO documents
            (doc_id, source, source_url, title, space_or_project, labels, last_modified, version, content_hash, last_synced)
@@ -336,7 +336,7 @@ async def test_metadata_search_can_return_subchannel_hits_for_ranker(db):
 @pytest.mark.asyncio
 async def test_metadata_alias_recall_splits_camel_case_source_title(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: PeriodCutOffBlockerHint regression",
@@ -361,7 +361,7 @@ async def test_metadata_alias_recall_splits_camel_case_source_title(db):
 @pytest.mark.asyncio
 async def test_metadata_trigram_recall_handles_compound_no_space_query(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -406,7 +406,7 @@ async def test_metadata_index_populates_from_atomic_memory_source_insert(db):
 @pytest.mark.asyncio
 async def test_metadata_search_excludes_user_disabled_source_rows(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -428,7 +428,7 @@ async def test_metadata_search_excludes_user_disabled_source_rows(db):
 @pytest.mark.asyncio
 async def test_metadata_search_applies_source_filter_to_matching_support_row(db):
     await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await db.upsert_source(
         "src-wiki", "confluence", "Payroll Wiki", "{}", access_policy="workspace", owner_user_id="dev"
     )
@@ -476,7 +476,7 @@ async def test_metadata_search_applies_source_filter_to_matching_support_row(db)
 @pytest.mark.asyncio
 async def test_metadata_search_applies_source_time_range_to_matching_support_row(db):
     await db.insert_memory(_memory("m-shared", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -613,7 +613,7 @@ async def test_metadata_search_applies_memory_updated_time_range(db):
             updated_at=datetime(2026, 6, 20, tzinfo=timezone.utc),
         )
     )
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -688,7 +688,7 @@ async def _upsert_doc(
 @pytest.mark.asyncio
 async def test_metadata_index_refreshes_when_document_title_changes(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(db, title="Old Lifecycle Title")
     await db.add_memory_source(
         "m-blocker",
@@ -712,7 +712,7 @@ async def test_metadata_index_refreshes_when_document_title_changes(db):
 @pytest.mark.asyncio
 async def test_metadata_index_refreshes_when_source_name_changes(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(db, title="PAYR-179397")
     await db.add_memory_source(
         "m-blocker",
@@ -736,7 +736,7 @@ async def test_metadata_index_refreshes_when_source_name_changes(db):
 @pytest.mark.asyncio
 async def test_rebuild_metadata_index_backfills_existing_sources(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -765,7 +765,7 @@ async def test_rebuild_metadata_index_backfills_existing_sources(db):
 @pytest.mark.asyncio
 async def test_metadata_index_drops_support_of_a_removed_source(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         title="PAYR-179397: Create Blocker Hint in On Demand Lifecycle Assignment",
@@ -790,7 +790,7 @@ async def test_metadata_index_drops_support_of_a_removed_source(db):
 @pytest.mark.asyncio
 async def test_metadata_search_collapses_multiple_matching_sources_per_memory(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     await _upsert_doc(
         db,
         doc_id="PAYR-179397",
@@ -826,7 +826,7 @@ async def test_metadata_search_collapses_multiple_matching_sources_per_memory(db
 @pytest.mark.asyncio
 async def test_metadata_search_preserves_source_refs_before_memory_limit(db):
     await db.insert_memory(_memory("m-blocker", "Lifecycle assignment skips person assignment creation"))
-    await db.upsert_source("src-jira", "jira", "TeamAlpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
+    await db.upsert_source("src-jira", "jira", "Alpha Defects", "{}", access_policy="workspace", owner_user_id="dev")
     doc_ids = [f"PAYR-17939{i}" for i in range(6)]
     for doc_id in doc_ids:
         await _upsert_doc(

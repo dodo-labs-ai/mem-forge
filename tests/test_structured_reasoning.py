@@ -170,9 +170,9 @@ async def test_an_open_generation_call_keeps_the_provider_default(operation) -> 
 @pytest.mark.parametrize(
     "invocation",
     [
-        ResolvedInvocation(route="litellm_proxy/claude-sonnet", provider="litellm"),
+        ResolvedInvocation(route="litellm_proxy/team-claude-sonnet", provider="litellm"),
         ResolvedInvocation(route="openrouter/anthropic/claude-haiku-5.5", provider="litellm"),
-        ResolvedInvocation(route="litellm_proxy/claude-sonnet"),
+        ResolvedInvocation(route="litellm_proxy/team-claude-sonnet"),
         ResolvedInvocation(route="openai/gpt-5-mini", api_base="https://models.example.test/v1",
                            provider="openai_compatible"),
     ],

@@ -322,7 +322,7 @@ async def test_sqlite_structured_attempt_diagnostics_round_trip(db) -> None:
             reason_code="schema_validation_failed",
             operation="memory_extraction",
             provider="litellm",
-            model="litellm_proxy/claude-sonnet",
+            model="litellm_proxy/team-claude-sonnet",
             attempt_index=1,
             structured_mode="native_schema",
             schema_transport="json_schema_response_format",

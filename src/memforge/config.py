@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -24,6 +28,25 @@ _RETIRED_OUTPUT_LIMIT_VARIABLES = ("MEMFORGE_ENRICHMENT_MAX_TOKENS", "MEMFORGE_M
 DEFAULT_SEARCH_TOP_K = 20
 DEFAULT_RANK_WINDOW_SIZE = 50
 DEFAULT_RRF_K = 20
+METADATA_MODELS_VARIABLE = "MEMFORGE_LLM_METADATA_MODELS"
+
+
+@lru_cache(maxsize=4)
+def parse_metadata_models(raw: str) -> Mapping[str, str]:
+    """The route-to-LiteLLM-model mapping that ``MEMFORGE_LLM_METADATA_MODELS`` holds.
+
+    An empty value maps no route. Anything but a JSON object whose values are
+    model names raises a ``ValueError`` naming the variable.
+    """
+    if not raw.strip():
+        return MappingProxyType({})
+    try:
+        aliases = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{METADATA_MODELS_VARIABLE} must be a JSON object") from exc
+    if not isinstance(aliases, dict) or not all(isinstance(target, str) and target for target in aliases.values()):
+        raise ValueError(f"{METADATA_MODELS_VARIABLE} must map each route to a LiteLLM model name")
+    return MappingProxyType(aliases)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +205,7 @@ class AppConfig:
             if value is not None and value < 1:
                 raise ValueError(f"llm.{name} must be positive")
             setattr(self.llm, name, value)
+        parse_metadata_models(os.environ.get(METADATA_MODELS_VARIABLE, ""))
         self.llm.input_budget_fraction = float(os.environ.get("MEMFORGE_LLM_INPUT_BUDGET_FRACTION") or self.llm.input_budget_fraction)
         if not 0 < self.llm.input_budget_fraction <= 1:
             raise ValueError("llm.input_budget_fraction must be in (0, 1]")

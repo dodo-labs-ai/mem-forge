@@ -103,7 +103,7 @@ def test_a_command_given_a_configuration_file_completes_earlier_settings_from_th
             Path(config.storage.db_path),
             {
                 "enrichment_model": "claude-opus-ui",
-                "enrichment_base_url": "http://proxy.internal:6655/anthropic",
+                "enrichment_base_url": "http://proxy.internal:4000/anthropic",
                 "embedding_model": "text-embedding-3-large",
                 "embedding_base_url": "https://api.openai.com/v1",
             },
@@ -114,7 +114,7 @@ def test_a_command_given_a_configuration_file_completes_earlier_settings_from_th
 
     assert result.exit_code == 0, result.output
     assert "claude-opus-ui (Anthropic)" in result.output
-    assert "http://proxy.internal:6655/anthropic" in result.output
+    assert "http://proxy.internal:4000/anthropic" in result.output
     assert "text-embedding-3-large (OpenAI)" in result.output
     assert "claude-from-the-file" not in result.output
     assert result.output.count("API key from the environment") == 2

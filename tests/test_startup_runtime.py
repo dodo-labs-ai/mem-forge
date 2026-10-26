@@ -63,10 +63,10 @@ async def test_default_runtime_provider_forwards_the_collection_attempt(monkeypa
 
 def _config(tmp_path: Path) -> AppConfig:
     cfg = AppConfig(base_dir=tmp_path / "mem")
-    cfg.llm.enrichment_base_url = "http://localhost:6655/anthropic"
+    cfg.llm.enrichment_base_url = "http://localhost:4000/anthropic"
     cfg.llm.enrichment_api_key = "test-key"
     cfg.llm.request_timeout_s = 42.0
-    cfg.llm.embedding_base_url = "http://localhost:6655/openai/v1"
+    cfg.llm.embedding_base_url = "http://localhost:4000/openai/v1"
     cfg.llm.embedding_api_key = "test-key"
     cfg.server.jwt_secret = "test-secret"
     # Route and wiring tests must not implicitly own long-lived background
@@ -268,8 +268,8 @@ async def test_build_sync_runtime_wires_configured_litellm_structured_client(db,
     config.storage.db_path = str(tmp_path / "mem.db")
     config.storage.chroma_path = str(tmp_path / "chroma")
     config.storage.docs_path = str(tmp_path / "docs")
-    config.llm.enrichment_model = "anthropic--claude-sonnet-latest"
-    config.llm.enrichment_base_url = "http://localhost:6655/anthropic"
+    config.llm.enrichment_model = "claude-sonnet-latest"
+    config.llm.enrichment_base_url = "http://localhost:4000/anthropic"
     config.llm.enrichment_api_key = "local-key"
 
     runtime = await build_sync_runtime(db, config)
@@ -277,10 +277,10 @@ async def test_build_sync_runtime_wires_configured_litellm_structured_client(db,
     assert runtime.structured_llm_client is captured["client"]
     assert runtime.memory_extractor.structured_llm_client is captured["client"]
     assert runtime.memory_engine.structured_llm_client is captured["client"]
-    assert captured["config"].model == "anthropic/anthropic--claude-sonnet-latest"
-    assert captured["config"].base_url == "http://localhost:6655/anthropic"
+    assert captured["config"].model == "anthropic/claude-sonnet-latest"
+    assert captured["config"].base_url == "http://localhost:4000/anthropic"
     assert captured["config"].api_key == "local-key"
-    assert runtime.llm_model == "anthropic/anthropic--claude-sonnet-latest"
+    assert runtime.llm_model == "anthropic/claude-sonnet-latest"
 
 
 @pytest.mark.asyncio
@@ -3287,15 +3287,15 @@ def test_config_env_overrides_startup_runtime_values(monkeypatch, tmp_path):
     from memforge.config import load_config
 
     monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path / "env-base"))
-    monkeypatch.setenv("MEMFORGE_ENRICHMENT_BASE_URL", "http://localhost:6655/anthropic")
-    monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", "http://localhost:6655/openai/v1")
+    monkeypatch.setenv("MEMFORGE_ENRICHMENT_BASE_URL", "http://localhost:4000/anthropic")
+    monkeypatch.setenv("MEMFORGE_EMBEDDING_BASE_URL", "http://localhost:4000/openai/v1")
     monkeypatch.setenv("MEMFORGE_ADMIN_API_PORT", "9876")
 
     cfg = load_config(base_dir=tmp_path / "ignored")
 
     assert cfg.base_dir == tmp_path / "env-base"
-    assert cfg.llm.enrichment_base_url == "http://localhost:6655/anthropic"
-    assert cfg.llm.embedding_base_url == "http://localhost:6655/openai/v1"
+    assert cfg.llm.enrichment_base_url == "http://localhost:4000/anthropic"
+    assert cfg.llm.embedding_base_url == "http://localhost:4000/openai/v1"
     assert cfg.server.admin_api_port == 9876
 
 

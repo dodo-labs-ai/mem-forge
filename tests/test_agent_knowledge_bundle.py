@@ -67,9 +67,9 @@ async def bundle_stack(tmp_path, monkeypatch):
         name="Codex Session",
         config_json='{"client":"codex"}',
         access_policy="private",
-        owner_user_id="u-andrew",
-        created_by_user_id="u-andrew",
-        execution_owner_user_id="u-andrew",
+        owner_user_id="u-riley",
+        created_by_user_id="u-riley",
+        execution_owner_user_id="u-riley",
     )
     collection = RecordingCollection()
     adapters = build_sqlite_adapters(db, collection)
@@ -164,7 +164,7 @@ async def test_upsert_agent_concept_rolls_back_after_cancellation(bundle_stack, 
     concept = {
         "concept_id": "concept-cancelled-upsert",
         "source_id": "src-agent-sessions-codex",
-        "owner_user_id": "u-andrew",
+        "owner_user_id": "u-riley",
         "workspace": "/workspace/memforge-cloud",
         "repo_identifier": "github.example.com/acme/memforge-cloud",
         "concept_type": "decision",
@@ -225,7 +225,7 @@ async def test_concept_revision_time_is_the_authorizing_event_time(bundle_stack,
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -253,7 +253,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -271,7 +271,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
 
     concept = await db.get_agent_concept(result.concept_id)
     assert concept is not None
-    assert concept["owner_user_id"] == "u-andrew"
+    assert concept["owner_user_id"] == "u-riley"
     assert concept["visibility"] == Visibility.PRIVATE.value
     assert concept["repo_identifier"] == "github.example.com/acme/memforge-cloud"
 
@@ -283,7 +283,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     memory = await db.get_memory(result.memory_id)
     assert memory is not None
     assert memory.visibility == Visibility.PRIVATE.value
-    assert memory.owner_user_id == "u-andrew"
+    assert memory.owner_user_id == "u-riley"
     assert memory.repo_identifier == "github.example.com/acme/memforge-cloud"
     assert (
         memory.content == "Workspace source schedulers must start during app startup.\n"
@@ -291,7 +291,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
         "Why: This lets overdue schedules run without waiting for UI traffic."
     )
     assert "overdue source schedules" in claim["claim_text"]
-    assert collection.upserted[result.memory_id]["owner_user_id"] == "u-andrew"
+    assert collection.upserted[result.memory_id]["owner_user_id"] == "u-riley"
 
     relation_runs = await _relation_runs_for_memory(db, result.memory_id)
     assert len(relation_runs) == 1
@@ -302,7 +302,7 @@ async def test_create_private_concept_claim_and_memory(bundle_stack):
     assert evidence_unit.client == "codex"
     assert evidence_unit.repo_identifier == "github.example.com/acme/memforge-cloud"
     assert evidence_unit.source_metadata["claim_anchor"] == (
-        f"u-andrew:github.example.com/acme/memforge-cloud:{result.concept_id}:{result.claim_id}"
+        f"u-riley:github.example.com/acme/memforge-cloud:{result.concept_id}:{result.claim_id}"
     )
     relations = await db.get_evidence_relations(evidence_unit.id)
     assert [(relation.memory_id, relation.relation_type) for relation in relations] == [
@@ -319,7 +319,7 @@ async def test_created_claim_without_reason_records_program_reason(bundle_stack)
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(reason=""),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -351,7 +351,7 @@ async def test_agent_claim_identity_does_not_merge_with_ordinary_exact_memory(bu
         content=content,
         content_hash=content_hash(content),
         visibility=Visibility.PRIVATE.value,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         project_key="UNSORTED",
         repo_identifier="github.example.com/acme/memforge-cloud",
     )
@@ -360,7 +360,7 @@ async def test_agent_claim_identity_does_not_merge_with_ordinary_exact_memory(bu
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-agent-after-ordinary",
@@ -393,7 +393,7 @@ async def test_shared_managed_source_exposes_concepts_to_subscribed_workspace_me
     bundle = AgentKnowledgeBundleService(db=db, memory_store=store)
     result = await bundle.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-share",
@@ -414,7 +414,7 @@ async def test_shared_managed_source_exposes_concepts_to_subscribed_workspace_me
     access = SourceAccessTransitionService(db=db, memory_store=store)
     transition = await access.start(
         source_id="src-agent-sessions-codex",
-        actor_user_id="u-andrew",
+        actor_user_id="u-riley",
         target_policy="workspace",
         idempotency_key="share-codex-source",
     )
@@ -448,7 +448,7 @@ async def test_create_concept_does_not_commit_projection_before_memory_lifecycle
     with pytest.raises(RuntimeError, match="memory lifecycle commit failed"):
         await service.apply_patch_proposal(
             proposal=_proposal(concept_id="akb_concept_fail", claim_id="akb_claim_fail"),
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-1",
@@ -477,7 +477,7 @@ async def test_create_concept_does_not_leave_memory_when_claim_projection_fails(
     with pytest.raises(RuntimeError, match="claim projection failed"):
         await service.apply_patch_proposal(
             proposal=_proposal(concept_id="akb_concept_projection_fail", claim_id="akb_claim_projection_fail"),
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-1",
@@ -505,7 +505,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -529,7 +529,7 @@ async def test_add_claim_does_not_commit_projection_before_memory_lifecycle(bund
                 claim_text="A second claim should not be projected if memory creation fails.",
                 durable_claim=_durable("A second claim should not be projected if memory creation fails."),
             ),
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -550,7 +550,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -578,7 +578,7 @@ async def test_add_claim_writes_citations_and_markdown_inside_lifecycle_contract
             durable_claim=_durable("Scheduler claims persist with their concept markdown in one lifecycle commit."),
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -619,7 +619,7 @@ async def test_correction_rebinds_unchanged_multi_fragment_claim_in_one_v2_unit(
             claim_text=multi_block_claim,
             durable_claim=_durable("MemForge Cloud uses current runtime DDL."),
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-multi-fragment-1",
@@ -636,7 +636,7 @@ async def test_correction_rebinds_unchanged_multi_fragment_claim_in_one_v2_unit(
             claim_text="The second managed claim is still stale.",
             durable_claim=_durable("The second managed claim is still stale."),
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-multi-fragment-2",
@@ -678,7 +678,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -703,7 +703,7 @@ async def test_update_claim_does_not_commit_projection_before_memory_lifecycle(b
                 claim_text="This update must not replace the projection if memory supersession fails.",
                 durable_claim=_durable("This update must not replace the projection if memory supersession fails."),
             ),
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -727,7 +727,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -760,7 +760,7 @@ async def test_update_claim_rolls_back_when_atomic_citation_projection_fails(bun
                 reason="New evidence refines the scheduler lifecycle claim.",
                 citations=["agent-window://codex/sess-2/sha256-window"],
             ),
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -786,7 +786,7 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -815,7 +815,7 @@ async def test_update_existing_claim_rolls_back_if_claim_projection_commit_fails
     with pytest.raises(RuntimeError, match="atomic claim replacement commit failed"):
         await service.apply_patch_proposal(
             proposal=update_proposal,
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -843,7 +843,7 @@ async def test_update_agent_concept_markdown_fails_if_projection_target_is_missi
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -871,7 +871,7 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -887,7 +887,7 @@ async def test_retired_claim_backed_memory_is_removed_from_active_claim_projecti
         created.memory_id,
         reason="user_retired",
         expected_content_hash=old.content_hash,
-        actor_user_id="u-andrew",
+        actor_user_id="u-riley",
     )
 
     active_claims = await db.list_agent_claims(created.concept_id)
@@ -908,7 +908,7 @@ async def test_update_agent_concept_markdown_ignores_stale_projection_body(bundl
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -944,7 +944,7 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -970,7 +970,7 @@ async def test_update_existing_claim_records_relation_inside_supersede_contract(
     monkeypatch.setattr(db, "record_relation_outcome_bundle", fail_public_relation_bundle)
     await service.apply_patch_proposal(
         proposal=update_proposal,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -997,7 +997,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1029,7 +1029,7 @@ async def test_update_existing_claim_supersedes_memory_projection(bundle_stack):
             reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1111,7 +1111,7 @@ async def test_update_of_a_claim_memory_another_unit_supports_adds_the_replaceme
     db, store, _collection = bundle_stack
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     request = {
-        "owner_user_id": "u-andrew",
+        "owner_user_id": "u-riley",
         "source_id": "src-agent-sessions-codex",
         "client": "codex",
         "workspace": "/workspace/memforge-cloud",
@@ -1193,7 +1193,7 @@ async def test_update_without_model_claim_id_resolves_target_from_memory_candida
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1220,7 +1220,7 @@ async def test_update_without_model_claim_id_resolves_target_from_memory_candida
             reason="The new session outcome refines the older scheduler lifecycle memory.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1253,7 +1253,7 @@ async def test_create_action_reconciles_existing_memory_candidate_instead_of_dup
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1276,7 +1276,7 @@ async def test_create_action_reconciles_existing_memory_candidate_instead_of_dup
             durable_claim=_durable("Source schedulers are owned by the cloud app bootstrap."),
             reason="The model proposed a new concept, but the memory candidate is the current scheduler claim.",
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1303,7 +1303,7 @@ async def test_create_action_with_same_memory_content_moves_existing_claim_forwa
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1321,7 +1321,7 @@ async def test_create_action_with_same_memory_content_moves_existing_claim_forwa
             concept_id=None,
             claim_id=None,
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1351,7 +1351,7 @@ async def test_update_without_model_claim_id_does_not_create_duplicate_when_no_m
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1369,7 +1369,7 @@ async def test_update_without_model_claim_id_does_not_create_duplicate_when_no_m
             claim_text="This update has no safe memory target.",
             durable_claim=_durable("This update has no safe memory target."),
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1393,7 +1393,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1419,7 +1419,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
 
     first_update = await service.apply_patch_proposal(
         proposal=update,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1439,7 +1439,7 @@ async def test_update_existing_claim_retry_is_idempotent_after_replacement(bundl
 
     retry = await service.apply_patch_proposal(
         proposal=update,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1488,7 +1488,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1512,7 +1512,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
     )
     first_update = await service.apply_patch_proposal(
         proposal=update,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1533,7 +1533,7 @@ async def test_update_existing_claim_retry_rejects_changed_relation_payload(bund
     with pytest.raises(RuntimeError, match="relation_run_id collision"):
         await service.apply_patch_proposal(
             proposal=changed_retry,
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -1553,7 +1553,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1577,7 +1577,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
     )
     first_update = await service.apply_patch_proposal(
         proposal=update,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1599,7 +1599,7 @@ async def test_update_existing_claim_retry_rejects_committed_candidate_snapshot_
     with pytest.raises(RuntimeError, match="relation_run_id collision"):
         await service.apply_patch_proposal(
             proposal=update,
-            owner_user_id="u-andrew",
+            owner_user_id="u-riley",
             source_id="src-agent-sessions-codex",
             client="codex",
             session_id="sess-2",
@@ -1616,7 +1616,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1631,7 +1631,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
         content="A separate scheduler claim under the same concept remains active.",
         content_hash=content_hash("A separate scheduler claim under the same concept remains active."),
         visibility=Visibility.PRIVATE.value,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         repo_identifier="github.example.com/acme/memforge-cloud",
     )
     await db.insert_memory(same_doc_memory)
@@ -1653,7 +1653,7 @@ async def test_update_existing_claim_records_complete_mandatory_candidate_univer
             reason="New evidence refines the scheduler lifecycle claim.",
             citations=["agent-window://codex/sess-2/sha256-window"],
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1683,7 +1683,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1705,7 +1705,7 @@ async def test_supersede_existing_claim_records_memory_lifecycle(bundle_stack):
             durable_claim=_durable("Source scheduler startup is owned by the cloud app bootstrap lifespan."),
             reason="New implementation replaced the older scheduler startup claim.",
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-2",
@@ -1735,7 +1735,7 @@ async def test_agent_claim_requires_structured_memory_projection(bundle_stack):
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(durable_claim=None),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1794,7 +1794,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
 
     parsed_failure = await service.apply_patch_proposal(
         proposal=_proposal(durable_claim=None),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1805,7 +1805,7 @@ async def test_agent_patch_result_carries_explicit_result_bucket(bundle_stack):
     )
     no_output = await service.apply_patch_proposal(
         proposal=_proposal(action="no_output", claim_text="", durable_claim=None),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1826,7 +1826,7 @@ async def test_no_output_validates_covered_concept_and_claim_ids(bundle_stack):
 
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1844,7 +1844,7 @@ async def test_no_output_validates_covered_concept_and_claim_ids(bundle_stack):
             covered_concept_id=created.concept_id,
             covered_claim_id=created.claim_id,
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1861,7 +1861,7 @@ async def test_no_output_validates_covered_concept_and_claim_ids(bundle_stack):
             covered_concept_id=created.concept_id,
             covered_claim_id=created.claim_id,
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1878,7 +1878,7 @@ async def test_no_output_validates_covered_concept_and_claim_ids(bundle_stack):
             covered_concept_id=created.concept_id,
             covered_claim_id="claim-does-not-exist",
         ),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1905,7 +1905,7 @@ async def test_agent_claim_accepts_detailed_memory_projection(bundle_stack):
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(durable_claim=_durable(detailed_projection)),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -1928,7 +1928,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
     )
     first = await service.apply_patch_proposal(
         proposal=proposal,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-retry",
@@ -1939,7 +1939,7 @@ async def test_agent_evidence_unit_retry_is_idempotent(bundle_stack):
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-retry",
@@ -1967,7 +1967,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
 
     first = await service.apply_patch_proposal(
         proposal=proposal,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-retry-no-ids",
@@ -1978,7 +1978,7 @@ async def test_agent_evidence_unit_retry_is_idempotent_without_model_supplied_id
     )
     second = await service.apply_patch_proposal(
         proposal=proposal,
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-retry-no-ids",
@@ -2013,7 +2013,7 @@ async def test_agent_patch_missing_claim_text_is_failed_not_no_output(bundle_sta
 
     result = await service.apply_patch_proposal(
         proposal=_proposal(claim_text=""),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",
@@ -2034,7 +2034,7 @@ async def test_private_concept_rejects_other_user_update(bundle_stack):
     service = AgentKnowledgeBundleService(db=db, memory_store=store)
     created = await service.apply_patch_proposal(
         proposal=_proposal(),
-        owner_user_id="u-andrew",
+        owner_user_id="u-riley",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="sess-1",

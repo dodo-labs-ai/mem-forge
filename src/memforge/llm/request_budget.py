@@ -6,17 +6,29 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import logging
+import os
 
 import litellm
+
+from memforge.config import METADATA_MODELS_VARIABLE, parse_metadata_models
 
 logger = logging.getLogger(__name__)
 
 
 def metadata_model(model: str) -> str:
-    """Route aliases identify models; all capacity numbers remain SDK-owned."""
-    return {
-        "litellm_proxy/claude-sonnet": "bedrock/anthropic.claude-sonnet-4-6",
-    }.get(model, model)
+    """The LiteLLM model whose token limits and tokenizer stand for ``model``.
+
+    A deployment that reaches a model under a route name LiteLLM does not
+    know, such as an alias on a hosted LiteLLM gateway, names the model the
+    route serves in ``MEMFORGE_LLM_METADATA_MODELS``, a JSON object from
+    route to LiteLLM model::
+
+        MEMFORGE_LLM_METADATA_MODELS='{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}'
+
+    The capacity numbers stay LiteLLM's, and every other route is its own
+    metadata model.
+    """
+    return parse_metadata_models(os.environ.get(METADATA_MODELS_VARIABLE, "")).get(model, model)
 
 
 @dataclass(frozen=True)
@@ -38,8 +50,9 @@ class RequestBudget:
         is what the operator's machine holds, which the model's own window
         does not tell.
         """
+        catalog_model = metadata_model(model)
         try:
-            info = litellm.get_model_info(metadata_model(model))
+            info = litellm.get_model_info(catalog_model)
         except Exception:
             info = {}
 

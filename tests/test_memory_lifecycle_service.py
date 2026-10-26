@@ -290,7 +290,7 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
             "matched after using Status and FollowUpStepStatus."
         ),
         memory_type="fact",
-        owner_user_id="owner@example.com",
+        owner_user_id="riley@example.com",
         client="codex",
         repo_identifier="github.com/dodo-labs-ai/mem-forge",
     )
@@ -301,7 +301,7 @@ async def test_create_memory_writes_private_user_memory_with_provenance(db: Data
     assert stored is not None
     assert stored.content == "Use Status and FollowUpStepStatus when polling PayrollProcessingTriggerViews."
     assert stored.visibility == Visibility.PRIVATE.value
-    assert stored.owner_user_id == "owner@example.com"
+    assert stored.owner_user_id == "riley@example.com"
     assert stored.project_key == "UNSORTED"
     assert stored.repo_identifier == "github.com/dodo-labs-ai/mem-forge"
     assert [(source.doc_id, source.source_type) for source in sources] == [
@@ -786,8 +786,8 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
         "Codex Session",
         "{}",
         "private",
-        "owner@example.com",
-        created_by_user_id="owner@example.com",
+        "riley@example.com",
+        created_by_user_id="riley@example.com",
     )
     collection = RecordingCollection()
     store = _store(db, collection)
@@ -806,7 +806,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
             memory_type="fact",
             reason="Initial observed convention.",
         ),
-        owner_user_id="owner@example.com",
+        owner_user_id="riley@example.com",
         source_id="src-agent-sessions-codex",
         client="codex",
         session_id="session-initial",
@@ -827,7 +827,7 @@ async def test_replace_agent_claim_memory_updates_claim_lineage(db: Database):
         provenance="User corrected the command while reviewing Claude Code CLI usage.",
         reason="User corrected the command name.",
         expected_content_hash=old.content_hash,
-        authority=_authority("owner@example.com", "member"),
+        authority=_authority("riley@example.com", "member"),
         replacement_kind="revision",
     )
 
@@ -1611,7 +1611,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
-        principal_resolver=lambda _request: "owner@example.com",
+        principal_resolver=lambda _request: "riley@example.com",
         runtime_provider=RoundTripRuntimeProvider(),
     )
 
@@ -1676,7 +1676,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     stored = await db.get_memory(payload["memory_id"])
     assert payload["status"] == "inserted"
     assert stored is not None
-    assert stored.owner_user_id == "owner@example.com"
+    assert stored.owner_user_id == "riley@example.com"
     assert stored.visibility == "private"
     assert stored.repo_identifier is None
     assert [source.excerpt for source in await db.get_memory_sources(payload["memory_id"])] == [
@@ -1688,7 +1688,7 @@ async def test_create_search_get_memory_round_trip_keeps_provenance_out_of_searc
     )
     assert len(audit_rows) == 1
     assert audit_rows[0].actor_type == "user"
-    assert audit_rows[0].actor_id == "owner@example.com"
+    assert audit_rows[0].actor_id == "riley@example.com"
     document = await db.get_document(f"user-memory-{payload['memory_id']}")
     assert document is not None
     assert document.client == "codex"
@@ -1706,7 +1706,7 @@ async def test_create_memory_route_requires_provenance(db: Database, tmp_path, m
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
-        principal_resolver=lambda _request: "owner@example.com",
+        principal_resolver=lambda _request: "riley@example.com",
     )
 
     with TestClient(app) as client:
@@ -1735,7 +1735,7 @@ async def test_create_memory_route_rejects_legacy_reason_field(db: Database, tmp
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
-        principal_resolver=lambda _request: "owner@example.com",
+        principal_resolver=lambda _request: "riley@example.com",
     )
 
     provenance = "User explicitly asked to keep this convention after reviewing MCP memory behavior."
@@ -1785,7 +1785,7 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
-        principal_resolver=lambda _request: "owner@example.com",
+        principal_resolver=lambda _request: "riley@example.com",
     )
 
     with TestClient(app) as client:
@@ -1804,7 +1804,7 @@ async def test_retire_memory_route_audits_request_principal(db: Database, tmp_pa
     )
     assert len(audit_rows) == 1
     assert audit_rows[0].actor_type == "user"
-    assert audit_rows[0].actor_id == "owner@example.com"
+    assert audit_rows[0].actor_id == "riley@example.com"
 
 
 def _private_memory(mem_id: str, content: str, *, owner_user_id: str) -> Memory:
@@ -1988,7 +1988,7 @@ async def test_propose_memory_correction_route_audits_request_principal(db: Data
     app = create_admin_app(
         db=db,
         config=_api_config(tmp_path),
-        principal_resolver=lambda _request: "owner@example.com",
+        principal_resolver=lambda _request: "riley@example.com",
     )
 
     with TestClient(app) as client:
@@ -2021,7 +2021,7 @@ async def test_propose_memory_correction_route_audits_request_principal(db: Data
     )
     assert len(audit_rows) == 1
     assert audit_rows[0].actor_type == "user"
-    assert audit_rows[0].actor_id == "owner@example.com"
+    assert audit_rows[0].actor_id == "riley@example.com"
 
 
 @pytest.mark.asyncio

@@ -79,7 +79,7 @@ def test_github_repo_preview_tree_result(monkeypatch):
 
     result = _run(
         "github_repo_preview_tree",
-        {"repo_url": "https://github.internal.example.com/acme-gamma/architecture", "ref": "main", "limit": 2},
+        {"repo_url": "https://github.example.com/acme/architecture", "ref": "main", "limit": 2},
         source_id="src-gh",
     )
 

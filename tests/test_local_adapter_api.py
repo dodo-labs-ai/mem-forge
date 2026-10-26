@@ -188,7 +188,7 @@ def _create_github_repo_source(
             "access_policy": "private",
             "config": {
                 "connection_mode": connection_mode,
-                "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                "repo_url": "https://github.example.com/acme/architecture",
                 "ref": "main",
                 "include_paths": ["Payroll Processing/"],
                 "exclude_paths": exclude_paths or [],
@@ -343,7 +343,7 @@ def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path)
             row = asyncio.run(database.get_source(created["id"]))
         assert row is not None
         assert row["type"] == "github_repo"
-        assert row["config"]["repo_url"] == "https://github.internal.example.com/acme-gamma/architecture"
+        assert row["config"]["repo_url"] == "https://github.example.com/acme/architecture"
         documents_dir = Path(row["config"]["documents_dir"])
         assert documents_dir.exists()
         expected_root = Path(cfg.storage.docs_path).parent / "local-adapter-submissions"
@@ -1034,7 +1034,7 @@ def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type
             else:
                 source_id = _create_github_repo_source(client)["id"]
                 payload = {
-                    "repo_url": ("https://github.internal.example.com/acme-gamma/architecture"),
+                    "repo_url": ("https://github.example.com/acme/architecture"),
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/emptied.md",
                     "markdown_body": "",
@@ -1083,7 +1083,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "title": "Payroll Processing",
@@ -1100,7 +1100,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         assert body["source_id"] == source_id
         assert body["doc_id"] == build_github_repo_doc_id(
             source_id=source_id,
-            repo_url="https://github.internal.example.com/acme-gamma/architecture",
+            repo_url="https://github.example.com/acme/architecture",
             repo_ref="main",
             relative_path="Payroll Processing/README.md",
         )
@@ -1111,7 +1111,7 @@ def test_github_repo_adapter_document_push_writes_package(tmp_path):
         package_path = Path(body["package_uri"])
         package = json.loads(package_path.read_text())
         assert package["package_kind"] == "github_repo_document"
-        assert package["repo_url"] == "https://github.internal.example.com/acme-gamma/architecture"
+        assert package["repo_url"] == "https://github.example.com/acme/architecture"
         assert package["repo_ref"] == "main"
         assert package["relative_path"] == "Payroll Processing/README.md"
         assert package["blob_sha"] == "blob-sha-1"
@@ -1156,7 +1156,7 @@ def test_github_repo_symlink_push_preserves_logical_identity_and_audit_locator(t
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Contributions\n\nUse reviewed changes.",
@@ -1176,7 +1176,7 @@ def test_github_repo_symlink_push_preserves_logical_identity_and_audit_locator(t
         package = json.loads(Path(body["package_uri"]).read_text())
         assert package["doc_id"] == build_github_repo_doc_id(
             source_id=source_id,
-            repo_url="https://github.internal.example.com/acme-gamma/architecture",
+            repo_url="https://github.example.com/acme/architecture",
             repo_ref="main",
             relative_path="Payroll Processing/README.md",
         )
@@ -1230,7 +1230,7 @@ def test_github_repo_symlink_push_rejects_unsafe_audit_locator(
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Contributions",
@@ -1273,7 +1273,7 @@ def test_github_repo_symlink_push_rejects_incomplete_audit_locator(
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# A",
@@ -1328,7 +1328,7 @@ def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
             package_response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/architecture.png",
                     "markdown_body": "",
@@ -1521,7 +1521,7 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
             relative_path = "Payroll Processing/README.md"
             doc_id = build_github_repo_doc_id(
                 source_id=source_id,
-                repo_url="https://github.internal.example.com/acme-gamma/architecture",
+                repo_url="https://github.example.com/acme/architecture",
                 repo_ref="main",
                 relative_path=relative_path,
             )
@@ -1540,7 +1540,7 @@ def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp
             first = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": relative_path,
                     "markdown_body": "# Payroll Processing\n\nArchitecture notes.",
@@ -1618,13 +1618,13 @@ def test_file_package_without_source_time_is_uploaded_once_more_under_the_source
                 relative_path = "Payroll Processing/README.md"
                 doc_id = build_github_repo_doc_id(
                     source_id=source_id,
-                    repo_url="https://github.internal.example.com/acme-gamma/architecture",
+                    repo_url="https://github.example.com/acme/architecture",
                     repo_ref="main",
                     relative_path=relative_path,
                 )
                 revision = "blob-sha-1"
                 package = {
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": relative_path,
                     "markdown_body": markdown_body,
@@ -1721,14 +1721,14 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
             relative_path = "Payroll Processing/README.md"
             doc_id = build_github_repo_doc_id(
                 source_id=source_id,
-                repo_url="https://github.internal.example.com/acme-gamma/architecture",
+                repo_url="https://github.example.com/acme/architecture",
                 repo_ref="main",
                 relative_path=relative_path,
             )
             first = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": relative_path,
                     "markdown_body": "# Payroll Processing",
@@ -1828,7 +1828,7 @@ def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Payroll Processing",
@@ -1856,7 +1856,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
             wrong_ref = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "feature",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Payroll Processing",
@@ -1866,7 +1866,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
             wrong_path = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Flexible Payroll/README.md",
                     "markdown_body": "# Flexible Payroll",
@@ -1876,7 +1876,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
             wrong_extension = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/diagram.png",
                     "markdown_body": "png bytes",
@@ -1886,7 +1886,7 @@ def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path
             excluded_path = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/archived/README.md",
                     "markdown_body": "# Archived",
@@ -1917,7 +1917,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
             first = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Payroll Processing",
@@ -1927,7 +1927,7 @@ def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
             second = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/Second.md",
                     "markdown_body": "# Second",
@@ -1958,7 +1958,7 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
                     {
                         "package_kind": "github_repo_document",
                         "doc_id": "stale",
-                        "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                        "repo_url": "https://github.example.com/acme/architecture",
                         "repo_ref": "main",
                         "relative_path": "Flexible Payroll/README.md",
                         "content_type": "text/markdown",
@@ -1969,7 +1969,7 @@ def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(t
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+                    "repo_url": "https://github.example.com/acme/architecture",
                     "repo_ref": "main",
                     "relative_path": "Payroll Processing/README.md",
                     "markdown_body": "# Payroll Processing",
@@ -2566,7 +2566,7 @@ def test_a_retried_package_push_survives_cleanup_of_the_failed_attempt(tmp_path)
     database = _connect_database(tmp_path)
     document_store = LocalDocumentStore(cfg.storage.docs_path)
     package = {
-        "repo_url": "https://github.internal.example.com/acme-gamma/architecture",
+        "repo_url": "https://github.example.com/acme/architecture",
         "repo_ref": "main",
         "relative_path": "Payroll Processing/overview.md",
         "markdown_body": "# Overview\n\nPayroll runs nightly.",
