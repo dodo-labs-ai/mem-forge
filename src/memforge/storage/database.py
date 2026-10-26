@@ -11040,9 +11040,8 @@ class Database:
         """Load the old Support each Memory's latest current-revision decision kept skipped.
 
         Every applied Plan on a Unit's current revision, including a Review's
-        approval or refresh Plan that decides one incumbent, is folded in apply
-        order, so each Memory keeps only the skipped Support of its latest
-        decision.
+        approval Plan that decides one incumbent, is folded in apply order, so
+        each Memory keeps only the skipped Support of its latest decision.
         """
 
         ordered_unit_ids = sorted(source_unit_ids)

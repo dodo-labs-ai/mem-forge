@@ -15,7 +15,10 @@ from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_planner import lifecycle_memory_version
-from memforge.memory.review_decision import memory_review_decision_fingerprint
+from memforge.memory.review_decision import (
+    lifecycle_review_decision_fingerprint,
+    memory_review_decision_fingerprint,
+)
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.review_service import (
     ResolvedReview,
@@ -795,6 +798,35 @@ class TestUnifiedLifecycleReviewApi:
         assert stored is not None and stored.status is LifecycleReviewStatus.APPROVED
         current = await db.get_memory("mem-lifecycle-current")
         assert current is not None and current.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_review_without_its_plan_cannot_be_decided(self, db, tmp_path, monkeypatch):
+        review_id = await _seed_decidable_lifecycle_review(db)
+        review = await db.get_lifecycle_review(review_id)
+        assert review is not None
+        fingerprint = lifecycle_review_decision_fingerprint(review)
+
+        async def no_plan_payload(plan_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(db, "get_lifecycle_plan_payload", no_plan_payload)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            approved = client.post(
+                f"/api/v1/memory-reviews/{review_id}/approve",
+                json={"expected_fingerprint": fingerprint},
+            )
+            rejected = client.post(
+                f"/api/v1/memory-reviews/{review_id}/reject",
+                json={"expected_fingerprint": fingerprint, "note": "Keep it."},
+            )
+
+        assert (approved.status_code, approved.json()["detail"]) == (409, "Lifecycle review plan is unavailable")
+        assert (rejected.status_code, rejected.json()["detail"]) == (409, "Lifecycle review plan is unavailable")
+        stored = await db.get_lifecycle_review(review_id)
+        assert stored is not None and stored.status is LifecycleReviewStatus.PENDING
 
     @pytest.mark.asyncio
     async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(

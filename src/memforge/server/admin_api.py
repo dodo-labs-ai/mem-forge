@@ -8077,28 +8077,33 @@ def create_admin_app(
         }
 
     async def _decide_lifecycle_review(
-        source_id: str,
-        review_id: str,
+        review: LifecycleReview,
         request: Request,
         db: Database,
         *,
         action: Literal["use_latest_state", "keep_current_state"],
         expected_fingerprint: str,
         note: str | None,
-        config: AppConfig | None = None,
-        runtime_provider: RuntimeProvider | None = None,
-    ) -> dict[str, object]:
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> tuple[LifecycleReview, dict[str, Any]]:
+        """Decide one LifecycleReview and return it with the Source its Plan scoped.
+
+        The Review's own Plan payload names that Source, whose management
+        authority the decision requires. Repeating the decision the Review
+        already records returns it unchanged.
+        """
         from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        review = await db.get_lifecycle_review(review_id)
-        if review is None:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        if review.source_id != source_id:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
         await _require_lifecycle_review_visibility(request, db, review)
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        scope = payload.get("scope") if isinstance(payload, Mapping) else None
+        if payload is None or not isinstance(scope, Mapping):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        source_id = scope.get("source_id")
+        source = await db.get_source(source_id) if isinstance(source_id, str) and source_id else None
+        if source is None:
+            raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
         _require_review_decision_authority(request, [source])
         if lifecycle_review_decision_fingerprint(review) != expected_fingerprint:
             raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
@@ -8106,62 +8111,45 @@ def create_admin_app(
             LifecycleReviewStatus.APPROVED if action == "use_latest_state" else LifecycleReviewStatus.REJECTED
         )
         if review.status is target_status:
-            return {
-                "source_id": source_id,
-                "review_id": review_id,
-                "status": review.status.value,
-                **(
-                    {"lifecycle_plan_id": f"lifecycle-review-approval-{review.id}"}
-                    if target_status is LifecycleReviewStatus.APPROVED
-                    else {}
-                ),
-            }
+            return review, source
         if review.status is not LifecycleReviewStatus.PENDING:
             raise HTTPException(
                 status_code=409,
                 detail=f"Lifecycle review is already {review.status.value}",
             )
-        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-        if payload is None or not isinstance(payload.get("scope"), dict):
-            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
-        if payload["scope"].get("source_id") != source_id:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
         reviewer = resolve_request_principal(request)
+        review_note = note.strip() if note and note.strip() else None
         if action == "keep_current_state":
-            if not note or not note.strip():
-                raise HTTPException(status_code=400, detail="A note is required to keep the current state")
             try:
                 rejected = await db.resolve_lifecycle_review(
-                    review_id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=note.strip(),
+                    review.id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=review_note,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {"source_id": source_id, "review_id": review_id, "status": rejected.status.value}
+            return rejected, source
         try:
             plan = build_lifecycle_review_approval_plan(
-                review, payload, reviewer=reviewer, review_note=note.strip() if note else None,
+                review, payload, reviewer=reviewer, review_note=review_note,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _apply_lifecycle_review_plan(
-            source_id, review, plan, db, config=config, runtime_provider=runtime_provider,
+        decided = await _apply_lifecycle_review_plan(
+            review, plan, db, config=config, runtime_provider=runtime_provider,
         )
+        return decided, source
 
     async def _apply_lifecycle_review_plan(
-        source_id: str,
         review: LifecycleReview,
         plan: LifecyclePlan,
         db: Database,
         *,
-        config: AppConfig | None,
-        runtime_provider: RuntimeProvider | None,
-    ) -> dict[str, object]:
-        """Apply one approval's Plan and deliver its vector changes.
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> LifecycleReview:
+        """Apply one approval's Plan, deliver its vector changes and return the decided Review.
 
         An approval whose guard no longer holds marks the Review stale.
         """
-        if config is None or runtime_provider is None:
-            raise RuntimeError("Lifecycle approval requires the configured runtime")
         try:
             await db.apply_lifecycle_plan(plan)
         except ValueError as exc:
@@ -8181,13 +8169,9 @@ def create_admin_app(
                 delivery.error_types,
             )
         decided = await db.get_lifecycle_review(review.id)
-        assert decided is not None
-        return {
-            "source_id": source_id,
-            "review_id": review.id,
-            "status": decided.status.value,
-            "lifecycle_plan_id": plan.id,
-        }
+        if decided is None:
+            raise HTTPException(status_code=404, detail="Review not found")
+        return decided
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
@@ -10162,12 +10146,8 @@ def create_admin_app(
         if lifecycle_review is not None and review_before is not None:
             raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
-            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-            scope = payload.get("scope") if isinstance(payload, Mapping) else None
-            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-            await _decide_lifecycle_review(
-                source_id,
-                review_id,
+            decided, source = await _decide_lifecycle_review(
+                lifecycle_review,
                 request,
                 db,
                 action="use_latest_state",
@@ -10176,12 +10156,9 @@ def create_admin_app(
                 config=config,
                 runtime_provider=runtime_provider,
             )
-            updated = await db.get_lifecycle_review(review_id)
-            source = await db.get_source(source_id)
-            assert updated is not None and source is not None
             return await _lifecycle_review_response(
                 db,
-                updated,
+                decided,
                 source,
                 request=request,
                 detail=True,
@@ -10260,12 +10237,8 @@ def create_admin_app(
         if lifecycle_review is not None and review_before is not None:
             raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
-            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-            scope = payload.get("scope") if isinstance(payload, Mapping) else None
-            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-            await _decide_lifecycle_review(
-                source_id,
-                review_id,
+            decided, source = await _decide_lifecycle_review(
+                lifecycle_review,
                 request,
                 db,
                 action="keep_current_state",
@@ -10274,12 +10247,9 @@ def create_admin_app(
                 config=config,
                 runtime_provider=runtime_provider,
             )
-            updated = await db.get_lifecycle_review(review_id)
-            source = await db.get_source(source_id)
-            assert updated is not None and source is not None
             return await _lifecycle_review_response(
                 db,
-                updated,
+                decided,
                 source,
                 request=request,
                 detail=True,
