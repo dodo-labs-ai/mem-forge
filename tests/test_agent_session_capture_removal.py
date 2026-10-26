@@ -498,6 +498,7 @@ async def test_an_agent_session_source_with_an_open_access_change_stops_the_upgr
     assert "op-open" in message
     assert "delete the Source in the admin UI" in message
     assert f"recovery point {point.id}" in message
+    assert f"memforge backup restore {point.id}" in message
     assert _schema(db_path) == REMOVAL - 1
     assert set(CAPTURE_TABLES) <= _capture_objects(db_path)
     assert _rows(db_path, "SELECT status FROM sources WHERE id = ?", (AGENT_SOURCE,)) == source_status

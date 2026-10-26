@@ -5597,7 +5597,8 @@ class Database:
                     if recovery_point is not None:
                         message += (
                             f" The data as it was before this upgrade is kept as recovery point "
-                            f"{recovery_point.id}."
+                            f"{recovery_point.id}; to go back to it, stop MemForge and run "
+                            f"`memforge backup restore {recovery_point.id}`."
                         )
                     raise MigrationFailed(message) from exc
             finally:
@@ -17822,6 +17823,10 @@ class Database:
         running, a local agent job queued or leased, or an access transition
         queued, running or failed) is refused with a ``ValueError`` naming that
         work, before anything changes.
+
+        Migration 131 also runs this core, for every agent-session Source still
+        active on an older database. A schema change to a table it reads or
+        writes must keep that migration replayable from schema 130.
         """
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
