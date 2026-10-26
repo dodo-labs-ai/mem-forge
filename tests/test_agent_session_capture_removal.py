@@ -262,7 +262,14 @@ async def _seed_current_data(path: Path) -> str:
 
 
 def _make_prior_release(path: Path) -> None:
-    """Make the database look as a release that still kept agent-session capture left it."""
+    """Make the database look as a release that still kept agent-session capture left it.
+
+    The database keeps every later table and column, so migration 131 runs the
+    live Source retirement core against the current schema. A later migration
+    that changes a table the core reads or writes must keep a real upgrade from
+    schema 130 runnable and prove it on a schema-130 database, which this
+    fixture does not build.
+    """
 
     with closing(sqlite3.connect(path)) as connection:
         connection.executescript(CAPTURE_TABLES_SCHEMA)
@@ -454,19 +461,25 @@ async def test_restoring_the_recovery_point_brings_the_capture_data_back(db_path
     assert _rows(db_path, "SELECT status FROM memories WHERE id = ?", (CLAIM_MEMORY,)) == [("active",)]
 
 
-async def test_an_agent_session_source_with_a_failed_access_change_stops_the_upgrade(db_path, points) -> None:
+@pytest.mark.parametrize("transition_status", ["queued", "running", "failed"])
+async def test_an_agent_session_source_with_an_open_access_change_stops_the_upgrade(
+    db_path, points, transition_status
+) -> None:
     await _seed_current_data(db_path)
     db = Database(str(db_path))
     await db.connect()
     try:
         await db.create_source_access_transition(
-            operation_id="op-failed",
+            operation_id="op-open",
             source_id=AGENT_SOURCE,
-            idempotency_key="key-failed",
+            idempotency_key="key-open",
             actor_user_id=OWNER,
             target_policy="workspace",
         )
-        await db.db.execute("UPDATE source_access_transitions SET status = 'failed' WHERE operation_id = 'op-failed'")
+        await db.db.execute(
+            "UPDATE source_access_transitions SET status = ? WHERE operation_id = 'op-open'",
+            (transition_status,),
+        )
         await db.db.commit()
     finally:
         await db.close()
@@ -482,7 +495,7 @@ async def test_an_agent_session_source_with_a_failed_access_change_stops_the_upg
     [point] = points.list()
     assert f"Migration {REMOVAL}" in message
     assert AGENT_SOURCE in message
-    assert "op-failed" in message
+    assert "op-open" in message
     assert "delete the Source in the admin UI" in message
     assert f"recovery point {point.id}" in message
     assert _schema(db_path) == REMOVAL - 1

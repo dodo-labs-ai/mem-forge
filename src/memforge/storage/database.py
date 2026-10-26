@@ -17817,7 +17817,11 @@ class Database:
         This is the relational part of ``delete_source_cascade``: it neither
         takes the write lock nor commits. Each Memory it retires gets a
         ``source_deletion_vector_outbox`` row, from which the lifecycle vector
-        worker removes it from the vector index.
+        worker removes it from the vector index. A missing or already retired
+        Source retires nothing. A Source with open work (a sync run pending or
+        running, a local agent job queued or leased, or an access transition
+        queued, running or failed) is refused with a ``ValueError`` naming that
+        work, before anything changes.
         """
         source_lock = await self.db.execute(
             "UPDATE sources SET status = status WHERE id = ?",
@@ -18280,10 +18284,6 @@ class Database:
             )
             await self.db.commit()
             return cursor.rowcount > 0
-
-    # ==================================================================
-    # Agent session receipt lineage
-    # ==================================================================
 
     # ==================================================================
     # Sync
