@@ -117,7 +117,7 @@ class ConversationLayer:
 
         The previous attempt is the manifest the Source received last, which
         may be a failed run or a dry run; a range only a dry run read counts
-        as read (issue dodoman-sun/memforge-cloud#638).
+        as read.
         """
 
         initial_history = timedelta(days=selection.initial_history_days)
@@ -388,8 +388,7 @@ def _left_unread(
     Above ``R`` lies the next regular poll's range. A conversation the
     previous attempt could not read leaves nothing to backfill; the regular
     poll restarts the chain. The previous attempt may be a failed run or a dry
-    run; a range only a dry run read counts as read (issue
-    dodoman-sun/memforge-cloud#638).
+    run; a range only a dry run read counts as read.
     """
 
     conversation = evidence.ref

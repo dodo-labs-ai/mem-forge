@@ -65,7 +65,7 @@ def _candidate(**overrides) -> CandidateMemory:
 
 def _access(**overrides) -> AccessContext:
     defaults = dict(
-        actor_user_id="owner@example.com",
+        actor_user_id="riley@example.com",
         workspace_ids=("ws-1",),
         role_grants=("workspace_admin",),
         source_subscriptions=("src-1", "src-2"),

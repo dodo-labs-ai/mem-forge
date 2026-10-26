@@ -5,7 +5,7 @@ from memforge.repo_identity import normalize_repo_identifier
 
 def test_normalize_repo_identifier_prefers_canonical_remote_slug():
     assert (
-        normalize_repo_identifier("git@github.example.com:acme/memforge-cloud.git")
+        normalize_repo_identifier("git@github.example.com:Acme/memforge-cloud.git")
         == "github.example.com/acme/memforge-cloud"
     )
     assert (

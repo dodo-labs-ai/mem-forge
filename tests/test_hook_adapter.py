@@ -1749,7 +1749,7 @@ def test_mcp_proxy_adds_client_root_git_remote_as_ranking_hint_only(monkeypatch,
     captured = {}
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/acme/memforge-cloud.git")
 
     class FakeResponse:
         headers = {"content-type": "application/json"}
@@ -1774,7 +1774,7 @@ def test_mcp_proxy_adds_client_root_git_remote_as_ranking_hint_only(monkeypatch,
     proxy._call_tool("search", {"query": "scheduler fix"})
 
     body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
+    assert body["active_repo_identifier"] == "github.com/acme/memforge-cloud"
     assert "source_filter" not in body
 
 
@@ -1783,7 +1783,7 @@ def test_mcp_proxy_uses_explicit_repository_context_as_ranking_hint(monkeypatch,
     captured = {}
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/acme/memforge-cloud.git")
 
     class FakeResponse:
         headers = {"content-type": "application/json"}
@@ -1815,7 +1815,7 @@ def test_mcp_proxy_uses_explicit_repository_context_as_ranking_hint(monkeypatch,
     )
 
     body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
+    assert body["active_repo_identifier"] == "github.com/acme/memforge-cloud"
     assert "repository_context" not in body
 
 
@@ -1826,7 +1826,7 @@ def test_mcp_proxy_explicit_repository_context_selects_one_repo_from_multiple_ro
     other_root = tmp_path / "mem-forge"
     active_root.mkdir()
     other_root.mkdir()
-    _init_git_repo_with_origin(active_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(active_root, "https://github.com/acme/memforge-cloud.git")
     _init_git_repo_with_origin(other_root, "https://github.com/dodo-labs-ai/mem-forge.git")
     _provide_mcp_roots(proxy, active_root, other_root)
 
@@ -1860,7 +1860,7 @@ def test_mcp_proxy_explicit_repository_context_selects_one_repo_from_multiple_ro
     )
 
     body = json.loads(captured["body"].decode())
-    assert body["active_repo_identifier"] == "github.com/dodoman-sun/memforge-cloud"
+    assert body["active_repo_identifier"] == "github.com/acme/memforge-cloud"
     assert "repository_context" not in body
 
 
@@ -1895,7 +1895,7 @@ def test_mcp_proxy_rejects_current_repo_filter_even_when_client_roots_are_availa
     proxy = _load_plugin_mcp_proxy()
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/acme/memforge-cloud.git")
     plugin_root = tmp_path / "plugin"
     plugin_root.mkdir()
     monkeypatch.chdir(plugin_root)
@@ -1958,7 +1958,7 @@ def test_mcp_proxy_rejects_current_repo_filter_when_cwd_is_git_repo_but_roots_ar
     proxy = _load_plugin_mcp_proxy()
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/acme/memforge-cloud.git")
     monkeypatch.chdir(repo_root)
 
     class FakeOpener:
@@ -1989,7 +1989,7 @@ def test_mcp_proxy_ignores_codex_workspace_root_when_roots_are_not_advertised(mo
     captured = {}
     repo_root = tmp_path / "memforge-cloud"
     repo_root.mkdir()
-    _init_git_repo_with_origin(repo_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(repo_root, "https://github.com/acme/memforge-cloud.git")
     plugin_root = tmp_path / "plugin-cache"
     plugin_root.mkdir()
     monkeypatch.chdir(plugin_root)
@@ -2062,7 +2062,7 @@ def test_mcp_proxy_rejects_current_repo_filter_when_roots_have_multiple_git_remo
     second_root = tmp_path / "mem-forge"
     first_root.mkdir()
     second_root.mkdir()
-    _init_git_repo_with_origin(first_root, "https://github.com/dodoman-sun/memforge-cloud.git")
+    _init_git_repo_with_origin(first_root, "https://github.com/acme/memforge-cloud.git")
     _init_git_repo_with_origin(second_root, "https://github.com/dodo-labs-ai/mem-forge.git")
     _provide_mcp_roots(proxy, first_root, second_root)
 

@@ -41,7 +41,7 @@ Usage::
         --openrouter-generation-model openai/gpt-5-mini
     uv run python scripts/provider_smoke.py --ollama-endpoint http://gpu-box:11434
     uv run python scripts/provider_smoke.py --litellm-route voyage/voyage-3 --kind embedding
-    uv run python scripts/provider_smoke.py --litellm-route litellm_proxy/gpt-5-mini --endpoint https://...
+    uv run python scripts/provider_smoke.py --litellm-route litellm_proxy/team-gpt-mini --endpoint https://...
 """
 
 from __future__ import annotations
