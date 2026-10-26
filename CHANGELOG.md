@@ -27,8 +27,10 @@
   `SameUnitRelationType`, `SameUnitRelationAssessment`, `SameUnitPairDecision`,
   `SameUnitPairResponse` and the structured client method
   `classify_same_unit_pairs`.
-  Stored tables, contract versions, audit events, error codes and HTTP and MCP
-  field names are unchanged, so no migration runs. Cloud: the HANA adapter, the
+  Stored tables, contract versions, audit events, error codes, the LLM call
+  operation names in runtime events and metrics (`cross_document_relation`,
+  `memory_relation`) and HTTP and MCP field names are unchanged, so no
+  migration runs. Cloud: the HANA adapter, the
   core-integration `WorkspaceDatabase` and the runtime provider take the new
   names with the pin.
 

@@ -1447,6 +1447,10 @@ def _schema_operation_name(response_format: type[BaseModel]) -> str:
         return "support_assessment"
     if response_format is ChangeImpactWireResponse:
         return "change_impact"
+    if response_format is RelationCandidateResponse:
+        return "cross_document_relation"
+    if response_format is SameUnitPairResponse:
+        return "memory_relation"
     name = response_format.__name__.removesuffix("Response")
     return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 

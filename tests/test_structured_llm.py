@@ -838,6 +838,31 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
 
 
 @pytest.mark.asyncio
+async def test_relation_operations_keep_their_stored_telemetry_names(monkeypatch):
+    telemetry: list[StructuredLlmCallTelemetry] = []
+
+    async def fake_acompletion(**kwargs):
+        return CompletionResponse('{"decisions":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="gateway/structured-model",
+            base_url=None,
+            api_key=None,
+            timeout_s=120.0,
+            native_schema_transport="json_schema_response_format",
+        ),
+        telemetry_sink=telemetry.append,
+    )
+
+    await client.classify_relation_candidates("prompt")
+    await client.classify_same_unit_pairs("prompt")
+
+    assert [row.operation for row in telemetry] == ["cross_document_relation", "memory_relation"]
+
+
+@pytest.mark.asyncio
 async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(monkeypatch):
     async def fake_acompletion(**kwargs):
         return CompletionResponse(
