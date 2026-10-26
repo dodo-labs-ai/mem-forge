@@ -921,7 +921,6 @@ export interface MemoryReviewSummary {
   created_at: string | null;
   resolved_at: string | null;
   is_stale: boolean;
-  refreshable?: boolean;
   decision_fingerprint: string;
   presentation: MemoryReviewPresentation;
   incumbent?: MemoryReviewMemorySummary | null;

@@ -76,8 +76,8 @@ that one memory after you confirm, never a transcript. A decision you saved in
 Claude Code is there when you open Codex.
 
 **It follows the source.** When a page or ticket changes, the next sync
-rechecks the memories built on it. Each one is kept, replaced or retired, or it
-waits for your review, and earlier versions keep their history. Across
+rechecks the memories built on it. Each one is kept, replaced or retired, and
+earlier versions keep their history. Across
 documents, MemForge marks memories that repeat, update or contradict each
 other.
 
@@ -111,7 +111,7 @@ flowchart LR
   Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local Markdown"]
   API["MemForge API"]
   Extract["Extract memories<br/>with source Evidence"]
-  Recheck["Plan updates and Reviews<br/>relate memories"]
+  Recheck["Plan updates<br/>relate memories"]
   Store[("SQLite + FTS5<br/>Chroma")]
 
   CC --> Plugin

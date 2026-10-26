@@ -35,6 +35,7 @@ from memforge.release import current_release
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from tests.relation_evidence_fixture import primary_evidence_unit_fixture, primary_observation_revision_fixture
+from tests.stored_review_fixture import attach_stored_related_challenger, insert_stored_memory_review
 
 MAX_ATTEMPTS = DEFAULT_RELATION_DISCOVERY_BUDGET.max_attempts
 REVIEWED_AT = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
@@ -165,7 +166,8 @@ async def _review(
     challenger: Memory,
     incumbent: Memory,
 ) -> None:
-    await db.insert_memory_review(
+    await insert_stored_memory_review(
+        db,
         MemoryReview(
             id=review_id,
             kind=CROSS_SOURCE_CONFLICT_REVIEW_KIND,
@@ -478,7 +480,7 @@ async def _seed_reviews(db: Database) -> dict[str, Memory]:
     await _review(db, "rev-dismissed-old", ReviewStatus.REJECTED, challenger=memories["e"], incumbent=memories["f"])
     await _review(db, "rev-pending", ReviewStatus.PENDING, challenger=memories["g"], incumbent=memories["h"])
     await _review(db, "rev-confirmed-old", ReviewStatus.APPROVED, challenger=memories["i"], incumbent=memories["j"])
-    await db.add_memory_review_related_challenger("rev-pending", "c", reason="same conflict")
+    await attach_stored_related_challenger(db, "rev-pending", "c", reason="same conflict")
     await _change(db, memories["f"])
     await _change(db, memories["j"])
     await _work(db, memories["g"], status="completed", attempts=1, classifier_version="memory-relation-v4-sparse")

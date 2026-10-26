@@ -25,17 +25,12 @@ from memforge.memory.lifecycle_plan import (
     LifecycleReviewStatus,
     ReconciliationScope,
     StaleGuard,
-    lifecycle_plan_to_payload,
 )
 from memforge.memory.lifecycle_planner import (
     NewMemoryDefaults,
     build_lifecycle_plan,
-    lifecycle_memory_version,
 )
-from memforge.memory.lifecycle_review import (
-    build_lifecycle_review_approval_plan,
-    build_lifecycle_review_refresh_plan,
-)
+from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 from memforge.models import (
     DocumentRecord,
     Memory,
@@ -50,7 +45,8 @@ from memforge.source_activity import SourceActivityConflict, SourceActivityKind
 from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
-from tests.lifecycle_review_fixture import hold_for_review
+from tests.lifecycle_review_fixture import StoredLifecycleReview, held_for_review, store_lifecycle_review
+from tests.stored_review_fixture import insert_stored_memory_review
 from tests.test_source_projection_store import _projection
 from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
 
@@ -165,12 +161,14 @@ async def test_upgrade_drops_the_lifecycle_gate_table_and_keeps_reviews_and_plan
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
-    held = _held_retirement_plan(
-        unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-before-upgrade",
+    held = await store_lifecycle_review(
+        db,
+        _held_retirement_review(
+            unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-before-upgrade",
+        ),
     )
-    await db.apply_lifecycle_plan(held)
     [review] = await db.list_lifecycle_reviews("src-1")
-    plan_payload = await db.get_lifecycle_plan_payload(held.id)
+    plan_payload = await db.get_lifecycle_plan_payload(held.lifecycle_plan_id)
     await db.db.executescript(
         """CREATE TABLE source_lifecycle_gates (
                source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
@@ -194,7 +192,7 @@ async def test_upgrade_drops_the_lifecycle_gate_table_and_keeps_reviews_and_plan
     )
     assert tables == []
     assert await db.list_lifecycle_reviews("src-1") == [review]
-    assert await db.get_lifecycle_plan_payload(held.id) == plan_payload
+    assert await db.get_lifecycle_plan_payload(held.lifecycle_plan_id) == plan_payload
 
 
 async def _persist_exact_support_and_provenance(db: Database) -> str:
@@ -681,15 +679,15 @@ def _retirement_plan(evidence_unit_id: str, support_hash: str) -> LifecyclePlan:
     )
 
 
-def _held_retirement_plan(
+def _held_retirement_review(
     evidence_unit_id: str,
     incumbent: Memory,
     support_hash: str,
     *,
     plan_id: str,
     scope_id: str | None = None,
-) -> LifecyclePlan:
-    """A Plan that holds the retirement of ``incumbent`` for Review."""
+) -> StoredLifecycleReview:
+    """A pending Review that holds the retirement of ``incumbent``."""
 
     direct = build_lifecycle_plan(
         plan_id=plan_id,
@@ -722,7 +720,7 @@ def _held_retirement_plan(
             access_context_hash="workspace",
         ),
     )
-    return hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
+    return held_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
 
 
 @pytest.mark.asyncio
@@ -765,31 +763,24 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
         content_hash=content_hash("Independent challenger"),
     )
     await db.insert_memory(challenger)
-    await db.insert_memory_review(
+    await insert_stored_memory_review(
+        db,
         MemoryReview(
             id="review-terminal-incumbent",
             kind=ReviewKind.SUPERSEDE.value,
             status=ReviewStatus.PENDING.value,
             incumbent_memory_id="mem-1",
             challenger_memory_id=challenger.id,
-        )
+        ),
     )
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
-    review_plan = _held_retirement_plan(
-        unit_id,
-        incumbent,
-        support_hash,
-        plan_id="plan-terminal-review",
+    held = await store_lifecycle_review(
+        db,
+        _held_retirement_review(unit_id, incumbent, support_hash, plan_id="plan-terminal-review"),
     )
-    await db.apply_lifecycle_plan(review_plan)
-    lifecycle_reviews = await db.list_lifecycle_reviews(
-        "src-1",
-        status=LifecycleReviewStatus.PENDING,
-    )
-    assert len(lifecycle_reviews) == 1
     plan = replace(
         _retirement_plan(unit_id, support_hash),
         id="plan-terminal-retire",
@@ -801,7 +792,7 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
     assert review is not None
     assert review.status == ReviewStatus.STALE.value
     assert review.resolved_at is not None
-    lifecycle_review = await db.get_lifecycle_review(lifecycle_reviews[0].id)
+    lifecycle_review = await db.get_lifecycle_review(held.id)
     assert lifecycle_review is not None
     assert lifecycle_review.status is LifecycleReviewStatus.STALE
     assert lifecycle_review.resolved_at is not None
@@ -815,125 +806,23 @@ async def test_review_approval_applies_proposal_and_resolves_review_atomically(
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
-    original = _held_retirement_plan(
-        unit_id,
-        incumbent,
-        support_hash,
-        plan_id="plan-held-delete",
+    review = await store_lifecycle_review(
+        db,
+        _held_retirement_review(unit_id, incumbent, support_hash, plan_id="plan-held-delete"),
     )
-
-    await db.apply_lifecycle_plan(original)
-    reviews = await db.list_lifecycle_reviews(
-        "src-1",
-        status=LifecycleReviewStatus.PENDING,
-    )
-    assert len(reviews) == 1
     assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
-    payload = await db.get_lifecycle_plan_payload(original.id)
+    payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
     assert payload is not None
-    approval = build_lifecycle_review_approval_plan(reviews[0], payload)
+    approval = build_lifecycle_review_approval_plan(review, payload)
     await db.apply_lifecycle_plan(approval)
 
-    approved = await db.get_lifecycle_review(reviews[0].id)
+    approved = await db.get_lifecycle_review(review.id)
     retired = await db.get_memory(incumbent.id)
     assert approved is not None and approved.status is LifecycleReviewStatus.APPROVED
     assert retired is not None and retired.status == "retired"
     tasks = await db.list_lifecycle_vector_tasks(source_id="src-1")
     assert {(task.memory_id, task.operation.value) for task in tasks} == {(incumbent.id, "delete")}
-
-
-@pytest.mark.asyncio
-async def test_stale_nonterminal_review_refresh_preserves_other_source_support(
-    db: Database,
-) -> None:
-    source_unit_id = await _persist_exact_support_and_provenance(db)
-    other_unit = await _attach_overlapping_source_support(
-        db,
-        plan_id="plan-review-refresh-other-source",
-    )
-    incumbent = await db.get_memory("mem-1")
-    assert incumbent is not None
-    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    direct = build_lifecycle_plan(
-        plan_id="plan-review-refresh-original",
-        scope=ReconciliationScope(
-            id="scope-review-refresh-original",
-            source_id="src-1",
-            source_unit_id="unit-page-1",
-            base_unit_revision_id="unitrev-page-1-v1",
-            target_unit_revision_id="unitrev-page-1-v2",
-        ),
-        operations=(
-            ReconcileOperation(
-                action=ReconcileAction.DELETE,
-                memory_id=incumbent.id,
-                reason="source no longer supports claim",
-            ),
-        ),
-        incumbents={incumbent.id: incumbent},
-        source_support_unit_ids={incumbent.id: (source_unit_id,)},
-        all_active_support_unit_ids={incumbent.id: support_state.unit_ids},
-        support_set_hashes={incumbent.id: support_state.support_set_hash},
-        observation_revision_ids=("obsrev-page-1-v2",),
-        defaults=NewMemoryDefaults(
-            visibility="workspace",
-            owner_user_id=None,
-            project_key=None,
-            repo_identifier=None,
-            doc_id="source-doc",
-            source_type="confluence",
-            access_context_hash="workspace",
-        ),
-    )
-    original = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
-    await db.apply_lifecycle_plan(original)
-    [stale_review] = await db.list_lifecycle_reviews(
-        "src-1",
-        status=LifecycleReviewStatus.PENDING,
-    )
-
-    additional_other_unit = replace(other_unit, id="eu-review-refresh-other-source-additional")
-    await record_unit_support(
-        db,
-        memory_id=incumbent.id,
-        unit=additional_other_unit,
-        references=(
-            primary_reference(
-                SourceAnchor(
-                    kind=AnchorKind.WHOLE_OBSERVATION,
-                    observation_id="obs-page-1-body-source-2",
-                    observation_revision_id="obsrev-page-1-v2-source-2",
-                )
-            ),
-        ),
-    )
-    await db.resolve_lifecycle_review(stale_review.id, LifecycleReviewStatus.STALE)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-    payload = await db.get_lifecycle_plan_payload(original.id)
-    assert payload is not None
-    refreshed_plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
-        await db.get_lifecycle_review(stale_review.id),  # type: ignore[arg-type]
-        payload,
-        current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
-        current_memory_version=lifecycle_memory_version(incumbent),
-    )
-
-    await db.apply_lifecycle_plan(refreshed_plan)
-    await db.apply_lifecycle_plan(refreshed_plan)
-    refreshed_review = await db.get_lifecycle_review(refreshed_review_id)
-    assert refreshed_review is not None
-    assert refreshed_review.status is LifecycleReviewStatus.PENDING
-    assert (await db.get_lifecycle_review(stale_review.id)).status is LifecycleReviewStatus.STALE  # type: ignore[union-attr]
-
-    approval = build_lifecycle_review_approval_plan(refreshed_review, lifecycle_plan_to_payload(refreshed_plan))
-    await db.apply_lifecycle_plan(approval)
-
-    assert (await db.get_lifecycle_review(refreshed_review_id)).status is LifecycleReviewStatus.APPROVED  # type: ignore[union-attr]
-    remaining = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert set(remaining.unit_ids) == {other_unit.id, additional_other_unit.id}
-    assert (await db.get_memory(incumbent.id)).status == "active"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -1188,32 +1077,17 @@ async def test_evidence_reference_write_rejects_an_expired_activity_lease(
 
 
 @pytest.mark.asyncio
-async def test_review_mutations_refuse_an_existing_review_id_and_an_unknown_resolution(db: Database) -> None:
+async def test_review_resolution_refuses_an_unknown_status(db: Database) -> None:
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")
     assert incumbent is not None
-    raising = _held_retirement_plan(
-        unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-held-raise",
+    pending = await store_lifecycle_review(
+        db,
+        _held_retirement_review(
+            unit_id, incumbent, await db.get_memory_support_set_hash(incumbent.id), plan_id="plan-held-raise",
+        ),
     )
-    [create] = [item for item in raising.mutations if item.mutation_type is LifecycleMutationType.CREATE_REVIEW]
-    # A row that already holds the Review ID; only its identity matters here.
-    await db.db.execute("PRAGMA foreign_keys = OFF")
-    await db.db.execute(
-        """INSERT INTO lifecycle_reviews (id, lifecycle_plan_id, incumbent_memory_id, status,
-               staged_evidence_json, reason, created_at)
-           VALUES (?, 'plan-other', 'mem-other', 'pending', '{}', 'other', '2026-01-01T00:00:00+00:00')""",
-        (create.payload["review_id"],),
-    )
-    await db.db.commit()
-    await db.db.execute("PRAGMA foreign_keys = ON")
-    with pytest.raises(ValueError, match="already exists"):
-        await db.apply_lifecycle_plan(raising)
-    await db.db.execute("DELETE FROM lifecycle_reviews WHERE id = ?", (create.payload["review_id"],))
-    await db.db.commit()
-
-    await db.apply_lifecycle_plan(raising)
-    [pending] = await db.list_lifecycle_reviews("src-1", status=LifecycleReviewStatus.PENDING)
-    approval = build_lifecycle_review_approval_plan(pending, await db.get_lifecycle_plan_payload(raising.id))
+    approval = build_lifecycle_review_approval_plan(pending, await db.get_lifecycle_plan_payload(pending.lifecycle_plan_id))
     unknown = replace(approval, mutations=tuple(
         replace(item, payload={**item.payload, "status": LifecycleReviewStatus.PENDING.value})
         if item.mutation_type is LifecycleMutationType.RESOLVE_REVIEW else item

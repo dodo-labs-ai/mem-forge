@@ -1374,26 +1374,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/memory-reviews/{review_id}/refresh": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Refresh Memory Review
-         * @description Create a new pending Lifecycle Review from a stale proposal.
-         */
-        post: operations["refresh_memory_review_api_v1_memory_reviews__review_id__refresh_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/memory-reviews/{review_id}/reject": {
         parameters: {
             query?: never;
@@ -2260,46 +2240,6 @@ export interface paths {
         get: operations["get_source_memory_lifecycle_api_v1_sources__source_id__memory_lifecycle_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/approve": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Approve Source Lifecycle Review
-         * @description Use the latest state after the stale-guard checks.
-         */
-        post: operations["approve_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__approve_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/reject": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reject Source Lifecycle Review
-         * @description Keep the current state and discard the staged proposal.
-         */
-        post: operations["reject_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__reject_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4966,11 +4906,6 @@ export interface components {
             presentation: components["schemas"]["ReviewPresentationResponse"];
             /** Reason */
             reason?: string | null;
-            /**
-             * Refreshable
-             * @default false
-             */
-            refreshable: boolean;
             /** Related Challengers */
             related_challengers?: components["schemas"]["MemoryReviewMemorySummary"][];
             /**
@@ -5030,11 +4965,6 @@ export interface components {
             presentation: components["schemas"]["ReviewPresentationResponse"];
             /** Reason */
             reason?: string | null;
-            /**
-             * Refreshable
-             * @default false
-             */
-            refreshable: boolean;
             /**
              * Replacement Kind
              * @default supersession
@@ -5124,11 +5054,6 @@ export interface components {
             status: string;
             /** Updated At */
             updated_at?: string | null;
-        };
-        /** MemoryReviewRefreshRequest */
-        MemoryReviewRefreshRequest: {
-            /** Expected Fingerprint */
-            expected_fingerprint: string;
         };
         /** MemorySearchRequest */
         MemorySearchRequest: {
@@ -6156,7 +6081,7 @@ export interface components {
              * Decision Label
              * @enum {string}
              */
-            decision_label: "Updated" | "Support removed" | "Conflict";
+            decision_label: "Updated" | "Support removed";
             /** Proposed Empty Text */
             proposed_empty_text: string;
             /** Proposed Label */
@@ -9592,41 +9517,6 @@ export interface operations {
             };
         };
     };
-    refresh_memory_review_api_v1_memory_reviews__review_id__refresh_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                review_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MemoryReviewRefreshRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MemoryReviewDetailResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     reject_memory_review_api_v1_memory_reviews__review_id__reject_post: {
         parameters: {
             query?: never;
@@ -11070,78 +10960,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    approve_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__approve_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-                review_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MemoryReviewDecisionRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reject_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__reject_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-                review_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MemoryReviewDecisionRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {

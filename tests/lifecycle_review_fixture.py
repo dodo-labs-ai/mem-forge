@@ -1,34 +1,50 @@
-"""A Lifecycle Plan that holds one old Memory's decision for Review.
+"""A Lifecycle Review as an earlier version stored it.
 
-A LifecycleReview stays readable and decidable: it is listed, approved,
-rejected and refreshed, and it contests the exact Support it stages for
-removal. Tests of those paths build the creating Plan here from the direct Plan
-the planner would commit, so they do not depend on which path raises a Review.
+No revision raises a Lifecycle Review. One that an earlier version raised held
+one old Memory's decided mutations, and the creation of its replacement, as
+staged evidence beside the Plan that decided everything else. Such a Review
+stays readable and, while pending, decidable, and it contests the exact Support
+it staged for removal. Tests of those paths build the stored rows here from the
+direct Plan the planner commits today.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
+import hashlib
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from memforge.memory.lifecycle_plan import (
-    IncumbentDisposition,
     LifecycleMutation,
-    LifecycleMutationType,
     LifecyclePlan,
+    LifecycleReview,
+    LifecycleReviewStatus,
+    lifecycle_plan_to_payload,
     lifecycle_stable_id,
 )
 from memforge.models import RawMemory, ReconcileAction
+from memforge.storage.database import Database
 
 
-def hold_for_review(
+@dataclass(frozen=True, slots=True)
+class StoredLifecycleReview:
+    """The creating Plan's stored payload and the Review row it held."""
+
+    plan_payload: Mapping[str, object]
+    review: LifecycleReview
+
+
+def held_for_review(
     plan: LifecyclePlan,
     memory_id: str,
     *,
     action: ReconcileAction,
     candidate: RawMemory | None = None,
     replacement_memory_id: str | None = None,
-) -> LifecyclePlan:
-    """Move one incumbent's decided mutations, and its replacement's creation, into a pending Review."""
+) -> StoredLifecycleReview:
+    """Hold one incumbent's decided mutations, and its replacement's creation, in a pending Review."""
 
     [decision] = [item for item in plan.coverage_proof.incumbent_decisions if item.memory_id == memory_id]
     held_ids = {memory_id} | ({replacement_memory_id} if replacement_memory_id else set())
@@ -39,9 +55,8 @@ def hold_for_review(
     staged["proposed_disposition"] = decision.disposition.value
     staged["replacement_memory_id"] = replacement_memory_id
     staged["proposed_mutations"] = [_serialize(mutation) for mutation in held]
-    requests = {request.memory_id: request for request in plan.relation_discovery_requests}
     if replacement_memory_id is not None:
-        request = requests[replacement_memory_id]
+        [request] = [item for item in plan.relation_discovery_requests if item.memory_id == replacement_memory_id]
         staged["relation_discovery_seed"] = {
             "memory_id": request.memory_id,
             "expected_content_hash": request.expected_content_hash,
@@ -52,34 +67,75 @@ def hold_for_review(
             "actor_user_id": request.actor_user_id,
             "entity_ids": list(request.entity_ids),
         }
-    review = LifecycleMutation(
-        LifecycleMutationType.CREATE_REVIEW,
-        memory_id=memory_id,
+    payload = lifecycle_plan_to_payload(plan)
+    payload["mutations"] = [
+        item for item in payload["mutations"] if item["memory_id"] not in held_ids  # type: ignore[index]
+    ]
+    payload["relation_discovery_requests"] = [
+        item
+        for item in payload["relation_discovery_requests"]  # type: ignore[union-attr]
+        if item["memory_id"] not in held_ids
+    ]
+    for item in payload["coverage_proof"]["incumbent_decisions"]:  # type: ignore[index]
+        if item["memory_id"] == memory_id:
+            item["disposition"] = "review"
+            item["replacement_memory_id"] = None
+    review = LifecycleReview(
+        id=lifecycle_stable_id("review", plan.id, memory_id, action.value),
+        lifecycle_plan_id=plan.id,
+        incumbent_memory_id=memory_id,
+        status=LifecycleReviewStatus.PENDING,
+        staged_evidence=staged,
+        reason=decision.reason,
         source_id=plan.scope.source_id,
-        payload={
-            "review_id": lifecycle_stable_id("review", plan.id, memory_id, action.value),
-            "reason": decision.reason,
-            "staged_evidence": staged,
-        },
     )
-    held_plan = replace(
-        plan,
-        coverage_proof=replace(
-            plan.coverage_proof,
-            incumbent_decisions=tuple(
-                replace(item, disposition=IncumbentDisposition.REVIEW, replacement_memory_id=None)
-                if item.memory_id == memory_id
-                else item
-                for item in plan.coverage_proof.incumbent_decisions
-            ),
-        ),
-        mutations=(*(mutation for mutation in plan.mutations if mutation.memory_id not in held_ids), review),
-        relation_discovery_requests=tuple(
-            request for request in plan.relation_discovery_requests if request.memory_id not in held_ids
+    return StoredLifecycleReview(plan_payload=payload, review=review)
+
+
+async def store_lifecycle_review(db: Database, stored: StoredLifecycleReview) -> LifecycleReview:
+    """Write the applied creating Plan and its pending Review, and read the Review back."""
+
+    payload_json = json.dumps(stored.plan_payload, sort_keys=True)
+    scope = stored.plan_payload["scope"]
+    assert isinstance(scope, Mapping)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.db.execute(
+        """INSERT INTO lifecycle_plans (
+               id, reconciliation_scope_id, source_id, source_unit_id,
+               target_unit_revision_id, status, payload_json, payload_hash,
+               created_at, applied_at
+           ) VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?, ?)""",
+        (
+            stored.review.lifecycle_plan_id,
+            scope["id"],
+            scope["source_id"],
+            scope["source_unit_id"],
+            scope["target_unit_revision_id"],
+            payload_json,
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            now,
+            now,
         ),
     )
-    held_plan.validate()
-    return held_plan
+    await db.db.execute(
+        """INSERT INTO lifecycle_reviews (
+               id, lifecycle_plan_id, incumbent_memory_id, status,
+               staged_evidence_json, reason, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            stored.review.id,
+            stored.review.lifecycle_plan_id,
+            stored.review.incumbent_memory_id,
+            stored.review.status.value,
+            json.dumps(stored.review.staged_evidence, sort_keys=True),
+            stored.review.reason,
+            now,
+        ),
+    )
+    await db.db.commit()
+    review = await db.get_lifecycle_review(stored.review.id)
+    assert review is not None
+    return review
 
 
 def _serialize(mutation: LifecycleMutation) -> dict[str, object]:

@@ -81,7 +81,7 @@ export function queueSummary(tab: ReviewTab, total: number): QueueSummary {
     case "expired":
       return {
         title: "Expired proposals",
-        description: `${pluralize(total, "proposal")} expired because the memory changed before anyone decided. Open one to recheck it.`,
+        description: `${pluralize(total, "proposal")} expired because the memory changed before anyone decided.`,
       };
     case "applied":
       return {

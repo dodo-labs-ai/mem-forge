@@ -717,10 +717,6 @@ def test_tool_client_memory_review_methods_use_review_endpoints():
 
     client.list_memory_reviews(status="open", limit=5, offset=2)
     client.get_memory_review("rev-1")
-    client.refresh_memory_review(
-        "review-stale-1",
-        expected_fingerprint="review-decision-v1:stale",
-    )
     client.resolve_memory_review(
         "rev-1",
         decision="reject",
@@ -741,11 +737,6 @@ def test_tool_client_memory_review_methods_use_review_endpoints():
     assert client.calls == [
         ("GET", "/api/v1/memory-reviews?status=open&limit=5&offset=2", None),
         ("GET", "/api/v1/memory-reviews/rev-1", None),
-        (
-            "POST",
-            "/api/v1/memory-reviews/review-stale-1/refresh",
-            {"expected_fingerprint": "review-decision-v1:stale"},
-        ),
         (
             "POST",
             "/api/v1/memory-reviews/rev-1/reject",

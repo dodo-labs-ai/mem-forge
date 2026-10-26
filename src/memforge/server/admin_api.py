@@ -3458,7 +3458,7 @@ class ReviewActionPresentationResponse(BaseModel):
 
 
 class ReviewPresentationResponse(BaseModel):
-    decision_label: Literal["Updated", "Support removed", "Conflict"]
+    decision_label: Literal["Updated", "Support removed"]
     summary: str
     why_human: str
     current_label: str
@@ -3486,8 +3486,6 @@ class MemoryReviewResponse(BaseModel):
     created_at: str | None = None
     resolved_at: str | None = None
     is_stale: bool = False
-    # A stale proposal a reviewer may reissue against the current state.
-    refreshable: bool = False
     decision_fingerprint: str
     presentation: ReviewPresentationResponse
     can_decide: bool = Field(
@@ -3714,12 +3712,6 @@ class AgentEvaluationLangfuseExportRequest(BaseModel):
     provider_reviewer_id: str = Field(min_length=1)
     queue_id: str = Field(min_length=1)
     score_config_id: str = Field(min_length=1)
-
-
-class MemoryReviewRefreshRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    expected_fingerprint: str = Field(min_length=1)
 
 
 class MemoryReviewManifestDecision(BaseModel):
@@ -4635,7 +4627,6 @@ async def _lifecycle_review_response(
         "created_at": review.created_at,
         "resolved_at": review.resolved_at,
         "is_stale": review.status.value == "stale",
-        "refreshable": review.status.value == "stale",
         "decision_fingerprint": lifecycle_review_decision_fingerprint(review),
         "presentation": _presentation_response(
             present_lifecycle_review(
@@ -8086,28 +8077,33 @@ def create_admin_app(
         }
 
     async def _decide_lifecycle_review(
-        source_id: str,
-        review_id: str,
+        review: LifecycleReview,
         request: Request,
         db: Database,
         *,
         action: Literal["use_latest_state", "keep_current_state"],
         expected_fingerprint: str,
         note: str | None,
-        config: AppConfig | None = None,
-        runtime_provider: RuntimeProvider | None = None,
-    ) -> dict[str, object]:
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> tuple[LifecycleReview, dict[str, Any]]:
+        """Decide one LifecycleReview and return it with the Source its Plan scoped.
+
+        The Review's own Plan payload names that Source, whose management
+        authority the decision requires. Repeating the decision the Review
+        already records returns it unchanged.
+        """
         from memforge.memory.lifecycle_review import build_lifecycle_review_approval_plan
 
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        review = await db.get_lifecycle_review(review_id)
-        if review is None:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
-        if review.source_id != source_id:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
         await _require_lifecycle_review_visibility(request, db, review)
+        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
+        scope = payload.get("scope") if isinstance(payload, Mapping) else None
+        if payload is None or not isinstance(scope, Mapping):
+            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
+        source_id = scope.get("source_id")
+        source = await db.get_source(source_id) if isinstance(source_id, str) and source_id else None
+        if source is None:
+            raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
         _require_review_decision_authority(request, [source])
         if lifecycle_review_decision_fingerprint(review) != expected_fingerprint:
             raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
@@ -8115,63 +8111,45 @@ def create_admin_app(
             LifecycleReviewStatus.APPROVED if action == "use_latest_state" else LifecycleReviewStatus.REJECTED
         )
         if review.status is target_status:
-            return {
-                "source_id": source_id,
-                "review_id": review_id,
-                "status": review.status.value,
-                **(
-                    {"lifecycle_plan_id": f"lifecycle-review-approval-{review.id}"}
-                    if target_status is LifecycleReviewStatus.APPROVED
-                    else {}
-                ),
-            }
+            return review, source
         if review.status is not LifecycleReviewStatus.PENDING:
             raise HTTPException(
                 status_code=409,
                 detail=f"Lifecycle review is already {review.status.value}",
             )
-        payload = await db.get_lifecycle_plan_payload(review.lifecycle_plan_id)
-        if payload is None or not isinstance(payload.get("scope"), dict):
-            raise HTTPException(status_code=409, detail="Lifecycle review plan is unavailable")
-        if payload["scope"].get("source_id") != source_id:
-            raise HTTPException(status_code=404, detail="Lifecycle review not found")
         reviewer = resolve_request_principal(request)
+        review_note = note.strip() if note and note.strip() else None
         if action == "keep_current_state":
-            if not note or not note.strip():
-                raise HTTPException(status_code=400, detail="A note is required to keep the current state")
             try:
                 rejected = await db.resolve_lifecycle_review(
-                    review_id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=note.strip(),
+                    review.id, LifecycleReviewStatus.REJECTED, reviewer=reviewer, review_note=review_note,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-            return {"source_id": source_id, "review_id": review_id, "status": rejected.status.value}
+            return rejected, source
         try:
             plan = build_lifecycle_review_approval_plan(
-                review, payload, reviewer=reviewer, review_note=note.strip() if note else None,
+                review, payload, reviewer=reviewer, review_note=review_note,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return await _apply_lifecycle_review_plan(
-            source_id, review, plan, db, config=config, runtime_provider=runtime_provider,
+        decided = await _apply_lifecycle_review_plan(
+            review, plan, db, config=config, runtime_provider=runtime_provider,
         )
+        return decided, source
 
     async def _apply_lifecycle_review_plan(
-        source_id: str,
         review: LifecycleReview,
         plan: LifecyclePlan,
         db: Database,
         *,
-        config: AppConfig | None,
-        runtime_provider: RuntimeProvider | None,
-    ) -> dict[str, object]:
-        """Apply one approval's Plan and deliver its vector changes.
+        config: AppConfig,
+        runtime_provider: RuntimeProvider,
+    ) -> LifecycleReview:
+        """Apply one approval's Plan, deliver its vector changes and return the decided Review.
 
-        An approval whose guard no longer holds marks the Review stale for a
-        reviewer to refresh.
+        An approval whose guard no longer holds marks the Review stale.
         """
-        if config is None or runtime_provider is None:
-            raise RuntimeError("Lifecycle approval requires the configured runtime")
         try:
             await db.apply_lifecycle_plan(plan)
         except ValueError as exc:
@@ -8191,67 +8169,9 @@ def create_admin_app(
                 delivery.error_types,
             )
         decided = await db.get_lifecycle_review(review.id)
-        assert decided is not None
-        return {
-            "source_id": source_id,
-            "review_id": review.id,
-            "status": decided.status.value,
-            "lifecycle_plan_id": plan.id,
-        }
-
-    @source_router.post(
-        "/{source_id}/memory-lifecycle/reviews/{review_id}/approve",
-        dependencies=[Depends(refuse_memory_writes_during_reindex)],
-    )
-    async def approve_source_lifecycle_review(
-        source_id: str,
-        review_id: str,
-        request: Request,
-        req: MemoryReviewDecisionRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Use the latest state after the stale-guard checks."""
-
-        return await _decide_lifecycle_review(
-            source_id,
-            review_id,
-            request,
-            db,
-            action="use_latest_state",
-            expected_fingerprint=req.expected_fingerprint,
-            note=req.note,
-            config=config,
-            runtime_provider=runtime_provider,
-        )
-
-    @source_router.post(
-        "/{source_id}/memory-lifecycle/reviews/{review_id}/reject",
-        dependencies=[Depends(refuse_memory_writes_during_reindex)],
-    )
-    async def reject_source_lifecycle_review(
-        source_id: str,
-        review_id: str,
-        request: Request,
-        req: MemoryReviewDecisionRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        runtime_provider: RuntimeProvider = Depends(get_runtime_provider),
-    ):
-        """Keep the current state and discard the staged proposal."""
-
-        return await _decide_lifecycle_review(
-            source_id,
-            review_id,
-            request,
-            db,
-            action="keep_current_state",
-            expected_fingerprint=req.expected_fingerprint,
-            note=req.note,
-            config=config,
-            runtime_provider=runtime_provider,
-        )
+        if decided is None:
+            raise HTTPException(status_code=404, detail="Review not found")
+        return decided
 
     @source_router.get("/{source_id}/projects", response_model=SourceProjectsResponse)
     async def list_source_projects(
@@ -10207,65 +10127,6 @@ def create_admin_app(
             artifact_store=artifact_store,
         )
 
-    @review_router.post("/{review_id}/refresh", response_model=MemoryReviewDetailResponse)
-    async def refresh_memory_review(
-        review_id: str,
-        request: Request,
-        req: MemoryReviewRefreshRequest,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        artifact_store: DocumentArtifactStore = Depends(get_document_store),
-    ):
-        """Create a new pending Lifecycle Review from a stale proposal."""
-
-        from memforge.memory.lifecycle_planner import lifecycle_memory_version
-        from memforge.memory.lifecycle_review import build_lifecycle_review_refresh_plan
-
-        lifecycle_review = await db.get_lifecycle_review(review_id)
-        memory_review = await db.get_memory_review(review_id)
-        if lifecycle_review is not None and memory_review is not None:
-            raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
-        if lifecycle_review is None:
-            if memory_review is not None:
-                raise HTTPException(status_code=400, detail="Only stale Lifecycle Reviews can be refreshed")
-            raise HTTPException(status_code=404, detail="Review not found")
-        payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-        scope = payload.get("scope") if isinstance(payload, Mapping) else None
-        source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-        source = await db.get_source(source_id) if source_id else None
-        if source is None:
-            raise HTTPException(status_code=409, detail="Lifecycle review source is unavailable")
-        await _require_lifecycle_review_visibility(request, db, lifecycle_review)
-        _require_review_decision_authority(request, [source])
-        if lifecycle_review_decision_fingerprint(lifecycle_review) != req.expected_fingerprint:
-            raise HTTPException(status_code=409, detail="Review decision fingerprint is stale")
-        incumbent = await db.get_memory(lifecycle_review.incumbent_memory_id)
-        if incumbent is None or incumbent.status != "active":
-            raise HTTPException(status_code=409, detail="Lifecycle review incumbent is no longer active")
-        try:
-            plan, refreshed_review_id = build_lifecycle_review_refresh_plan(
-                lifecycle_review,
-                payload,
-                current_support_set_hash=await db.get_memory_support_set_hash(incumbent.id),
-                current_memory_version=lifecycle_memory_version(incumbent),
-            )
-            await db.apply_lifecycle_plan(plan)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        refreshed = await db.get_lifecycle_review(refreshed_review_id)
-        if refreshed is None:
-            raise HTTPException(status_code=409, detail="Refreshed Lifecycle Review is unavailable")
-        return await _lifecycle_review_response(
-            db,
-            refreshed,
-            source,
-            request=request,
-            detail=True,
-            config=config,
-            artifact_store=artifact_store,
-        )
-
     @review_router.post(
         "/{review_id}/approve",
         response_model=MemoryReviewDetailResponse,
@@ -10285,12 +10146,8 @@ def create_admin_app(
         if lifecycle_review is not None and review_before is not None:
             raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
-            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-            scope = payload.get("scope") if isinstance(payload, Mapping) else None
-            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-            await _decide_lifecycle_review(
-                source_id,
-                review_id,
+            decided, source = await _decide_lifecycle_review(
+                lifecycle_review,
                 request,
                 db,
                 action="use_latest_state",
@@ -10299,12 +10156,9 @@ def create_admin_app(
                 config=config,
                 runtime_provider=runtime_provider,
             )
-            updated = await db.get_lifecycle_review(review_id)
-            source = await db.get_source(source_id)
-            assert updated is not None and source is not None
             return await _lifecycle_review_response(
                 db,
-                updated,
+                decided,
                 source,
                 request=request,
                 detail=True,
@@ -10383,12 +10237,8 @@ def create_admin_app(
         if lifecycle_review is not None and review_before is not None:
             raise HTTPException(status_code=409, detail="Review ID is ambiguous across storage origins")
         if lifecycle_review is not None:
-            payload = await db.get_lifecycle_plan_payload(lifecycle_review.lifecycle_plan_id)
-            scope = payload.get("scope") if isinstance(payload, Mapping) else None
-            source_id = str(scope.get("source_id") or "") if isinstance(scope, Mapping) else ""
-            await _decide_lifecycle_review(
-                source_id,
-                review_id,
+            decided, source = await _decide_lifecycle_review(
+                lifecycle_review,
                 request,
                 db,
                 action="keep_current_state",
@@ -10397,12 +10247,9 @@ def create_admin_app(
                 config=config,
                 runtime_provider=runtime_provider,
             )
-            updated = await db.get_lifecycle_review(review_id)
-            source = await db.get_source(source_id)
-            assert updated is not None and source is not None
             return await _lifecycle_review_response(
                 db,
-                updated,
+                decided,
                 source,
                 request=request,
                 detail=True,
