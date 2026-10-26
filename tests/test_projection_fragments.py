@@ -1163,7 +1163,8 @@ async def test_extractor_skips_a_malformed_batch_without_normalizing_or_pruning(
     assert result.metadata["fragment_selection_rejection_counts"] == {"duplicate_ref": 30}
     assert result.metadata["selection_skipped_reading_group_count"] == 2
     assert result.metadata["skipped_reading_group_count"] == 2
-    assert [signal.reason_code for signal in collector.snapshot()] == ["duplicate_ref"] * 30
+    # Each skipped ReadingGroup signals the five rejections of its last response.
+    assert [signal.reason_code for signal in collector.snapshot()] == ["duplicate_ref"] * 10
 
 
 @pytest.mark.asyncio

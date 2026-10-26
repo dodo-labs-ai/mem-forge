@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The Evaluation page no longer reports an Evidence selection failure when
+  extraction recovers from it. When the model cites a passage it may not use
+  as a memory's main evidence, extraction asks it to correct the selection,
+  then retries with fewer parts of the document; only a part that still cannot
+  be read is skipped. Until now every rejected attempt counted as a failed
+  `evidence_fragment_selectability` (or other Evidence) check, even when the
+  correction succeeded and nothing was lost. Now a recovered selection counts
+  only as accepted, and the check fails only for a skipped part, the case
+  where content is actually missing. Sync metadata still counts every rejected
+  selection, corrections and retries included
+  (`fragment_selection_rejection_counts`), and the requests a correction
+  recovered (`selection_corrected_request_count`).
+
 - A document update no longer opens a Review when the document states two
   incompatible claims that both still have source text, for example an
   earlier Jira comment saying a bug reproduces and a later one saying it is
