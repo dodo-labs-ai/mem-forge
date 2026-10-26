@@ -21,7 +21,7 @@ from memforge.memory.evidence import (
     ReviewCase,
     relation_bundle_snapshot_audit,
 )
-from memforge.models import DocumentRecord, Memory, MemoryReview, MemorySource, content_hash
+from memforge.models import DocumentRecord, Memory, MemorySource, content_hash
 from memforge.storage.database import Database
 
 
@@ -1369,75 +1369,6 @@ async def test_purge_memory_does_not_delete_non_materializing_evidence_unit(db: 
     assert await db.get_evidence_unit("eu-1") is not None
     assert await db.get_relation_run("rel-run-1") is not None
     assert await db.get_evidence_relations("eu-1") == []
-
-
-@pytest.mark.asyncio
-async def test_mark_pending_review_with_case_is_idempotent_for_same_review_id(db: Database) -> None:
-    await db.insert_memory(_memory("mem-incumbent"))
-    await db.insert_memory(_memory("mem-review-repeat"))
-    review = MemoryReview(
-        id="rev-repeat",
-        kind="supersede",
-        status="pending",
-        incumbent_memory_id="mem-incumbent",
-        challenger_memory_id="mem-review-repeat",
-        reason="conflict",
-        created_at=datetime.fromisoformat("2026-06-22T12:00:00+00:00"),
-    )
-
-    await db.mark_memory_pending_review_with_case("mem-review-repeat", reason="conflict", review=review)
-    await db.mark_memory_pending_review_with_case("mem-review-repeat", reason="conflict", review=review)
-
-    stored = await db.get_memory_review("rev-repeat")
-    reviews = await db.list_memory_reviews(status="pending")
-    memory = await db.get_memory("mem-review-repeat")
-    assert stored is not None
-    assert [item.id for item in reviews] == ["rev-repeat"]
-    assert memory.status == "pending_review"
-
-
-@pytest.mark.asyncio
-async def test_mark_pending_review_does_not_reopen_resolved_review(db: Database) -> None:
-    await db.insert_memory(_memory("mem-incumbent"))
-    await db.insert_memory(_memory("mem-review-resolved"))
-    original = MemoryReview(
-        id="rev-resolved",
-        kind="supersede",
-        status="pending",
-        incumbent_memory_id="mem-incumbent",
-        challenger_memory_id="mem-review-resolved",
-        reason="original conflict",
-        created_at=datetime.fromisoformat("2026-06-22T12:00:00+00:00"),
-    )
-    await db.mark_memory_pending_review_with_case("mem-review-resolved", reason="conflict", review=original)
-    await db.resolve_memory_review(
-        "rev-resolved",
-        status="approved",
-        reviewer="tester",
-        review_note="resolved by a person",
-    )
-    await db.update_memory_status("mem-review-resolved", "active")
-
-    retry = MemoryReview(
-        id="rev-resolved",
-        kind="supersede",
-        status="pending",
-        incumbent_memory_id="mem-incumbent",
-        challenger_memory_id="mem-review-resolved",
-        reason="retry conflict",
-        created_at=datetime.fromisoformat("2026-06-23T12:00:00+00:00"),
-    )
-    with pytest.raises(RuntimeError, match="already exists with status approved"):
-        await db.mark_memory_pending_review_with_case("mem-review-resolved", reason="retry", review=retry)
-
-    stored = await db.get_memory_review("rev-resolved")
-    memory = await db.get_memory("mem-review-resolved")
-    assert stored is not None
-    assert stored.status == "approved"
-    assert stored.reason == "original conflict"
-    assert stored.created_at == original.created_at
-    assert stored.resolved_at is not None
-    assert memory.status == "active"
 
 
 @pytest.mark.asyncio

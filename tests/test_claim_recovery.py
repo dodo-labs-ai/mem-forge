@@ -110,7 +110,7 @@ async def test_provider_validation_diagnostic_reaches_durable_lifecycle_event(mo
     bundle = bind_source_lifecycle_outcome(source_id="source-1", source_type="github_repo", doc_id="doc", source_unit_id="unit",
         base_unit_revision_id="base", target_unit_revision_id="target", projection_run_id="projection", operation_input_hash="a"*64,
         execution_owner_id="fixture-execution", outcome="failed", reason_code="relation_first_failed", attempt_count=1,
-        duration_ms=10, incumbent_count=1, relation_pair_count=1, mutation_count=0, review_count=0, model_call_count=1,
+        duration_ms=10, incumbent_count=1, relation_pair_count=1, mutation_count=0, model_call_count=1,
         operation="assess_claim_revisions", terminal_category=error.terminal_category, error_code=error.error_code,
         validation_fields=error.validation_fields, diagnostic=error.diagnostic)
     assert bundle.event.validation_location == "results.0.relations.0.relation"

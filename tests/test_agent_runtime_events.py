@@ -97,7 +97,6 @@ def _lifecycle_bundle(
         incumbent_count=2,
         relation_pair_count=4,
         mutation_count=2,
-        review_count=0,
         model_call_count=2,
         occurred_at=NOW,
         deployment_revision="cloud-pr-258",

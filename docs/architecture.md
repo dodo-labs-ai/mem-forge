@@ -28,14 +28,16 @@ MemForge or contribute to it.
    decisions, procedures and conventions. Each memory keeps Evidence that
    points back to the text it came from.
 3. **Reconcile.** When a source changes, the memories built on it are rechecked
-   against the new revision. A memory is kept, replaced or retired, or it waits
-   for a review; a source that states two incompatible claims keeps both. Two memories, from one
-   document or from different ones, are related when they state the same thing,
-   update one another or contradict one another.
+   against the new revision. A memory is kept, replaced or retired without
+   waiting for a person; a source that states two incompatible claims keeps
+   both. Two memories, from one document or from different ones, are related
+   when they state the same thing, update one another or contradict one another.
 4. **Recall.** An agent calls `search` for memory cards, `get_memory` for a
    memory's Evidence and relations, and `get_resource` for the backing
    document. An agent can also propose creating, correcting or retiring a
-   memory, and confirms with the person first.
+   memory, and confirms with the person first. A correction of a memory that a
+   source backs waits in the review queue until someone who manages that source
+   decides it.
 
 ## Deployment
 

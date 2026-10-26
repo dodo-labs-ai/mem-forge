@@ -798,8 +798,8 @@ class MemoryStore:
             incomplete_mandatory_buckets=(),
             classifier_version="dedup-support-v1",
             lifecycle_action=lifecycle.action,
-            review_case=lifecycle.review_case,
-            status="applied" if lifecycle.action is LifecycleAction.ATTACH_SUPPORT else "review",
+            review_case=None,
+            status="applied",
             result_memory_id=target_memory.id,
             audit={
                 "source": "MemoryStore.deduplicate_and_insert",
@@ -808,14 +808,6 @@ class MemoryStore:
                 "dedup_score": score,
             },
         )
-        relations: tuple[EvidenceRelationRecord, ...] = ()
-        if lifecycle.action is not LifecycleAction.ATTACH_SUPPORT:
-            return RelationOutcomeBundle(
-                evidence_unit=unit,
-                relation_run=relation_run,
-                candidates=(candidate,),
-                relations=relations,
-            )
         relations = (
             EvidenceRelationRecord(
                 evidence_unit_id=unit.id,
@@ -850,8 +842,6 @@ class MemoryStore:
         excerpt: str | None = None,
         relation_outcome: RelationOutcomeBundle | None = None,
         review: MemoryReview | None = None,
-        related_review_id: str | None = None,
-        related_review_reason: str | None = None,
     ) -> None:
         """Insert a memory without deduplication.
 
@@ -869,8 +859,6 @@ class MemoryStore:
             source_updated_at=source_updated_at,
             relation_outcome=relation_outcome,
             review=review,
-            related_review_id=related_review_id,
-            related_review_reason=related_review_reason,
         )
         await self._emit(
             "memory_insert_committed",
@@ -984,8 +972,6 @@ class MemoryStore:
         source_updated_at: datetime | None,
         relation_outcome: RelationOutcomeBundle | None = None,
         review: MemoryReview | None = None,
-        related_review_id: str | None = None,
-        related_review_reason: str | None = None,
     ) -> None:
         """Insert memory into SQLite + FTS5 + ChromaDB + link entities and sources.
 
@@ -1008,8 +994,6 @@ class MemoryStore:
                 relation_outcome=relation_outcome,
                 source_updated_at=source_updated_at,
                 review=review,
-                related_review_id=related_review_id,
-                related_review_reason=related_review_reason,
             )
             inserted = True
             await self._emit(
@@ -1945,40 +1929,6 @@ class MemoryStore:
             reason=reason,
         )
 
-    async def mark_pending_review_with_case(
-        self,
-        memory_id: str,
-        reason: str | None = None,
-        *,
-        relation_outcome: RelationOutcomeBundle | None = None,
-        review: MemoryReview | None = None,
-        related_review_id: str | None = None,
-    ) -> None:
-        """Quarantine a memory and create/link its review work item as one DB mutation."""
-        context = self._operation_context()
-        previous = await self.db.get_memory(memory_id)
-        await self._remove_from_search_indexes(memory_id, label="pending_review", context=context)
-        try:
-            await self.db.mark_memory_pending_review_with_case(
-                memory_id,
-                reason=reason,
-                relation_outcome=relation_outcome,
-                review=review,
-                related_review_id=related_review_id,
-            )
-        except Exception:
-            if previous:
-                await self._restore_memory_row(previous)
-                await self._restore_search_indexes(previous, context=context, label="pending_review_rollback")
-            raise
-        await self._emit(
-            "memory_pending_review_committed",
-            "committed",
-            context=context,
-            memory_id=memory_id,
-            reason=reason,
-        )
-
     async def purge_memory(self, memory_id: str) -> bool:
         """Hard-delete a memory from SQLite, FTS5, and ChromaDB."""
         context = self._operation_context()
@@ -2190,31 +2140,6 @@ class MemoryStore:
     ) -> None:
         """Record a memory audit event for pipeline decisions that do not mutate storage."""
         await self._emit(event_type, status, context=context or self._operation_context(), **fields)
-
-    async def restore_review_transition(
-        self,
-        *,
-        incumbent: Memory | None,
-        challenger: Memory,
-        context: AuditContext,
-        review_id: str,
-        reason: str,
-    ) -> None:
-        """Restore review participant memory state after review-row resolution fails."""
-        if incumbent:
-            await self._restore_memory_row(incumbent)
-            await self._restore_search_indexes(incumbent, context=context, label=reason)
-        await self._restore_memory_row(challenger)
-        if challenger.status not in set(allowed_search_statuses()):
-            await self._remove_from_search_indexes(challenger.id, label=reason, context=context)
-        await self._emit(
-            "review_memory_transition_rolled_back",
-            "committed",
-            context=context,
-            memory_id=challenger.id,
-            review_id=review_id,
-            reason=reason,
-        )
 
     async def _remove_from_search_indexes(
         self,

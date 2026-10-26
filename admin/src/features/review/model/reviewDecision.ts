@@ -81,25 +81,9 @@ export function decidedBanner(
   };
 }
 
-export interface ExpiredExplanation {
-  text: string;
-  /** Whether a new proposal can be made from the current state. */
-  canRecheck: boolean;
-}
-
-/** Why an expired proposal cannot be applied, and whether it can be rechecked. */
-export function expiredExplanation(review: Pick<ReviewListItem, "review_origin" | "refreshable">): ExpiredExplanation {
-  if (review.refreshable) {
-    return {
-      text: "The underlying memory changed before a decision was applied. This record remains in audit history.",
-      canRecheck: true,
-    };
-  }
-  return {
-    text: "The memories in this proposal changed before a decision was applied, so it can no longer be applied. This record remains in audit history.",
-    canRecheck: false,
-  };
-}
+/** Why an expired proposal cannot be applied. */
+export const EXPIRED_EXPLANATION =
+  "The memories in this proposal changed before a decision was applied, so it can no longer be applied. This record remains in audit history.";
 
 export interface DecisionFailure {
   message: string;
@@ -144,7 +128,6 @@ export function memoryStatus(status: string): { label: string; tone: Tone } {
 const DECISION_LABEL_TONE: Record<ReviewPresentation["decision_label"], Tone> = {
   Updated: "live",
   "Support removed": "warn",
-  Conflict: "danger",
 };
 
 export function decisionLabelTone(label: ReviewPresentation["decision_label"]): Tone {

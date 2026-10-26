@@ -15,7 +15,10 @@ from memforge.config import AppConfig
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.lifecycle_plan import LifecycleReviewStatus
 from memforge.memory.lifecycle_planner import lifecycle_memory_version
-from memforge.memory.review_decision import memory_review_decision_fingerprint
+from memforge.memory.review_decision import (
+    lifecycle_review_decision_fingerprint,
+    memory_review_decision_fingerprint,
+)
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.review_service import (
     ResolvedReview,
@@ -33,12 +36,12 @@ from memforge.models import (
     ReviewKind,
     ReviewStatus,
     content_hash,
-    generate_review_id,
 )
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.embedding_fixture import unconfigured_embedding
+from tests.stored_review_fixture import attach_stored_related_challenger, insert_stored_memory_review
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +256,7 @@ async def _seed_supersede_review(
     incumbent = await db.get_memory(incumbent.id)  # type: ignore[assignment]
     challenger = await db.get_memory(challenger.id)  # type: ignore[assignment]
     review = MemoryReview(
-        id=generate_review_id(),
+        id=f"rev-{suffix}",
         kind=ReviewKind.SUPERSEDE.value,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
@@ -264,7 +267,7 @@ async def _seed_supersede_review(
         replacement_kind=replacement_kind,
         created_at=datetime.now(timezone.utc),
     )
-    await db.insert_memory_review(review)
+    await insert_stored_memory_review(db, review)
     review = await db.get_memory_review(review.id)  # type: ignore[assignment]
     return incumbent, challenger, review
 
@@ -337,8 +340,9 @@ async def _seed_lifecycle_review(db: Database, *, review_id: str = "review-lifec
     return review_id
 
 
-async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
-    review_id = await _seed_lifecycle_review(db, review_id="review-lifecycle-stale")
+async def _seed_decidable_lifecycle_review(db: Database) -> str:
+    """A pending Lifecycle Review whose creating Plan guards the current incumbent."""
+    review_id = await _seed_lifecycle_review(db, review_id="review-lifecycle-decidable")
     incumbent = await db.get_memory("mem-lifecycle-current")
     assert incumbent is not None
     support_hash = await db.get_memory_support_set_hash(incumbent.id)
@@ -381,10 +385,8 @@ async def _seed_refreshable_stale_lifecycle_review(db: Database) -> str:
         (json.dumps(payload),),
     )
     await db.db.execute(
-        """UPDATE lifecycle_reviews
-              SET status = 'stale', staged_evidence_json = ?, resolved_at = ?
-            WHERE id = ?""",
-        (json.dumps(staged), now, review_id),
+        "UPDATE lifecycle_reviews SET staged_evidence_json = ? WHERE id = ?",
+        (json.dumps(staged), review_id),
     )
     await db.db.commit()
     return review_id
@@ -402,7 +404,8 @@ async def _attach_related_challenger(
         status="pending_review",
     )
     await db.insert_memory(challenger)
-    await db.add_memory_review_related_challenger(
+    await attach_stored_related_challenger(
+        db,
         review.id,
         challenger.id,
         reason="Same source document produced another challenger",
@@ -425,7 +428,7 @@ async def _seed_cross_source_review(
         metadatas=[{"status": "active"}, {"status": "active"}],
     )
     review = MemoryReview(
-        id=generate_review_id(),
+        id="rev-cross",
         kind=CROSS_SOURCE_CONFLICT_REVIEW_KIND,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
@@ -435,7 +438,7 @@ async def _seed_cross_source_review(
         expected_challenger_updated_at=(await db.get_memory(challenger.id)).updated_at.isoformat(),
         created_at=datetime.now(timezone.utc),
     )
-    await db.insert_memory_review(review)
+    await insert_stored_memory_review(db, review)
     return incumbent, challenger, review
 
 
@@ -525,10 +528,8 @@ class TestReviewCrud:
         )
 
         open_reviews = await db.list_memory_reviews(status="open")
-        open_count = await db.count_memory_reviews(status="open")
 
         assert [r.id for r in open_reviews] == [pending_review.id]
-        assert open_count == 1
 
     @pytest.mark.asyncio
     async def test_review_list_includes_pending_challenger_snapshot(self, db, chroma, tmp_path):
@@ -549,26 +550,6 @@ class TestReviewCrud:
         assert row["challenger"]["id"] == challenger.id
         assert row["challenger"]["status"] == "pending_review"
         assert row["challenger"]["content"] == challenger.content
-
-    @pytest.mark.asyncio
-    async def test_related_challenger_conflict_is_explicit(self, db, chroma):
-        _, _, first_review = await _seed_supersede_review(db, chroma, suffix="one")
-        _, _, second_review = await _seed_supersede_review(db, chroma, suffix="two")
-        related = await _attach_related_challenger(db, first_review)
-
-        await db.add_memory_review_related_challenger(
-            first_review.id,
-            related.id,
-            reason="Repeated insert for the same visible case is idempotent",
-        )
-        assert len(await db.list_memory_review_related_challengers(first_review.id)) == 1
-
-        with pytest.raises(ValueError, match="already attached"):
-            await db.add_memory_review_related_challenger(
-                second_review.id,
-                related.id,
-                reason="A challenger cannot move silently to another review",
-            )
 
     @pytest.mark.asyncio
     async def test_purge_memory_removes_related_challenger_references(self, db, chroma):
@@ -764,46 +745,43 @@ class TestUnifiedLifecycleReviewApi:
         assert queue.json()["data"] == []
 
     @pytest.mark.asyncio
-    async def test_stale_lifecycle_review_refresh_is_guarded_and_idempotent(self, db, tmp_path):
-        review_id = await _seed_refreshable_stale_lifecycle_review(db)
+    async def test_stale_lifecycle_review_is_read_only_history(self, db, tmp_path):
+        review_id = await _seed_lifecycle_review(db)
+        await db.resolve_lifecycle_review(review_id, LifecycleReviewStatus.STALE)
         from memforge.server.admin_api import create_admin_app
 
         app = create_admin_app(db=db, config=_config(tmp_path))
         with TestClient(app) as client:
-            stale_detail = client.get(f"/api/v1/memory-reviews/{review_id}").json()
-            rejected = client.post(
-                f"/api/v1/memory-reviews/{review_id}/refresh",
-                json={"expected_fingerprint": "review-decision-v1:outdated"},
+            queue = client.get("/api/v1/memory-reviews", params={"status": "stale"})
+            detail = client.get(f"/api/v1/memory-reviews/{review_id}")
+            fingerprint = detail.json()["decision_fingerprint"]
+            approved = client.post(
+                f"/api/v1/memory-reviews/{review_id}/approve",
+                json={"expected_fingerprint": fingerprint},
             )
-            refreshed = client.post(
-                f"/api/v1/memory-reviews/{review_id}/refresh",
-                json={"expected_fingerprint": stale_detail["decision_fingerprint"]},
-            )
-            replayed = client.post(
-                f"/api/v1/memory-reviews/{review_id}/refresh",
-                json={"expected_fingerprint": stale_detail["decision_fingerprint"]},
-            )
+            removed = [
+                client.post(path, json={"expected_fingerprint": fingerprint}).status_code
+                for path in (
+                    f"/api/v1/memory-reviews/{review_id}/refresh",
+                    f"/api/v1/sources/src-lifecycle/memory-lifecycle/reviews/{review_id}/approve",
+                    f"/api/v1/sources/src-lifecycle/memory-lifecycle/reviews/{review_id}/reject",
+                )
+            ]
 
-        assert rejected.status_code == 409
-        assert refreshed.status_code == 200
-        assert replayed.status_code == 200
-        assert refreshed.json()["id"] == replayed.json()["id"]
-        assert refreshed.json()["status"] == "pending"
-        assert refreshed.json()["review_origin"] == "lifecycle"
-        old_review = await db.get_lifecycle_review(review_id)
-        assert old_review is not None and old_review.status is LifecycleReviewStatus.STALE
-        new_review = await db.get_lifecycle_review(refreshed.json()["id"])
-        assert new_review is not None
-        assert new_review.staged_evidence["refreshed_from_review_id"] == review_id
+        assert [item["id"] for item in queue.json()["data"]] == [review_id]
+        assert detail.status_code == 200
+        assert detail.json()["status"] == "stale"
+        assert detail.json()["is_stale"] is True
+        assert "refreshable" not in detail.json()
+        assert approved.status_code == 409
+        assert removed == [404, 404, 404]
+        stored = await db.get_lifecycle_review(review_id)
+        assert stored is not None and stored.status is LifecycleReviewStatus.STALE
+        assert [review.id for review in await db.list_lifecycle_reviews()] == [review_id]
 
     @pytest.mark.asyncio
     async def test_approving_a_pending_lifecycle_review_applies_its_plan(self, db, tmp_path):
-        review_id = await _seed_refreshable_stale_lifecycle_review(db)
-        await db.db.execute(
-            "UPDATE lifecycle_reviews SET status = 'pending', resolved_at = NULL WHERE id = ?",
-            (review_id,),
-        )
-        await db.db.commit()
+        review_id = await _seed_decidable_lifecycle_review(db)
         from memforge.server.admin_api import create_admin_app
 
         app = create_admin_app(db=db, config=_config(tmp_path))
@@ -820,6 +798,35 @@ class TestUnifiedLifecycleReviewApi:
         assert stored is not None and stored.status is LifecycleReviewStatus.APPROVED
         current = await db.get_memory("mem-lifecycle-current")
         assert current is not None and current.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_review_without_its_plan_cannot_be_decided(self, db, tmp_path, monkeypatch):
+        review_id = await _seed_decidable_lifecycle_review(db)
+        review = await db.get_lifecycle_review(review_id)
+        assert review is not None
+        fingerprint = lifecycle_review_decision_fingerprint(review)
+
+        async def no_plan_payload(plan_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(db, "get_lifecycle_plan_payload", no_plan_payload)
+        from memforge.server.admin_api import create_admin_app
+
+        app = create_admin_app(db=db, config=_config(tmp_path))
+        with TestClient(app) as client:
+            approved = client.post(
+                f"/api/v1/memory-reviews/{review_id}/approve",
+                json={"expected_fingerprint": fingerprint},
+            )
+            rejected = client.post(
+                f"/api/v1/memory-reviews/{review_id}/reject",
+                json={"expected_fingerprint": fingerprint, "note": "Keep it."},
+            )
+
+        assert (approved.status_code, approved.json()["detail"]) == (409, "Lifecycle review plan is unavailable")
+        assert (rejected.status_code, rejected.json()["detail"]) == (409, "Lifecycle review plan is unavailable")
+        stored = await db.get_lifecycle_review(review_id)
+        assert stored is not None and stored.status is LifecycleReviewStatus.PENDING
 
     @pytest.mark.asyncio
     async def test_queue_pages_one_stable_order_across_memory_and_lifecycle_reviews(
@@ -1331,48 +1338,6 @@ class TestReviewResolutionConcurrency:
             assert stored.status == "rejected"
             assert current_incumbent.status == "active"
             assert current_challenger.status == "retired"
-
-    @pytest.mark.asyncio
-    async def test_cross_connection_cannot_attach_participant_after_resolution_cohort_lock(
-        self,
-        db,
-        chroma,
-        review_service,
-        monkeypatch,
-    ):
-        _, _, review = await _seed_supersede_review(db, chroma, suffix="cohortlock")
-        related = _memory("mem-related-cohortlock", "PostgreSQL is version 17", status="pending_review")
-        await db.insert_memory(related)
-        second = Database(db.db_path)
-        await second.connect()
-        entered_guard = asyncio.Event()
-        release_guard = asyncio.Event()
-        original_guard = db._assert_no_active_source_support_unlocked
-
-        async def pause_after_cohort_lock(memory_id: str) -> None:
-            entered_guard.set()
-            await release_guard.wait()
-            await original_guard(memory_id)
-
-        monkeypatch.setattr(db, "_assert_no_active_source_support_unlocked", pause_after_cohort_lock)
-        resolution = asyncio.create_task(_approve(review_service, review.id, reviewer="alice"))
-        await entered_guard.wait()
-        attachment = asyncio.create_task(
-            second.add_memory_review_related_challenger(review.id, related.id, reason="late candidate")
-        )
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(attachment), timeout=0.05)
-        release_guard.set()
-
-        try:
-            await resolution
-            with pytest.raises(ValueError, match="not pending"):
-                await attachment
-        finally:
-            await second.close()
-
-        assert await db.list_memory_review_related_challengers(review.id) == []
-        assert (await db.get_memory_review(review.id)).status == "approved"
 
 
 class TestApprove:

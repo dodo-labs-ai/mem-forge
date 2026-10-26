@@ -6036,11 +6036,6 @@
             ],
             "title": "Reason"
           },
-          "refreshable": {
-            "default": false,
-            "title": "Refreshable",
-            "type": "boolean"
-          },
           "related_challengers": {
             "items": {
               "$ref": "#/components/schemas/MemoryReviewMemorySummary"
@@ -6240,11 +6235,6 @@
               }
             ],
             "title": "Reason"
-          },
-          "refreshable": {
-            "default": false,
-            "title": "Refreshable",
-            "type": "boolean"
           },
           "replacement_kind": {
             "default": "supersession",
@@ -6531,21 +6521,6 @@
           "status"
         ],
         "title": "MemoryReviewMemorySummary",
-        "type": "object"
-      },
-      "MemoryReviewRefreshRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_fingerprint": {
-            "minLength": 1,
-            "title": "Expected Fingerprint",
-            "type": "string"
-          }
-        },
-        "required": [
-          "expected_fingerprint"
-        ],
-        "title": "MemoryReviewRefreshRequest",
         "type": "object"
       },
       "MemorySearchRequest": {
@@ -9179,8 +9154,7 @@
           "decision_label": {
             "enum": [
               "Updated",
-              "Support removed",
-              "Conflict"
+              "Support removed"
             ],
             "title": "Decision Label",
             "type": "string"
@@ -15397,59 +15371,6 @@
         ]
       }
     },
-    "/api/v1/memory-reviews/{review_id}/refresh": {
-      "post": {
-        "description": "Create a new pending Lifecycle Review from a stale proposal.",
-        "operationId": "refresh_memory_review_api_v1_memory_reviews__review_id__refresh_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "review_id",
-            "required": true,
-            "schema": {
-              "title": "Review Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/MemoryReviewRefreshRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemoryReviewDetailResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Refresh Memory Review",
-        "tags": [
-          "memory-reviews"
-        ]
-      }
-    },
     "/api/v1/memory-reviews/{review_id}/reject": {
       "post": {
         "operationId": "reject_memory_review_api_v1_memory_reviews__review_id__reject_post",
@@ -17681,126 +17602,6 @@
           }
         },
         "summary": "Get Source Memory Lifecycle",
-        "tags": [
-          "sources"
-        ]
-      }
-    },
-    "/api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/approve": {
-      "post": {
-        "description": "Use the latest state after the stale-guard checks.",
-        "operationId": "approve_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__approve_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "source_id",
-            "required": true,
-            "schema": {
-              "title": "Source Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "review_id",
-            "required": true,
-            "schema": {
-              "title": "Review Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/MemoryReviewDecisionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Approve Source Lifecycle Review",
-        "tags": [
-          "sources"
-        ]
-      }
-    },
-    "/api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/reject": {
-      "post": {
-        "description": "Keep the current state and discard the staged proposal.",
-        "operationId": "reject_source_lifecycle_review_api_v1_sources__source_id__memory_lifecycle_reviews__review_id__reject_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "source_id",
-            "required": true,
-            "schema": {
-              "title": "Source Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "review_id",
-            "required": true,
-            "schema": {
-              "title": "Review Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/MemoryReviewDecisionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Reject Source Lifecycle Review",
         "tags": [
           "sources"
         ]

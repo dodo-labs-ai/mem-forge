@@ -137,20 +137,13 @@ test("a decided review shows who decided, when and why, and no decision panel", 
   expect(screen.queryByRole("heading", { name: "Choose what MemForge should do" })).not.toBeInTheDocument();
 });
 
-test("rechecking an expired proposal opens the new review", async () => {
-  const expired = makeReviewDetail({ status: "stale", is_stale: true, refreshable: true, decision_fingerprint: "fp-stale" });
-  const rechecked = makeReviewDetail({ id: "review-2", decision_fingerprint: "fp-new" });
-  const { calls } = renderReview(expired, {
-    "POST /api/v1/memory-reviews/review-1/refresh": () => rechecked,
-    "GET /api/v1/memory-reviews/review-2": () => rechecked,
-  });
-  const user = userEvent.setup();
+test("an expired proposal explains why it can no longer be applied and offers no decision", async () => {
+  renderReview(makeReviewDetail({ status: "stale", is_stale: true }));
 
   expect(await screen.findByText("This proposal expired.")).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: "Recheck current state" }));
-
-  expect(await screen.findByRole("heading", { name: "Choose what MemForge should do" })).toBeInTheDocument();
-  expect(await bodyOf(calls, "/api/v1/memory-reviews/review-1/refresh")).toEqual({ expected_fingerprint: "fp-stale" });
+  expect(screen.getByText(/can no longer be applied/)).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Choose what MemForge should do" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /recheck/i })).not.toBeInTheDocument();
 });
 
 test("lists the other memories a decision touches, linked to their pages", async () => {

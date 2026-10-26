@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from tests.evidence_display_fixture import evidence_displays
-from tests.lifecycle_review_fixture import hold_for_review
+from tests.lifecycle_review_fixture import StoredLifecycleReview, held_for_review, store_lifecycle_review
 
 import asyncio
 import hashlib
@@ -89,6 +89,7 @@ from memforge.memory.lifecycle_plan import (
     LifecycleMutationType,
     ProjectedLifecycleDeferredError,
     ProjectedSupportInvariantError,
+    LifecycleReview,
     LifecycleReviewStatus,
     LifecycleVectorDeliveryResult,
     LifecycleVectorDeliveryState,
@@ -866,7 +867,7 @@ async def test_a_contradiction_of_a_supported_claim_keeps_both_and_rebinds_the_i
     event_window_end = datetime.now(timezone.utc) + timedelta(seconds=1)
 
     # Both claims keep Support: the contradicting Candidate is added beside the kept incumbent.
-    assert (stats["added"], stats["pending_review"]) == (1, 0)
+    assert stats["added"] == 1
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "active"
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
@@ -1061,7 +1062,6 @@ async def test_runbook_component_fallback_commits_candidate_once_and_keeps_branc
     current_by_id = {memory.id: memory for memory in memories}
     assert stats["added"] == 1
     assert stats["noop"] == 3
-    assert stats["pending_review"] == 0
     assert sorted(memory.content for memory in memories if memory.status == "active") == sorted(
         [*branch_claims, current_procedure]
     )
@@ -1158,7 +1158,6 @@ async def test_runbook_component_revision_creates_one_replacement_for_all_branch
     active = [memory for memory in memories if memory.status == "active"]
     assert stats["added"] == 1
     assert stats["updated"] == 3
-    assert stats["pending_review"] == 0
     assert len(replacement_ids) == 1
     assert all(memory.status == "superseded" for memory in old_memories)
     assert len(active) == 1
@@ -1272,7 +1271,7 @@ async def test_an_artifact_the_model_cannot_read_keeps_its_memory_unchanged(
     current = await db.get_memory(incumbent.id)
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current is not None and current.status == "active"
-    assert stats["pending_review"] == 0 and stats["deleted"] == 0 and stats["noop"] == 1
+    assert stats["deleted"] == 0 and stats["noop"] == 1
     assert stats["support_revalidation_skipped_memory_count"] == 1
     assert stats["support_revalidation_unreadable_memory_count"] == 1
     assert await db.list_lifecycle_reviews("src-1") == []
@@ -1378,7 +1377,7 @@ async def test_an_emptied_page_keeps_only_the_memory_whose_image_the_model_canno
         protected_source_observation_ids=(artifact_observation_id,),
     )
 
-    assert stats["deleted"] == 1 and stats["noop"] == 1 and stats["pending_review"] == 0
+    assert stats["deleted"] == 1 and stats["noop"] == 1
     assert stats["support_revalidation_unreadable_memory_count"] == 1
     assert (await db.get_memory(text_only.id)).status == "retired"  # type: ignore[union-attr]
     assert (await db.get_memory(image_backed.id)).status == "active"  # type: ignore[union-attr]
@@ -1509,7 +1508,7 @@ async def test_removed_artifact_dependency_commits_projection_and_retires_the_me
         structured_llm_client=RemovedArtifactClient(),
     )
 
-    stats = await reviewing_engine.prepare_and_commit_projected_lifecycle(
+    await reviewing_engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -1525,7 +1524,6 @@ async def test_removed_artifact_dependency_commits_projection_and_retires_the_me
 
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "retired"
-    assert stats["pending_review"] == 0
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == ()
     assert (
         second.source_unit_revisions[0].id == (await db.get_current_source_unit_revision(second.source_units[0].id)).id
@@ -2891,7 +2889,6 @@ async def test_atomic_projection_lifecycle_commits_document_and_derivation(
                 incumbent_count=0,
                 relation_pair_count=0,
                 mutation_count=0,
-                review_count=0,
                 model_call_count=0,
                 occurred_at=datetime(2026, 8, 17, tzinfo=timezone.utc),
             )
@@ -4020,56 +4017,36 @@ async def test_review_exempts_only_the_incumbent_support_staged_for_removal(
             access_context_hash="workspace-eng",
         ),
     )
-    plan = hold_for_review(direct, reviewed.id, action=ReconcileAction.DELETE)
-
-    with pytest.raises(ValueError, match="stale or incomplete Unit support"):
-        await db.apply_source_projection_lifecycle(second, plan)
-
-    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
-    assert current_unit is not None
-    assert current_unit.id == first.source_unit_revisions[0].id
-    assert await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"])) is None
-
-
-@pytest.mark.asyncio
-async def test_review_preserves_its_exact_contested_incumbent_support(
-    db: Database,
-) -> None:
-    first = _projection(run_id="projection-reviewed-support-1", body="A7 is removed.")
-    await db.record_source_projection(first)
-    incumbent = await _seed_incumbent_support(db, projection=first)
-    incumbent = await db.get_memory(incumbent.id)
-    assert incumbent is not None
-    old_support = await db.get_active_memory_support_unit_ids(incumbent.id)
-
-    second = _projection(
-        run_id="projection-reviewed-support-2",
-        body="A7 is retained.",
-        prior=first.source_unit_revisions[0],
-        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
-    )
-    delta = second.deltas[0]
-    scope = ReconciliationScope(
-        id="scope-reviewed-support",
-        source_id="src-1",
-        source_unit_id=delta.source_unit_id,
-        base_unit_revision_id=delta.previous_unit_revision_id,
-        target_unit_revision_id=delta.current_unit_revision_id,
-    )
-    direct = build_lifecycle_plan(
-        plan_id="plan-reviewed-support",
-        scope=scope,
+    await db.record_source_projection(second)
+    review = await store_lifecycle_review(db, held_for_review(direct, reviewed.id, action=ReconcileAction.DELETE))
+    keep_both = build_lifecycle_plan(
+        plan_id="plan-after-review-support-exemption",
+        scope=replace(scope, id="scope-after-review-support-exemption"),
         operations=(
             ReconcileOperation(
-                action=ReconcileAction.DELETE,
-                memory_id=incumbent.id,
-                reason="the source now disputes this claim",
+                action=ReconcileAction.NOOP,
+                memory_id=reviewed.id,
+                reason="the pending Review still holds this claim",
+            ),
+            ReconcileOperation(
+                action=ReconcileAction.NOOP,
+                memory_id=unrelated.id,
+                reason="incorrectly kept without current evidence",
             ),
         ),
-        incumbents={incumbent.id: incumbent},
-        source_support_unit_ids={incumbent.id: old_support},
-        all_active_support_unit_ids={incumbent.id: old_support},
-        support_set_hashes={incumbent.id: await db.get_memory_support_set_hash(incumbent.id)},
+        incumbents={reviewed.id: reviewed, unrelated.id: unrelated},
+        source_support_unit_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        all_active_support_unit_ids={
+            reviewed.id: reviewed_support,
+            unrelated.id: unrelated_support,
+        },
+        support_set_hashes={
+            reviewed.id: await db.get_memory_support_set_hash(reviewed.id),
+            unrelated.id: await db.get_memory_support_set_hash(unrelated.id),
+        },
         observation_revision_ids=tuple(revision.id for revision in second.observation_revisions),
         defaults=NewMemoryDefaults(
             visibility="workspace",
@@ -4082,19 +4059,11 @@ async def test_review_preserves_its_exact_contested_incumbent_support(
         ),
     )
 
-    plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
-    await db.apply_source_projection_lifecycle(second, plan)
+    with pytest.raises(ValueError, match=f"stale or incomplete Unit support: {unrelated.id}"):
+        await db.apply_lifecycle_plan(keep_both)
 
-    current_unit = await db.get_current_source_unit_revision(first.source_units[0].id)
-    assert current_unit is not None
-    assert current_unit.id == second.source_unit_revisions[0].id
-    assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    support_state = (await db.get_active_memory_support_states((incumbent.id,)))[incumbent.id]
-    assert support_state.unit_ids == old_support
-    assert support_state.current_unit_ids == ()
-    review = await db.get_lifecycle_review(str(plan.mutations[0].payload["review_id"]))
-    assert review is not None
-    assert review.status is LifecycleReviewStatus.PENDING
+    assert await db.get_lifecycle_plan_status(keep_both.id) is None
+    assert (await db.get_lifecycle_review(review.id)).status is LifecycleReviewStatus.PENDING  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -4146,8 +4115,8 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
             access_context_hash="workspace-eng",
         ),
     )
-    review_plan = hold_for_review(direct, incumbent.id, action=ReconcileAction.DELETE)
-    await db.apply_source_projection_lifecycle(changed, review_plan)
+    await db.record_source_projection(changed)
+    held = await store_lifecycle_review(db, held_for_review(direct, incumbent.id, action=ReconcileAction.DELETE))
 
     later = _projection(
         run_id="projection-durable-review-later-unit",
@@ -4192,14 +4161,14 @@ async def test_later_unit_plan_preserves_exact_support_contested_by_durable_revi
 
     assert await db.get_lifecycle_plan_status(later_plan.id) == "applied"
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == old_support
-    review = await db.get_lifecycle_review(str(review_plan.mutations[0].payload["review_id"]))
+    review = await db.get_lifecycle_review(held.id)
     assert review is not None
     assert review.status is LifecycleReviewStatus.PENDING
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("destructive", [False, True])
-async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_plan(
+async def test_stale_cross_unit_support_allows_a_support_preserving_plan_but_defers_a_destructive_one(
     db: Database, destructive: bool,
 ) -> None:
     first = _projection(run_id="projection-review-unit-1", body="A7 is removed.")
@@ -4221,25 +4190,7 @@ async def test_stale_cross_unit_support_allows_review_but_blocks_destructive_pla
     )
     await db.record_source_projection(other)
     plan = SimpleNamespace(
-        mutations=(
-            LifecycleMutation(
-                mutation_type=LifecycleMutationType.CREATE_REVIEW,
-                memory_id=incumbent.id,
-                source_id="src-1",
-                payload={
-                    "staged_evidence": {
-                        "proposed_mutations": [
-                            {
-                                "mutation_type": "remove_support",
-                                "memory_id": incumbent.id,
-                                "source_id": "src-1",
-                                "evidence_unit_ids": list(old_support),
-                            }
-                        ]
-                    }
-                },
-            ),
-        ),
+        mutations=(),
         coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
@@ -4284,26 +4235,38 @@ async def test_review_does_not_exempt_mismatched_observation_revision_lineage(
         (_body_revision(other).id, support[0]),
     )
     await db.db.commit()
-    plan = SimpleNamespace(
-        mutations=(
-            LifecycleMutation(
-                mutation_type=LifecycleMutationType.CREATE_REVIEW,
-                memory_id=incumbent.id,
-                source_id="src-1",
-                payload={
-                    "staged_evidence": {
-                        "proposed_mutations": [
-                            {
-                                "mutation_type": "remove_support",
-                                "memory_id": incumbent.id,
-                                "source_id": "src-1",
-                                "evidence_unit_ids": list(support),
-                            }
-                        ]
-                    }
+    await store_lifecycle_review(
+        db,
+        StoredLifecycleReview(
+            plan_payload={
+                "scope": {
+                    "id": "scope-review-lineage",
+                    "source_id": "src-1",
+                    "source_unit_id": first.source_units[0].id,
+                    "target_unit_revision_id": first.source_unit_revisions[0].id,
                 },
+            },
+            review=LifecycleReview(
+                id="review-lineage",
+                lifecycle_plan_id="plan-review-lineage",
+                incumbent_memory_id=incumbent.id,
+                status=LifecycleReviewStatus.PENDING,
+                staged_evidence={
+                    "proposed_mutations": [
+                        {
+                            "mutation_type": "remove_support",
+                            "memory_id": incumbent.id,
+                            "source_id": "src-1",
+                            "evidence_unit_ids": list(support),
+                        }
+                    ]
+                },
+                reason="the source disputes this claim",
             ),
         ),
+    )
+    plan = SimpleNamespace(
+        mutations=(),
         coverage_proof=SimpleNamespace(mandatory_incumbent_ids=(incumbent.id,), incumbent_decisions=()),
         scope=SimpleNamespace(
             source_id="src-1",
@@ -4791,7 +4754,6 @@ async def test_noop_assesses_each_same_unit_alternative(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 0
     assert stats["support_revalidation_work_item_count"] == 2
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current_support and set(current_support).isdisjoint(old_support)
@@ -5193,7 +5155,7 @@ async def test_incremental_noop_invalidated_primary_retires_the_memory(
         ),
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -5207,7 +5169,6 @@ async def test_incremental_noop_invalidated_primary_retires_the_memory(
         source_updated_at=datetime(2026, 7, 16, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 0
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "retired"
     assert await db.list_lifecycle_reviews("src-1") == []
@@ -5630,7 +5591,7 @@ async def test_partial_jira_projection_keeps_a_validated_support_on_an_unreturne
     assert stats["support_revalidation_model_call_count"] == 0
     assert stats["support_revalidation_unresolved_partial_coverage_count"] == 1
     assert stats["support_revalidation_skipped_memory_count"] == 1
-    assert stats["deleted"] == 0 and stats["pending_review"] == 0
+    assert stats["deleted"] == 0
     assert await db.get_memory(memory.id) == memory
     # Same Evidence, same validation baseline: the next revision still compares against the first.
     assert await active_support_evidence(db, memory.id, source_id="src-1") == before
@@ -5698,7 +5659,7 @@ async def test_only_admitted_candidates_reach_relation_and_rejections_add_nothin
 
     [relation_prompt] = client.prompts
     assert description_text in relation_prompt and rejected_claim not in relation_prompt
-    assert stats["added"] == 1 and stats["pending_review"] == 0
+    assert stats["added"] == 1
     assert stats["candidate_admission_admitted_count"] == 1
     assert stats["candidate_admission_rejected_count"] == 1
     assert sorted(memory.content for memory in await db.list_memories(status="active")) == sorted(
@@ -6284,7 +6245,7 @@ async def test_noop_model_selects_exact_ref_among_repeated_text(
         structured_llm_client=client,
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -6298,7 +6259,6 @@ async def test_noop_model_selects_exact_ref_among_repeated_text(
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 0
     current_support = await db.get_active_memory_support_unit_ids(incumbent.id)
     assert current_support and set(current_support).isdisjoint(old_support)
     assert len(client.validation_prompts) == 1
@@ -6342,7 +6302,7 @@ async def test_noop_semantically_unsupported_current_fragment_retires_the_memory
         ),
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -6356,7 +6316,6 @@ async def test_noop_semantically_unsupported_current_fragment_retires_the_memory
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 0
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "retired"
     assert await db.list_lifecycle_reviews("src-1") == []
@@ -6554,7 +6513,7 @@ async def test_revising_a_memory_another_unit_supports_keeps_it_on_that_support(
 
     # This Unit removes only its own Support; the other Unit keeps the old claim
     # and the Candidate becomes its own Memory, related by relation discovery.
-    assert stats["pending_review"] == 0 and stats["superseded"] == 0 and stats["updated"] == 0
+    assert stats["superseded"] == 0 and stats["updated"] == 0
     assert stats["added"] == 1 and stats["relation_discovery_enqueued"] == 1
     assert await db.list_lifecycle_reviews("src-1") == []
     old = await db.get_memory(incumbent.id)
@@ -6726,7 +6685,7 @@ async def test_another_unit_changes_a_memory_kept_on_unreadable_evidence(db: Dat
 
     # The other Unit's current revision already kept its Support unread, so this
     # removal does not wait for it: the Memory stays Active on that Support alone.
-    assert stats["added"] == (1 if revises else 0) and stats["pending_review"] == 0
+    assert stats["added"] == (1 if revises else 0)
     old = await db.get_memory(incumbent.id)
     assert old is not None and old.status == "active" and old.superseded_by is None
     assert await db.get_active_memory_support_unit_ids(incumbent.id) == unreadable_support
@@ -7658,7 +7617,7 @@ async def test_noop_with_invalidated_required_evidence_retires_the_memory(db: Da
         ),
     )
 
-    stats = await engine.prepare_and_commit_projected_lifecycle(
+    await engine.prepare_and_commit_projected_lifecycle(
         projection=second,
         doc_id="confluence-123",
         raw_memories=[],
@@ -7672,7 +7631,6 @@ async def test_noop_with_invalidated_required_evidence_retires_the_memory(db: Da
         source_updated_at=datetime(2026, 7, 15, 10, 36, tzinfo=timezone.utc),
     )
 
-    assert stats["pending_review"] == 0
     current = await db.get_memory(incumbent.id)
     assert current is not None and current.status == "retired"
     assert await db.list_lifecycle_reviews("src-1") == []
@@ -9502,7 +9460,7 @@ async def test_source_revision_supersedes_incumbent_in_one_atomic_plan(db: Datab
     ).process_slice(worker_id="relation-worker-cross-source")
     assert discovery.completed_work == 1
     assert discovery.checked_candidate_pairs >= 1
-    assert await db.get_pending_review_for_challenger(replacement.id) is None
+    assert await db.list_memory_reviews() == []
     relation_rows = await db.db.execute_fetchall(
         "SELECT memory_low_id, memory_high_id, label, decided_by FROM cross_document_relations"
     )
@@ -10004,7 +9962,6 @@ async def test_an_undecided_claim_keeps_what_was_verified_and_resumes_after_sour
     assert stats["added"] == (1 if restated else 0)
     assert len(await db.db.execute_fetchall("SELECT id FROM memories")) == (3 if restated else 2)
     assert not await db.db.execute_fetchall("SELECT id FROM lifecycle_reviews")
-    assert stats["pending_review"] == 0
     assert stats["support_revalidation_skipped_memory_count"] == (1 if skip_stage == "support" else 0)
 
     client.skip_claim = False

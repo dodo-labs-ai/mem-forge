@@ -171,7 +171,6 @@ def test_lifecycle_binder_retains_optional_safe_diagnostics():
         incumbent_count=1,
         relation_pair_count=0,
         mutation_count=0,
-        review_count=0,
         model_call_count=2,
     )
     legacy = bind_source_lifecycle_outcome(**values).event

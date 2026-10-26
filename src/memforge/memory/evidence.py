@@ -460,13 +460,18 @@ class LifecycleAction(str, Enum):
     ATTACH_SUPPORT = "attach_support"
     CREATE_MEMORY = "create_memory"
     CREATE_REVISION = "create_revision"
+    # May appear on stored relation runs; never produced.
     CREATE_REVIEW = "create_review"
     SUPERSEDE_MEMORY = "supersede_memory"
     RETIRE_MEMORY = "retire_memory"
 
 
 class ReviewCase(str, Enum):
-    # May appear on stored relation runs; never produced.
+    """Why a stored relation run held its decision for a Review.
+
+    These values may appear on stored relation runs; none is produced.
+    """
+
     LEGACY_LIMITED_EVIDENCE = "legacy_limited_evidence"
     MISSING_CONTENT_PROVENANCE = "missing_content_provenance"
     MULTI_DESTRUCTIVE_MATCH = "multi_destructive_match"
@@ -618,9 +623,12 @@ class RelationDecision:
 @dataclass(frozen=True, slots=True)
 class LifecycleDecision:
     action: LifecycleAction
-    review_case: ReviewCase | None = None
     created_memory_id: str | None = None
     target_memory_id: str | None = None
+
+
+class LifecycleDecisionBlocked(RuntimeError):
+    """Relation decisions that no automatic lifecycle action may apply."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1018,7 +1026,13 @@ def _private_scope_is_allowed(
 
 
 class MemoryRelationApplyService:
-    """Derive deterministic lifecycle actions from evidence relation decisions."""
+    """Derive deterministic lifecycle actions from evidence relation decisions.
+
+    A decision that would replace or rewrite a Memory needs a source excerpt,
+    complete mandatory candidate coverage and a single target, and no candidate
+    may lie outside the caller's scope. Decisions that miss any of these are
+    refused with ``LifecycleDecisionBlocked``.
+    """
 
     _DESTRUCTIVE_RELATIONS = {
         RelationType.EQUIVALENT,
@@ -1026,25 +1040,14 @@ class MemoryRelationApplyService:
         RelationType.CONTRADICTS,
     }
 
-    def __init__(self, *, created_memory_ids_by_evidence_unit: dict[str, str] | None = None) -> None:
-        self.created_memory_ids_by_evidence_unit = created_memory_ids_by_evidence_unit or {}
-
     def derive_lifecycle(
         self,
         unit: EvidenceUnit,
         decisions: list[RelationDecision],
     ) -> LifecycleDecision:
-        existing_memory_id = self.created_memory_ids_by_evidence_unit.get(unit.id)
-        if existing_memory_id:
-            return LifecycleDecision(
-                action=LifecycleAction.CREATE_REVIEW,
-                review_case=ReviewCase.EVIDENCE_UNIT_ALREADY_MATERIALIZED,
-                target_memory_id=existing_memory_id,
-            )
-
-        blocking_review = self._blocking_review_case(unit, decisions)
-        if blocking_review is not None:
-            return LifecycleDecision(action=LifecycleAction.CREATE_REVIEW, review_case=blocking_review)
+        blocking_reason = self._blocking_reason(unit, decisions)
+        if blocking_reason is not None:
+            raise LifecycleDecisionBlocked(blocking_reason)
 
         destructive = [decision for decision in decisions if self._is_destructive_candidate(decision)]
         if destructive:
@@ -1057,31 +1060,31 @@ class MemoryRelationApplyService:
         if self._has_attachable_support(decisions):
             return LifecycleDecision(action=LifecycleAction.ATTACH_SUPPORT)
 
-        created_memory_id = self._memory_id_for_unit(unit)
-        self.created_memory_ids_by_evidence_unit[unit.id] = created_memory_id
-        return LifecycleDecision(action=LifecycleAction.CREATE_MEMORY, created_memory_id=created_memory_id)
+        return LifecycleDecision(
+            action=LifecycleAction.CREATE_MEMORY,
+            created_memory_id=self._memory_id_for_unit(unit),
+        )
 
-    def _blocking_review_case(
+    def _blocking_reason(
         self,
         unit: EvidenceUnit,
         decisions: list[RelationDecision],
-    ) -> ReviewCase | None:
+    ) -> str | None:
         if any(decision.authority_case is AuthorityCase.CROSS_SCOPE_BLOCKED for decision in decisions):
-            return ReviewCase.CROSS_SCOPE_BLOCKED
+            return "a candidate Memory lies outside the caller's scope"
 
-        if any(self._is_destructive_candidate(decision) for decision in decisions):
-            if unit.evidence_provenance is not EvidenceContentProvenance.SOURCE_EXCERPT or not unit.excerpt:
-                return ReviewCase.MISSING_CONTENT_PROVENANCE
-            destructive_decisions = [decision for decision in decisions if self._is_destructive_candidate(decision)]
+        has_excerpt = unit.evidence_provenance is EvidenceContentProvenance.SOURCE_EXCERPT and bool(unit.excerpt)
+        destructive_decisions = [decision for decision in decisions if self._is_destructive_candidate(decision)]
+        if destructive_decisions:
+            if not has_excerpt:
+                return "a destructive relation needs a source excerpt"
             if any(not decision.matched_bucket_complete for decision in destructive_decisions):
-                return ReviewCase.MANDATORY_INCOMPLETE
-            destructive_targets = {decision.candidate_memory_id for decision in destructive_decisions}
-            if len(destructive_targets) > 1:
-                return ReviewCase.MULTI_DESTRUCTIVE_MATCH
+                return "a destructive relation needs complete mandatory candidate coverage"
+            if len({decision.candidate_memory_id for decision in destructive_decisions}) > 1:
+                return "destructive relations name more than one Memory"
 
-        if any(decision.proposed_memory_content for decision in decisions):
-            if unit.evidence_provenance is not EvidenceContentProvenance.SOURCE_EXCERPT or not unit.excerpt:
-                return ReviewCase.MISSING_CONTENT_PROVENANCE
+        if any(decision.proposed_memory_content for decision in decisions) and not has_excerpt:
+            return "proposed Memory content needs a source excerpt"
 
         return None
 

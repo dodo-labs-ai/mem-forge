@@ -15,10 +15,10 @@ from memforge.memory.evidence import (
     EvidenceRole,
     EvidenceUnit,
     LifecycleAction,
+    LifecycleDecisionBlocked,
     MemoryRelationApplyService,
     RelationDecision,
     RelationType,
-    ReviewCase,
     build_candidate_universe,
     build_mandatory_candidate_bucket_results,
     is_mandatory_candidate_bucket,
@@ -218,10 +218,8 @@ def test_legacy_limited_evidence_cannot_supersede_memory() -> None:
         proposed_memory_content="Updated lifecycle group assignment rule.",
     )
 
-    result = service.derive_lifecycle(unit, [decision])
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.MISSING_CONTENT_PROVENANCE
+    with pytest.raises(LifecycleDecisionBlocked, match="source excerpt"):
+        service.derive_lifecycle(unit, [decision])
 
 
 def test_llm_proposed_content_requires_source_provenance() -> None:
@@ -235,10 +233,8 @@ def test_llm_proposed_content_requires_source_provenance() -> None:
         proposed_memory_content="Refined lifecycle group assignment rule.",
     )
 
-    result = service.derive_lifecycle(unit, [decision])
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.MISSING_CONTENT_PROVENANCE
+    with pytest.raises(LifecycleDecisionBlocked, match="source excerpt"):
+        service.derive_lifecycle(unit, [decision])
 
 
 def test_destructive_decision_requires_source_excerpt_even_without_proposed_content() -> None:
@@ -253,13 +249,11 @@ def test_destructive_decision_requires_source_excerpt_even_without_proposed_cont
         matched_bucket_complete=True,
     )
 
-    result = service.derive_lifecycle(unit, [decision])
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.MISSING_CONTENT_PROVENANCE
+    with pytest.raises(LifecycleDecisionBlocked, match="source excerpt"):
+        service.derive_lifecycle(unit, [decision])
 
 
-def test_cross_batch_destructive_conflicts_create_review() -> None:
+def test_cross_batch_destructive_conflicts_are_refused() -> None:
     service = MemoryRelationApplyService()
     decisions = [
         RelationDecision(
@@ -278,13 +272,11 @@ def test_cross_batch_destructive_conflicts_create_review() -> None:
         ),
     ]
 
-    result = service.derive_lifecycle(_unit(), decisions)
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.MULTI_DESTRUCTIVE_MATCH
+    with pytest.raises(LifecycleDecisionBlocked, match="more than one Memory"):
+        service.derive_lifecycle(_unit(), decisions)
 
 
-def test_same_batch_multi_target_destructive_conflicts_create_review() -> None:
+def test_same_batch_multi_target_destructive_conflicts_are_refused() -> None:
     service = MemoryRelationApplyService()
     decisions = [
         RelationDecision(
@@ -303,36 +295,30 @@ def test_same_batch_multi_target_destructive_conflicts_create_review() -> None:
         ),
     ]
 
-    result = service.derive_lifecycle(_unit(), decisions)
-
-    assert result.action is LifecycleAction.CREATE_REVIEW
-    assert result.review_case is ReviewCase.MULTI_DESTRUCTIVE_MATCH
+    with pytest.raises(LifecycleDecisionBlocked, match="more than one Memory"):
+        service.derive_lifecycle(_unit(), decisions)
 
 
-def test_evidence_unit_lifetime_uniqueness_blocks_second_created_memory() -> None:
-    service = MemoryRelationApplyService()
+def test_created_memory_id_is_derived_from_the_evidence_unit() -> None:
     unit = _unit()
 
-    first = service.derive_lifecycle(unit, [])
-    second = service.derive_lifecycle(replace(unit, access_context_hash="changed-access"), [])
+    first = MemoryRelationApplyService().derive_lifecycle(unit, [])
+    second = MemoryRelationApplyService().derive_lifecycle(replace(unit, access_context_hash="changed-access"), [])
 
     assert first.action is LifecycleAction.CREATE_MEMORY
-    assert second.action is LifecycleAction.CREATE_REVIEW
-    assert second.review_case is ReviewCase.EVIDENCE_UNIT_ALREADY_MATERIALIZED
-    assert service.created_memory_ids_by_evidence_unit[unit.id] == first.created_memory_id
+    assert second.created_memory_id == first.created_memory_id
 
 
 @pytest.mark.parametrize(
-    ("bucket", "complete", "expected_review"),
+    ("bucket", "complete"),
     [
-        (CandidateBucket.EXACT_SOURCE_ANCHOR, True, None),
-        (CandidateBucket.SAME_DOC_LINEAGE, False, ReviewCase.MANDATORY_INCOMPLETE),
+        (CandidateBucket.EXACT_SOURCE_ANCHOR, True),
+        (CandidateBucket.SAME_DOC_LINEAGE, False),
     ],
 )
 def test_mandatory_bucket_completeness_controls_destructive_actions(
     bucket: CandidateBucket,
     complete: bool,
-    expected_review: ReviewCase | None,
 ) -> None:
     service = MemoryRelationApplyService()
     decision = RelationDecision(
@@ -344,13 +330,11 @@ def test_mandatory_bucket_completeness_controls_destructive_actions(
         matched_bucket_complete=complete,
     )
 
-    result = service.derive_lifecycle(_unit(), [decision])
-
-    if expected_review is None:
-        assert result.action is LifecycleAction.SUPERSEDE_MEMORY
+    if complete:
+        assert service.derive_lifecycle(_unit(), [decision]).action is LifecycleAction.SUPERSEDE_MEMORY
     else:
-        assert result.action is LifecycleAction.CREATE_REVIEW
-        assert result.review_case is expected_review
+        with pytest.raises(LifecycleDecisionBlocked, match="complete mandatory candidate coverage"):
+            service.derive_lifecycle(_unit(), [decision])
 
 
 def test_non_destructive_incomplete_bucket_does_not_block_destructive_match() -> None:

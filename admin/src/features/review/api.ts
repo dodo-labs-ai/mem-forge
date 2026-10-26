@@ -65,25 +65,6 @@ export function useDecideReview(review: ReviewDetail) {
   });
 }
 
-/** Asks for a new proposal from the current state of an expired review; resolves to the new review. */
-export function useRecheckReview(review: ReviewDetail) {
-  const api = useApi();
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () =>
-      unwrap(
-        api.POST("/api/v1/memory-reviews/{review_id}/refresh", {
-          params: { path: { review_id: review.id } },
-          body: { expected_fingerprint: review.decision_fingerprint },
-        }),
-      ),
-    onSuccess: (rechecked) => {
-      queryClient.setQueryData(reviewKeys.detail(rechecked.id), rechecked);
-      return queryClient.invalidateQueries({ queryKey: reviewKeys.all });
-    },
-  });
-}
-
 async function validateBatch(api: ApiClient, decisions: DecisionManifestItem[]) {
   return unwrap(api.POST("/api/v1/memory-reviews/decisions/validate", { body: { decisions } }));
 }
