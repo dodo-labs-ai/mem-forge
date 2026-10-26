@@ -304,7 +304,8 @@ MEMFORGE_LLM_METADATA_MODELS='{"litellm_proxy/team-claude-sonnet": "anthropic/cl
 ```
 
 The route is then sized and its requests counted as that model's, and a limit
-set in Settings or `.env` still lowers what LiteLLM gives.
+set in Settings or `.env` still lowers what LiteLLM gives. A value that is not
+such an object stops MemForge at startup with an error naming the variable.
 
 Every request asks for the most the model can write, up to a quarter of the
 context window. A provider bills only what the model writes, but some, such as

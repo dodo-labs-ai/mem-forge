@@ -1291,7 +1291,7 @@ async def test_a_starting_server_translates_earlier_settings_with_the_configurat
         Path(config.storage.db_path),
         {
             "enrichment_model": "claude-opus-ui",
-            "enrichment_base_url": "http://proxy.internal:6655/anthropic",
+            "enrichment_base_url": "http://proxy.internal:4000/anthropic",
             "embedding_model": "text-embedding-3-large",
             "embedding_api_key": EMBEDDING_KEY,
         },
@@ -1303,7 +1303,7 @@ async def test_a_starting_server_translates_earlier_settings_with_the_configurat
     generation, embedding = payload["generation"]["active"], payload["embedding"]["active"]
     assert (generation["route"], generation["endpoint"], generation["config_source"], generation["state"]) == (
         "anthropic/claude-opus-ui",
-        "http://proxy.internal:6655/anthropic",
+        "http://proxy.internal:4000/anthropic",
         "settings",
         "not_validated",
     )

@@ -121,7 +121,7 @@ async def test_structured_llm_admission_is_shared_across_client_instances(
 
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     config = StructuredLlmConfig(
-        model="anthropic--claude-sonnet-latest",
+        model="claude-sonnet-latest",
         base_url=None,
         api_key=None,
         timeout_s=1.0,
@@ -221,7 +221,7 @@ async def test_structured_llm_metrics_scope_isolates_concurrent_source_units(
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -268,7 +268,7 @@ def test_litellm_model_name_preserves_explicit_provider_prefix():
 
 
 def test_litellm_model_name_defaults_to_anthropic_provider():
-    assert litellm_model_name("anthropic--claude-sonnet-latest") == ("anthropic/anthropic--claude-sonnet-latest")
+    assert litellm_model_name("claude-sonnet-latest") == ("anthropic/claude-sonnet-latest")
 
 
 @pytest.mark.asyncio
@@ -285,8 +285,8 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -295,8 +295,8 @@ async def test_litellm_structured_client_uses_response_schema_for_source_support
     response = await client.admit_candidates("prompt")
 
     assert response.decisions == []
-    assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
-    assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
+    assert calls[0]["model"] == "anthropic/claude-sonnet-latest"
+    assert calls[0]["api_base"] == "http://localhost:4000/anthropic"
     assert calls[0]["api_key"] == "local-key"
     assert calls[0]["timeout"] == pytest.approx(120.0, abs=0.01)
     assert calls[0]["messages"] == [{"role": "user", "content": "prompt"}]
@@ -321,8 +321,8 @@ async def test_litellm_structured_client_uses_response_schema_for_memory_extract
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -353,8 +353,8 @@ async def test_litellm_structured_client_uses_response_schema_for_semantic_judge
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -385,8 +385,8 @@ async def test_litellm_structured_client_sends_images_in_same_logical_extraction
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -452,7 +452,7 @@ async def test_litellm_structured_client_normalizes_oversized_images_once_per_lo
     set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -497,7 +497,7 @@ async def test_litellm_structured_client_rejects_invalid_image_before_provider_c
     set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -540,8 +540,8 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
     caplog.set_level(logging.DEBUG, logger="memforge.llm.structured")
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -551,8 +551,8 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
 
     assert response.memories[0].content == "Service A uses PostgreSQL 16."
     assert len(calls) == 1
-    assert calls[0]["model"] == "anthropic/anthropic--claude-sonnet-latest"
-    assert calls[0]["api_base"] == "http://localhost:6655/anthropic"
+    assert calls[0]["model"] == "anthropic/claude-sonnet-latest"
+    assert calls[0]["api_base"] == "http://localhost:4000/anthropic"
     assert calls[0]["api_key"] == "local-key"
     assert 119.0 < calls[0]["timeout"] <= 120.0
     assert calls[0]["max_tokens"] == client.request_budget().output_tokens
@@ -564,7 +564,7 @@ async def test_litellm_structured_client_skips_response_schema_without_registry_
         record for record in caplog.records if "is not known to take a native response schema" in record.message
     ]
     assert fallback_log.levelno == logging.DEBUG
-    assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
+    assert "anthropic/claude-sonnet-latest" in fallback_log.message
 
 
 _RERANK_ANSWER = '{"ranking":[]}'
@@ -849,7 +849,7 @@ async def test_litellm_structured_client_repairs_invalid_json_backslash_escapes(
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -881,7 +881,7 @@ async def test_litellm_structured_client_repairs_unescaped_quotes_without_changi
     caplog.set_level(logging.WARNING, logger="memforge.llm.structured")
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -910,7 +910,7 @@ async def test_litellm_structured_client_does_not_repair_missing_json_delimiter(
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -935,7 +935,7 @@ async def test_litellm_structured_client_does_not_guess_ambiguous_terminal_quote
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -963,7 +963,7 @@ async def test_litellm_structured_client_rejects_quote_repair_when_schema_is_inv
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -1010,7 +1010,7 @@ async def test_litellm_structured_client_accepts_one_schema_valid_json_object_wi
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -1037,7 +1037,7 @@ async def test_litellm_structured_client_rejects_ambiguous_schema_valid_json_obj
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -1070,7 +1070,7 @@ async def test_litellm_structured_client_reports_content_free_validation_fields(
     set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=120.0,
@@ -1114,8 +1114,8 @@ async def test_litellm_structured_client_supports_all_pipeline_schemas(monkeypat
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -1198,8 +1198,8 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
     caplog.set_level(logging.WARNING, logger="memforge.llm.structured")
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -1216,7 +1216,7 @@ async def test_litellm_structured_client_falls_back_once_to_json_text(monkeypatc
     [fallback_log] = [record for record in caplog.records if "retrying with JSON-text schema" in record.message]
     assert fallback_log.levelno == logging.WARNING
     assert fallback_log.exc_info is None
-    assert "anthropic/anthropic--claude-sonnet-latest" in fallback_log.message
+    assert "anthropic/claude-sonnet-latest" in fallback_log.message
     assert "ProjectionFragmentMemoryExtractionResponse" in fallback_log.message
     assert "error_code=Exception" in fallback_log.message
     assert "response_format unsupported" not in fallback_log.message
@@ -1236,8 +1236,8 @@ async def test_litellm_structured_client_fails_closed_after_both_strategies_are_
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -1274,7 +1274,7 @@ async def test_litellm_structured_client_does_not_resend_truncated_output(monkey
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1333,7 +1333,7 @@ async def test_litellm_structured_client_repairs_invalid_json_fallback_with_vali
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1553,8 +1553,8 @@ async def test_litellm_structured_client_fails_closed_when_litellm_rejects_schem
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -1573,7 +1573,7 @@ async def test_litellm_structured_client_fails_closed_on_missing_content(monkeyp
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key="local-key",
             timeout_s=120.0,
@@ -1604,7 +1604,7 @@ async def test_litellm_structured_client_bounds_native_and_json_fallback_by_one_
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=0.05,
@@ -1665,7 +1665,7 @@ async def test_litellm_structured_client_shares_one_transport_retry_budget_acros
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1707,7 +1707,7 @@ async def test_litellm_structured_client_aggregates_available_usage_without_esti
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1740,7 +1740,7 @@ async def test_litellm_structured_client_does_not_use_schema_fallback_for_provid
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1792,7 +1792,7 @@ async def test_litellm_structured_client_does_not_retain_provider_failure_contex
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1841,7 +1841,7 @@ async def test_litellm_structured_client_classifies_remote_disconnect_without_le
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1895,7 +1895,7 @@ async def test_litellm_structured_client_reports_request_size_rejections_without
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest", base_url=None, api_key=None, timeout_s=1.0, num_retries=0,
+            model="claude-sonnet-latest", base_url=None, api_key=None, timeout_s=1.0, num_retries=0,
         )
     )
 
@@ -1920,7 +1920,7 @@ async def test_litellm_structured_client_distinguishes_provider_timeout_from_log
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -1945,7 +1945,7 @@ async def test_litellm_structured_client_fails_closed_on_invalid_schema(monkeypa
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key="local-key",
             timeout_s=120.0,
@@ -1964,7 +1964,7 @@ async def test_litellm_structured_client_fails_closed_when_decisions_missing(mon
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             base_url=None,
             api_key="local-key",
             timeout_s=120.0,
@@ -1987,8 +1987,8 @@ async def test_litellm_structured_client_disables_nested_litellm_retries(monkeyp
 
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
-            base_url="http://localhost:6655/anthropic",
+            model="claude-sonnet-latest",
+            base_url="http://localhost:4000/anthropic",
             api_key="local-key",
             timeout_s=120.0,
         )
@@ -2166,7 +2166,7 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     set_native_schema_support(monkeypatch, True)
     client = LiteLlmStructuredClient(StructuredLlmConfig(
-        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None,
+        model="claude-sonnet-latest", base_url=None, api_key=None,
         timeout_s=1.0, num_retries=1,
     ))
     with pytest.raises(StructuredLlmError) as error:
@@ -2248,7 +2248,7 @@ async def test_a_call_without_a_response_to_validate_is_a_request_error_not_an_i
     monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
     set_native_schema_support(monkeypatch, False)
     client = LiteLlmStructuredClient(StructuredLlmConfig(
-        model="anthropic--claude-sonnet-latest", base_url=None, api_key=None, timeout_s=120.0,
+        model="claude-sonnet-latest", base_url=None, api_key=None, timeout_s=120.0,
     ))
 
     with pytest.raises(StructuredLlmError) as raised:

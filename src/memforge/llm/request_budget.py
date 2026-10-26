@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from functools import lru_cache
 import hashlib
 import json
 import logging
 import os
-from types import MappingProxyType
 
 import litellm
 
-logger = logging.getLogger(__name__)
+from memforge.config import METADATA_MODELS_VARIABLE, parse_metadata_models
 
-METADATA_MODELS_VARIABLE = "MEMFORGE_LLM_METADATA_MODELS"
+logger = logging.getLogger(__name__)
 
 
 def metadata_model(model: str) -> str:
@@ -31,20 +28,7 @@ def metadata_model(model: str) -> str:
     The capacity numbers stay LiteLLM's, and every other route is its own
     metadata model.
     """
-    return _metadata_models(os.environ.get(METADATA_MODELS_VARIABLE, "")).get(model, model)
-
-
-@lru_cache(maxsize=4)
-def _metadata_models(raw: str) -> Mapping[str, str]:
-    if not raw.strip():
-        return MappingProxyType({})
-    try:
-        aliases = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"{METADATA_MODELS_VARIABLE} must be a JSON object") from exc
-    if not isinstance(aliases, dict) or not all(isinstance(target, str) and target for target in aliases.values()):
-        raise ValueError(f"{METADATA_MODELS_VARIABLE} must map each route to a LiteLLM model name")
-    return MappingProxyType(aliases)
+    return parse_metadata_models(os.environ.get(METADATA_MODELS_VARIABLE, "")).get(model, model)
 
 
 @dataclass(frozen=True)

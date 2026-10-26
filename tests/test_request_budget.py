@@ -7,7 +7,7 @@ import logging
 import litellm
 import pytest
 
-from memforge.config import LlmConfig
+from memforge.config import AppConfig, LlmConfig
 from memforge.llm.request_budget import RequestBudget
 
 LOGGER = "memforge.llm.request_budget"
@@ -147,9 +147,13 @@ def test_a_route_the_deployment_maps_takes_the_limits_of_the_model_it_names(monk
     assert unmapped.output_limit == 64_000
 
 
-@pytest.mark.parametrize("value", ["not json", '["gateway/claude-sonnet"]', '{"gateway/claude-sonnet": ""}'])
-def test_a_malformed_metadata_model_mapping_is_refused(monkeypatch, value) -> None:
+@pytest.mark.parametrize(
+    "value",
+    ["not json", "{'gateway/claude-sonnet': 'anthropic/claude-sonnet-4-6'}", '["gateway/claude-sonnet"]', '{"gateway/claude-sonnet": ""}'],
+)
+def test_a_malformed_metadata_model_mapping_stops_config_load(monkeypatch, tmp_path, value) -> None:
+    monkeypatch.setenv("MEMFORGE_BASE_DIR", str(tmp_path))
     monkeypatch.setenv("MEMFORGE_LLM_METADATA_MODELS", value)
 
     with pytest.raises(ValueError, match="MEMFORGE_LLM_METADATA_MODELS"):
-        RequestBudget.resolve("gateway/claude-sonnet", LlmConfig())
+        AppConfig()

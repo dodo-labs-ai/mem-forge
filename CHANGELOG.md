@@ -8,7 +8,8 @@
   for example `{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}`.
   The route is sized and its requests counted as that model's, and a limit
   set in Settings or `MEMFORGE_LLM_*` still lowers what LiteLLM gives; a value
-  that is not such an object fails with an error naming the variable.
+  that is not such an object stops MemForge at startup with an error naming
+  the variable.
   MemForge itself maps no route. Cloud: set `MEMFORGE_LLM_METADATA_MODELS` for
   each generation route that relied on MemForge mapping it before pinning this
   change.

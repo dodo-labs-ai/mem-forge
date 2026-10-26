@@ -95,10 +95,10 @@ async def _store_active(db: Database, kind: str, *, api_key: str | None = None, 
         ),
         (
             "generation",
-            "anthropic--claude-sonnet-latest",
-            "http://localhost:6655/anthropic",
+            "claude-sonnet-latest",
+            "http://localhost:4000/anthropic",
             True,
-            ("anthropic", "anthropic/anthropic--claude-sonnet-latest", "http://localhost:6655/anthropic", "api_key"),
+            ("anthropic", "anthropic/claude-sonnet-latest", "http://localhost:4000/anthropic", "api_key"),
         ),
         ("generation", "provider/chat-model", "", False, ("litellm", "provider/chat-model", None, "environment")),
         (
@@ -773,7 +773,7 @@ async def test_stored_settings_with_plaintext_keys_become_active_bindings_with_e
         path,
         {
             "enrichment_model": "claude-sonnet-4",
-            "enrichment_base_url": "http://localhost:6655/anthropic",
+            "enrichment_base_url": "http://localhost:4000/anthropic",
             "enrichment_api_key": GENERATION_KEY,
             "embedding_model": "BAAI/bge-m3",
             "embedding_base_url": "https://embed.example.test/v1",
@@ -794,7 +794,7 @@ async def test_stored_settings_with_plaintext_keys_become_active_bindings_with_e
     assert (generation.provider, generation.route, generation.endpoint) == (
         "anthropic",
         "anthropic/claude-sonnet-4",
-        "http://localhost:6655/anthropic",
+        "http://localhost:4000/anthropic",
     )
     assert (embedding.provider, embedding.route, embedding.endpoint) == (
         "openai_compatible",
@@ -812,7 +812,7 @@ async def test_stored_settings_with_plaintext_keys_become_active_bindings_with_e
     with sqlite3.connect(path) as raw:
         origins = {row[0] for row in raw.execute("SELECT origin FROM model_secrets")}
     assert "llm_config" not in _tables(path)
-    assert origins == {"http://localhost:6655", "https://embed.example.test"}
+    assert origins == {"http://localhost:4000", "https://embed.example.test"}
 
 
 async def test_an_empty_stored_row_leaves_both_kinds_to_the_environment(tmp_path, default_environment) -> None:
@@ -886,7 +886,7 @@ async def test_empty_columns_take_the_values_of_the_configuration_the_process_ru
         path,
         {
             "enrichment_model": "claude-opus-ui",
-            "enrichment_base_url": "http://proxy.internal:6655/anthropic",
+            "enrichment_base_url": "http://proxy.internal:4000/anthropic",
             "embedding_model": "text-embedding-3-large",
         },
     )
@@ -903,7 +903,7 @@ async def test_empty_columns_take_the_values_of_the_configuration_the_process_ru
 
     assert (models.generation.route, models.generation.api_base, models.generation.api_key) == (
         "anthropic/claude-opus-ui",
-        "http://proxy.internal:6655/anthropic",
+        "http://proxy.internal:4000/anthropic",
         GENERATION_KEY,
     )
     assert (models.embedding.route, models.embedding.api_base, models.embedding.api_key) == (
@@ -919,7 +919,7 @@ async def test_a_stored_model_without_any_key_stays_the_model_and_waits_for_the_
     path = tmp_path / "earlier.db"
     await _database_with_llm_config(
         path,
-        {"enrichment_model": "claude-opus-ui", "enrichment_base_url": "http://proxy.internal:6655/anthropic"},
+        {"enrichment_model": "claude-opus-ui", "enrichment_base_url": "http://proxy.internal:4000/anthropic"},
     )
     config = AppConfig(base_dir=tmp_path / "mem")
 
@@ -934,13 +934,13 @@ async def test_a_stored_model_without_any_key_stays_the_model_and_waits_for_the_
 
     assert (generation.route, generation.endpoint, generation.secret_ref) == (
         "anthropic/claude-opus-ui",
-        "http://proxy.internal:6655/anthropic",
+        "http://proxy.internal:4000/anthropic",
         "env:MEMFORGE_ENRICHMENT_API_KEY",
     )
     assert without_key.generation is None
     assert (with_key.generation.route, with_key.generation.api_base, with_key.generation.api_key) == (
         "anthropic/claude-opus-ui",
-        "http://proxy.internal:6655/anthropic",
+        "http://proxy.internal:4000/anthropic",
         GENERATION_KEY,
     )
 
