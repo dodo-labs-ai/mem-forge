@@ -18499,206 +18499,212 @@ class Database:
         Units and their lineage stay as immutable history; its active Support
         is removed. Document rows stay: a row this Source wrote last names a
         Source that still holds the Document, when one does. Its Projection
-        Scope transitions and their member rows are deleted.
+        Scope transitions and their member rows are deleted. A missing or
+        already retired Source retires nothing. A Source with a sync run, a
+        local agent job or an access transition still open is refused with a
+        ``ValueError`` naming that work.
         """
 
         async with self._write_lock:
             try:
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
-                source_lock = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
-                )
-                if source_lock.rowcount != 1:
-                    await self.db.commit()
-                    return SourceDeletionResult(
-                        retired_memory_ids=(),
-                        retired_search_cleanup_required=False,
-                    )
-                async with self.db.execute(
-                    "SELECT status FROM sources WHERE id = ?",
-                    (source_id,),
-                ) as cursor:
-                    source = await cursor.fetchone()
-                if source is not None and str(source["status"]) == "retired":
-                    await self.db.commit()
-                    return SourceDeletionResult(
-                        retired_memory_ids=(),
-                        retired_search_cleanup_required=False,
-                    )
-
-                active_work_queries = (
-                    (
-                        "source sync run already active",
-                        "SELECT run_id AS id FROM source_sync_runs "
-                        "WHERE source_id = ? AND status IN ('pending', 'running') LIMIT 1",
-                    ),
-                    (
-                        "local agent job already active",
-                        "SELECT job_id AS id FROM local_agent_jobs "
-                        "WHERE source_id = ? AND status IN ('queued', 'leased') LIMIT 1",
-                    ),
-                    (
-                        "source access transition already active",
-                        "SELECT operation_id AS id FROM source_access_transitions "
-                        "WHERE source_id = ? AND status IN ('queued', 'running', 'failed') LIMIT 1",
-                    ),
-                )
-                for message, query in active_work_queries:
-                    async with self.db.execute(query, (source_id,)) as cursor:
-                        active = await cursor.fetchone()
-                    if active is not None:
-                        raise ValueError(f"{message}: {active['id']}")
-
-                affected_rows = await self.db.execute_fetchall(
-                    """SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?
-                       UNION
-                       SELECT DISTINCT memory_id FROM memory_unit_support_assertions
-                        WHERE source_id = ? AND active = 1""",
-                    (source_id, source_id),
-                )
-                affected_memory_ids = tuple(
-                    sorted(str(row["memory_id"]) for row in affected_rows)
-                )
-                projected_doc_rows = await self.db.execute_fetchall(
-                    "SELECT DISTINCT doc_id FROM memory_sources WHERE source_id = ?",
-                    (source_id,),
-                )
-                projected_doc_ids = tuple(
-                    sorted(str(row["doc_id"]) for row in projected_doc_rows)
-                )
-                source_document_rows = await self.db.execute_fetchall(
-                    "SELECT doc_id FROM documents WHERE source = ?",
-                    (source_id,),
-                )
-                surviving_document_sources: dict[str, str] = {}
-                for row in source_document_rows:
-                    doc_id = str(row["doc_id"])
-                    surviving_source = await self._document_surviving_source_unlocked(
-                        doc_id,
-                        excluding_source_id=source_id,
-                    )
-                    if surviving_source is not None:
-                        surviving_document_sources[doc_id] = surviving_source
-                now = _now_iso()
-                await self.db.execute(
-                    """UPDATE memory_unit_support_assertions
-                          SET active = 0, removed_at = ?
-                        WHERE source_id = ? AND active = 1""",
-                    (now, source_id),
-                )
-                await self.db.execute(
-                    "DELETE FROM memory_sources WHERE source_id = ?",
-                    (source_id,),
-                )
-                for doc_id, surviving_source in surviving_document_sources.items():
-                    await self.db.execute(
-                        "UPDATE documents SET source = ? WHERE doc_id = ? AND source = ?",
-                        (surviving_source, doc_id, source_id),
-                    )
-                for doc_id in projected_doc_ids:
-                    await self._refresh_metadata_fts_for_doc_unlocked(doc_id)
-
-                retired_ids: list[str] = []
-                for memory_id in affected_memory_ids:
-                    await self.db.execute(
-                        """UPDATE memories
-                              SET corroboration_count = (
-                                  SELECT COUNT(*) FROM memory_sources
-                                   WHERE memory_id = memories.id
-                              ), updated_at = ?
-                            WHERE id = ?""",
-                        (now, memory_id),
-                    )
-                    async with self.db.execute(
-                        """SELECT 1 FROM memory_unit_support_assertions
-                            WHERE memory_id = ? AND active = 1 LIMIT 1""",
-                        (memory_id,),
-                    ) as cursor:
-                        has_support = await cursor.fetchone() is not None
-                    if not has_support:
-                        retired = await self.db.execute(
-                            """UPDATE memories
-                                  SET status = 'retired', retirement_reason = 'source_deleted',
-                                      retired_at = ?, valid_until = ?, updated_at = ?
-                                WHERE id = ? AND status = 'active'""",
-                            (now, _today_iso(), now, memory_id),
-                        )
-                        if retired.rowcount:
-                            retired_ids.append(memory_id)
-                            await self._stale_pending_reviews_unlocked(
-                                (memory_id,),
-                                now=now,
-                            )
-                    await self._rebuild_memory_fts_unlocked(
-                        memory_id,
-                        search_visible_statuses=set(allowed_search_statuses()),
-                    )
-
-                await self.db.execute(
-                    """UPDATE sources
-                          SET status = 'retired', sync_schedule_enabled = 0,
-                              sync_schedule_next_at = NULL, doc_count = 0
-                        WHERE id = ?""",
-                    (source_id,),
-                )
-                await self.db.execute(
-                    "DELETE FROM sync_state WHERE source = ?",
-                    (source_id,),
-                )
-                await self.db.execute(
-                    "DELETE FROM source_item_failures WHERE source_id = ?",
-                    (source_id,),
-                )
-                # Collected message bodies hold message text; none outlives its Source.
-                for table in (
-                    "conversation_collection_bodies",
-                    "conversation_collection_manifests",
-                    "conversation_collection_requests",
-                ):
-                    await self.db.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
-                # A retired Source changes scope no more; its transitions and,
-                # by cascade, their member rows go with it.
-                await self.db.execute(
-                    "DELETE FROM projection_scope_transitions WHERE source_id = ?",
-                    (source_id,),
-                )
-                await self.db.execute(
-                    "DELETE FROM source_subscriptions WHERE source_id = ?",
-                    (source_id,),
-                )
-                await self.db.execute(
-                    "DELETE FROM source_list_pins WHERE source_id = ?",
-                    (source_id,),
-                )
-                for memory_id in retired_ids:
-                    await self.db.execute(
-                        """INSERT INTO source_deletion_vector_outbox (
-                               id, source_id, memory_id, status, created_at, updated_at
-                           ) VALUES (?, ?, ?, 'pending', ?, ?)""",
-                        (
-                            f"source-delete-vector-{uuid.uuid4().hex}",
-                            source_id,
-                            memory_id,
-                            now,
-                            now,
-                        ),
-                    )
-                await self._assert_source_activity_fence_unlocked(
-                    source_id,
-                    source_activity,
-                )
+                await self._assert_source_activity_fence_unlocked(source_id, source_activity)
+                result = await self._retire_source_unlocked(source_id)
+                await self._assert_source_activity_fence_unlocked(source_id, source_activity)
                 await self.db.commit()
-                return SourceDeletionResult(
-                    retired_memory_ids=tuple(retired_ids),
-                    retired_search_cleanup_required=bool(retired_ids),
-                )
+                return result
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def _retire_source_unlocked(self, source_id: str) -> SourceDeletionResult:
+        """Retire one Source inside the transaction the caller holds.
+
+        This is the relational part of ``delete_source_cascade``: it neither
+        takes the write lock nor commits. Each Memory it retires gets a
+        ``source_deletion_vector_outbox`` row, from which the lifecycle vector
+        worker removes it from the vector index.
+        """
+        source_lock = await self.db.execute(
+            "UPDATE sources SET status = status WHERE id = ?",
+            (source_id,),
+        )
+        if source_lock.rowcount != 1:
+            return SourceDeletionResult(
+                retired_memory_ids=(),
+                retired_search_cleanup_required=False,
+            )
+        async with self.db.execute(
+            "SELECT status FROM sources WHERE id = ?",
+            (source_id,),
+        ) as cursor:
+            source = await cursor.fetchone()
+        if source is not None and str(source["status"]) == "retired":
+            return SourceDeletionResult(
+                retired_memory_ids=(),
+                retired_search_cleanup_required=False,
+            )
+
+        active_work_queries = (
+            (
+                "source sync run already active",
+                "SELECT run_id AS id FROM source_sync_runs "
+                "WHERE source_id = ? AND status IN ('pending', 'running') LIMIT 1",
+            ),
+            (
+                "local agent job already active",
+                "SELECT job_id AS id FROM local_agent_jobs "
+                "WHERE source_id = ? AND status IN ('queued', 'leased') LIMIT 1",
+            ),
+            (
+                "source access transition already active",
+                "SELECT operation_id AS id FROM source_access_transitions "
+                "WHERE source_id = ? AND status IN ('queued', 'running', 'failed') LIMIT 1",
+            ),
+        )
+        for message, query in active_work_queries:
+            async with self.db.execute(query, (source_id,)) as cursor:
+                active = await cursor.fetchone()
+            if active is not None:
+                raise ValueError(f"{message}: {active['id']}")
+
+        affected_rows = await self.db.execute_fetchall(
+            """SELECT DISTINCT memory_id FROM memory_sources WHERE source_id = ?
+               UNION
+               SELECT DISTINCT memory_id FROM memory_unit_support_assertions
+                WHERE source_id = ? AND active = 1""",
+            (source_id, source_id),
+        )
+        affected_memory_ids = tuple(
+            sorted(str(row["memory_id"]) for row in affected_rows)
+        )
+        projected_doc_rows = await self.db.execute_fetchall(
+            "SELECT DISTINCT doc_id FROM memory_sources WHERE source_id = ?",
+            (source_id,),
+        )
+        projected_doc_ids = tuple(
+            sorted(str(row["doc_id"]) for row in projected_doc_rows)
+        )
+        source_document_rows = await self.db.execute_fetchall(
+            "SELECT doc_id FROM documents WHERE source = ?",
+            (source_id,),
+        )
+        surviving_document_sources: dict[str, str] = {}
+        for row in source_document_rows:
+            doc_id = str(row["doc_id"])
+            surviving_source = await self._document_surviving_source_unlocked(
+                doc_id,
+                excluding_source_id=source_id,
+            )
+            if surviving_source is not None:
+                surviving_document_sources[doc_id] = surviving_source
+        now = _now_iso()
+        await self.db.execute(
+            """UPDATE memory_unit_support_assertions
+                  SET active = 0, removed_at = ?
+                WHERE source_id = ? AND active = 1""",
+            (now, source_id),
+        )
+        await self.db.execute(
+            "DELETE FROM memory_sources WHERE source_id = ?",
+            (source_id,),
+        )
+        for doc_id, surviving_source in surviving_document_sources.items():
+            await self.db.execute(
+                "UPDATE documents SET source = ? WHERE doc_id = ? AND source = ?",
+                (surviving_source, doc_id, source_id),
+            )
+        for doc_id in projected_doc_ids:
+            await self._refresh_metadata_fts_for_doc_unlocked(doc_id)
+
+        retired_ids: list[str] = []
+        for memory_id in affected_memory_ids:
+            await self.db.execute(
+                """UPDATE memories
+                      SET corroboration_count = (
+                          SELECT COUNT(*) FROM memory_sources
+                           WHERE memory_id = memories.id
+                      ), updated_at = ?
+                    WHERE id = ?""",
+                (now, memory_id),
+            )
+            async with self.db.execute(
+                """SELECT 1 FROM memory_unit_support_assertions
+                    WHERE memory_id = ? AND active = 1 LIMIT 1""",
+                (memory_id,),
+            ) as cursor:
+                has_support = await cursor.fetchone() is not None
+            if not has_support:
+                retired = await self.db.execute(
+                    """UPDATE memories
+                          SET status = 'retired', retirement_reason = 'source_deleted',
+                              retired_at = ?, valid_until = ?, updated_at = ?
+                        WHERE id = ? AND status = 'active'""",
+                    (now, _today_iso(), now, memory_id),
+                )
+                if retired.rowcount:
+                    retired_ids.append(memory_id)
+                    await self._stale_pending_reviews_unlocked(
+                        (memory_id,),
+                        now=now,
+                    )
+            await self._rebuild_memory_fts_unlocked(
+                memory_id,
+                search_visible_statuses=set(allowed_search_statuses()),
+            )
+
+        await self.db.execute(
+            """UPDATE sources
+                  SET status = 'retired', sync_schedule_enabled = 0,
+                      sync_schedule_next_at = NULL, doc_count = 0
+                WHERE id = ?""",
+            (source_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM sync_state WHERE source = ?",
+            (source_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM source_item_failures WHERE source_id = ?",
+            (source_id,),
+        )
+        # Collected message bodies hold message text; none outlives its Source.
+        for table in (
+            "conversation_collection_bodies",
+            "conversation_collection_manifests",
+            "conversation_collection_requests",
+        ):
+            await self.db.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
+        # A retired Source changes scope no more; its transitions and,
+        # by cascade, their member rows go with it.
+        await self.db.execute(
+            "DELETE FROM projection_scope_transitions WHERE source_id = ?",
+            (source_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM source_subscriptions WHERE source_id = ?",
+            (source_id,),
+        )
+        await self.db.execute(
+            "DELETE FROM source_list_pins WHERE source_id = ?",
+            (source_id,),
+        )
+        for memory_id in retired_ids:
+            await self.db.execute(
+                """INSERT INTO source_deletion_vector_outbox (
+                       id, source_id, memory_id, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, 'pending', ?, ?)""",
+                (
+                    f"source-delete-vector-{uuid.uuid4().hex}",
+                    source_id,
+                    memory_id,
+                    now,
+                    now,
+                ),
+            )
+        return SourceDeletionResult(
+            retired_memory_ids=tuple(retired_ids),
+            retired_search_cleanup_required=bool(retired_ids),
+        )
 
     async def source_artifact_uri_is_referenced(self, artifact_uri: str, *, source_id: str) -> bool:
         """Whether anything still names the object.
