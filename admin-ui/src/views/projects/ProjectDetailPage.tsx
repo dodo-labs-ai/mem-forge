@@ -360,7 +360,6 @@ export function ProjectDetailPage() {
                 <div className="flex min-w-0 items-start gap-3">
                   <SourceIcon
                     type={row.source.type}
-                    client={row.source.client}
                     className="mt-0.5 size-5"
                   />
                   <div className="min-w-0">
