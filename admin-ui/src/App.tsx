@@ -55,7 +55,7 @@ export default function App() {
   return (
     <ShellWrapper workspaceApi={workspaceApi}>
       <QueryClientProvider client={queryClient}>
-        <BrowserRouter>
+        <BrowserRouter basename={import.meta.env.BASE_URL}>
           <Routes>
             <Route element={<AppShell />}>
               <Route path="/memories" element={<MemoriesPage />} />

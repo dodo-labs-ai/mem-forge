@@ -1,6 +1,6 @@
 ARG DOCKERHUB_PREFIX=
 
-# Deprecated (admin-ui-v1): builds the V1 admin UI served at /. Delete this
+# Deprecated (admin-ui-v1): builds the V1 admin UI served at /v1/. Delete this
 # stage and its COPY below when V1 is removed.
 FROM ${DOCKERHUB_PREFIX}node:20-alpine AS build-v1
 
@@ -41,8 +41,8 @@ RUN npm run build
 FROM ${DOCKERHUB_PREFIX}nginx:1.27-alpine
 
 COPY admin/nginx.conf /etc/nginx/conf.d/default.conf
-# Deprecated (admin-ui-v1): the V1 bundle at /.
-COPY --from=build-v1 /app/dist /usr/share/nginx/html
-COPY --from=build /app/dist /usr/share/nginx/html/v2
+COPY --from=build /app/dist /usr/share/nginx/html
+# Deprecated (admin-ui-v1): the V1 bundle at /v1/.
+COPY --from=build-v1 /app/dist /usr/share/nginx/html/v1
 
 EXPOSE 8080

@@ -88,6 +88,16 @@ class State:
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+class _KeepRedirect(urllib.request.HTTPRedirectHandler):
+    """Answers a redirect as an HTTP error, so its status and Location can be read."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _KeepRedirect())
+
+
 @dataclass(frozen=True)
 class Response:
     status: int
@@ -112,6 +122,17 @@ def request(method: str, url: str, payload: Any = None, *, timeout: float = 30.0
         return Response(exc.code, exc.headers.get("Content-Type", ""), exc.read())
     except (urllib.error.URLError, OSError) as exc:
         raise CheckFailed(f"{method} {url} did not answer: {exc}") from exc
+
+
+def redirect(url: str, *, timeout: float = 30.0) -> tuple[int, str]:
+    """The status and Location of one GET, without following a redirect."""
+    try:
+        with _NO_REDIRECT_OPENER.open(urllib.request.Request(url), timeout=timeout) as response:
+            return response.status, ""
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("Location", "")
+    except (urllib.error.URLError, OSError) as exc:
+        raise CheckFailed(f"GET {url} did not answer: {exc}") from exc
 
 
 def api_json(api: str, method: str, path: str, payload: Any = None, *, expect: Iterable[int] = (200,)) -> Any:
@@ -197,17 +218,22 @@ def probe(api: str, ui: str) -> str:
     if database != "ok":
         raise CheckFailed(f"health reports the database as {database!r}")
     pages = []
-    for path in ("/", "/v2/"):
+    # Deprecated (admin-ui-v1): /v1/ serves V1 and /v2/ redirects to / for the
+    # release that moves the admin UI to /. Remove both checks with V1.
+    for path in ("/", "/v1/"):
         response = request("GET", f"{ui}{path}")
         if response.status != 200 or "text/html" not in response.content_type:
             raise CheckFailed(f"admin UI {path} answered {response.status} {response.content_type!r}")
         if b"<html" not in response.body.lower():
             raise CheckFailed(f"admin UI {path} is not an HTML page")
         pages.append(path)
+    status, location = redirect(f"{ui}/v2/settings?from=smoke")
+    if status != 301 or location != "/settings?from=smoke":
+        raise CheckFailed(f"admin UI /v2/settings?from=smoke answered {status} to {location!r}, not 301 to /settings?from=smoke")
     proxied = api_json(ui, "GET", "/api/v1/health")
     if (proxied.get("database") or {}).get("status") != "ok":
         raise CheckFailed("the admin UI does not proxy /api to the API")
-    return f"health {health.get('status')}; admin UI serves {' and '.join(pages)} and proxies /api"
+    return f"health {health.get('status')}; admin UI serves {' and '.join(pages)}, redirects /v2/ to / and proxies /api"
 
 
 # -- Packaged MCP proxy ----------------------------------------------------------------

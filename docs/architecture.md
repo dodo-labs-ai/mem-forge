@@ -17,7 +17,7 @@ MemForge or contribute to it.
 | Retrieval | Vector, keyword and entity channels run in parallel and are fused into one ranking | `src/memforge/retrieval` |
 | Agent plugins | Claude Code and Codex plugins. A `SessionStart` hook adds MemForge usage guidance, and a local MCP proxy forwards tool calls to the API | `integrations` |
 | Local daemon | Uploads files from a local folder or repository for a Local Repository source | `src/memforge/local_agent` |
-| Admin UI | The web UI for sources, memories, reviews, projects and settings. `admin` is replacing `admin-ui`; both ship until the replacement is complete | `admin`, `admin-ui` |
+| Admin UI | The web UI for sources, memories, reviews, projects and settings, served at `/` by `admin`. The previous UI, `admin-ui`, is served at `/v1/` for one release | `admin`, `admin-ui` |
 
 ## How data moves
 

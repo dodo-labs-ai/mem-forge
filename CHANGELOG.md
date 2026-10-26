@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- The admin UI is served at `/`, and the previous admin UI (V1, `admin-ui/`)
+  moves to `/v1/`. A link to a page under `/v2/`, where the admin UI ran beside
+  V1, answers `301` to the same page at `/` with its query kept, so
+  `/v2/settings` opens `/settings`. The `/v1/` bundle and the `/v2/` redirects
+  are served for this release only and are removed with V1 in the next. In
+  development, `npm run dev` in `admin/` serves the admin UI at
+  `http://localhost:5175` and forwards `/v1/` to the V1 dev server on port
+  5174. Cloud: its composed build must emit V2 at the dist root and V1 under
+  `v1/` with the `/v1/` base, mount them at `/` and `/v1/`, redirect `/v2/*`
+  to `/*`, and hand the frozen V1 shell's Cloud pages over to `/`; no API,
+  schema or configuration change.
+
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
   as a memory's main evidence, extraction asks it to correct the selection,

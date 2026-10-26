@@ -6,11 +6,11 @@ import { APP_BASE_PATH } from "./src/app/basePath.ts";
 
 const DEV_PORT = 5175;
 const DEV_API_TARGET = "http://localhost:8765";
-// Deprecated (admin-ui-v1): in development, every path outside /v2/ and /api/
-// opens the V1 dev server (`npm run dev` in admin-ui), as the image serves V1
-// beside V2. Source setup still links there. Remove with V1.
+// Deprecated (admin-ui-v1): in development, /v1/ opens the V1 dev server
+// (`npm run dev` in admin-ui), as the image serves V1 at /v1/ beside the admin
+// UI at /. Remove with V1.
 const V1_DEV_TARGET = "http://localhost:5174";
-const V1_DEV_PATHS = "^/(?!v2(/|$)|api/)";
+const V1_DEV_PATHS = "^/v1(/|$)";
 
 /**
  * `--mode e2e` builds what the Playwright suite runs against: the app as
@@ -32,7 +32,7 @@ export default defineConfig(({ mode }) => ({
     strictPort: true,
     proxy: {
       "/api": { target: DEV_API_TARGET, changeOrigin: true },
-      [V1_DEV_PATHS]: { target: V1_DEV_TARGET, changeOrigin: true },
+      [V1_DEV_PATHS]: { target: V1_DEV_TARGET, changeOrigin: true, ws: true },
     },
   },
   preview: { port: DEV_PORT },

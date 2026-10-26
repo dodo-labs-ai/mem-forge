@@ -29,7 +29,9 @@ docker compose up --build
 
 Open `http://localhost:5174`. The UI is served by the `admin-ui` container and
 proxies `/api/*` requests to the `api` container. The API is also available
-directly at `http://localhost:8765`.
+directly at `http://localhost:8765`. For this release the container also
+serves the previous admin UI at `http://localhost:5174/v1/`, and a link to a
+page under `/v2/` redirects to the same page at `/`.
 
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance. To move to a new
@@ -110,7 +112,7 @@ MemForge uses two models:
 - An **embedding model** turns memories into vectors for semantic search. It
   is optional: without one, search falls back to full-text ranking.
 
-Open `http://localhost:5174/v2/settings`. For each model, choose a provider
+Open `http://localhost:5174/settings`. For each model, choose a provider
 and fill in what it asks for:
 
 | Provider | Use it for | You enter |
@@ -159,9 +161,8 @@ or choose **Discard changes**.
 
 Each card shows the model in use above the form. **Validate again** repeats
 the request for that model at any time; the model stays in use whatever the
-result. Until a generation model is ready, every other page of the new admin
-(the pages under `http://localhost:5174/v2/`) shows a notice that links to
-Settings.
+result. Until a generation model is ready, every other page of the admin UI
+shows a notice that links to Settings.
 
 Each model shows one of three states:
 
@@ -214,7 +215,7 @@ without its semantic channel, creating a memory is refused with the code
 `reindex_required` (`vector_index_missing` when the stored vectors fit no
 index) until the index is rebuilt, vector updates that were already queued
 wait, and the health endpoint and Settings say that a reindex is required.
-Every other page of the new admin shows a notice that vector search is off,
+Every other page of the admin UI shows a notice that vector search is off,
 with a link to Settings, also while the reindex that ends this state runs.
 This happens when you change `MEMFORGE_EMBEDDING_MODEL` or
 `MEMFORGE_EMBEDDING_BASE_URL` in `.env` for an installation that already has
@@ -430,12 +431,13 @@ workspace id `local`.
 
 Use the **Sources** screen in the admin UI to add a source and run a sync.
 
-Each source can also run on its own server-side schedule. Open the source's
-**Configure** dialog, enable **Sync on a schedule**, and choose an interval.
-Scheduled runs use the same backend queue and source permissions as a manual
-**Sync** click; an already-running source is skipped until the next interval.
+Each source can also run on its own server-side schedule. In the source's
+**Schedule** step (**Configure** in its actions menu), turn on **Sync
+automatically** and choose a frequency. Scheduled runs use the same backend
+queue and source permissions as a manual sync; an already-running source is
+skipped until the next interval.
 
-To sync a local folder or repository, choose **Add Source -> Local Repository**
+To sync a local folder or repository, choose **Add source -> Local Repository**
 and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 
 | Source | What is synced |
@@ -487,9 +489,9 @@ works the same self-hosted and hosted.
    choose **•••** → **Connections**, and add the connection.
 4. Paste each root's URL, or its ID, into **Root pages** or **Databases**.
 
-Until the admin UI's new Add Source dialog offers Notion, create the source
-through the API instead, with `POST /api/v1/sources` and this body
-(`access_policy` is `"private"` or `"workspace"`):
+Add the source in the admin UI's **Add source**, or create it through the API
+with `POST /api/v1/sources` and this body (`access_policy` is `"private"` or
+`"workspace"`):
 
 ```json
 {"type": "notion", "name": "Team wiki", "access_policy": "private",
@@ -708,7 +710,7 @@ cp .env.example .env
 uv run memforge api
 ```
 
-In another terminal, start V2 at `http://localhost:5175/v2/`:
+In another terminal, start the admin UI at `http://localhost:5175`:
 
 ```bash
 cd admin
@@ -716,8 +718,9 @@ npm ci
 npm run dev
 ```
 
-V1 remains in `admin-ui/` until V2 replaces it. Source setup still opens V1 pages. For that flow, also start V1 in a third
-terminal at `http://localhost:5174`:
+The previous admin UI (V1) remains in `admin-ui/` for one release, served at
+`/v1/`. To open it from the dev server at `http://localhost:5175/v1/`, also
+start it in a third terminal:
 
 ```bash
 cd admin-ui
@@ -750,8 +753,8 @@ Project layout:
 
 ```text
 src/memforge/        Python service, CLI, pipeline, genes, plugin MCP proxy
-admin/               V2 React admin console, served at /v2/
-admin-ui/            V1 console, until V2 replaces it
+admin/               React admin console, served at /
+admin-ui/            V1 console, served at /v1/ for one release
 integrations/        Codex and Claude Code plugin packages
 docs/                Quickstart, architecture overview and API notes
 tests/               Python tests
