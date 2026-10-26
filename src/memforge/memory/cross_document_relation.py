@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any, Protocol
 
@@ -34,6 +34,7 @@ from memforge.pipeline.evidence_fragments import (
 )
 from memforge.source_projection import AnchorKind, SourceObservationRevision
 from memforge.source_representation import representation_contract_for_profile
+from memforge.source_time import parse_source_time, reported_source_time
 
 
 class CrossDocumentRelationLabel(str, Enum):
@@ -50,19 +51,12 @@ class CrossDocumentRelationDecider(str, Enum):
     REVIEW = "review"
 
 
-CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v5"
+CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v6"
 # Classifier contracts that read the current ``RelationSubject`` input. An
 # evaluation case pinned under any of them holds the input this contract reads
 # and is replayed under it; a contract that changes the input is evaluated on a
 # set seeded again under it.
-CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset(
-    {
-        "cross-document-relation-v2",
-        "cross-document-relation-v3",
-        "cross-document-relation-v4",
-        CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    }
-)
+CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset({CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION})
 CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
 
 
@@ -70,9 +64,10 @@ CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOC
 class RelationSubject:
     """What the classifier sees of one Memory; identity stays out of the prompt.
 
-    ``evidence_time`` is the UTC date on which the source recorded the Primary
-    Evidence, or None when no source time is known. ``evidence`` holds the
-    readable text of the Primary Evidence followed by any Required Evidence.
+    ``evidence_time`` is the instant at which the source recorded the Primary
+    Evidence, in UTC ISO 8601, or None when no source time is known.
+    ``evidence`` holds the readable text of the Primary Evidence followed by
+    any Required Evidence.
     """
 
     memory_id: str
@@ -182,11 +177,23 @@ def pair_counterpart(memory_low_id: str, memory_high_id: str, memory_id: str) ->
     raise ValueError(f"{memory_id} is not part of this pair")
 
 
-def _evidence_date(evidence_time: str | None) -> date | None:
-    if not evidence_time:
-        return None
+def _evidence_instant(evidence_time: str | None) -> datetime | None:
+    """An Evidence time as a UTC instant; None when it is unknown or holds no instant."""
+
     try:
-        return date.fromisoformat(evidence_time)
+        return parse_source_time(evidence_time)
+    except ValueError:
+        return None
+
+
+def _evidence_date(evidence_time: str | None) -> date | None:
+    """The UTC calendar date of an Evidence time, whether it holds an instant or only a date."""
+
+    instant = _evidence_instant(evidence_time)
+    if instant is not None:
+        return instant.date()
+    try:
+        return date.fromisoformat(evidence_time) if evidence_time else None
     except ValueError:
         return None
 
@@ -197,10 +204,22 @@ def newer_memory_by_evidence_time(
     low_evidence_time: str | None,
     high_evidence_time: str | None,
 ) -> str | None:
-    """The Memory whose Evidence the source recorded later, or None when the times do not order the pair."""
+    """The Memory whose Evidence the source recorded later, or None when the times do not order the pair.
 
-    low = _evidence_date(low_evidence_time)
-    high = _evidence_date(high_evidence_time)
+    Discovery gives each Memory the instant its source recorded the Evidence,
+    so two statements of one day are ordered by their instants. A relation
+    keeps the times it was decided on, and relations decided by earlier
+    classifier contracts hold UTC calendar dates; a pair is compared at the
+    precision both of its times hold, so two times are ordered by instant only
+    when both are instants. Equal or unknown times do not order the pair.
+    """
+
+    low_instant = _evidence_instant(low_evidence_time)
+    high_instant = _evidence_instant(high_evidence_time)
+    if low_instant is not None and high_instant is not None:
+        low, high = low_instant, high_instant
+    else:
+        low, high = _evidence_date(low_evidence_time), _evidence_date(high_evidence_time)
     if low is None or high is None or low == high:
         return None
     return memory_low_id if low > high else memory_high_id
@@ -217,8 +236,8 @@ def recorded_relation_label(
 
     The program, not the classifier, orders an ``updates`` pair, by the same
     Evidence times the classifier saw (``RelationSubject.evidence_time``). A
-    pair those times do not order, because either is unknown or both fall on
-    the same date, is recorded as ``contradicts``.
+    pair those times do not order, because either is unknown or both are the
+    same, is recorded as ``contradicts``.
     """
 
     if label is CrossDocumentRelationLabel.UPDATES and (
@@ -374,7 +393,8 @@ class CurrentCrossDocumentRelation:
     Current means both Memories are active and visible to the caller, both
     contents still equal the judged contents, and no active dismissal hides
     it. The Evidence times are the ones the relation was decided on; they
-    order an ``updates`` pair and date each Memory for the reader.
+    order an ``updates`` pair and tell the reader when each Memory's source
+    recorded it.
     """
 
     memory_low_id: str
@@ -444,8 +464,8 @@ class RelationDismissalConflict(ValueError):
 
 CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements, taken from the same document or from different
 ones. Each statement comes with its memory type, the source type and title of its
-document, evidence_time (the date on which its source recorded the Evidence,
-null when unknown), and the Evidence text it was taken from. Use all of them
+document, evidence_time (the UTC time at which its source recorded the
+Evidence, null when unknown), and the Evidence text it was taken from. Use all of them
 to tell what each statement is about.
 
 Two statements are about the same situation only if all of these hold:
@@ -626,20 +646,14 @@ class RelationSubjectStore(Protocol):
 
 
 def source_evidence_time(value: object) -> str | None:
-    """The Evidence time a stored source timestamp gives: its UTC calendar date, or None when unparsable."""
+    """The Evidence time a stored source time gives: its UTC instant, or None when it cannot be placed in time.
 
-    if isinstance(value, datetime):
-        moment = value
-    elif isinstance(value, str) and value.strip():
-        try:
-            moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    if moment.tzinfo is not None:
-        moment = moment.astimezone(timezone.utc)
-    return moment.date().isoformat()
+    A stored ``observed_at`` is the offset-aware time the source reported for
+    the content, so the Evidence time keeps its full precision; a value without
+    an offset or in another format is unknown, never read as some timezone.
+    """
+
+    return reported_source_time(value)
 
 
 def _evidence_time(primary_revision: SourceObservationRevision | None) -> str | None:
@@ -660,17 +674,18 @@ def newest_evidence_unit_id(evidence_times: Mapping[str, str | None]) -> str | N
     """The Evidence Unit a Memory's relation subject is read from.
 
     ``evidence_times`` maps each current Evidence Unit of the Memory to its
-    Evidence time. The subject reads the Unit with the newest Evidence time, the
-    time ``updates`` is ordered by; an unknown time ranks below every known one,
-    and Units with the same time go to the lowest Evidence Unit id, so the
-    choice is the same on every read. Storage applies this rule when discovery
-    reads the challenger's Evidence in its Source Unit, and the subject builder
-    applies it to every other Memory.
+    Evidence time (``source_evidence_time``). The subject reads the Unit with
+    the newest Evidence time, the time ``updates`` is ordered by; an unknown
+    time ranks below every known one, and Units with the same time go to the
+    lowest Evidence Unit id, so the choice is the same on every read. Storage
+    applies this rule when discovery reads the challenger's Evidence in its
+    Source Unit, and the subject builder applies it to every other Memory.
     """
 
+    instants = {unit_id: _evidence_instant(time) for unit_id, time in evidence_times.items()}
     return max(
         sorted(evidence_times),
-        key=lambda unit_id: (evidence_times[unit_id] is not None, evidence_times[unit_id] or ""),
+        key=lambda unit_id: (instants[unit_id] is not None, instants[unit_id] or datetime.min.replace(tzinfo=UTC)),
         default=None,
     )
 

@@ -459,6 +459,15 @@ def test_updates_is_ordered_by_evidence_time_and_otherwise_recorded_as_contradic
     assert recorded_relation_label(EQUIVALENT, "mem-a", "mem-b", None, None) is EQUIVALENT
 
 
+def test_updates_of_one_day_is_ordered_by_instant_and_a_date_orders_only_by_date():
+    morning, evening = "2026-08-01T08:00:00+00:00", "2026-08-01T19:30:00+00:00"
+
+    assert _stored("mem-a", "mem-b", UPDATES, {"mem-a": morning, "mem-b": evening}).newer_memory_id == "mem-b"
+    assert _stored("mem-a", "mem-b", UPDATES, {"mem-a": EARLIER, "mem-b": evening}).newer_memory_id == "mem-b"
+    for low_time, high_time in ((morning, morning), (LATER, evening)):
+        assert recorded_relation_label(UPDATES, "mem-a", "mem-b", low_time, high_time) is CONTRADICTS
+
+
 def test_window_order_puts_each_memory_after_every_newer_one_in_an_updates_chain():
     times = {"mem-1": "2026-06-01", "mem-2": EARLIER, "mem-3": LATER}
     graph = _graph(

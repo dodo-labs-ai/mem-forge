@@ -396,8 +396,8 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
     assert by_pair["mem-b", "mem-m"].high_content_hash == challenger.content_hash
     assert by_pair["mem-m", "mem-y"].label is CrossDocumentRelationLabel.UPDATES
     assert (by_pair["mem-m", "mem-y"].low_evidence_time, by_pair["mem-m", "mem-y"].high_evidence_time) == (
-        "2026-04-02",
-        "2026-03-01",
+        "2026-04-02T09:00:00+00:00",
+        "2026-03-01T09:00:00+00:00",
     )
     assert by_pair["mem-m", "mem-z"].label is CrossDocumentRelationLabel.CONTRADICTS
     for record in outcome.relations:
@@ -420,14 +420,14 @@ async def test_relation_discovery_records_one_relation_per_labeled_pair_and_no_r
 @pytest.mark.asyncio
 async def test_relation_discovery_records_updates_as_contradicts_when_evidence_times_do_not_order_the_pair() -> None:
     challenger = _memory("mem-m", "Current claim")
-    same_day = _memory("mem-s", "Claim recorded the same day")
+    same_time = _memory("mem-s", "Claim recorded at the same instant")
     untimed = _memory("mem-u", "Claim without a source time")
-    store = _Store(challenger, (same_day, untimed))
+    store = _Store(challenger, (same_time, untimed))
     store.observed_at = {"mem-u": ""}
 
     await _discovery(
         store,
-        (same_day, untimed),
+        (same_time, untimed),
         _Classifier({"mem-s": CrossDocumentRelationLabel.UPDATES, "mem-u": CrossDocumentRelationLabel.UPDATES}),
     ).process_slice(worker_id="worker-1")
 
@@ -436,6 +436,23 @@ async def test_relation_discovery_records_updates_as_contradicts_when_evidence_t
         CrossDocumentRelationLabel.CONTRADICTS,
     ]
     assert store.completed_run.relation_run.audit["labels"] == {"mem-s": "updates", "mem-u": "updates"}
+
+
+@pytest.mark.asyncio
+async def test_relation_discovery_orders_an_updates_pair_of_one_day_by_its_evidence_instants() -> None:
+    challenger = _memory("mem-m", "Current claim")
+    earlier = _memory("mem-e", "Claim recorded earlier that day")
+    store = _Store(challenger, (earlier,))
+    store.observed_at = {"mem-m": "2026-03-25T16:30:00+00:00", "mem-e": "2026-03-25T09:15:00+00:00"}
+
+    await _discovery(
+        store, (earlier,), _Classifier({"mem-e": CrossDocumentRelationLabel.UPDATES})
+    ).process_slice(worker_id="worker-1")
+
+    [record] = store.completed.relations
+    assert record.label is CrossDocumentRelationLabel.UPDATES
+    assert (record.memory_low_id, record.low_evidence_time) == ("mem-e", "2026-03-25T09:15:00+00:00")
+    assert (record.memory_high_id, record.high_evidence_time) == ("mem-m", "2026-03-25T16:30:00+00:00")
 
 
 @pytest.mark.asyncio
@@ -469,7 +486,7 @@ async def test_relation_discovery_shows_the_classifier_statements_titles_time_an
     assert pair.challenger.statement == "Current claim"
     assert pair.candidate.document_title == "Title of doc-candidate"
     assert pair.candidate.evidence == ("Evidence for candidate.",)
-    assert pair.candidate.evidence_time == "2026-03-25"
+    assert pair.candidate.evidence_time == "2026-03-25T10:00:00+00:00"
     assert pair.candidate.source_type == "jira"
 
 
@@ -728,13 +745,33 @@ class _RecordingUpdatesClassifier:
 
 
 @pytest.mark.asyncio
-async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_evidence_time(db: Database) -> None:
+@pytest.mark.parametrize(
+    ("older_time", "newer_time", "older_evidence_time", "newer_evidence_time"),
+    [
+        (
+            "2026-07-10T09:00:00.000+0000",
+            "2026-07-14T09:00:00.000+0000",
+            "2026-07-10T09:00:00+00:00",
+            "2026-07-14T09:00:00+00:00",
+        ),
+        # Two comments of one day are ordered by the times Jira gives them.
+        (
+            "2026-07-14T09:00:00.000+0000",
+            "2026-07-14T17:45:00.000+0200",
+            "2026-07-14T09:00:00+00:00",
+            "2026-07-14T15:45:00+00:00",
+        ),
+    ],
+)
+async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_evidence_time(
+    db: Database, older_time: str, newer_time: str, older_evidence_time: str, newer_evidence_time: str
+) -> None:
     older_claim = "Payroll approval needs two reviewers."
     newer_claim = "Payroll approval needs three reviewers."
     await _set_fixture_source_type(db, "jira")
     projection = _jira_issue_with_comments(
-        ("501", "2026-07-10T09:00:00.000+0000", older_claim),
-        ("502", "2026-07-14T09:00:00.000+0000", newer_claim),
+        ("501", older_time, older_claim),
+        ("502", newer_time, newer_claim),
     )
     await coordination_engine(db, ScriptedClient()).prepare_and_commit_projected_lifecycle(
         projection=projection,
@@ -781,7 +818,7 @@ async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_e
     # Real retrieval selected the other Memory of the challenger's own Source Unit.
     [pair] = classifier.pairs_of(newer.id)
     assert pair.candidate.memory_id == older.id
-    assert (pair.challenger.evidence_time, pair.candidate.evidence_time) == ("2026-07-14", "2026-07-10")
+    assert (pair.challenger.evidence_time, pair.candidate.evidence_time) == (newer_evidence_time, older_evidence_time)
     scope = AccessScope(
         user_id=LOCAL_DEV_USER_ID,
         include_private=True,
@@ -793,6 +830,6 @@ async def test_relation_discovery_orders_an_updates_pair_of_one_source_unit_by_e
     [newer_side] = relations[newer.id]
     [older_side] = relations[older.id]
     assert (newer_side.label, newer_side.role, newer_side.counterpart.memory_id) == ("updates", "newer", older.id)
-    assert newer_side.counterpart.evidence_time == "2026-07-10"
+    assert newer_side.counterpart.evidence_time == older_evidence_time
     assert (older_side.label, older_side.role, older_side.counterpart.memory_id) == ("updates", "older", newer.id)
-    assert older_side.counterpart.evidence_time == "2026-07-14"
+    assert older_side.counterpart.evidence_time == newer_evidence_time

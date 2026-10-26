@@ -55,7 +55,7 @@ def _subject(memory_id: str, statement: str) -> RelationSubject:
         memory_type="decision",
         source_type="jira",
         document_title=f"Ticket for {memory_id}",
-        evidence_time="2026-03-25",
+        evidence_time="2026-03-25T10:00:00+00:00",
         evidence=(f"Evidence for {memory_id}",),
     )
 
@@ -198,7 +198,7 @@ async def test_prompt_shows_statement_context_without_identity() -> None:
     challenger = replace(
         _subject("mem-challenger-secret-id", "Payroll runs weekly."),
         document_title="Payroll design",
-        evidence_time="2026-04-10",
+        evidence_time="2026-04-10T09:00:00+00:00",
         evidence=("Payroll runs weekly for all employees.",),
     )
     candidate = replace(
@@ -216,7 +216,7 @@ async def test_prompt_shows_statement_context_without_identity() -> None:
         "memory_type": "decision",
         "source_type": "jira",
         "document_title": "Payroll design",
-        "evidence_time": "2026-04-10",
+        "evidence_time": "2026-04-10T09:00:00+00:00",
         "evidence": ["Payroll runs weekly for all employees."],
     }
     assert _section(prompt, "questions") == [
@@ -296,17 +296,12 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
         assert sentence in framing
 
 
-def test_the_contract_is_v5_and_replays_cases_pinned_under_the_same_input() -> None:
-    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v5"
-    assert CROSS_DOCUMENT_RELATION_INPUT_VERSIONS == {
-        "cross-document-relation-v2",
-        "cross-document-relation-v3",
-        "cross-document-relation-v4",
-        "cross-document-relation-v5",
-    }
-    assert " ".join(CROSS_DOCUMENT_RELATION_RULES.split()).startswith(
-        "Each pair holds two statements, taken from the same document or from different ones."
-    )
+def test_the_contract_is_v6_and_replays_only_cases_pinned_with_evidence_instants() -> None:
+    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v6"
+    assert CROSS_DOCUMENT_RELATION_INPUT_VERSIONS == {"cross-document-relation-v6"}
+    rules = " ".join(CROSS_DOCUMENT_RELATION_RULES.split())
+    assert rules.startswith("Each pair holds two statements, taken from the same document or from different ones.")
+    assert "evidence_time (the UTC time at which its source recorded the Evidence, null when unknown)" in rules
 
 
 def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> None:
@@ -354,9 +349,35 @@ def test_a_decision_is_the_pair_index_and_its_label_only() -> None:
 @pytest.mark.parametrize(
     ("challenger_time", "candidate_time", "label", "recorded"),
     [
+        (
+            "2026-04-10T09:00:00+00:00",
+            "2026-04-01T09:00:00+00:00",
+            CrossDocumentRelationLabel.UPDATES,
+            CrossDocumentRelationLabel.UPDATES,
+        ),
+        # Two statements of one day are ordered by the instants their sources recorded.
+        (
+            "2026-04-10T16:45:00+00:00",
+            "2026-04-10T09:00:00+00:00",
+            CrossDocumentRelationLabel.UPDATES,
+            CrossDocumentRelationLabel.UPDATES,
+        ),
+        (
+            "2026-04-10T09:00:00+00:00",
+            "2026-04-10T09:00:00+00:00",
+            CrossDocumentRelationLabel.UPDATES,
+            CrossDocumentRelationLabel.CONTRADICTS,
+        ),
+        (None, "2026-04-01T09:00:00+00:00", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        # Times that hold only a date order a pair by date.
         ("2026-04-10", "2026-04-01", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.UPDATES),
         ("2026-04-10", "2026-04-10", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
-        (None, "2026-04-01", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        (
+            "2026-04-10T16:45:00+00:00",
+            "2026-04-10",
+            CrossDocumentRelationLabel.UPDATES,
+            CrossDocumentRelationLabel.CONTRADICTS,
+        ),
         (None, None, CrossDocumentRelationLabel.EQUIVALENT, CrossDocumentRelationLabel.EQUIVALENT),
         (None, None, CrossDocumentRelationLabel.NONE, CrossDocumentRelationLabel.NONE),
     ],
@@ -525,7 +546,7 @@ async def test_subject_shows_readable_record_fields_and_the_observation_revision
     subject = (await load_relation_subjects(store, (_memory("mem-jira"),)))["mem-jira"]
 
     assert subject.document_title == "PAY-1: Rename"
-    assert subject.evidence_time == "2026-03-26"
+    assert subject.evidence_time == "2026-03-26T07:30:00+00:00"
     history_text, core_text = subject.evidence
     assert "Change recorded: 2026-03-25T23:30:00.000-0800" in history_text
     assert "Change author: Dev" in history_text
@@ -589,7 +610,7 @@ async def test_record_fields_keep_each_array_item_together_and_skip_empty_values
 @pytest.mark.parametrize("source_type", ["confluence", "github_repo", "local_markdown", "agent_session", "jira"])
 @pytest.mark.parametrize(
     ("observed_at", "evidence_time"),
-    [("2026-03-02T23:30:00-05:00", "2026-03-03"), (None, None)],
+    [("2026-03-02T23:30:00-05:00", "2026-03-03T04:30:00+00:00"), (None, None)],
 )
 async def test_evidence_time_is_the_anchored_revision_source_time(source_type: str, observed_at, evidence_time) -> None:
     """Every Source is read alike; a document time never stands in for a missing revision time."""
@@ -701,7 +722,7 @@ async def test_subjects_come_from_the_current_evidence_unit() -> None:
 
     assert subjects["mem-a"].document_title == "Current page"
     assert subjects["mem-a"].evidence == ("Evidence for mem-a.",)
-    assert subjects["mem-a"].evidence_time == "2026-03-25"
+    assert subjects["mem-a"].evidence_time == "2026-03-25T10:00:00+00:00"
     assert subjects["mem-plain"] == RelationSubject(
         memory_id="mem-plain", content_hash=content_hash("mem-plain"), statement="mem-plain", memory_type="fact",
     )
@@ -737,10 +758,12 @@ def test_engine_classifies_discovery_only_with_a_capable_client(client, expects_
 @pytest.mark.parametrize(
     ("evidence_times", "chosen"),
     [
-        ({"eu-b": "2026-03-24", "eu-a": "2026-03-25"}, "eu-a"),
-        ({"eu-a": "2026-03-24", "eu-b": "2026-03-25"}, "eu-b"),
-        ({"eu-b": "2026-03-25", "eu-a": "2026-03-25"}, "eu-a"),
-        ({"eu-a": None, "eu-b": "2026-03-01"}, "eu-b"),
+        ({"eu-b": "2026-03-24T10:00:00+00:00", "eu-a": "2026-03-25T10:00:00+00:00"}, "eu-a"),
+        ({"eu-a": "2026-03-24T10:00:00+00:00", "eu-b": "2026-03-25T10:00:00+00:00"}, "eu-b"),
+        # Units of one day are chosen by instant.
+        ({"eu-a": "2026-03-25T09:59:59+00:00", "eu-b": "2026-03-25T10:00:00.500000+00:00"}, "eu-b"),
+        ({"eu-b": "2026-03-25T10:00:00+00:00", "eu-a": "2026-03-25T10:00:00+00:00"}, "eu-a"),
+        ({"eu-a": None, "eu-b": "2026-03-01T10:00:00+00:00"}, "eu-b"),
         ({"eu-b": None, "eu-a": None}, "eu-a"),
         ({}, None),
     ],
@@ -795,8 +818,8 @@ async def test_subject_reads_the_newest_of_several_current_evidence_units_in_one
         )
     )[memory_id]
 
-    assert (subject.evidence_time, subject.evidence) == ("2026-04-02", ("Evidence of eu-z-newer.",))
-    assert (pinned.evidence_time, pinned.evidence) == ("2026-03-25", (f"Evidence for {memory_id}.",))
+    assert (subject.evidence_time, subject.evidence) == ("2026-04-02T09:00:00+00:00", ("Evidence of eu-z-newer.",))
+    assert (pinned.evidence_time, pinned.evidence) == ("2026-03-25T10:00:00+00:00", (f"Evidence for {memory_id}.",))
     with pytest.raises(ValueError, match="no longer current"):
         await load_relation_subjects(store, (_memory(memory_id),), evidence_unit_ids={memory_id: "eu-removed"})
 

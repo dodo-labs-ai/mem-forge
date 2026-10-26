@@ -304,7 +304,7 @@ async def test_seed_pins_each_group_with_its_ordered_candidates_and_recorded_lab
     assert [candidate["memory_id"] for candidate in case.manifest["candidates"]] == list(
         _payroll_group().candidate_memory_ids
     )
-    assert case.manifest["candidates"][2]["evidence_time"] == "2026-03-01"
+    assert case.manifest["candidates"][2]["evidence_time"] == "2026-03-01T10:00:00+00:00"
     assert case.manifest["candidates"][0]["document_title"] == "Title doc-mem-monthly"
     assert rubric == {
         "expected_labels": {

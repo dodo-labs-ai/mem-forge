@@ -642,7 +642,10 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
         "SELECT label, decided_by, low_evidence_time, high_evidence_time FROM cross_document_relations"
     )
     assert (relation["label"], relation["decided_by"]) == ("updates", "review")
-    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == ("2026-07-02", "2026-06-30")
+    assert (relation["low_evidence_time"], relation["high_evidence_time"]) == (
+        "2026-07-02T08:00:00+00:00",
+        "2026-06-30T08:00:00+00:00",
+    )
     [event] = await db.db.execute_fetchall(
         "SELECT payload FROM memory_audit_events WHERE event_type = ?",
         (CONVERSION_APPLIED_EVENT,),
@@ -655,8 +658,8 @@ async def test_conversion_apply_writes_a_relabeled_confirmed_review_as_a_confirm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "times",
-    [{}, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-07-02T17:00:00+00:00"}],
-    ids=["unknown", "same-date"],
+    [{}, {"a": "2026-07-02T08:00:00+00:00", "b": "2026-07-02T08:00:00+00:00"}],
+    ids=["unknown", "same-time"],
 )
 async def test_conversion_records_an_updates_relabel_as_contradicts_when_evidence_times_do_not_order_it(
     db: Database, tmp_path, times: dict[str, str]

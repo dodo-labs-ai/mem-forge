@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Relation discovery now orders two statements recorded on the same day by
+  the exact time their sources recorded them, for example two comments of one
+  Jira issue, two messages of one Teams chat, or two pages modified the same
+  day. Such a pair is recorded as `updates`, the later one first in search,
+  where it used to be recorded as `contradicts` because only the date was
+  compared. A pair is still `contradicts` when either source records no time
+  or both give the same time. The classifier now sees each statement's source
+  time in UTC instead of its date, so its contract is
+  `cross-document-relation-v6`; evaluation cases pinned under an earlier
+  contract hold dates and are not replayed, so seed the relation evaluation
+  sets again before evaluating it on workspace data. Relations already
+  recorded keep the dates they were decided on until discovery judges the pair
+  again; to judge them now, re-run completed discovery work from the relation
+  discovery work admin action (`POST /api/v1/relation-discovery/work/rerun`
+  with state `completed` and classifier version
+  `cross-document-relation-v5`). Cloud: arrives with the pin; HANA reads the
+  Evidence time through the same shared function, and its relation time
+  columns already hold a full time, so it needs no change.
+
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
   as a memory's main evidence, extraction asks it to correct the selection,

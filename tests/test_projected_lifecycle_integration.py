@@ -8820,7 +8820,7 @@ async def test_relation_discovery_records_relation_after_lifecycle_commit(
     assert relation["label"] == "contradicts"
     evidence_times = {low_id: relation["low_evidence_time"], high_id: relation["high_evidence_time"]}
     # The Confluence page time of the challenger's current revision; the candidate has none.
-    assert evidence_times == {challenger.id: "2026-07-15", candidate.id: None}
+    assert evidence_times == {challenger.id: "2026-07-15T00:00:00+00:00", candidate.id: None}
     assert relation["decided_by"] == "classifier"
     assert relation["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
     assert {relation["low_content_hash"], relation["high_content_hash"]} == {

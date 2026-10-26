@@ -644,4 +644,4 @@ async def test_a_github_file_commit_time_reaches_the_relation_classifier(db: Dat
 
     assert before.evidence_time is None
     # The next sync records the commit time on the same revision; the Evidence stays anchored.
-    assert after.evidence_time == "2026-05-01"
+    assert after.evidence_time == "2026-05-01T10:00:00+00:00"

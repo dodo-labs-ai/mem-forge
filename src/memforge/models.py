@@ -957,8 +957,9 @@ class RelatedMemory:
     summary: str
     content_hash: str
     sources: tuple[MemorySourceRef, ...] = ()
-    # UTC date on which the source recorded the Evidence the relation was
-    # decided on; None when unknown or outside a relation.
+    # When the source recorded the Evidence the relation was decided on, in
+    # UTC ISO 8601 (a calendar date on relations decided on dates); None when
+    # unknown or outside a relation.
     evidence_time: str | None = None
 
 

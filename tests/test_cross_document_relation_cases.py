@@ -171,7 +171,7 @@ async def test_seed_pins_decided_reviews_with_labels_and_is_repeatable(db: Datab
         challenger_id = case.manifest["challenger"]["memory_id"]
         assert case.manifest["challenger"]["statement"] == store.memories[challenger_id].content
         assert case.manifest["challenger"]["evidence"] == [f"Evidence for {challenger_id}."]
-        assert case.manifest["challenger"]["evidence_time"] == "2026-03-25"
+        assert case.manifest["challenger"]["evidence_time"] == "2026-03-25T10:00:00+00:00"
         assert case.manifest["candidate"]["document_title"].startswith("Title ")
         labels_by_review[case.manifest["origin"]["review_id"]] = (
             ground_truth.rubric["expected_label"],
@@ -421,14 +421,18 @@ async def _executed_relation_run(db: Database) -> str:
 
 
 @pytest.mark.asyncio
-async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_replayed(db: Database) -> None:
+# v5 pinned each Evidence time as a date, so its cases hold an input v6 does not read.
+@pytest.mark.parametrize("pinned_version", ["cross-document-relation-v1", "cross-document-relation-v5"])
+async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_replayed(
+    db: Database, pinned_version: str
+) -> None:
     run_id = await _executed_relation_run(db)
     [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
         run_id, requesting_user_id=ACTOR
     )
-    earlier = {**output.case.manifest, "classifier_version": "cross-document-relation-v1"}
+    earlier = {**output.case.manifest, "classifier_version": pinned_version}
 
-    with pytest.raises(ValueError, match="cross-document-relation-v1"):
+    with pytest.raises(ValueError, match=pinned_version):
         await OfflineAgentEvaluation(db, executors={}).curate_case(
             case_kind=AgentEvaluationCaseKind.CROSS_DOCUMENT_RELATION,
             source_id=output.case.source_id,
@@ -438,7 +442,7 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
             promotion_policy_version="test",
             created_by=ACTOR,
         )
-    with pytest.raises(ValueError, match="cross-document-relation-v1"):
+    with pytest.raises(ValueError, match=pinned_version):
         await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
             replace(output.case, manifest=earlier),
             {"model": FIXTURE_MODEL},
@@ -446,31 +450,13 @@ async def test_a_case_pinned_for_another_classifier_is_neither_curated_nor_repla
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pinned_version", ["cross-document-relation-v2", "cross-document-relation-v3"])
-async def test_a_case_pinned_for_a_classifier_with_the_same_input_is_replayed(
-    db: Database, pinned_version: str,
-) -> None:
-    run_id = await _executed_relation_run(db)
-    [output, *_rest] = await OfflineAgentEvaluation(db, executors={}).read_case_outputs(
-        run_id, requesting_user_id=ACTOR
-    )
-    pinned = {**output.case.manifest, "classifier_version": pinned_version}
-
-    replayed = await CrossDocumentRelationReplayExecutor(_LabelClient()).execute(
-        replace(output.case, manifest=pinned),
-        {"model": FIXTURE_MODEL},
-    )
-
-    assert replayed["classifier_version"] == CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("challenger_time", "candidate_time", "recorded"),
     [
-        ("2026-03-25", "2026-03-01", "updates"),
-        ("2026-03-25", "2026-03-25", "contradicts"),
-        ("2026-03-25", None, "contradicts"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-01T10:00:00+00:00", "updates"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-25T08:30:00+00:00", "updates"),
+        ("2026-03-25T10:00:00+00:00", "2026-03-25T10:00:00+00:00", "contradicts"),
+        ("2026-03-25T10:00:00+00:00", None, "contradicts"),
     ],
 )
 async def test_replay_scores_the_label_discovery_records(
