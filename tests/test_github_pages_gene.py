@@ -788,7 +788,7 @@ async def test_normalize_extracts_main_article_and_removes_page_chrome():
         body=b"""
     <html>
       <body>
-        <header>AcmePayroll Documentation</header>
+        <header>Payroll Documentation</header>
         <nav>Home General Cloud Native Platform</nav>
         <aside class="md-sidebar">Process Tracking</aside>
         <main>
@@ -812,7 +812,7 @@ async def test_normalize_extracts_main_article_and_removes_page_chrome():
     assert "Access to REST Endpoints" in normalized.markdown_body
     assert "`/api/`" in normalized.markdown_body
     assert "GET /process-tracker/v1/" in normalized.markdown_body
-    assert "AcmePayroll Documentation" not in normalized.markdown_body
+    assert "Payroll Documentation" not in normalized.markdown_body
     assert "Table of contents" not in normalized.markdown_body
     assert normalized.source_semantics["source_type"] == "github_pages"
     assert normalized.source_semantics["page_url"].endswith("/cloud-native-platform/process-tracking")

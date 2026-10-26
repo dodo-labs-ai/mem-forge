@@ -10225,7 +10225,7 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     )
     structured_client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,
@@ -10348,7 +10348,7 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
     )
     structured_client = LiteLlmStructuredClient(
         StructuredLlmConfig(
-            model="anthropic--claude-sonnet-latest",
+            model="claude-sonnet-latest",
             max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
             base_url=None,
             api_key=None,

@@ -232,13 +232,13 @@ def test_rerank_model_follows_the_generation_model() -> None:
 
     config = AppConfig()
     models = ResolvedModels(
-        generation=ResolvedInvocation(route="litellm_proxy/claude-sonnet"),
-        embedding=ResolvedInvocation(route="litellm_proxy/text-embedding-3-small"),
+        generation=ResolvedInvocation(route="litellm_proxy/team-claude-sonnet"),
+        embedding=ResolvedInvocation(route="litellm_proxy/team-text-embedding"),
     )
 
     retrieval = _retrieval_config_for_models(config, models)
 
-    assert retrieval.rerank_model == "litellm_proxy/claude-sonnet"
+    assert retrieval.rerank_model == "litellm_proxy/team-claude-sonnet"
     assert config.retrieval.rerank_model != retrieval.rerank_model
 
 

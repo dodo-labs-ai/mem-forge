@@ -147,7 +147,7 @@ async def test_evidence_unit_retry_preserves_identity_fields(db: Database) -> No
         source_metadata={"space": "OTHER"},
         project_key="OTHER",
         visibility="private",
-        owner_user_id="owner@example.com",
+        owner_user_id="riley@example.com",
         content="Different content under the same id must not rewrite canonical evidence.",
         excerpt="Different excerpt",
         evidence_provenance=EvidenceContentProvenance.SOURCE_EXCERPT,

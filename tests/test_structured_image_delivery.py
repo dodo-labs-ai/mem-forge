@@ -24,7 +24,7 @@ from memforge.llm.structured_images import StructuredLlmImage, StructuredLlmImag
 from memforge.raster_views import complete_rectangles, native_fits
 from tests.test_projection_fragments import BINARY_PROFILE, _compile, _projection
 
-MODEL = "litellm_proxy/claude-sonnet"
+MODEL = "litellm_proxy/team-claude-sonnet"
 
 
 class Reply(BaseModel):

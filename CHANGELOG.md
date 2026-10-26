@@ -17,6 +17,22 @@
   Sync stats no longer report `pending_review`, and lifecycle runtime events
   no longer carry `review_count`.
 
+- A route LiteLLM has no limits for, such as an alias on a hosted LiteLLM
+  gateway, can take the token limits of the model it serves:
+  `MEMFORGE_LLM_METADATA_MODELS` is a JSON object from route to LiteLLM model,
+  for example `{"litellm_proxy/team-claude-sonnet": "anthropic/claude-sonnet-4-6"}`.
+  The route is sized and its requests counted as that model's, and a limit
+  set in Settings or `MEMFORGE_LLM_*` still lowers what LiteLLM gives; a value
+  that is not such an object stops MemForge at startup with an error naming
+  the variable.
+  MemForge itself maps no route. Cloud: set `MEMFORGE_LLM_METADATA_MODELS` for
+  each generation route that relied on MemForge mapping it before pinning this
+  change.
+
+- `Database.insert_memory_and_upsert_agent_claim`, which nothing called, is
+  removed. Cloud: remove the HANA store's `insert_memory_and_upsert_agent_claim`
+  and its protocol entry.
+
 - Admin: a related Memory shows when its source recorded it as a readable
   date and time, such as "Mar 3, 2026, 12:30 PM", or as a date alone for a
   relation decided from dates, instead of the raw stored value. The card on a
@@ -805,8 +821,8 @@
   - The admin API's model listing, candidate and binding responses gain a
     `native_schema` field, and the model bindings table a `native_schema`
     column (migration 119).
-  - Cloud: nothing to change. Cloud's a hosted LiteLLM gateway models use the generic
-    LiteLLM route provider, whose requests are unchanged, and the
+  - Cloud: nothing to change. Cloud's models use the generic LiteLLM route
+    provider, whose requests are unchanged, and the
     `native_schema_transport` Cloud sets is still honoured.
 
 - Contributors: `scripts/provider_smoke.py` checks that real providers
@@ -834,8 +850,8 @@
     LiteLLM sends it, without the key; choose the Ollama provider for a server
     behind authentication.
   - Cloud: nothing to change. Only bindings with the Ollama provider send
-    embeddings differently; Cloud's a hosted LiteLLM gateway models use the generic LiteLLM
-    route provider, whose requests are unchanged.
+    embeddings differently; Cloud's models use the generic LiteLLM route
+    provider, whose requests are unchanged.
 
 - The quickstart no longer offers AWS Bedrock or Google Vertex AI as LiteLLM
   route examples. Their routes need Python packages MemForge does not ship
@@ -850,10 +866,10 @@
   happened for an embedding model. Timeouts, connection failures, 408, 409,
   429 and 5xx are still retried. After fixing the key or the model, reprocess
   the affected Documents or wait for them to change.
-  - Cloud: no code or configuration change. Cloud's a hosted LiteLLM gateway generation
-    calls go through the same classification, so one a hosted LiteLLM gateway refuses (for
-    example an expired credential or an undeployed model) is no longer retried
-    at the run level.
+  - Cloud: no code or configuration change. Cloud's generation calls go
+    through the same classification, so a call its hosted LiteLLM routes
+    refuse (for example an expired credential or an undeployed model) is no
+    longer retried at the run level.
 
 - Memories you write by hand, and corrections you make, now appear in the
   recent-memories listing (`list_recent_memories` and
@@ -1082,8 +1098,8 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   are all configured, no longer logs `request_budget_metadata_unavailable` as a
   warning on every request: it is logged at debug level, and a warning remains
   for a limit that nothing configures. Cloud: no change needed; no Cloud test
-  or UI matches the old provider label. Cloud's LiteLLM gateway models are bindings of
-  that provider, so wherever Cloud's Settings shows them the provider reads
+  or UI matches the old provider label. Cloud's models are bindings of that
+  provider, so wherever Cloud's Settings shows them the provider reads
   "Other provider (LiteLLM route)".
 - `memforge search` and `memforge memory search` find your own private
   memories, which include every memory from a Claude Code or Codex session and
@@ -1130,10 +1146,9 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   or JSON-text attempt of the same call keeps that limit; the call's
   telemetry, the Source Unit LLM summary (`reasoning_budget_retries`) and the
   `reasoning_budget_recovered` quality signal show it. Cloud: no change
-  needed. Cloud's LiteLLM gateway models are bindings of the LiteLLM route provider,
-  so their requests gain no parameter; only the once-raised `max_tokens` can
-  differ, and only when an LiteLLM gateway reply reports reasoning that used up its
-  budget.
+  needed. Cloud's models are bindings of the LiteLLM route provider, so their
+  requests gain no parameter; only the once-raised `max_tokens` can differ,
+  and only when a reply reports reasoning that used up its budget.
 - Settings → Load models ends a listing request at five seconds, counted from
   sending it to the last byte of the answer. Before, the five seconds applied
   to each wait on its own, so an endpoint that sent a byte now and then could
@@ -1145,9 +1160,9 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   could hold a direct LiteLLM call open far past its timeout. Generation,
   embedding and capability checks were already bounded by their own
   deadlines and behave as before. Cloud: no change needed; no request
-  parameter is added, so the `litellm_proxy/` routes of the `litellm` provider receive
-  the same requests as before, and their requests through LiteLLM's Acme
-  client end at the timeout MemForge already sends them with.
+  parameter is added, so Cloud's routes of the `litellm` provider receive the
+  same requests as before, and end at the timeout MemForge already sends them
+  with.
 - Settings → Load models lists the models of the kind being set up. OpenRouter
   embedding models come from its embedding list (`/embeddings/models`) instead
   of its chat models; OpenAI's one list is split by model id; Ollama is asked
@@ -1170,9 +1185,9 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   `/v1`, Anthropic's `/v1/messages`) is stored without it. Optional fields
   are marked "(optional)", and a base URL with a provider default names it.
   Cloud: no change needed; the discovery response only gains fields
-  (`kind_filtered`, and token limits on each model), and Cloud's LiteLLM gateway
-  models are LiteLLM routes with no base URL, which the new base URL reading
-  leaves alone.
+  (`kind_filtered`, and token limits on each model), and Cloud's models are
+  LiteLLM routes with no base URL, which the new base URL reading leaves
+  alone.
 - A fresh install no longer reports its health as degraded after the first
   sync. A Memory created by a sync wrote the entity names as the extraction
   spelled them into its keyword search row, while the entities it was
@@ -1398,7 +1413,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   its workspace store is not a `Database`. `SourceSyncWorker`,
   `ModelSettings` and the admin routes call the new storage methods only for
   a managed index. An environment generation model
-  LiteLLM has no limits for (a `litellm_proxy/...` route without an entry in its
+  LiteLLM has no limits for (a hosted LiteLLM route without an entry in its
   registry) now needs `MEMFORGE_LLM_MAX_INPUT_TOKENS`,
   `MEMFORGE_LLM_CONTEXT_WINDOW_TOKENS` and `MEMFORGE_LLM_MAX_OUTPUT_TOKENS`
   to read `ready` in `GET /api/v1/health`; it is used either way. No HANA
@@ -1512,8 +1527,8 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   resolution compiles the bindings in memory from the environment with
   `config_source: "deployment"` and neither reads nor writes the workspace
   store, so the HANA store needs no new table or method and its
-  `get_llm_config` and `set_llm_config` are no longer called; a `litellm_proxy/...`
-  model resolves to the `litellm` descriptor with the `environment` strategy
+  `get_llm_config` and `set_llm_config` are no longer called; a hosted
+  LiteLLM route resolves to the `litellm` descriptor with the `environment` strategy
   (or `api_key` when `MEMFORGE_*_API_KEY` is set). Change
   the runtime provider's `build_structured_llm_client(llm, ...)` to take
   `ResolvedModels` (`models.generation.route`, `.api_base`, `.api_key`,
@@ -1525,7 +1540,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   its environment bindings once at start with one generation request and four
   embedding inputs, keeps the outcome in memory, and reports it in
   `GET /api/v1/health`; confirm that this start-up request is acceptable on
-  LiteLLM gateway. No HANA schema change.
+  Cloud's model routes. No HANA schema change.
 - The admin UI V2 Settings page shows the search index, which is the Memory
   vector index, on the card of the embedding model: the model that built it,
   the number of memories it holds, whether vector search is on, and the marks
@@ -1580,7 +1595,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
 - Embedding goes through the LiteLLM SDK only, behind an Embedding Runtime
   (`memforge.llm.embedding.EmbeddingRuntime`, with `embed_query` and
   `embed_documents`). An embedding model name whose first segment is a
-  provider LiteLLM knows (`ollama/nomic-embed-text`, `litellm_proxy/...`) is used as
+  provider LiteLLM knows (`ollama/nomic-embed-text`, `voyage/voyage-3`) is used as
   that route. Any other name, including one with a slash such as
   `BAAI/bge-m3`, is a model id sent on the `openai/<model>` route to the
   configured base URL, and never to an endpoint named by the environment. The
@@ -1620,10 +1635,10 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   asynchronous and needs no thread hand-off. The attributes `embed_cfg` and
   `SearchEngine._embed_cfg` are `embedding` and `SearchEngine._embedding`,
   and a test that replaced `embed_texts`, `litellm.embedding` or `httpx`
-  replaces `litellm.aembedding`. SDK retries are disabled for `litellm_proxy/` routes
-  as well (`max_retries=0` on every request), so confirm that LiteLLM gateway accepts
-  requests without them and that embedding on a `litellm_proxy/` route does not hold
-  the event loop. No HANA change.
+  replaces `litellm.aembedding`. SDK retries are disabled for Cloud's routes
+  as well (`max_retries=0` on every request), so confirm that they accept
+  requests without them and that embedding on them does not hold the event
+  loop. No HANA change.
 - A document Source run whose scope listing or absence confirmation does not
   complete still succeeds and removes nothing (ADR 0045), and now records why
   on the run: `SyncState.absence_check_skipped_reason`, stored in the new
@@ -1635,7 +1650,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   store adds the nullable `SYNC_HISTORY.ABSENCE_CHECK_SKIPPED_REASON` column at
   startup with `_add_column_if_missing`, writes it with every sync history row
   and returns it from `get_sync_history`. Existing rows read as null; no data
-  migration, `litellm_proxy/` route or environment configuration change.
+  migration, model route or environment configuration change.
 - A Support that cites the stored Unit Title is judged again
   (`revision-support-v12`). Evidence on a stored revision in a representation
   no adapter projects kept its whole Support unresolved, so a Memory that
@@ -1709,7 +1724,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   unchanged. Cloud: a provider backed by HANA never opens a local Chroma store
   on the container disk, including on every `/api/v1/projects` and memory
   write request. Cloud's `CloudRuntimeProvider.build_adapters` takes the new
-  signature together with the pin to this version; no HANA schema, `litellm_proxy/`
+  signature together with the pin to this version; no HANA schema, model
   route or environment configuration change.
 - `GET /api/v1/projects` returns each project's `memory_count`: the active
   memories in that project the caller can see, including the caller's private
@@ -1787,7 +1802,7 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   `list_sources_released_by_project_deletion` and release the bindings in its
   `commit_project_deletion` transaction through `released_project_bindings`,
   reading the live bound Sources `FOR UPDATE ... ORDER BY ID`, and return
-  their ids; no schema, `litellm_proxy/` route or configuration change. The V1 link
+  their ids; no schema, model route or configuration change. The V1 link
   opens `/v2/projects/<code>`, where Cloud already serves the V2 bundle.
 - `GET /api/v1/llm-config` reports `writable`, false when
   `MEMFORGE_LLM_CONFIG_WRITABLE` hands LLM settings to the deployment
@@ -1821,12 +1836,10 @@ plugins are versioned `0.2.0-beta.1`, the same version in semver spelling.
   discovery alone proves absence only for an authoritative snapshot or a
   complete discovery of a newly configured scope, and scope transitions are
   unchanged (ADR 0005). Force-full keeps meaning "re-read every Unit". Cloud:
-  arrives with the pin; no HANA schema, protocol, configuration or `litellm_proxy/` route
-  change. The first scheduled run after the pin retires what the dev landscape has
-  accumulated: 183 absent Units (169 renamed or moved files in one GitHub
-  repository, 9 GitHub Pages pages, 5 Confluence pages) and the 844 active
-  Memories whose last Support they hold; 678 unlisted Jira issues and 2
-  Confluence pages still exist and are kept. See ADR 0045.
+  arrives with the pin; no HANA schema, protocol, configuration or model route
+  change. The first scheduled run after the pin retires the absent Units a
+  deployment has accumulated and the Memories whose last Support they hold.
+  See ADR 0045.
 
 - Genes decode stored input by the bytes themselves. A local-agent package is
   recognized by its own `package_kind`, exactly that Gene's kind, never by
