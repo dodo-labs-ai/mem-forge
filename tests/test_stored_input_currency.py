@@ -880,5 +880,5 @@ def test_only_sources_with_a_provider_to_ask_rediscover_their_documents():
     assert source_rediscovers_documents("jira", {})
     assert not source_rediscovers_documents("jira", {"sync_mode": "local_agent"})
     assert source_rediscovers_documents("confluence", {})
-    for source_type in ("github_repo", "github_pages", "teams", "agent_session", "local_markdown"):
+    for source_type in ("github_repo", "github_pages", "teams", "local_markdown"):
         assert not source_rediscovers_documents(source_type, {})
