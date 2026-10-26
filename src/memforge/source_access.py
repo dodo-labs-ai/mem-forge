@@ -42,6 +42,8 @@ def infer_legacy_source_access(
     if not owner:
         raise ValueError(f"cannot migrate Source access without an owner: {source_id}")
     if source_type == "agent_session":
+        # A store from before Source access policies can still hold agent-session
+        # Sources; each belonged to the one user whose sessions it captured.
         return SourceAccessPolicy.PRIVATE, owner
 
     rows = tuple(

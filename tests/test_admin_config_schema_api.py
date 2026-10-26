@@ -7,6 +7,8 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 
+from memforge.source_types import registered_source_types
+
 from tests.test_source_authority_api import _app, _connect_database
 
 
@@ -84,15 +86,16 @@ def test_scope_and_fixed_after_create_come_from_the_descriptor(client):
 
 
 def test_project_field_is_sent(client):
-    assert _schema(client, "agent_session")["project_field"] == "repo"
-    assert _schema(client, "confluence")["project_field"] is None
+    schema = _schema(client, "confluence")
+    assert "project_field" in schema
+    assert schema["project_field"] is None
 
 
-def test_gene_list_marks_managed_types(client):
-    genes = {gene["name"]: gene for gene in client.get("/api/v1/genes").json()}
+def test_gene_list_offers_every_registered_source_type(client):
+    genes = client.get("/api/v1/genes").json()
 
-    assert genes["agent_session"]["managed"] is True
-    assert {name for name, gene in genes.items() if gene["managed"]} == {"agent_session"}
+    assert [gene["name"] for gene in genes] == sorted(d.source_type for d in registered_source_types())
+    assert all("managed" not in gene for gene in genes)
 
 
 def test_the_openapi_document_marks_options_deprecated(client):

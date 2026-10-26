@@ -1,15 +1,12 @@
 import { cn } from "@/lib/cn";
 import { BRAND_MARKS, SOURCE_DOT_FALLBACK, sourceBrandKeysFor } from "./model/sourceBrand";
 
-const AGENT_SESSION_TYPE = "agent_session";
-
 type SourceIconProps = {
-  /** Source type, e.g. "confluence" or "agent_session". */
+  /** Source type, e.g. "confluence" or "user_memory". */
   type: string;
   /**
-   * For client-authored sources such as agent_session or user_memory, the
-   * plugin client identifier ("codex" or "claude-code"). Picks exactly one
-   * producer mark.
+   * For a Memory a coding agent wrote (type user_memory), the plugin client
+   * identifier ("codex" or "claude-code"). Picks exactly one producer mark.
    */
   client?: string | null;
   /** Sizing/positioning classes applied to each mark (e.g. "size-5"). */
@@ -26,16 +23,6 @@ export function SourceIcon({ type, client, className }: SourceIconProps) {
   const keys = sourceBrandKeysFor(type, client);
 
   if (!keys) {
-    if (type === AGENT_SESSION_TYPE) {
-      return (
-        <span
-          role="img"
-          aria-label="Agent session"
-          className={cn("inline-block size-2.5 rounded-full bg-muted-foreground", className)}
-        />
-      );
-    }
-
     return (
       <span
         role="img"

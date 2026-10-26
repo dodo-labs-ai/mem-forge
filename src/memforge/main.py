@@ -2122,18 +2122,11 @@ def sync(ctx, source: str | None):
 
             source_type = src["type"]
             descriptor = source_type_descriptor(source_type)
-            family = descriptor.family if descriptor is not None else None
-            if family is CollectionFamilyKind.CONVERSATION:
+            if descriptor is not None and descriptor.family is CollectionFamilyKind.CONVERSATION:
                 # Its local agent collects each attempt; the server processes what was uploaded.
                 console.print(
                     f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
                     "a conversation Source is collected by its local agent; sync it from the Admin UI."
-                )
-                continue
-            if descriptor is not None and family is None:
-                console.print(
-                    f"\n[yellow]Skipping {src['name']}[/] (type={source_type}): "
-                    "it receives content as it is captured and has no sync run."
                 )
                 continue
 

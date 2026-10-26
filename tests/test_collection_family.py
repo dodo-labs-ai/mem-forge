@@ -10,7 +10,6 @@ from click.testing import CliRunner
 import memforge
 import memforge.main as main
 import memforge.runtime as runtime_module
-from memforge.genes.agent_session_gene import AgentSessionGene
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.teams_gene import TeamsGene
 from memforge.main import cli
@@ -45,11 +44,6 @@ def _family(gene, db, tmp_path):
 async def test_a_run_takes_the_family_of_its_gene(db, tmp_path) -> None:
     assert isinstance(_family(FakeGene(), db, tmp_path), DocumentFamily)
     assert isinstance(_family(TeamsGene(dict(TEAMS_CONFIG), "src-1"), db, tmp_path), ConversationFamily)
-
-
-async def test_a_gene_of_neither_family_has_no_sync_run(db, tmp_path) -> None:
-    with pytest.raises(ValueError, match="no collection family"):
-        _family(AgentSessionGene({}, "src-1"), db, tmp_path)
 
 
 async def test_a_conversation_run_needs_its_collection_attempt(db, tmp_path) -> None:
@@ -112,7 +106,6 @@ def test_only_the_family_module_asks_a_gene_class_for_its_family() -> None:
 
 def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> None:
     sources = [
-        {"id": "src-capture", "name": "Captured", "type": "agent_session", "status": "active"},
         {"id": "src-chat", "name": "Chat", "type": "teams", "status": "active"},
         {"id": "src-wiki", "name": "Wiki", "type": "confluence", "status": "active"},
     ]
@@ -151,7 +144,6 @@ def test_the_cli_syncs_only_sources_with_a_sync_run(monkeypatch, tmp_path) -> No
 
     assert result.exit_code == 0, result.output
     assert synced == ["src-wiki"]
-    assert "Skipping Captured" in result.output
     assert "Skipping Chat" in result.output
 
 

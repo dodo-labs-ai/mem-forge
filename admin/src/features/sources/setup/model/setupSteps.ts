@@ -20,8 +20,8 @@ import {
  * | Basics | Always | `name` |
  * | Each group, by `order` | Always | `config` |
  * | Access | Create only, in a shared workspace | `access_policy` |
- * | Project | Always; the only step of a managed type | `project_binding` |
- * | Schedule | For configurable types | `sync_schedule` |
+ * | Project | Always | `project_binding` |
+ * | Schedule | Always | `sync_schedule` |
  *
  * A group step is keyed by the group's key, so `?step=connection` opens the
  * connection group and `?step=project` the Project step.
@@ -41,19 +41,15 @@ export interface SetupStepOptions {
   mode: "create" | "edit";
   /** The workspace is shared, so a new Source chooses who can see it. */
   sharedWorkspace: boolean;
-  /** The service creates Sources of this type; only their project is set here. */
-  managed?: boolean;
 }
 
 /** The steps of the setup page, in order. */
 export function setupSteps(schema: ConfigSchema, options: SetupStepOptions): SetupStep[] {
-  const project: SetupStep = { key: "project", label: "Project", kind: "project" };
-  if (options.managed) return [project];
   return [
     { key: "basics", label: "Basics", kind: "basics" },
     ...inDeclaredOrder(schema.groups).map((group): SetupStep => ({ key: group.key, label: group.label, kind: "group", group })),
     ...(options.mode === "create" && options.sharedWorkspace ? [{ key: "access", label: "Access", kind: "access" as const }] : []),
-    project,
+    { key: "project", label: "Project", kind: "project" },
     { key: "schedule", label: "Schedule", kind: "schedule" },
   ];
 }

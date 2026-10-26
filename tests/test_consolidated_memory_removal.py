@@ -6,6 +6,7 @@ import pytest
 
 from memforge.models import Memory
 from memforge.storage.database import Database
+from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 
 
 @pytest.mark.asyncio
@@ -51,6 +52,24 @@ async def test_upgrade_purges_old_consolidated_rows_and_drops_curator_schema(tmp
             "UPDATE memories SET memory_level = 'consolidated', curation_cluster_id = 'old-family' "
             "WHERE id = 'mem-old-consolidated'"
         )
+        legacy.executescript(CAPTURE_TABLES_SCHEMA)
+        legacy.execute(
+            """INSERT INTO agent_concepts (
+                id, source_id, owner_user_id, workspace, concept_type, concept_path,
+                title, markdown_body, last_observed_at
+            ) VALUES ('concept-old', 'src-old', 'user-1', 'default', 'decision',
+                      'decisions/old.md', 'Old decision', 'Body', '2026-01-01T00:00:00Z')"""
+        )
+        legacy.execute(
+            """INSERT INTO agent_claims (
+                id, concept_id, display_anchor, claim_text, memory_type, memory_id, last_observed_at
+            ) VALUES ('claim-old', 'concept-old', 'anchor', 'Claim text', 'fact',
+                      'mem-old-consolidated', '2026-01-01T00:00:00Z')"""
+        )
+        legacy.execute(
+            """INSERT INTO agent_claim_citations (claim_id, citation_url, observed_at)
+               VALUES ('claim-old', 'https://example.com/old', '2026-01-01T00:00:00Z')"""
+        )
         legacy.execute("DELETE FROM schema_migrations WHERE version = 53")
 
     upgraded = Database(str(db_path))
@@ -69,4 +88,8 @@ async def test_upgrade_purges_old_consolidated_rows_and_drops_curator_schema(tmp
         tables = {str(row[0]) async for row in cursor}
     assert "memory_derivations" not in tables
     assert "memory_curation_runs" not in tables
+    for table in ("agent_claims", "agent_claim_citations"):
+        async with upgraded.db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None and row[0] == 0
     await upgraded.close()

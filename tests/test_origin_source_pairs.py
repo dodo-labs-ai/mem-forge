@@ -79,7 +79,7 @@ async def test_groups_pairs_oldest_first_and_omits_sourceless(db: Database):
 
     pairs = await db.get_origin_source_pairs(["mem-a", "mem-b", "mem-c"])
 
-    # Each triple is (source_type, support_kind, client). Non-agent-session docs have client=None.
+    # Each triple is (source_type, support_kind, client). A configured Source's docs have client=None.
     assert pairs["mem-a"] == [
         ("jira", "corroborated", None),
         ("confluence", "extracted", None),
@@ -97,14 +97,14 @@ async def test_groups_pairs_oldest_first_and_omits_sourceless(db: Database):
     assert client_b is None
 
 
-async def test_client_is_returned_for_agent_session_documents(db: Database):
-    """Client from documents.client is included in the triple for agent-session docs."""
+async def test_client_is_returned_for_documents_a_client_wrote(db: Database):
+    """Client from documents.client is included in the triple, as for a Memory create_memory wrote."""
     await db.insert_memory(_memory("mem-codex"))
     await _add_source(
         db,
         "mem-codex",
-        "doc-agent-sess",
-        "agent_session",
+        "doc-user-memory",
+        "user_memory",
         "extracted",
         "2026-01-01T00:00:00",
         client="codex",
@@ -112,7 +112,7 @@ async def test_client_is_returned_for_agent_session_documents(db: Database):
 
     pairs = await db.get_origin_source_pairs(["mem-codex"])
 
-    assert pairs["mem-codex"] == [("agent_session", "extracted", "codex")]
+    assert pairs["mem-codex"] == [("user_memory", "extracted", "codex")]
     source_type, client = _pick_origin_source_type(pairs["mem-codex"])
-    assert source_type == "agent_session"
+    assert source_type == "user_memory"
     assert client == "codex"

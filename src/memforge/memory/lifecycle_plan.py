@@ -189,7 +189,6 @@ class IncumbentAuthority(str, Enum):
     """Authority that admits an incumbent to one destructive decision."""
 
     CURRENT_SOURCE_SUPPORT = "current_source_support"
-    EXPLICIT_OWNER_MANAGED_CLAIM = "explicit_owner_managed_claim"
     MAINTENANCE_OPERATOR = "maintenance_operator"
 
 
@@ -222,21 +221,6 @@ DESTRUCTIVE_MUTATIONS = frozenset(
         LifecycleMutationType.RETIRE_MEMORY,
     }
 )
-
-
-def plan_supersedes_memory(plan: "LifecyclePlan", memory_id: str) -> bool:
-    """Return whether this Plan supersedes the Memory.
-
-    A replacement of a Memory another Unit also supports removes only this
-    Unit's Support and adds the replacement beside it, so the old Memory stays
-    Active and is not superseded.
-    """
-
-    return any(
-        mutation.mutation_type is LifecycleMutationType.SUPERSEDE_MEMORY
-        and mutation.memory_id == memory_id
-        for mutation in plan.mutations
-    )
 
 
 def plan_requires_complete_current_support(

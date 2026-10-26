@@ -24,7 +24,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, NoReturn, cast
+from typing import Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -343,8 +343,6 @@ async def _run_source_access_background(
     except Exception:
         logger.exception("Background Source access operation failed: %s", operation_id)
 
-
-SEARCH_CLIENTS = ("claude-code", "codex")
 
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
@@ -1442,7 +1440,6 @@ class SourceFacetFilterRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_ids: list[str] | None = None
-    clients: list[str] | None = None
     repo_identifiers: list[str] | None = None
 
     @field_validator("source_ids")
@@ -1454,21 +1451,9 @@ class SourceFacetFilterRequest(BaseModel):
             raise ValueError("source_ids must be a non-empty list of source IDs")
         return value
 
-    @field_validator("clients")
-    @classmethod
-    def _validate_clients(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return value
-        allowed = set(SEARCH_CLIENTS)
-        invalid = [item for item in value if item not in allowed]
-        if invalid:
-            raise ValueError("clients must exactly match supported clients: " + ", ".join(SEARCH_CLIENTS))
-        return value
-
     def to_source_filter(self) -> MemorySourceFilter:
         return MemorySourceFilter(
             source_ids=tuple(self.source_ids or ()),
-            clients=tuple(self.clients or ()),
             repo_identifiers=tuple(self.repo_identifiers or ()),
         )
 
@@ -1635,7 +1620,6 @@ class MemorySearchRequest(BaseModel):
             raise ValueError("intent requires a ranked query")
         has_source_filter = self.source_filter is not None and bool(
             (self.source_filter.source_ids or [])
-            or (self.source_filter.clients or [])
             or (self.source_filter.repo_identifiers or [])
         )
         has_time_range = self.time_range is not None
@@ -1773,7 +1757,6 @@ class GeneMetadataResponse(BaseModel):
     auth_method: str
     data_shape: str
     execution_kinds: list[SourceExecutionKind]
-    managed: bool = Field(description="Managed capture, created by the service; the type picker leaves it out.")
 
 
 class ConfigConditionResponse(BaseModel):
@@ -2206,9 +2189,6 @@ class SourceResponse(BaseModel):
     )
     scope_transition: SourceScopeTransitionResponse | None = Field(
         description="The scope change the Source is applying; null when none is in progress.",
-    )
-    client: str | None = Field(
-        description="The agent client (for example codex or claude-code) of an agent-session Source; null otherwise.",
     )
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
@@ -3379,42 +3359,6 @@ async def _require_complete_collection(intake: CollectionIntake, source_id: str,
         raise HTTPException(status_code=409, detail="conversation_manifest_required") from exc
     if missing:
         raise HTTPException(status_code=409, detail="conversation_bodies_incomplete")
-
-
-AGENT_SESSION_CAPTURE_REMOVED_CODE = "agent_session_capture_removed"
-AGENT_SESSION_CAPTURE_REMOVED_MESSAGE = (
-    "MemForge no longer captures agent sessions automatically. Update the MemForge memory plugin."
-)
-
-
-class AgentSessionCaptureRemovedDetail(BaseModel):
-    """Why an automatic agent-session upload is refused, and what the user does next."""
-
-    code: Literal["agent_session_capture_removed"]
-    message: str
-
-
-class AgentSessionCaptureRemovedResponse(BaseModel):
-    """The ``410 Gone`` body of the removed agent-session capture routes.
-
-    Example::
-
-        {"detail": {"code": "agent_session_capture_removed",
-                    "message": "MemForge no longer captures agent sessions automatically. "
-                               "Update the MemForge memory plugin."}}
-    """
-
-    detail: AgentSessionCaptureRemovedDetail
-
-
-def _refuse_removed_agent_session_capture() -> NoReturn:
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "code": AGENT_SESSION_CAPTURE_REMOVED_CODE,
-            "message": AGENT_SESSION_CAPTURE_REMOVED_MESSAGE,
-        },
-    )
 
 
 class AgentHookContextRequest(BaseModel):
@@ -5464,7 +5408,6 @@ def create_admin_app(
         tags=["agent-evaluations"],
     )
     source_list_router = APIRouter(prefix="/api/v1/source-list", tags=["sources"])
-    agent_session_router = APIRouter(prefix="/api/v1/agent-sessions", tags=["agent-sessions"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
     recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
     model_settings_router = build_model_settings_router(
@@ -6901,7 +6844,6 @@ def create_admin_app(
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
-                managed=source_type_descriptor(g.name).family is None,
             )
             for g in genes
         ]
@@ -7183,8 +7125,6 @@ def create_admin_app(
         )
 
         # Attach memory_count and sync status to each source
-        from memforge.agent_sessions import AGENT_SESSION_SOURCE_TYPE
-
         jira_auth_service = JiraAuthSessionService(db)
         for s in sources:
             original_config = s.get("config", {})
@@ -7200,12 +7140,6 @@ def create_admin_app(
                 s["config"] = {}
             if s.get("scope_transition") is not None:
                 s["scope_transition"] = _viewed_scope_transition(s, s["scope_transition"])
-            # Surface the originating client for agent-session sources so the UI
-            # can pick a per-client brand mark without decoding opaque source ids.
-            if s["type"] == AGENT_SESSION_SOURCE_TYPE:
-                s["client"] = original_config.get("client")
-            else:
-                s["client"] = None
             if (
                 s["type"] == "jira"
                 and auth_mode == "browser_cookie"
@@ -8483,7 +8417,7 @@ def create_admin_app(
         return {"sort_mode": req.sort_mode}
 
     # ===================================================================
-    # 4c. Recent Changes
+    # 4b. Recent Changes
     # ===================================================================
 
     @recent_change_router.get("")
@@ -9828,40 +9762,6 @@ def create_admin_app(
         }
 
     # ===================================================================
-    # 4b. Removed agent-session capture
-    # ===================================================================
-
-    @agent_session_router.post(
-        "/windows",
-        status_code=410,
-        deprecated=True,
-        responses={410: {"model": AgentSessionCaptureRemovedResponse}},
-    )
-    async def refuse_agent_session_window() -> None:
-        """Refuse an automatic session-window upload from an earlier memory plugin.
-
-        MemForge no longer captures agent sessions. The route reads no body,
-        creates no Source, calls no model and takes no Source activity; it
-        answers ``410`` with ``agent_session_capture_removed`` so the upload
-        stops at the plugin. It is removed in the next release.
-        """
-        _refuse_removed_agent_session_capture()
-
-    @hook_router.post(
-        "/receipts",
-        status_code=410,
-        deprecated=True,
-        responses={410: {"model": AgentSessionCaptureRemovedResponse}},
-    )
-    async def refuse_agent_hook_receipt() -> None:
-        """Refuse a turn-end hook receipt from an earlier memory plugin.
-
-        Same contract as ``POST /api/v1/agent-sessions/windows``: no body is
-        read and nothing is recorded. It is removed in the next release.
-        """
-        _refuse_removed_agent_session_capture()
-
-    # ===================================================================
     # 4c. Agent Hook Context
     # ===================================================================
 
@@ -10890,7 +10790,6 @@ def create_admin_app(
     app.include_router(source_router)
     app.include_router(evaluation_router)
     app.include_router(source_list_router)
-    app.include_router(agent_session_router)
     app.include_router(hook_router)
     app.include_router(recent_change_router)
     app.include_router(model_settings_router)

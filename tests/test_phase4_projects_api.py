@@ -887,8 +887,8 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
     async def _seed():
         await database.upsert_source(
             id="src-doc",
-            type="agent_session",
-            name="codex sessions",
+            type="local_markdown",
+            name="private notes",
             config_json="{}",
             access_policy="private",
             owner_user_id="dev",
@@ -929,7 +929,7 @@ def test_resolved_projects_endpoint_groups_memories_by_resolved_key(tmp_path):
             await database.add_memory_source(
                 memory_id=mid,
                 doc_id=doc,
-                source_type="agent_session",
+                source_type="local_markdown",
                 excerpt=None,
                 source_updated_at=None,
             )

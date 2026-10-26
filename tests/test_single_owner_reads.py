@@ -1,8 +1,8 @@
 """Every OSS read surface returns all of the single owner's Memories.
 
-The OSS edition has one principal, ``LOCAL_DEV_USER_ID``. Agent-session
-Memories, hand-made Memories and Memories from a private configured Source
-are private to that owner; each read surface returns them alongside
+The OSS edition has one principal, ``LOCAL_DEV_USER_ID``. Hand-made
+Memories and Memories from a private configured Source are private to that
+owner; each read surface returns them alongside
 workspace Memories and never returns another user's private Memory.
 
 A new read surface is one more row in ``SURFACES``.
@@ -25,7 +25,6 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from memforge import plugin_mcp_proxy, tool_client
-from tests.agent_session_fixture import seed_agent_session_source
 from memforge.api_target import build_target
 from memforge.config import AppConfig, RetrievalConfig
 from memforge.main import cli
@@ -48,13 +47,12 @@ from tests.embedding_fixture import unconfigured_embedding
 OTHER_USER_ID = "u-other"
 QUERY = "release checklist"
 
-OWNER_AGENT_SESSION = "m-owner-agent-session"
 OWNER_HAND_MADE = "m-owner-hand-made"
 OWNER_PRIVATE_SOURCE = "m-owner-private-source"
 WORKSPACE_VISIBLE = "m-workspace"
 OTHER_USERS_PRIVATE = "m-other-private"
 
-OWNER_READABLE = {OWNER_AGENT_SESSION, OWNER_HAND_MADE, OWNER_PRIVATE_SOURCE, WORKSPACE_VISIBLE}
+OWNER_READABLE = {OWNER_HAND_MADE, OWNER_PRIVATE_SOURCE, WORKSPACE_VISIBLE}
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -254,11 +252,9 @@ async def owner_deployment(tmp_path, monkeypatch):
     await database.connect()
     collection = _VectorCollection()
     try:
-        owner_sessions = await seed_agent_session_source(
-            database, client="claude-code", owner_user_id=LOCAL_DEV_USER_ID
-        )
-        other_sessions = await seed_agent_session_source(
-            database, client="claude-code", owner_user_id=OTHER_USER_ID
+        await database.upsert_source(
+            "src-other-notes", "local_markdown", "Other user's notes", "{}",
+            access_policy="private", owner_user_id=OTHER_USER_ID,
         )
         await database.upsert_source(
             "src-owner-notes", "local_markdown", "Owner notes", "{}",
@@ -271,8 +267,6 @@ async def owner_deployment(tmp_path, monkeypatch):
 
         private, workspace = Visibility.PRIVATE.value, Visibility.WORKSPACE.value
         for memory, source_id, source_type in (
-            (_memory(OWNER_AGENT_SESSION, visibility=private, owner=LOCAL_DEV_USER_ID),
-             owner_sessions["id"], "agent_session"),
             (_memory(OWNER_HAND_MADE, visibility=private, owner=LOCAL_DEV_USER_ID),
              "user_memory", "user_memory"),
             (_memory(OWNER_PRIVATE_SOURCE, visibility=private, owner=LOCAL_DEV_USER_ID),
@@ -280,7 +274,7 @@ async def owner_deployment(tmp_path, monkeypatch):
             (_memory(WORKSPACE_VISIBLE, visibility=workspace, owner=None),
              "src-team-wiki", "local_markdown"),
             (_memory(OTHER_USERS_PRIVATE, visibility=private, owner=OTHER_USER_ID),
-             other_sessions["id"], "agent_session"),
+             "src-other-notes", "local_markdown"),
         ):
             await _seed_memory(database, memory, source_id=source_id, source_type=source_type, collection=collection)
 

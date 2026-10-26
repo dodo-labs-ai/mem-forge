@@ -19,13 +19,10 @@ class MemorySourceFilter:
     """
 
     source_ids: tuple[str, ...] = ()
-    clients: tuple[str, ...] = ()
     repo_identifiers: tuple[str, ...] = ()
 
     def is_empty(self) -> bool:
-        return not (
-            self.source_ids or self.clients or self.repo_identifiers
-        )
+        return not (self.source_ids or self.repo_identifiers)
 
 
 @dataclass(frozen=True)

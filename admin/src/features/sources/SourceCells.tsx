@@ -15,7 +15,7 @@ export function SourceNameCell({ row, typeLabel }: { row: SourceRow; typeLabel: 
   return (
     <div className="flex min-w-0 items-center gap-3">
       <span className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-surface-subtle">
-        <SourceIcon type={source.type} client={source.client} className="size-4" />
+        <SourceIcon type={source.type} className="size-4" />
       </span>
       <div className="min-w-0">
         <div className="flex items-center gap-2">

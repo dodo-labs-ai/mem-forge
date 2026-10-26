@@ -22,24 +22,12 @@ function SetupSkeleton() {
   );
 }
 
-/**
- * The form of a type, once its metadata and form description have loaded.
- * A type the service manages is set up by its plugin, not here.
- */
+/** The form of a type, once its metadata and form description have loaded. */
 function SetupBody({ gene, source, loadingError, onRetry }: { gene: GeneMetadata | undefined; source?: Source; loadingError: unknown; onRetry: () => void }) {
   const api = useApi();
-  const schema = useQuery({ ...configSchemaQuery(api, gene?.name ?? ""), enabled: gene !== undefined && !gene.managed });
+  const schema = useQuery({ ...configSchemaQuery(api, gene?.name ?? ""), enabled: gene !== undefined });
   if (loadingError || schema.isError) {
     return <ErrorNotice title="Could not load the source setup" message={errorMessage(loadingError ?? schema.error)} onRetry={onRetry} />;
-  }
-  if (gene?.managed) {
-    return (
-      <EmptyState
-        title="This source is set up by its plugin"
-        description={`${gene.display_name} sources are created and configured by the MemForge plugin of each coding agent.`}
-        action={<Button nativeButton={false} render={<Link to={SOURCES_PATH} />}>Back to Sources</Button>}
-      />
-    );
   }
   if (!gene || !schema.data) return <SetupSkeleton />;
   return <SourceSetupForm key={source?.id ?? gene.name} gene={gene} schema={schema.data} source={source} />;

@@ -133,9 +133,18 @@ class SourceTypeDescriptor:
         return self.gene if isinstance(self.gene, type) else load_reference(self.gene)
 
     @property
-    def family(self) -> CollectionFamilyKind | None:
-        """The collection family its Gene's base class names; ``None`` for managed capture."""
+    def family(self) -> CollectionFamilyKind:
+        """The collection family its Gene's base class names.
+
+        The source-type contract refuses a Gene of neither family, so every
+        registered type has one; a descriptor whose Gene has none raises
+        ``ValueError``.
+        """
 
         from memforge.genes.family import gene_family
 
-        return gene_family(self.gene_class())
+        gene_cls = self.gene_class()
+        family = gene_family(gene_cls)
+        if family is None:
+            raise ValueError(f"{self.source_type}: {gene_cls.__name__} belongs to no collection family")
+        return family

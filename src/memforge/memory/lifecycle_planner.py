@@ -275,15 +275,11 @@ def build_lifecycle_plan(
             if operation.memory is None:
                 raise ValueError("replacement operation requires a new Memory candidate")
             grant = authority_grants.get(memory_id)
-            explicit_owner_action = (
-                grant is not None
-                and grant.authority is IncumbentAuthority.EXPLICIT_OWNER_MANAGED_CLAIM
-            )
             if grant is not None and grant.authority is IncumbentAuthority.MAINTENANCE_OPERATOR:
                 raise ValueError(
                     f"maintenance operator cannot replace incumbent: {memory_id}"
                 )
-            if not current_source_support and not explicit_owner_action:
+            if not current_source_support:
                 raise ValueError(f"replacement incumbent lacks current-scope support: {memory_id}")
             replacement_id = create_memory(operation.memory)
             if external_support:

@@ -31,7 +31,6 @@ TEXTUAL_BUILTIN_SOURCE_TYPES = (
     "local_markdown",
     "notion",
     "teams",
-    "agent_session",
 )
 
 
@@ -224,20 +223,6 @@ def _projection_inputs(
         content_type = "application/json"
         markdown = "normalized Teams window"
         target_observation_type = "message"
-    elif source_type == "agent_session":
-        item_id = "agent-session-window-1"
-        source_url = "memforge://agent-session/session-1"
-        raw_value = {
-            "doc_id": "agent-session-window-1",
-            "markdown": rule,
-            "receipt": {
-                "client": "codex",
-                "session_id": "session-1",
-                "history_window_kind": "summary",
-            },
-        }
-        content_type = "application/json"
-        target_observation_type = "session_summary"
     elif source_type != "extension_document":
         raise AssertionError(f"unsupported source fixture: {source_type}")
 

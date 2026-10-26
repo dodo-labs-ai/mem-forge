@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import aiosqlite
 import pytest
 
-from memforge.agent_sessions import agent_session_source_id
 from memforge.storage.database import Database, MIGRATIONS, SCHEMA
+from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 
 
 _LEGACY_SOURCES_SCHEMA = """
@@ -30,6 +31,10 @@ CREATE TABLE sources (
 );
 """
 
+def _agent_session_source_id(client: str, owner_user_id: str) -> str:
+    fingerprint = hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:16]
+    return f"src-agent-sessions-{client}-{fingerprint}"
+
 
 def test_migration_versions_are_unique_and_strictly_increasing() -> None:
     versions = [version for version, _description, _statements in MIGRATIONS]
@@ -49,6 +54,7 @@ async def _legacy_database(
     connection = await aiosqlite.connect(path)
     await connection.executescript(_LEGACY_SOURCES_SCHEMA)
     await connection.executescript(SCHEMA)
+    await connection.executescript(CAPTURE_TABLES_SCHEMA)
     for version, description, _ in MIGRATIONS:
         if version >= 42:
             break
@@ -231,7 +237,7 @@ def test_source_access_migration_partitions_ownerless_agent_source_from_receipts
         try:
             assert await database.get_source(legacy_source_id) is None
             for owner in ("alice", "bob"):
-                source_id = agent_session_source_id("claude-code", owner)
+                source_id = _agent_session_source_id("claude-code", owner)
                 source = await database.get_source(source_id)
                 document = await database.get_document(f"doc-{owner}")
                 assert source is not None

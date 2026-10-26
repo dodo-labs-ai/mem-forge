@@ -366,8 +366,6 @@ export interface SourceConnectionStatus {
 export interface Source {
   id: string;
   type: string;
-  /** For agent_session sources, identifies the plugin client: "codex" or "claude-code". */
-  client?: string | null;
   name: string;
   /**
    * Full redacted config. The backend returns `{}` for sources where the

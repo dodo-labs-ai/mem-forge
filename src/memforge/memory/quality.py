@@ -61,10 +61,10 @@ def _normalize(text: str) -> str:
 def _is_self_referential(content: str) -> bool:
     """Drop candidates that narrate the memory system itself or cite internal memory ids.
 
-    These arise when a generated agent-session summary describes its own tooling
-    (context injection, warm-context loading) or embeds internal ``mem-...`` ids.
-    They are never durable team knowledge, and "do not extract" prompt rules do
-    not reliably suppress them, so this is enforced deterministically.
+    Such a candidate describes MemForge's own tooling (context injection,
+    warm-context loading) or embeds internal ``mem-...`` ids. It is never
+    durable team knowledge, and "do not extract" prompt rules do not reliably
+    suppress it, so this is enforced deterministically.
     """
     if re.search(r"\bmem-[0-9a-f]{6,}\b", content):
         return True

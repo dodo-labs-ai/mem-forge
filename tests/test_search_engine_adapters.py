@@ -95,7 +95,6 @@ async def _document(
     doc_id: str,
     source: str,
     *,
-    client: str | None = None,
     title: str = "t",
 ) -> None:
     now = datetime.now(timezone.utc)
@@ -113,7 +112,6 @@ async def _document(
             content_hash=f"h-{doc_id}",
             token_count=1,
             last_synced=now,
-            client=client,
         )
     )
 
@@ -165,7 +163,7 @@ async def db(tmp_path):
         "jira",
         "other",
         "slack",
-        "src-agent-codex",
+        "src-notes",
         "src-jira",
         "src-alpha",
         "src-other",
@@ -787,9 +785,9 @@ async def test_structured_source_filter_accepts_multiple_source_ids(db, monkeypa
 
 @pytest.mark.asyncio
 async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
-    codex = _memory(
-        "m-codex",
-        "Scheduler claim was patched by Codex",
+    notes = _memory(
+        "m-notes",
+        "Scheduler claim was patched in the notes",
         repo_identifier="github.example.com/acme/memforge-cloud",
     )
     jira = _memory("m-jira", "Scheduler issue from Jira")
@@ -798,25 +796,25 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
         "Scheduler claim was patched elsewhere",
         repo_identifier="github.example.com/acme/other",
     )
-    await db.insert_memory(codex)
+    await db.insert_memory(notes)
     await db.insert_memory(jira)
     await db.insert_memory(other_repo)
-    await _document(db, "doc-codex", "src-agent-codex", client="codex")
+    await _document(db, "doc-notes", "src-notes")
     await _document(db, "doc-jira", "src-jira")
-    await _document(db, "doc-other-repo", "src-agent-codex", client="codex")
-    await db.add_memory_source("m-codex", "doc-codex", "agent_session", None, source_updated_at=None)
+    await _document(db, "doc-other-repo", "src-notes")
+    await db.add_memory_source("m-notes", "doc-notes", "local_markdown", None, source_updated_at=None)
     await db.add_memory_source("m-jira", "doc-jira", "jira", None, source_updated_at=None)
     await db.add_memory_source(
         "m-other-repo",
         "doc-other-repo",
-        "agent_session",
+        "local_markdown",
         None,
         source_updated_at=None,
     )
 
     adapters = build_sqlite_adapters(
         db,
-        FakeCollection(["m-codex", "m-jira", "m-other-repo"]),
+        FakeCollection(["m-notes", "m-jira", "m-other-repo"]),
     )
     engine = SearchEngine(
         relational=adapters.relational,
@@ -830,13 +828,12 @@ async def test_structured_source_filter_applies_to_vector_hits(db, monkeypatch):
     result = await engine.search(
         "Scheduler claim",
         source_filter=MemorySourceFilter(
-            clients=("codex",),
             repo_identifiers=("github.example.com/acme/memforge-cloud",),
         ),
         top_k=10,
     )
 
-    assert [r.memory_id for r in result["results"]] == ["m-codex"]
+    assert [r.memory_id for r in result["results"]] == ["m-notes"]
 
 
 @pytest.mark.asyncio

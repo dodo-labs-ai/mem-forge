@@ -508,51 +508,6 @@ async def test_metadata_search_applies_source_time_range_to_matching_support_row
 
 
 @pytest.mark.asyncio
-async def test_metadata_search_applies_client_filter_to_matching_support_row(db):
-    await db.insert_memory(_memory("m-codex", "Agent session summary"))
-    await db.upsert_source(
-        "src-codex", "agent_session", "Codex Sessions", "{}", access_policy="private", owner_user_id="dev"
-    )
-    await _upsert_doc(
-        db,
-        doc_id="codex-session-1",
-        source="src-codex",
-        title="Create Blocker Hint investigation",
-        client="codex",
-    )
-    await db.add_memory_source(
-        "m-codex",
-        "codex-session-1",
-        "agent_session",
-        support_kind="extracted",
-        source_updated_at=datetime.now(timezone.utc),
-    )
-
-    keyword = SqliteKeywordSearch(db)
-
-    hits = await keyword.search_metadata(
-        '"create" "blocker" "hint"',
-        _scope(),
-        None,
-        limit=10,
-        source_filter=MemorySourceFilter(clients=("codex",)),
-    )
-
-    assert [hit.memory_id for hit in hits] == ["m-codex"]
-    assert hits[0].source_refs[0].doc_id == "codex-session-1"
-    assert (
-        await keyword.search_metadata(
-            '"create" "blocker" "hint"',
-            _scope(),
-            None,
-            limit=10,
-            source_filter=MemorySourceFilter(clients=("claude-code",)),
-        )
-        == []
-    )
-
-
-@pytest.mark.asyncio
 async def test_metadata_search_applies_repo_identifier_filter(db):
     await db.insert_memory(
         _memory(
@@ -562,19 +517,18 @@ async def test_metadata_search_applies_repo_identifier_filter(db):
         )
     )
     await db.upsert_source(
-        "src-codex", "agent_session", "Codex Sessions", "{}", access_policy="private", owner_user_id="dev"
+        "src-notes", "local_markdown", "Notes", "{}", access_policy="private", owner_user_id="dev"
     )
     await _upsert_doc(
         db,
-        doc_id="codex-session-1",
-        source="src-codex",
+        doc_id="notes-1",
+        source="src-notes",
         title="Create Blocker Hint investigation",
-        client="codex",
     )
     await db.add_memory_source(
         "m-repo",
-        "codex-session-1",
-        "agent_session",
+        "notes-1",
+        "local_markdown",
         support_kind="extracted",
         source_updated_at=datetime.now(timezone.utc),
     )
@@ -663,7 +617,6 @@ async def _upsert_doc(
     doc_id: str = "PAYR-179397",
     title: str,
     source: str = "src-jira",
-    client: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc)
     await db.upsert_document(
@@ -680,7 +633,6 @@ async def _upsert_doc(
             content_hash=f"hash-{doc_id}-{title}",
             token_count=1,
             last_synced=now,
-            client=client,
         )
     )
 

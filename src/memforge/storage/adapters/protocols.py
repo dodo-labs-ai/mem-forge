@@ -35,7 +35,6 @@ from memforge.memory.evidence import (
     MemoryUnitSupportAssertion,
     RelationOutcomeBundle,
 )
-from memforge.memory.audit import MemoryAuditEvent
 from memforge.memory.memory_relation import MemoryRelationOutcome, CurrentMemoryRelation
 from memforge.memory.lifecycle_plan import (
     LifecyclePlan,
@@ -665,24 +664,6 @@ class RelationalStore(Protocol):
         that open transition, as ``record_source_projection`` does.
         """
         ...
-    async def apply_agent_claim_source_projection_lifecycle(
-        self,
-        projection: SourceProjection,
-        plan: LifecyclePlan,
-        *,
-        memory_id: str,
-        relation_outcome: RelationOutcomeBundle | None,
-        claim_id: str,
-        concept_id: str,
-        display_anchor: str,
-        claim_text: str,
-        memory_type: str,
-        observed_at: datetime,
-        citations: list[str] | None = None,
-        concept_projection: Mapping[str, object] | None = None,
-        concept_markdown_body: str | None = None,
-        maintenance_receipt: MemoryAuditEvent | None = None,
-    ) -> None: ...
     async def apply_lifecycle_plan(self, plan: LifecyclePlan) -> None: ...
     async def get_lifecycle_plan_payload(
         self,

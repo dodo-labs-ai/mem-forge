@@ -71,7 +71,6 @@ BODY_SOURCES = [
     ("github_repo", "file_content", {"relative_path": "docs/a.md", "repo_owner": "org", "repo_name": "repo"}),
     ("github_pages", "page_content", {"canonical_url": "https://org.github.io/docs/a"}),
     ("local_markdown", "file_content", {"relative_path": "notes/a.md"}),
-    ("agent_session", "session_summary", {}),
     ("extension_docs", "document_content", {}),
 ]
 

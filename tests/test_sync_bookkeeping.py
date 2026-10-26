@@ -2570,8 +2570,8 @@ class IncrementalNewDocumentGene(FakeGene):
     @classmethod
     def metadata(cls):
         return GeneMetadata(
-            name="agent_session",
-            display_name="Agent Session",
+            name="notes_digest",
+            display_name="Notes Digest",
             description="",
             default_sync_interval_minutes=0,
             auth_method="local_file",
@@ -2585,11 +2585,11 @@ class IncrementalNewDocumentGene(FakeGene):
         self.seen_since = since
         yield ContentItem(
             item_id="doc-new",
-            title="New Session",
-            source_url="agent-session://new",
+            title="New Digest",
+            source_url="notes-digest://new",
             last_modified=datetime.now(timezone.utc),
             content_type="application/json",
-            space_or_project="sessions",
+            space_or_project="digests",
             version="new-version",
         )
 
@@ -2597,7 +2597,7 @@ class IncrementalNewDocumentGene(FakeGene):
         return RawContent(item=item, body=b'{"summary":"new"}', content_type="application/json")
 
     async def normalize(self, raw):
-        return NormalizedContent(item=raw.item, markdown_body="# New Session\n\nSummary")
+        return NormalizedContent(item=raw.item, markdown_body="# New Digest\n\nSummary")
 
 
 class FailingAuthGene(FakeGene):
@@ -4525,8 +4525,8 @@ async def _insert_held_source_and_doc(db: Database, source_id: str) -> None:
 async def _insert_source_with_docs(db: Database, source_id: str, doc_ids: list[str]) -> None:
     await db.upsert_source(
         id=source_id,
-        type="agent_session",
-        name="Agent Session Summaries",
+        type="notes_digest",
+        name="Notes Digest",
         config_json="{}",
         access_policy="private",
         owner_user_id="dev",
@@ -4537,18 +4537,18 @@ async def _insert_source_with_docs(db: Database, source_id: str, doc_ids: list[s
             """INSERT INTO documents
                (doc_id, source, source_url, title, space_or_project, last_modified, version, content_hash, last_synced)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (doc_id, source_id, f"agent-session://{doc_id}", doc_id, "sessions", now, "1", f"hash-{doc_id}", now),
+            (doc_id, source_id, f"notes-digest://{doc_id}", doc_id, "digests", now, "1", f"hash-{doc_id}", now),
         )
         await _hold_document(
             db,
             source_id=source_id,
-            source_type="agent_session",
+            source_type="notes_digest",
             doc_id=doc_id,
             title=doc_id,
             markdown=f"# {doc_id}",
             version="1",
-            source_url=f"agent-session://{doc_id}",
-            space_or_project="sessions",
+            source_url=f"notes-digest://{doc_id}",
+            space_or_project="digests",
         )
     await db.update_source_doc_count(source_id, len(doc_ids))
 
@@ -5809,7 +5809,7 @@ async def test_incremental_sync_uses_overlap_window_for_discovery(db: Database):
 
 @pytest.mark.asyncio
 async def test_incremental_sync_does_not_delete_unchanged_documents_from_small_source(db: Database):
-    source_id = "src-agent-sessions-incremental"
+    source_id = "src-notes-digest-incremental"
     await _insert_source_with_docs(db, source_id, ["doc-old-a", "doc-old-b"])
     previous_sync = datetime.now(timezone.utc) - timedelta(hours=1)
     await db.upsert_sync_state(
@@ -5833,7 +5833,7 @@ async def test_incremental_sync_does_not_delete_unchanged_documents_from_small_s
 
     state = await orchestrator.sync_gene(
         gene=gene,
-        source_name="Agent Session Summaries",
+        source_name="Notes Digest",
         source_id=source_id,
     )
 
@@ -6998,9 +6998,9 @@ async def test_scheduler_excludes_sources_without_sync_execution(
     monkeypatch,
 ):
     await db.upsert_source(
-        id="src-agent-session-schedule-policy",
-        type="agent_session",
-        name="Codex Session",
+        id="src-retired-type-schedule-policy",
+        type="retired_type",
+        name="Retired Type",
         config_json="{}",
         access_policy="private",
         owner_user_id="dev",
@@ -7016,7 +7016,7 @@ async def test_scheduler_excludes_sources_without_sync_execution(
 
     await SyncScheduler(db, SyncService(db, AppConfig()))._sync_due_sources()
 
-    assert server_scan_calls == [("default", {"src-agent-session-schedule-policy"})]
+    assert server_scan_calls == [("default", {"src-retired-type-schedule-policy"})]
 
 
 @pytest.mark.asyncio
@@ -7137,11 +7137,11 @@ async def test_sync_service_attributes_durable_run_to_its_workspace(db: Database
 
 @pytest.mark.asyncio
 async def test_sync_service_rejects_source_without_sync_execution(db: Database):
-    source_id = "src-agent-session-service-policy"
+    source_id = "src-retired-type-service-policy"
     await db.upsert_source(
         id=source_id,
-        type="agent_session",
-        name="Codex Session",
+        type="retired_type",
+        name="Retired Type",
         config_json="{}",
         access_policy="private",
         owner_user_id="dev",
@@ -7433,11 +7433,11 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
 async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime(db: Database):
     import memforge.runtime as runtime
 
-    source_id = "src-agent-session-worker-policy"
+    source_id = "src-retired-type-worker-policy"
     await db.upsert_source(
         id=source_id,
-        type="agent_session",
-        name="Codex Session",
+        type="retired_type",
+        name="Retired Type",
         config_json='{"documents_dir":"/missing/local-only-path"}',
         access_policy="private",
         owner_user_id="dev",
@@ -7455,7 +7455,7 @@ async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime
         db,
         AppConfig(sync=SyncConfig(worker_max_attempts=1)),
         runtime_provider=RejectRuntimeProvider(),
-        worker_id="worker-agent-session-policy",
+        worker_id="worker-retired-type-policy",
     )
 
     await worker.run_once()

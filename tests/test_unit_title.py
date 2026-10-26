@@ -127,26 +127,6 @@ def teams(messages, *, conversation_name="Payroll Dev", prior=None, run_id="run-
     )
 
 
-def agent_session(markdown, *, prior=None, run_id="run-1"):
-    item = ContentItem(
-        item_id="concept-payroll", title="Payroll retention", source_url="memforge://agent/concept-payroll",
-        last_modified=NOW, version=run_id,
-    )
-    native = {
-        "item_id": item.item_id, "doc_id": "concept-payroll", "markdown": markdown,
-        "receipt": {"client": "codex", "session_id": "session-1", "history_window_kind": "agent_knowledge_patch"},
-    }
-    return project_source_item(
-        source_id="src-agent", source_type="agent_session", run_id=run_id, item=item,
-        raw=RawContent(item=item, body=json.dumps(native).encode(), content_type="application/json"),
-        normalized=NormalizedContent(item=item, markdown_body=markdown),
-        prior_unit_revision=prior.source_unit_revisions[0] if prior else None,
-        prior_observation_revisions=(
-            {revision.observation_id: revision for revision in prior.observation_revisions} if prior else None
-        ),
-    )
-
-
 FIRST_MESSAGE = {"id": "msg-1", "content": COMMENT, "time": "2026-09-29T02:39:00+00:00"}
 LATER_MESSAGE = {"id": "msg-2", "content": "Agreed.", "time": "2026-09-29T03:10:00+00:00"}
 
@@ -372,22 +352,9 @@ def test_a_unit_whose_prior_revision_held_only_its_title_is_compared_with_that_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stored_projection", "reproject"),
-    [
-        pytest.param(lambda: jira(), lambda prior: jira(comments_truncated=True, prior=prior, run_id="run-2"), id="jira"),
-        pytest.param(
-            lambda: agent_session(COMMENT),
-            lambda prior: agent_session(f"{COMMENT}\n\nAgreed.", prior=prior, run_id="run-2"),
-            id="agent_session",
-        ),
-    ],
-)
-async def test_a_partial_unit_that_stored_its_title_is_recorded_and_read_without_it(
-    tmp_path, monkeypatch, stored_projection, reproject,
-):
-    stored = with_stored_title(stored_projection())
-    partial = reproject(stored)
+async def test_a_partial_unit_that_stored_its_title_is_recorded_and_read_without_it(tmp_path, monkeypatch):
+    stored = with_stored_title(jira())
+    partial = jira(comments_truncated=True, prior=stored, run_id="run-2")
 
     assert partial.coverage is ProjectionCoverage.PARTIAL_PROJECTION
     assert "obsrev-stored-title" not in {revision.id for revision in partial.observation_revisions}

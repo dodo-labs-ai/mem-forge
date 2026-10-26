@@ -32,7 +32,6 @@ MEMBER_ROLE = "member"
 VIEWER_ROLE = "viewer"
 SELF_HOSTED_OWNER_ROLE = "owner"
 LOCAL_WORKSPACE_ROLE = SELF_HOSTED_OWNER_ROLE
-MANAGED_SOURCE_TYPES = frozenset({"agent_session"})
 # The failed Documents a Source row lists; its count covers every one.
 MAX_LISTED_FAILED_ITEMS = 100
 
@@ -78,10 +77,6 @@ def can_manage_workspace(viewer_role: str) -> bool:
     return viewer_role in {SELF_HOSTED_OWNER_ROLE, WORKSPACE_ADMIN_ROLE}
 
 
-def _is_managed_source_type(source_type: str) -> bool:
-    return source_type in MANAGED_SOURCE_TYPES
-
-
 def source_viewer_relationship(
     source: dict[str, Any], *, viewer_id: str, viewer_role: str
 ) -> str:
@@ -116,7 +111,6 @@ def source_ownership_and_capabilities(
         source, viewer_id=viewer_id, viewer_role=viewer_role
     )
     can_manage = can_manage_source(source, viewer_id=viewer_id, viewer_role=viewer_role)
-    managed_source = _is_managed_source_type(str(source.get("type") or ""))
     sync_supported = source_type_supports_sync(str(source.get("type") or ""))
     local_agent_backed = is_local_agent_backed_source(source)
     execution_owner = execution_owner_user_id(source)
@@ -130,26 +124,10 @@ def source_ownership_and_capabilities(
     }
     capabilities = {
         "can_subscribe": True,
-        "can_configure": can_manage and not managed_source,
-        "can_configure_connection": (
-            can_execute_locally if local_agent_backed else can_manage and not managed_source
-        ),
-        "can_sync": (
-            sync_supported
-            and (
-                can_execute_locally
-                if local_agent_backed
-                else can_manage and not managed_source
-            )
-        ),
-        "can_force_resync": (
-            sync_supported
-            and (
-                can_execute_locally
-                if local_agent_backed
-                else can_manage and not managed_source
-            )
-        ),
+        "can_configure": can_manage,
+        "can_configure_connection": can_execute_locally if local_agent_backed else can_manage,
+        "can_sync": sync_supported and (can_execute_locally if local_agent_backed else can_manage),
+        "can_force_resync": sync_supported and (can_execute_locally if local_agent_backed else can_manage),
         "can_delete": can_manage,
         "can_change_access": can_manage,
     }
@@ -230,7 +208,6 @@ async def list_source_admin_rows(
         row["access_transition"] = await reader.get_active_source_access_transition(
             source_id
         )
-        row.setdefault("client", None)
         if not source_type_supports_sync(str(row.get("type") or "")):
             row["sync"] = None
             row["failed_items"] = None

@@ -42,7 +42,6 @@ def test_memory_engine_lifecycle_writes_include_relation_outcome() -> None:
         "insert_memory_with_source_and_relation",
         "mark_pending_review",
         "supersede_memory",
-        "supersede_memory_and_upsert_agent_claim",
         "update_memory_status_with_relation_outcome",
     }
     forbidden_methods = {"update_memory_status"}

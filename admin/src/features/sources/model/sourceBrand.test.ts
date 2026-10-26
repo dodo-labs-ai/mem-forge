@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import {
-  AGENT_SESSION_CLIENT_MARK,
   BRAND_MARKS,
+  CLIENT_MARK,
   SOURCE_TYPE_MARKS,
   sourceBrandKeysFor,
 } from "./sourceBrand";
@@ -15,7 +15,7 @@ test("maps source types and clients to brand marks", () => {
     assert.match(mark.markup, /<path\b[^>]*\bd="[^"]+"\s*\/>/, `${key} mark should embed a complete SVG path`);
   }
 
-  // Source-type-keyed marks. agent_session resolves per-client; see below.
+  // Source-type-keyed marks. user_memory resolves per-client; see below.
   const SOURCE_TYPES = ["confluence", "jira", "github_pages", "github_repo", "teams", "local_markdown", "notion"];
   for (const type of SOURCE_TYPES) {
     const keys = SOURCE_TYPE_MARKS[type];
@@ -27,14 +27,13 @@ test("maps source types and clients to brand marks", () => {
 
   // Source-specific routing the UI depends on.
   assert.equal(
-    SOURCE_TYPE_MARKS.agent_session,
+    SOURCE_TYPE_MARKS.user_memory,
     undefined,
-    "agent_session brand is resolved via AGENT_SESSION_CLIENT_MARK, not SOURCE_TYPE_MARKS",
+    "user_memory brand is resolved via CLIENT_MARK, not SOURCE_TYPE_MARKS",
   );
-  assert.equal(AGENT_SESSION_CLIENT_MARK.codex, "codex");
-  assert.equal(AGENT_SESSION_CLIENT_MARK["claude-code"], "claude");
-  assert.deepEqual(sourceBrandKeysFor("agent_session", "codex"), ["codex"]);
-  assert.deepEqual(sourceBrandKeysFor("agent_session", "claude-code"), ["claude"]);
+  assert.equal(CLIENT_MARK.codex, "codex");
+  assert.equal(CLIENT_MARK["claude-code"], "claude");
+  assert.deepEqual(sourceBrandKeysFor("jira", "codex"), ["jira"], "a client brands only a user_memory Source");
   assert.deepEqual(sourceBrandKeysFor("user_memory", "codex"), ["codex"]);
   assert.deepEqual(sourceBrandKeysFor("user_memory", "claude-code"), ["claude"]);
   assert.equal(sourceBrandKeysFor("user_memory", null), undefined);

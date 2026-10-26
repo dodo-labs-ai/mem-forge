@@ -122,9 +122,6 @@ class AdapterOnlyEntityDb:
     async def get_memory_source_refs_many(self, memory_ids, scope):
         return {memory_id: () for memory_id in memory_ids}
 
-    async def get_agent_claim_by_memory_id(self, memory_id: str) -> None:
-        return None
-
     async def get_active_memory_support_states(self, memory_ids):
         return {
             memory_id: ActiveMemorySupportState(

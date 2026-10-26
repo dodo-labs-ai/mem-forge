@@ -157,7 +157,7 @@ export function SourceRow({
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex min-w-0 items-start gap-3">
-          <SourceIcon type={source.type} client={source.client} className="mt-0.5 size-5" />
+          <SourceIcon type={source.type} className="mt-0.5 size-5" />
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="max-w-full break-words text-sm font-medium">{source.name}</h3>

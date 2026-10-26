@@ -400,6 +400,8 @@ def test_plugin_readmes_key_the_upgrade_note_on_the_earlier_plugin_message():
     for client in ("codex", "claude-code"):
         readme = (root / "integrations" / client / "memforge-memory" / "README.md").read_text()
         assert "`MemForge hook skipped: /hooks/receipts returned HTTP 410`" in readme
+        assert "`MemForge hook skipped: /hooks/receipts returned HTTP 404`" in readme
+        assert "retires that Source" in readme
         assert "create_memory" in readme
         assert "agent-sessions/windows" not in readme
         assert "queue.sqlite" in readme

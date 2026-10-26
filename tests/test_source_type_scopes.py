@@ -104,11 +104,9 @@ _CONFIGS = {
         {"token": "other", "root_pages": ["1f3c2a4b5d6e4f708a9b0c1d2e3f4a5b"], "databases": []},
     ],
     "teams": [{"conversation_ids": ["b", "a"], "rolling_retention_days": 365, "channels": "c1"}],
-    "agent_session": [{"client": "codex"}],
 }
 
 _EXPECTED = {
-    "agent_session": [[{"client": "codex"}, {}, "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"]],
     "confluence": [
         [
             {"base_url": "https://wiki.example"},
@@ -220,7 +218,6 @@ def test_canonical_scope_and_namespace_are_fixed(source_type: str) -> None:
 
 def test_progress_nouns_and_available_genes() -> None:
     assert {name: source_progress_unit(name) for name in GENE_REGISTRY} == {
-        "agent_session": "item",
         "confluence": "page",
         "github_pages": "page",
         "github_repo": "file",

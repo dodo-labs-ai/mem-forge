@@ -30,7 +30,7 @@ function SourceRowLink({ row, typeLabel }: { row: ProjectSourceRow; typeLabel: s
     <li>
       <Link to={SOURCES_PATH} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/50">
         <span className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-surface-subtle">
-          <SourceIcon type={row.source.type} client={row.source.client} className="size-4" />
+          <SourceIcon type={row.source.type} className="size-4" />
         </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           <span className="flex items-center gap-2">

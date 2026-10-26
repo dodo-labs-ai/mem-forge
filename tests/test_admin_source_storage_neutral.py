@@ -165,7 +165,6 @@ def test_source_list_route_uses_storage_neutral_admin_reader(tmp_path):
     assert source["doc_count"] == 3
     assert source["memory_count"] == 7
     assert source["pinned_for_me"] is False
-    assert source["client"] is None
     assert source["access_policy"] == "private"
     assert source["owner_user_id"] == "dev"
     assert source["sync"] == {

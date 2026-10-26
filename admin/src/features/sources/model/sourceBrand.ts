@@ -94,16 +94,16 @@ export const SOURCE_TYPE_MARKS: Record<string, BrandKey[]> = {
  * Maps the producer `client` value to a single brand key. "codex" maps to the
  * OpenAI/Codex mark; "claude-code" maps to the Claude Code mark.
  */
-export const AGENT_SESSION_CLIENT_MARK: Record<string, BrandKey> = {
+export const CLIENT_MARK: Record<string, BrandKey> = {
   codex: "codex",
   "claude-code": "claude",
 };
 
-const CLIENT_BRANDED_SOURCE_TYPES = new Set(["agent_session", "user_memory"]);
+const CLIENT_BRANDED_SOURCE_TYPES = new Set(["user_memory"]);
 
 export function sourceBrandKeysFor(type: string, client?: string | null): BrandKey[] | undefined {
   if (CLIENT_BRANDED_SOURCE_TYPES.has(type) && client) {
-    const brandKey = AGENT_SESSION_CLIENT_MARK[client];
+    const brandKey = CLIENT_MARK[client];
     return brandKey ? [brandKey] : undefined;
   }
   return SOURCE_TYPE_MARKS[type];

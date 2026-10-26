@@ -256,7 +256,6 @@ def _source_filter_from_case(case: RetrievalCase) -> MemorySourceFilter | None:
         return None
     return MemorySourceFilter(
         source_ids=tuple(case.source_filter.get("source_ids") or ()),
-        clients=tuple(case.source_filter.get("clients") or ()),
         repo_identifiers=tuple(case.source_filter.get("repo_identifiers") or ()),
     )
 

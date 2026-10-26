@@ -3303,7 +3303,7 @@ async def test_skipped_extraction_group_reuses_work_and_commits_independent_memo
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "source_type",
-    ("confluence", "jira", "github", "local_markdown", "teams", "agent_session", "extension"),
+    ("confluence", "jira", "github", "local_markdown", "teams", "extension"),
 )
 async def test_source_deriver_binds_provider_neutral_quality_events_to_current_lineage(
     db: Database,
@@ -8682,8 +8682,7 @@ async def test_private_relation_completion_rechecks_access_as_current_owner(
 
 @pytest.mark.parametrize(
     ("candidate_source_id", "candidate_source_type"),
-    [("src-other", "confluence"), ("src-managed-capture", "agent_session"),
-     ("user_memory", "user_memory"), ("user_correction", "user_correction")],
+    [("src-other", "confluence"), ("user_memory", "user_memory"), ("user_correction", "user_correction")],
 )
 @pytest.mark.asyncio
 async def test_relation_discovery_records_relation_after_lifecycle_commit(

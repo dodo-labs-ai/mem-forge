@@ -490,7 +490,7 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     assert genes["github_repo"]["execution_kinds"] == ["server", "local_agent"]
     assert genes["teams"]["execution_kinds"] == ["local_agent"]
     assert genes["local_markdown"]["execution_kinds"] == ["local_agent"]
-    assert genes["agent_session"]["execution_kinds"] == []
+    assert "agent_session" not in genes
 
 
 def test_gene_execution_kinds_define_ordinary_sync_capability():
@@ -498,7 +498,6 @@ def test_gene_execution_kinds_define_ordinary_sync_capability():
 
     assert source_type_supports_sync("confluence") is True
     assert source_type_supports_sync("teams") is True
-    assert source_type_supports_sync("agent_session") is False
     assert source_type_supports_sync("unknown") is False
 
 
@@ -1349,12 +1348,12 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
 
     from memforge.server.admin_api import create_admin_app
 
-    source_id = "src-private-sessions"
+    source_id = "src-private-notes"
     now = "2026-06-20T10:00:00+00:00"
     await db.upsert_source(
         id=source_id,
-        type="agent_session",
-        name="Codex Session",
+        type="local_markdown",
+        name="Private notes",
         config_json=json.dumps({}),
         access_policy="private",
         owner_user_id="viewer-a",
@@ -1365,19 +1364,18 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
         await db.db.execute(
             """INSERT INTO documents
                (doc_id, source, source_url, title, space_or_project,
-                last_modified, version, content_hash, last_synced, client)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                last_modified, version, content_hash, last_synced)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 doc_id,
                 source_id,
-                f"agent-session://codex/session-{index}",
-                f"Session {index}",
+                f"file:///notes/note-{index}.md",
+                f"Note {index}",
                 "github.com/example/repo",
                 now,
                 "1",
                 f"doc-hash-{index}",
                 now,
-                "codex",
             ),
         )
         await db.insert_memory(
@@ -1394,7 +1392,7 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
         await db.add_memory_source(
             memory_id,
             doc_id,
-            "agent_session",
+            "local_markdown",
             f"Excerpt {index}",
             source_updated_at=None,
         )
@@ -1433,7 +1431,6 @@ async def test_admin_source_memory_count_matches_viewer_scoped_memory_list(db, t
     assert memories_response.status_code == 200
     source = next(item for item in sources_response.json()["data"] if item["id"] == source_id)
     memories = memories_response.json()
-    assert source["sync"] is None
     assert memories["total"] == 3
     assert source["memory_count"] == 3
     assert {item["id"] for item in memories["data"]} == {
@@ -1973,9 +1970,9 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
     monkeypatch.setattr(runtime, "create_gene", lambda **_kwargs: gene)
 
     await db.upsert_source(
-        id="src-agent-sessions",
-        type="agent_session",
-        name="Agent Sessions",
+        id="src-wiki",
+        type="confluence",
+        name="Wiki",
         config_json="{}",
         access_policy="workspace",
         owner_user_id="dev",
@@ -1984,7 +1981,7 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
     await runtime.run_source_sync(
         db=db,
         config=_config(tmp_path),
-        source={"id": "src-agent-sessions", "type": "agent_session", "name": "Agent Sessions", "config": {}},
+        source={"id": "src-wiki", "type": "confluence", "name": "Wiki", "config": {}},
         runtime=fake_runtime,
         lifecycle_cycle_id="source-sync-run-1",
     )

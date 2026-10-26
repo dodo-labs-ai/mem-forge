@@ -9,7 +9,7 @@ import { Skeleton } from "@/ui/skeleton";
 import { useSourceTypes } from "../api";
 import { SourceIcon } from "../SourceIcon";
 import { AgentPluginSetupSection } from "./AgentPluginSetup";
-import { addableSourceTypes, canRunOnLocalSync, runBadge } from "./model/sourceTypePicker";
+import { canRunOnLocalSync, runBadge } from "./model/sourceTypePicker";
 
 const LOCAL_SYNC_LABELS: Record<LocalSyncState, string> = {
   checking: "Checking local sync",
@@ -24,7 +24,6 @@ const LOCAL_SYNC_LABELS: Record<LocalSyncState, string> = {
 export function AddSourcePage() {
   const types = useSourceTypes();
   const localSync = localSyncState(useLocalSyncStatus());
-  const addable = addableSourceTypes(types.data ?? []);
 
   return (
     <div className="space-y-6">
@@ -41,7 +40,7 @@ export function AddSourcePage() {
         </div>
       ) : (
         <ul aria-label="Source types" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {addable.map((type) => (
+          {(types.data ?? []).map((type) => (
             <li key={type.name}>
               <Link
                 to={newSourcePath(type.name)}

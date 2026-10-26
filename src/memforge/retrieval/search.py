@@ -1356,7 +1356,6 @@ def _recent_listing_fingerprint(
 ) -> str:
     payload = {
         "source_ids": sorted(source_filter.source_ids),
-        "clients": sorted(source_filter.clients),
         "repo_identifiers": sorted(source_filter.repo_identifiers),
         "start_at": time_range.after.astimezone(timezone.utc).isoformat() if time_range.after else None,
         "end_at": time_range.before.astimezone(timezone.utc).isoformat() if time_range.before else None,

@@ -19,7 +19,6 @@ from memforge.llm.structured import (
     ProjectionFragmentMemoryExtractionResponse,
     StructuredLlmImage,
 )
-from memforge.agent_knowledge import AgentKnowledgePatchProposal
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceRole,
@@ -36,7 +35,6 @@ from memforge.pipeline.projection_fragments import (
     FragmentSelectionError,
     FragmentSelectionErrorCode,
     compile_projection_fragment_catalog,
-    resolve_projected_agent_claim_fragment,
 )
 from memforge.source_derivation import (
     SourceUnitDerivationContext,
@@ -270,37 +268,6 @@ def test_v9_candidate_rejects_legacy_authority() -> None:
                 "evidence_quote": "Approval is required.",
              "evidence_displays": evidence_displays("f000001", [])}
         )
-
-
-def test_agent_patch_proposal_reads_one_legacy_primary_event() -> None:
-    legacy = AgentKnowledgePatchProposal.model_validate(
-        {
-            "action": "create_new_concept",
-            "primary_evidence_ids": ["E1"],
-        }
-    )
-    assert legacy.primary_event_id == "E1"
-    with pytest.raises(ValidationError):
-        AgentKnowledgePatchProposal.model_validate(
-            {
-                "action": "create_new_concept",
-                "primary_evidence_ids": ["E1", "E2"],
-            }
-        )
-
-
-def test_agent_patch_proposal_refuses_primary_repeated_as_required() -> None:
-    with pytest.raises(ValidationError, match="primary_event_id cannot also be Required"):
-        AgentKnowledgePatchProposal(
-            action="create_new_concept",
-            primary_event_id="E1",
-            required_event_ids=["E1"],
-        )
-
-
-def test_agent_patch_proposal_no_output_with_events_fails() -> None:
-    with pytest.raises(ValidationError, match="no_output cannot select Evidence events"):
-        AgentKnowledgePatchProposal.model_validate({"action": "no_output", "required_event_ids": ["E2"]})
 
 
 def test_v9_response_accepts_redundant_selectors_for_admission_normalization() -> None:
@@ -946,69 +913,6 @@ def test_v9_derivation_identity_includes_model_presentation_policy(
     assert current.batches[0].input_payload_hash != (
         old.batches[0].input_payload_hash
     )
-
-
-def test_agent_event_receipt_maps_authority_to_one_projected_markdown_fragment() -> None:
-    projection = _projection()
-    selection, receipt = resolve_projected_agent_claim_fragment(
-        projection,
-        claim_text="Use approval before release.",
-        access_context_hash="access-1",
-        primary_event_id="E1",
-        required_event_ids=("E2",),
-    )
-    assert len(selection.parts) == 1
-    assert selection.parts[0].role is EvidenceRole.PRIMARY
-    assert receipt.claim_anchor == selection.parts[0].anchor
-    assert [(item.event_id, item.role) for item in receipt.event_ranges] == [
-        ("E1", EvidenceRole.PRIMARY),
-        ("E2", EvidenceRole.REQUIRED),
-    ]
-    assert receipt.to_payload()["catalog_digest"] == selection.catalog_digest
-
-
-def test_agent_claim_spanning_structural_blocks_uses_one_primary_required_unit() -> None:
-    claim = (
-        "MemForge Cloud uses two database tiers.\n\n"
-        "**Control plane**\n\n"
-        "- Uses native runtime DDL.\n"
-        "- Does not use the retired HDI deployer.\n\n"
-        "**Workspace plane**\n\n"
-        "Uses app-managed runtime migrations."
-    )
-    projection = _projection(primary_content=f"# Database architecture\n\n{claim}\n")
-
-    selection, receipt = resolve_projected_agent_claim_fragment(
-        projection,
-        claim_text=claim,
-        access_context_hash="access-1",
-        primary_event_id="E1",
-    )
-
-    assert len(selection.parts) > 1
-    assert selection.parts[0].role is EvidenceRole.PRIMARY
-    assert all(part.role is EvidenceRole.REQUIRED for part in selection.parts[1:])
-    assert {part.anchor.observation_revision_id for part in selection.parts} == {
-        "rev-primary"
-    }
-    assert receipt.claim_anchor.range_start == projection.observation_revisions[
-        0
-    ].content.index(claim)
-    assert receipt.claim_anchor.range_end == receipt.claim_anchor.range_start + len(
-        claim
-    )
-
-
-def test_agent_claim_fragment_set_rejects_uncovered_markdown_content() -> None:
-    claim = "First paragraph.\n\n---\n\nSecond paragraph."
-    projection = _projection(primary_content=f"# Rule\n\n{claim}\n")
-
-    with pytest.raises(ValueError, match="content gap"):
-        resolve_projected_agent_claim_fragment(
-            projection,
-            claim_text=claim,
-            access_context_hash="access-1",
-        )
 
 
 def test_missing_profile_makes_complete_catalog_unusable_without_widening() -> None:

@@ -122,11 +122,15 @@ After the update:
 - A `hook_workspace_id` entry in `~/.memforge/workspace-bindings.json` is
   ignored. The `memforge-setup` skill reports it and can remove it.
 - Memories captured from earlier sessions belong to the Claude Code Session
-  Source. Delete that Source in the admin UI to retire them.
+  Source. A MemForge server on a release after 0.2.0b2 retires that Source
+  when it upgrades, with the Memories no other Source supports. On a server
+  still on 0.2.0b2, delete the Source in the admin UI to retire it the same way.
 
 ## Troubleshooting
 
-**Claude Code shows `MemForge hook skipped: /hooks/receipts returned HTTP 410` at
-the end of a turn or at compaction.** An earlier plugin release is still
-installed, and MemForge no longer accepts its session uploads. Update the
+**Claude Code shows `MemForge hook skipped: /hooks/receipts returned HTTP 410` or
+`MemForge hook skipped: /hooks/receipts returned HTTP 404` at the end of a turn
+or at compaction.** An earlier plugin release is still installed, and MemForge
+no longer accepts its session uploads: a 0.2.0b2 server answers `410`, and a
+later server, which no longer has the upload routes, answers `404`. Update the
 plugin with the commands above and restart Claude Code.

@@ -87,60 +87,6 @@ test("a shared workspace shows who can use each source", async () => {
   expect(within(drawer).getByText("Only me")).toBeInTheDocument();
 });
 
-function agentSessionSource(canDelete: boolean) {
-  const base = makeSource();
-  return makeSource({
-    id: "src-claude",
-    type: "agent_session",
-    client: "claude-code",
-    name: "Claude Code Session",
-    access_policy: "private",
-    sync: null,
-    sync_schedule: null,
-    last_sync: "2026-10-24T05:00:00Z",
-    capabilities: {
-      ...base.capabilities!,
-      can_configure: false,
-      can_configure_connection: false,
-      can_sync: false,
-      can_force_resync: false,
-      can_delete: canDelete,
-    },
-  });
-}
-
-test("an agent-session source's drawer shows its content without coverage or a sync status it cannot have", async () => {
-  const { calls } = renderPage([agentSessionSource(true)]);
-
-  const table = await screen.findByRole("table", { name: "Sources" });
-  await userEvent.click(await within(table).findByText("Claude Code Session"));
-  const drawer = await screen.findByRole("dialog", { name: "Claude Code Session" });
-  expect(within(drawer).getByRole("heading", { name: "Content" })).toBeInTheDocument();
-  expect(within(drawer).queryByRole("heading", { name: "Sync" })).not.toBeInTheDocument();
-  for (const text of ["Session coverage", "Last window processed", "Not synced yet", "Last sync", "Schedule"]) {
-    expect(within(drawer).queryByText(text)).not.toBeInTheDocument();
-  }
-  expect(calls.some((request) => new URL(request.url).pathname.startsWith("/api/v1/agent-sessions"))).toBe(false);
-});
-
-test.each([
-  [true, "enabled"],
-  [false, "disabled"],
-])("an agent-session source offers Delete from the server's can_delete (%s)", async (canDelete, state) => {
-  renderPage([agentSessionSource(canDelete)]);
-
-  const table = await screen.findByRole("table", { name: "Sources" });
-  await within(table).findByText("Claude Code Session");
-  await userEvent.click(within(table).getByRole("button", { name: "More actions for Claude Code Session" }));
-  const remove = await screen.findByRole("menuitem", { name: "Delete source" });
-  if (state === "enabled") {
-    expect(remove).not.toHaveAttribute("aria-disabled", "true");
-  } else {
-    expect(remove).toHaveAttribute("aria-disabled", "true");
-  }
-  expect(screen.queryByRole("menuitem", { name: "Configure" })).not.toBeInTheDocument();
-});
-
 test("a synced source's drawer keeps its sync status, last sync and schedule", async () => {
   renderPage([makeSource()]);
 

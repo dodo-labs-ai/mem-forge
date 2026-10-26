@@ -8,7 +8,6 @@ so a field a client reads cannot disappear from the response unnoticed.
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -38,7 +37,6 @@ SOURCE_KEYS = {
     "sync",
     "failed_items",
     "scope_transition",
-    "client",
     "ownership",
     "capabilities",
     "execution",
@@ -212,16 +210,6 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
                 assert created.status_code == 200, created.text
                 ids[key] = created.json()["id"]
             asyncio.run(
-                database.upsert_source(
-                    id="src-agent",
-                    type="agent_session",
-                    name="Codex Session",
-                    config_json=json.dumps({"client": "codex"}),
-                    access_policy="private",
-                    owner_user_id="owner-user",
-                )
-            )
-            asyncio.run(
                 database.insert_sync_history(
                     source=ids["history"],
                     status="partial",
@@ -276,7 +264,6 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
         "Running Wiki",
         "Changing Wiki",
         "Payroll Jira",
-        "Codex Session",
     }
     for name, row in rows.items():
         type_keys = {"Payroll Jira": {"connection_status"}}
@@ -324,8 +311,6 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
         "reason": "authentication",
     }
     assert rows["Payroll Jira"]["execution"]["kind"] == "local_agent"
-    assert rows["Codex Session"]["client"] == "codex"
-    assert rows["Codex Session"]["sync"] is None
 
 
 def test_source_list_validates_rows_shaped_like_the_hana_workspace_store(tmp_path):

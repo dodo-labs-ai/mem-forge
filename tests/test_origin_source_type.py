@@ -40,15 +40,15 @@ def test_first_extracted_wins_when_several():
     assert client is None
 
 
-def test_extracted_origin_returns_client_for_agent_session():
-    pairs = [("agent_session", "extracted", "codex"), ("jira", "corroborated", None)]
+def test_extracted_origin_returns_its_client():
+    pairs = [("user_memory", "extracted", "codex"), ("jira", "corroborated", None)]
     source_type, client = _pick_origin_source_type(pairs)
-    assert source_type == "agent_session"
+    assert source_type == "user_memory"
     assert client == "codex"
 
 
 def test_first_source_returns_client_when_no_extracted():
-    pairs = [("agent_session", "corroborated", "claude-code")]
+    pairs = [("user_memory", "corroborated", "claude-code")]
     source_type, client = _pick_origin_source_type(pairs)
-    assert source_type == "agent_session"
+    assert source_type == "user_memory"
     assert client == "claude-code"

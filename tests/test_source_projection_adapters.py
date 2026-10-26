@@ -1093,16 +1093,6 @@ async def test_claim_evidence_scope_upgrade_creates_a_new_immutable_revision(
             "local_file",
             "file_content",
         ),
-        (
-            "agent_session",
-            {},
-            {
-                "receipt": {"client": "codex", "session_id": "session-1", "history_window_kind": "summary"},
-                "markdown": "The user confirmed A7.",
-            },
-            "agent_session_window",
-            "session_summary",
-        ),
     ],
 )
 def test_document_and_append_sources_use_stable_provider_units(
@@ -1125,30 +1115,6 @@ def test_document_and_append_sources_use_stable_provider_units(
 
     assert projection.source_units[0].unit_type == expected_unit_type
     assert projection.observations[0].observation_type == expected_observation_type
-
-
-@pytest.mark.parametrize("receipt", [
-    None, "invalid", {}, {"client": "codex", "session_id": "s:1", "history_window_kind": "summary"},
-])
-def test_session_window_projection_preserves_receipt_and_partial_coverage(receipt) -> None:
-    item = _item()
-    raw, normalized = _inputs(item, {"doc_id": "window:1", "receipt": receipt, "markdown": "Authored summary."})
-    projection = project_source_item(
-        source_id="src-session", source_type="agent_session", run_id="run-session",
-        item=item, raw=raw, normalized=normalized,
-    )
-    expected_receipt = receipt if isinstance(receipt, dict) else {}
-    unit = projection.source_units[0]
-    assert unit.id == _stable_id("unit", "src-session", "agent_session_window", "window:1")
-    assert unit.locator == {
-        "document_id": item.item_id,
-        "client": expected_receipt.get("client"),
-        "session_id": expected_receipt.get("session_id"),
-        "history_window_kind": expected_receipt.get("history_window_kind"),
-        "url": item.source_url,
-    }
-    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
-    assert projection.observation_revisions[0].content == "Authored summary."
 
 
 @pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
@@ -1332,8 +1298,6 @@ def test_unit_tombstone_removes_all_prior_observations_with_explicit_coverage() 
         ("github_pages", "page_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("local_markdown", "file_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("teams", "message", "canonical-record", "teams-message", EvidenceCoordinateSpace.UNICODE_SCALAR),
-        ("agent_session", "session_summary", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
-        ("agent_session", "agent_concept", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("future_extension", "document_content", "markdown-structural", None, EvidenceCoordinateSpace.UNICODE_SCALAR),
         ("jira", "binary_artifact", "binary-artifact", None, EvidenceCoordinateSpace.WHOLE_ARTIFACT),
     ],
