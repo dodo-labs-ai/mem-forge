@@ -33,12 +33,12 @@ from memforge.models import (
     ReviewKind,
     ReviewStatus,
     content_hash,
-    generate_review_id,
 )
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from tests.embedding_fixture import unconfigured_embedding
+from tests.stored_review_fixture import attach_stored_related_challenger, insert_stored_memory_review
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +253,7 @@ async def _seed_supersede_review(
     incumbent = await db.get_memory(incumbent.id)  # type: ignore[assignment]
     challenger = await db.get_memory(challenger.id)  # type: ignore[assignment]
     review = MemoryReview(
-        id=generate_review_id(),
+        id=f"rev-{suffix}",
         kind=ReviewKind.SUPERSEDE.value,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
@@ -264,7 +264,7 @@ async def _seed_supersede_review(
         replacement_kind=replacement_kind,
         created_at=datetime.now(timezone.utc),
     )
-    await db.insert_memory_review(review)
+    await insert_stored_memory_review(db, review)
     review = await db.get_memory_review(review.id)  # type: ignore[assignment]
     return incumbent, challenger, review
 
@@ -402,7 +402,8 @@ async def _attach_related_challenger(
         status="pending_review",
     )
     await db.insert_memory(challenger)
-    await db.add_memory_review_related_challenger(
+    await attach_stored_related_challenger(
+        db,
         review.id,
         challenger.id,
         reason="Same source document produced another challenger",
@@ -425,7 +426,7 @@ async def _seed_cross_source_review(
         metadatas=[{"status": "active"}, {"status": "active"}],
     )
     review = MemoryReview(
-        id=generate_review_id(),
+        id="rev-cross",
         kind=CROSS_SOURCE_CONFLICT_REVIEW_KIND,
         status=ReviewStatus.PENDING.value,
         incumbent_memory_id=incumbent.id,
@@ -435,7 +436,7 @@ async def _seed_cross_source_review(
         expected_challenger_updated_at=(await db.get_memory(challenger.id)).updated_at.isoformat(),
         created_at=datetime.now(timezone.utc),
     )
-    await db.insert_memory_review(review)
+    await insert_stored_memory_review(db, review)
     return incumbent, challenger, review
 
 
@@ -525,10 +526,8 @@ class TestReviewCrud:
         )
 
         open_reviews = await db.list_memory_reviews(status="open")
-        open_count = await db.count_memory_reviews(status="open")
 
         assert [r.id for r in open_reviews] == [pending_review.id]
-        assert open_count == 1
 
     @pytest.mark.asyncio
     async def test_review_list_includes_pending_challenger_snapshot(self, db, chroma, tmp_path):
@@ -549,26 +548,6 @@ class TestReviewCrud:
         assert row["challenger"]["id"] == challenger.id
         assert row["challenger"]["status"] == "pending_review"
         assert row["challenger"]["content"] == challenger.content
-
-    @pytest.mark.asyncio
-    async def test_related_challenger_conflict_is_explicit(self, db, chroma):
-        _, _, first_review = await _seed_supersede_review(db, chroma, suffix="one")
-        _, _, second_review = await _seed_supersede_review(db, chroma, suffix="two")
-        related = await _attach_related_challenger(db, first_review)
-
-        await db.add_memory_review_related_challenger(
-            first_review.id,
-            related.id,
-            reason="Repeated insert for the same visible case is idempotent",
-        )
-        assert len(await db.list_memory_review_related_challengers(first_review.id)) == 1
-
-        with pytest.raises(ValueError, match="already attached"):
-            await db.add_memory_review_related_challenger(
-                second_review.id,
-                related.id,
-                reason="A challenger cannot move silently to another review",
-            )
 
     @pytest.mark.asyncio
     async def test_purge_memory_removes_related_challenger_references(self, db, chroma):
@@ -1331,48 +1310,6 @@ class TestReviewResolutionConcurrency:
             assert stored.status == "rejected"
             assert current_incumbent.status == "active"
             assert current_challenger.status == "retired"
-
-    @pytest.mark.asyncio
-    async def test_cross_connection_cannot_attach_participant_after_resolution_cohort_lock(
-        self,
-        db,
-        chroma,
-        review_service,
-        monkeypatch,
-    ):
-        _, _, review = await _seed_supersede_review(db, chroma, suffix="cohortlock")
-        related = _memory("mem-related-cohortlock", "PostgreSQL is version 17", status="pending_review")
-        await db.insert_memory(related)
-        second = Database(db.db_path)
-        await second.connect()
-        entered_guard = asyncio.Event()
-        release_guard = asyncio.Event()
-        original_guard = db._assert_no_active_source_support_unlocked
-
-        async def pause_after_cohort_lock(memory_id: str) -> None:
-            entered_guard.set()
-            await release_guard.wait()
-            await original_guard(memory_id)
-
-        monkeypatch.setattr(db, "_assert_no_active_source_support_unlocked", pause_after_cohort_lock)
-        resolution = asyncio.create_task(_approve(review_service, review.id, reviewer="alice"))
-        await entered_guard.wait()
-        attachment = asyncio.create_task(
-            second.add_memory_review_related_challenger(review.id, related.id, reason="late candidate")
-        )
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(attachment), timeout=0.05)
-        release_guard.set()
-
-        try:
-            await resolution
-            with pytest.raises(ValueError, match="not pending"):
-                await attachment
-        finally:
-            await second.close()
-
-        assert await db.list_memory_review_related_challengers(review.id) == []
-        assert (await db.get_memory_review(review.id)).status == "approved"
 
 
 class TestApprove:

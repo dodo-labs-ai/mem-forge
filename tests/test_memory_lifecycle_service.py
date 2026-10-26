@@ -584,7 +584,7 @@ async def test_authorized_correction_fails_atomically_when_support_changes_after
     assert stored_old is not None and stored_old.status == "active"
     assert await db.count_memories() == 1
     assert await db.count_documents("user_correction") == 0
-    assert await db.count_memory_reviews() == 0
+    assert await db.list_memory_reviews() == []
 
 
 @pytest.mark.asyncio
@@ -615,7 +615,7 @@ async def test_authorized_correction_rolls_back_staging_when_atomic_resolution_f
     assert await db.count_memories() == 1
     assert await db.get_active_memory_support_unit_ids(old.id) == ("eu-atomic-rollback",)
     assert await db.count_documents("user_correction") == 0
-    assert await db.count_memory_reviews() == 0
+    assert await db.list_memory_reviews() == []
 
 
 @pytest.mark.asyncio
@@ -644,7 +644,7 @@ async def test_authorized_correction_rejects_non_correction_document_provenance(
 
     assert await db.count_memories() == 1
     assert await db.count_documents("user_correction") == 0
-    assert await db.count_memory_reviews() == 0
+    assert await db.list_memory_reviews() == []
 
 
 @pytest.mark.asyncio
@@ -699,7 +699,7 @@ async def test_failed_correction_review_keeps_its_error_and_discards_the_correct
         )
 
     assert await db.count_documents("user_correction") == 0
-    assert await db.count_memory_reviews() == 0
+    assert await db.list_memory_reviews() == []
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Sync stats no longer report `pending_review`, and lifecycle runtime events no
+  longer carry `review_count`: a document update never opens a Review, so both
+  were always zero. Reviews of every kind and status stay readable in the
+  review queue, a pending one can still be approved or rejected, and an expired
+  Lifecycle Review can still be rechecked against the current state.
+
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
   as a memory's main evidence, extraction asks it to correct the selection,

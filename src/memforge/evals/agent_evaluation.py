@@ -945,7 +945,6 @@ def bind_source_lifecycle_outcome(
     incumbent_count: int,
     relation_pair_count: int,
     mutation_count: int,
-    review_count: int,
     model_call_count: int,
     occurred_at: datetime | None = None,
     deployment_revision: str | None = None,
@@ -965,7 +964,6 @@ def bind_source_lifecycle_outcome(
         ("incumbent_count", incumbent_count),
         ("relation_pair_count", relation_pair_count),
         ("mutation_count", mutation_count),
-        ("review_count", review_count),
         ("model_call_count", model_call_count),
     ):
         if value < 0:
@@ -1009,7 +1007,6 @@ def bind_source_lifecycle_outcome(
         "incumbent_count": incumbent_count,
         "relation_pair_count": relation_pair_count,
         "mutation_count": mutation_count,
-        "review_count": review_count,
         "model_call_count": model_call_count,
     }
     payload.update(
@@ -1282,7 +1279,6 @@ def runtime_event_otel_attributes(event: AgentRuntimeEvent) -> Mapping[str, obje
         "memforge.agent.incumbent_count": event.incumbent_count,
         "memforge.agent.relation_pair_count": event.relation_pair_count,
         "memforge.agent.mutation_count": event.mutation_count,
-        "memforge.agent.review_count": event.review_count,
         "memforge.agent.model_call_count": event.model_call_count,
         "gen_ai.request.max_tokens": event.requested_max_tokens,
         "gen_ai.response.finish_reasons": (

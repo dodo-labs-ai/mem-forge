@@ -6156,7 +6156,7 @@ export interface components {
              * Decision Label
              * @enum {string}
              */
-            decision_label: "Updated" | "Support removed" | "Conflict";
+            decision_label: "Updated" | "Support removed";
             /** Proposed Empty Text */
             proposed_empty_text: string;
             /** Proposed Label */

@@ -13999,12 +13999,8 @@ class Database:
         relation_outcome: RelationOutcomeBundle | None = None,
         source_updated_at: datetime | None,
         review: MemoryReview | None = None,
-        related_review_id: str | None = None,
-        related_review_reason: str | None = None,
     ) -> str:
         """Insert a memory, source provenance, entities, relation audit, and optional review atomically."""
-        if review is not None and related_review_id is not None:
-            raise ValueError("review and related_review_id are mutually exclusive")
         async with self._write_lock:
             try:
                 await self._assert_direct_source_write_allowed_unlocked(doc_id)
@@ -14025,31 +14021,6 @@ class Database:
                     await self._record_relation_outcome_bundle_unlocked(
                         relation_outcome,
                     )
-                if related_review_id is not None:
-                    now = _now_iso()
-                    async with self.db.execute(
-                        """SELECT review_id FROM memory_review_related_challengers
-                           WHERE challenger_memory_id = ?""",
-                        (mem.id,),
-                    ) as cursor:
-                        existing = await cursor.fetchone()
-                    if existing:
-                        existing_review_id = existing["review_id"]
-                        if existing_review_id != related_review_id:
-                            raise ValueError(f"Challenger {mem.id} is already attached to review {existing_review_id}")
-                        await self.db.execute(
-                            """UPDATE memory_review_related_challengers
-                               SET reason = COALESCE(?, reason)
-                               WHERE review_id = ? AND challenger_memory_id = ?""",
-                            (related_review_reason, related_review_id, mem.id),
-                        )
-                    else:
-                        await self.db.execute(
-                            """INSERT INTO memory_review_related_challengers (
-                                review_id, challenger_memory_id, reason, created_at
-                            ) VALUES (?, ?, ?, ?)""",
-                            (related_review_id, mem.id, related_review_reason, now),
-                        )
                 if review is not None:
                     now = _now_iso()
                     created_at = review.created_at.isoformat() if review.created_at else now
@@ -23021,38 +22992,6 @@ class Database:
     # Memory reviews
     # ==================================================================
 
-    async def insert_memory_review(self, review: MemoryReview) -> str:
-        """Persist a new review record. ``created_at`` defaults to now if absent."""
-        async with self._write_lock:
-            now = _now_iso()
-            created_at = review.created_at.isoformat() if review.created_at else now
-            await self.db.execute(
-                """INSERT INTO memory_reviews (
-                    id, kind, status, incumbent_memory_id, challenger_memory_id,
-                    reason, review_note, reviewer,
-                    expected_incumbent_updated_at, expected_challenger_updated_at,
-                    expected_support_set_hash, replacement_kind, created_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    review.id,
-                    review.kind,
-                    review.status,
-                    review.incumbent_memory_id,
-                    review.challenger_memory_id,
-                    review.reason,
-                    review.review_note,
-                    review.reviewer,
-                    review.expected_incumbent_updated_at,
-                    review.expected_challenger_updated_at,
-                    review.expected_support_set_hash,
-                    _validate_replacement_kind(review.replacement_kind),
-                    created_at,
-                    review.resolved_at.isoformat() if review.resolved_at else None,
-                ),
-            )
-            await self.db.commit()
-        return review.id
-
     async def get_memory_review(self, review_id: str) -> MemoryReview | None:
         async with self.db.execute(
             "SELECT * FROM memory_reviews WHERE id = ?",
@@ -23062,213 +23001,6 @@ class Database:
             if not row:
                 return None
             return self._row_to_review(row)
-
-    async def get_pending_review_for_incumbent(self, incumbent_id: str) -> MemoryReview | None:
-        async with self.db.execute(
-            """SELECT * FROM memory_reviews
-               WHERE incumbent_memory_id = ? AND status = 'pending'
-               ORDER BY created_at DESC LIMIT 1""",
-            (incumbent_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return self._row_to_review(row) if row else None
-
-    async def get_pending_review_for_challenger(self, challenger_id: str) -> MemoryReview | None:
-        async with self.db.execute(
-            """SELECT * FROM memory_reviews
-               WHERE challenger_memory_id = ? AND status = 'pending'
-               ORDER BY created_at DESC LIMIT 1""",
-            (challenger_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return self._row_to_review(row) if row else None
-
-    async def get_open_review_for_incumbent_source_doc(
-        self,
-        *,
-        incumbent_memory_id: str,
-        doc_id: str,
-        kind: str,
-    ) -> MemoryReview | None:
-        """Return the visible open review case for an incumbent and source doc."""
-        async with self.db.execute(
-            """SELECT DISTINCT mr.* FROM memory_reviews mr
-               JOIN memory_sources ms
-                 ON ms.memory_id = mr.challenger_memory_id
-               WHERE mr.incumbent_memory_id = ?
-                 AND mr.kind = ?
-                 AND mr.status = 'pending'
-                 AND ms.doc_id = ?
-               ORDER BY mr.created_at DESC LIMIT 1""",
-            (incumbent_memory_id, kind, doc_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return self._row_to_review(row) if row else None
-
-    async def add_memory_review_related_challenger(
-        self,
-        review_id: str,
-        challenger_memory_id: str,
-        *,
-        reason: str | None = None,
-    ) -> None:
-        """Attach an additional challenger to an existing visible review case."""
-        async with self._write_lock:
-            try:
-                await self.db.execute("BEGIN IMMEDIATE")
-                async with self.db.execute(
-                    "SELECT status FROM memory_reviews WHERE id = ?",
-                    (review_id,),
-                ) as cursor:
-                    target_review = await cursor.fetchone()
-                if target_review is None or target_review["status"] != "pending":
-                    raise ValueError("memory review is not pending")
-                async with self.db.execute(
-                    """SELECT review_id FROM memory_review_related_challengers
-                       WHERE challenger_memory_id = ?""",
-                    (challenger_memory_id,),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                if existing:
-                    existing_review_id = existing["review_id"]
-                    if existing_review_id != review_id:
-                        raise ValueError(
-                            f"Challenger {challenger_memory_id} is already attached to review {existing_review_id}"
-                        )
-                    await self.db.execute(
-                        """UPDATE memory_review_related_challengers
-                           SET reason = COALESCE(?, reason)
-                           WHERE review_id = ? AND challenger_memory_id = ?""",
-                        (reason, review_id, challenger_memory_id),
-                    )
-                else:
-                    await self.db.execute(
-                        """INSERT INTO memory_review_related_challengers (
-                            review_id, challenger_memory_id, reason, created_at
-                        ) VALUES (?, ?, ?, ?)""",
-                        (review_id, challenger_memory_id, reason, _now_iso()),
-                    )
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    async def mark_memory_pending_review_with_case(
-        self,
-        memory_id: str,
-        *,
-        reason: str | None = None,
-        relation_outcome: RelationOutcomeBundle | None = None,
-        review: MemoryReview | None = None,
-        related_review_id: str | None = None,
-    ) -> None:
-        """Atomically quarantine a memory and materialize its review work item."""
-        if review is not None and related_review_id is not None:
-            raise ValueError("review and related_review_id are mutually exclusive")
-        async with self._write_lock:
-            try:
-                await self.db.execute("BEGIN IMMEDIATE")
-                if review is not None:
-                    async with self.db.execute(
-                        "SELECT status FROM memory_reviews WHERE id = ?",
-                        (review.id,),
-                    ) as cursor:
-                        existing_review = await cursor.fetchone()
-                    if existing_review is not None and existing_review["status"] != "pending":
-                        raise RuntimeError(
-                            f"memory review {review.id} already exists with status {existing_review['status']}"
-                        )
-                if related_review_id is not None:
-                    async with self.db.execute(
-                        "SELECT status FROM memory_reviews WHERE id = ?",
-                        (related_review_id,),
-                    ) as cursor:
-                        related_review = await cursor.fetchone()
-                    if related_review is None or related_review["status"] != "pending":
-                        raise ValueError("memory review is not pending")
-                now = _now_iso()
-                await self.db.execute(
-                    """UPDATE memories
-                       SET status = ?, updated_at = ?
-                       WHERE id = ? AND status IN ('active', 'pending_review')""",
-                    ("pending_review", now, memory_id),
-                )
-                if relation_outcome is not None:
-                    await self._record_relation_outcome_bundle_unlocked(
-                        relation_outcome,
-                    )
-                if related_review_id is not None:
-                    async with self.db.execute(
-                        """SELECT review_id FROM memory_review_related_challengers
-                           WHERE challenger_memory_id = ?""",
-                        (memory_id,),
-                    ) as cursor:
-                        existing = await cursor.fetchone()
-                    if existing:
-                        existing_review_id = existing["review_id"]
-                        if existing_review_id != related_review_id:
-                            raise ValueError(
-                                f"Challenger {memory_id} is already attached to review {existing_review_id}"
-                            )
-                        await self.db.execute(
-                            """UPDATE memory_review_related_challengers
-                               SET reason = COALESCE(?, reason)
-                               WHERE review_id = ? AND challenger_memory_id = ?""",
-                            (reason, related_review_id, memory_id),
-                        )
-                    else:
-                        await self.db.execute(
-                            """INSERT INTO memory_review_related_challengers (
-                                review_id, challenger_memory_id, reason, created_at
-                            ) VALUES (?, ?, ?, ?)""",
-                            (related_review_id, memory_id, reason, now),
-                        )
-                if review is not None:
-                    created_at = review.created_at.isoformat() if review.created_at else now
-                    cursor = await self.db.execute(
-                        """INSERT INTO memory_reviews (
-                            id, kind, status, incumbent_memory_id, challenger_memory_id,
-                            reason, review_note, reviewer,
-                            expected_incumbent_updated_at, expected_challenger_updated_at,
-                            expected_support_set_hash, replacement_kind, created_at, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(id) DO UPDATE SET
-                            kind=excluded.kind,
-                            status=excluded.status,
-                            incumbent_memory_id=excluded.incumbent_memory_id,
-                            challenger_memory_id=excluded.challenger_memory_id,
-                            reason=excluded.reason,
-                            review_note=excluded.review_note,
-                            reviewer=excluded.reviewer,
-                            expected_incumbent_updated_at=excluded.expected_incumbent_updated_at,
-                            expected_challenger_updated_at=excluded.expected_challenger_updated_at,
-                            expected_support_set_hash=excluded.expected_support_set_hash,
-                            replacement_kind=excluded.replacement_kind,
-                            resolved_at=excluded.resolved_at
-                        WHERE memory_reviews.status = 'pending'""",
-                        (
-                            review.id,
-                            review.kind,
-                            review.status,
-                            review.incumbent_memory_id,
-                            review.challenger_memory_id,
-                            review.reason,
-                            review.review_note,
-                            review.reviewer,
-                            review.expected_incumbent_updated_at,
-                            review.expected_challenger_updated_at,
-                            review.expected_support_set_hash,
-                            _validate_replacement_kind(review.replacement_kind),
-                            created_at,
-                            review.resolved_at.isoformat() if review.resolved_at else None,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        raise RuntimeError(f"memory review {review.id} was not created or refreshed")
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
 
     async def list_memory_review_related_challengers(
         self,
@@ -23387,26 +23119,6 @@ class Database:
                 review = self._row_to_review(row)
                 reviews[review.id] = review
         return list(reviews.values())
-
-    async def count_memory_reviews(
-        self,
-        status: str | None = None,
-        kind: str | None = None,
-    ) -> int:
-        query = "SELECT COUNT(*) FROM memory_reviews WHERE 1=1"
-        params: list = []
-        if status:
-            if status == "open":
-                query += " AND status = 'pending'"
-            else:
-                query += " AND status = ?"
-                params.append(status)
-        if kind:
-            query += " AND kind = ?"
-            params.append(kind)
-        async with self.db.execute(query, params) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
 
     async def resolve_memory_review(
         self,

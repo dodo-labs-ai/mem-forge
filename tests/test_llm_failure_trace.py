@@ -197,7 +197,7 @@ def test_failure_trace_uses_the_same_lifecycle_identity_as_online_events():
     event = bind_source_lifecycle_outcome(**args, source_type="jira", doc_id="doc-1",
         projection_run_id="run-1", outcome="failed", reason_code="reconciliation_failed",
         attempt_count=1, duration_ms=0, incumbent_count=0, relation_pair_count=0,
-        mutation_count=0, review_count=0, model_call_count=1).event
+        mutation_count=0, model_call_count=1).event
     assert identity == dict(operation_id=event.operation_id, execution_id=event.execution_id, trace_id=event.trace_id)
 
 

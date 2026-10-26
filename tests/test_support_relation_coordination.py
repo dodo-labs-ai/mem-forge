@@ -82,7 +82,7 @@ async def test_a_contradicted_supported_claim_keeps_both_memories_without_a_revi
     stats = await page.commit(client, page.next(TWO, ONE, RETENTION), ONE)
 
     assert await lifecycle_reviews(db, memory.id) == []
-    assert stats["added"] == 1 and stats["pending_review"] == 0
+    assert stats["added"] == 1
     active = {item.content: item for item in await db.list_memories(status="active")}
     assert set(active) == {TWO, ONE} and active[TWO].id == memory.id
     rebound = await active_support_evidence(db, memory.id, source_id=SOURCE_ID)

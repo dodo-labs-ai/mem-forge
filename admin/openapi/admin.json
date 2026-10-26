@@ -9179,8 +9179,7 @@
           "decision_label": {
             "enum": [
               "Updated",
-              "Support removed",
-              "Conflict"
+              "Support removed"
             ],
             "title": "Decision Label",
             "type": "string"

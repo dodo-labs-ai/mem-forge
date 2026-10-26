@@ -3,7 +3,6 @@ from dataclasses import replace
 import pytest
 
 from tests.test_evidence_unit_support import db as db, _seed_complete_unit_support
-from tests.lifecycle_review_fixture import hold_for_review
 from tests.unit_support_fixture import active_support_evidence
 
 
@@ -91,22 +90,6 @@ async def _support_plan(db, memory_id, unit_id, *, plan_id, action):
             doc_id=unit.doc_id, source_type=unit.source_type, access_context_hash=unit.access_context_hash,
         ),
     )
-
-
-@pytest.mark.asyncio
-async def test_a_pending_review_retains_last_successful_support_plan(db):
-    from memforge.models import ReconcileAction
-
-    memory_id, unit_id, source_id, _ = await _seed_complete_unit_support(db)
-    for plan_id, action in (("verified-plan", ReconcileAction.NOOP), ("review-plan", ReconcileAction.DELETE)):
-        plan = await _support_plan(db, memory_id, unit_id, plan_id=plan_id, action=action)
-        if action is ReconcileAction.DELETE:
-            plan = hold_for_review(plan, memory_id, action=action)
-        await db.apply_lifecycle_plan(plan)
-        support = await active_support_evidence(db, memory_id, source_id=source_id)
-        assert {item.validation_plan_id for item in support} == {"verified-plan"}
-        assert {item.validation_unit_revision_id for item in support} == {"unitrev-1"}
-    assert len(await db.list_lifecycle_reviews(source_id)) == 1
 
 
 @pytest.mark.asyncio

@@ -1397,7 +1397,6 @@ async def test_durable_recovery_records_one_terminal_lifecycle_failure_per_execu
             incumbent_count=2,
             relation_pair_count=4,
             mutation_count=0,
-            review_count=0,
             model_call_count=2,
             occurred_at=now + timedelta(seconds=lease_attempt_count),
         )
@@ -2987,7 +2986,6 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
                 incumbent_count=1,
                 relation_pair_count=0,
                 mutation_count=1,
-                review_count=0,
                 model_call_count=0,
                 deployment_revision="test",
             )
@@ -3065,7 +3063,6 @@ class RecoveryDeferredMemoryEngine(NoopMemoryEngine):
             incumbent_count=1,
             relation_pair_count=0,
             mutation_count=1,
-            review_count=0,
             model_call_count=0,
             deployment_revision="test",
         )
@@ -3132,7 +3129,6 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
             incumbent_count=1,
             relation_pair_count=0,
             mutation_count=1,
-            review_count=0,
             model_call_count=0,
             deployment_revision="test",
         )
@@ -3237,7 +3233,6 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
                 incumbent_count=1,
                 relation_pair_count=0,
                 mutation_count=1,
-                review_count=0,
                 model_call_count=0,
                 deployment_revision="test",
             )
@@ -3311,7 +3306,6 @@ class MixedBudgetConvergenceMemoryEngine(NoopMemoryEngine):
             incumbent_count=1,
             relation_pair_count=0,
             mutation_count=1,
-            review_count=0,
             model_call_count=0,
             deployment_revision="test",
         )
@@ -7305,7 +7299,6 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
                 incumbent_count=1,
                 relation_pair_count=1,
                 mutation_count=1,
-                review_count=0,
                 model_call_count=1,
             )
             return SyncState(

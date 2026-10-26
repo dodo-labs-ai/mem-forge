@@ -1025,31 +1025,16 @@ class ReviewKind(str, Enum):
     SUPERSEDE = "supersede"
 
 
-def generate_review_id() -> str:
-    return f"rev-{uuid.uuid4().hex[:8]}"
-
-
 def generate_deterministic_review_id(
     *,
     kind: str,
     incumbent_memory_id: str,
     challenger_memory_id: str,
-    relation_run_id: str | None = None,
-    evidence_unit_id: str | None = None,
-    review_case: str | None = None,
+    review_case: str,
 ) -> str:
     """Stable review id for retrying the same proposed lifecycle decision."""
     digest = content_hash(
-        "\x1f".join(
-            [
-                kind,
-                incumbent_memory_id,
-                challenger_memory_id,
-                relation_run_id or "",
-                evidence_unit_id or "",
-                review_case or "",
-            ]
-        )
+        "\x1f".join([kind, incumbent_memory_id, challenger_memory_id, review_case])
     )[:16]
     return f"rev-{digest}"
 

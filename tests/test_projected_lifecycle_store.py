@@ -51,6 +51,7 @@ from memforge.source_projection import AnchorKind, SourceAnchor
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
 from tests.lifecycle_review_fixture import hold_for_review
+from tests.stored_review_fixture import insert_stored_memory_review
 from tests.test_source_projection_store import _projection
 from tests.unit_support_fixture import complete_unit_parts, primary_reference, record_unit_support
 
@@ -765,14 +766,15 @@ async def test_terminal_lifecycle_mutation_stales_all_pending_reviews(
         content_hash=content_hash("Independent challenger"),
     )
     await db.insert_memory(challenger)
-    await db.insert_memory_review(
+    await insert_stored_memory_review(
+        db,
         MemoryReview(
             id="review-terminal-incumbent",
             kind=ReviewKind.SUPERSEDE.value,
             status=ReviewStatus.PENDING.value,
             incumbent_memory_id="mem-1",
             challenger_memory_id=challenger.id,
-        )
+        ),
     )
     unit_id = await _persist_exact_support_and_provenance(db)
     incumbent = await db.get_memory("mem-1")

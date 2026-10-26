@@ -27,6 +27,7 @@ from memforge.models import (
 )
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
+from tests.stored_review_fixture import attach_stored_related_challenger, insert_stored_memory_review
 
 SOURCE_ID = "src-queue"
 OWNER = "dev"
@@ -95,7 +96,7 @@ async def _memory_review(db: Database, index: int, *, status: str = ReviewStatus
         expected_challenger_updated_at=challenger.updated_at.isoformat(),
         created_at=_at(2 * index),
     )
-    await db.insert_memory_review(review)
+    await insert_stored_memory_review(db, review)
     return review
 
 
@@ -287,7 +288,7 @@ class TestPendingReviewLookup:
         first = await _memory_review(db, 0)
         second = await _memory_review(db, 1)
         await _memory(db, "mem-related", status="pending_review")
-        await db.add_memory_review_related_challenger(second.id, "mem-related")
+        await attach_stored_related_challenger(db, second.id, "mem-related")
         terminal = await _memory_review(db, 2, status=ReviewStatus.APPROVED.value)
         found = await db.list_pending_memory_reviews_for_memories([
             first.incumbent_memory_id, first.challenger_memory_id,
@@ -352,7 +353,7 @@ class TestReviewNavigationEligibility:
         review = await _memory_review(db, 0)
         if case == "hidden_related":
             related = await _memory(db, "mem-related", status="pending_review")
-            await db.add_memory_review_related_challenger(review.id, related.id)
+            await attach_stored_related_challenger(db, review.id, related.id)
             hidden_id = related.id
         else:
             hidden_id = review.incumbent_memory_id

@@ -515,7 +515,6 @@ class MemoryEngine:
                 incumbent_count=runtime_context.incumbent_count,
                 relation_pair_count=runtime_context.relation_pair_count,
                 mutation_count=0,
-                review_count=0,
                 model_call_count=runtime_context.model_call_count,
                 deployment_revision=current_deployment_revision(),
                 operation="assess_revision_support" if runtime_context.stage == "support_revalidation" else None,
@@ -673,10 +672,6 @@ class MemoryEngine:
             incumbent_count=prepared.incumbent_count,
             relation_pair_count=prepared.relation_pair_count,
             mutation_count=len(plan.mutations),
-            review_count=sum(
-                mutation.mutation_type.value == "create_review"
-                for mutation in plan.mutations
-            ),
             model_call_count=prepared.model_call_count,
             deployment_revision=current_deployment_revision(),
         )
@@ -788,8 +783,6 @@ class MemoryEngine:
                     stats["superseded"] += 1
             elif mutation.mutation_type.value == "retire_memory":
                 stats["deleted"] += 1
-            elif mutation.mutation_type.value == "create_review":
-                stats["pending_review"] += 1
         stats["noop"] = sum(
             decision.disposition.value == "keep"
             for decision in plan.coverage_proof.incumbent_decisions
@@ -898,7 +891,6 @@ class MemoryEngine:
             "superseded": 0,
             "deleted": 0,
             "noop": 0,
-            "pending_review": 0,
             "skipped": 0,
             "vector_delivery_pending": 0,
             "relation_discovery_enqueued": 0,
@@ -1227,7 +1219,6 @@ class MemoryEngine:
                     incumbent_count=len(incumbents),
                     relation_pair_count=result.metrics.relation_pair_count,
                     mutation_count=0,
-                    review_count=0,
                     model_call_count=_runtime_context.model_call_count,
                     deployment_revision=current_deployment_revision(),
                 )

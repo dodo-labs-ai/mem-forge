@@ -144,7 +144,6 @@ export function memoryStatus(status: string): { label: string; tone: Tone } {
 const DECISION_LABEL_TONE: Record<ReviewPresentation["decision_label"], Tone> = {
   Updated: "live",
   "Support removed": "warn",
-  Conflict: "danger",
 };
 
 export function decisionLabelTone(label: ReviewPresentation["decision_label"]): Tone {

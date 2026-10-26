@@ -3458,7 +3458,7 @@ class ReviewActionPresentationResponse(BaseModel):
 
 
 class ReviewPresentationResponse(BaseModel):
-    decision_label: Literal["Updated", "Support removed", "Conflict"]
+    decision_label: Literal["Updated", "Support removed"]
     summary: str
     why_human: str
     current_label: str
