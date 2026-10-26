@@ -9,24 +9,24 @@ from pydantic import ValidationError
 
 from memforge.llm.structured import (
     INPUT_CAPACITY_EXCEEDED,
-    CrossDocumentRelationDecision,
-    CrossDocumentRelationResponse,
+    RelationCandidateDecision,
+    RelationCandidateResponse,
     StructuredLlmError,
 )
-from memforge.memory.cross_document_relation import (
-    CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION,
-    CROSS_DOCUMENT_RELATION_INPUT_VERSIONS,
-    CROSS_DOCUMENT_RELATION_PROMPT,
-    CROSS_DOCUMENT_RELATION_QUESTION,
-    CROSS_DOCUMENT_RELATION_RULES,
-    CrossDocumentRelationJudgment,
-    CrossDocumentRelationLabel,
-    CrossDocumentRelationOutcome,
-    CrossDocumentRelationPair,
-    CrossDocumentRelationRecord,
+from memforge.memory.memory_relation import (
+    MEMORY_RELATION_CLASSIFIER_VERSION,
+    MEMORY_RELATION_INPUT_VERSIONS,
+    MEMORY_RELATION_CLASSIFIER_PROMPT,
+    MEMORY_RELATION_CLASSIFIER_QUESTION,
+    MEMORY_RELATION_CLASSIFIER_RULES,
+    MemoryRelationJudgment,
+    MemoryRelationLabel,
+    MemoryRelationOutcome,
+    MemoryRelationPair,
+    MemoryRelationRecord,
     RelationSubject,
-    StructuredCrossDocumentRelationClassifier,
-    cross_document_relation_prompt,
+    StructuredMemoryRelationClassifier,
+    memory_relation_classifier_prompt,
     load_relation_subjects,
     newest_evidence_unit_id,
     pair_key,
@@ -60,9 +60,9 @@ def _subject(memory_id: str, statement: str) -> RelationSubject:
     )
 
 
-def _pairs(count: int, *, challenger: str = "mem-challenger") -> tuple[CrossDocumentRelationPair, ...]:
+def _pairs(count: int, *, challenger: str = "mem-challenger") -> tuple[MemoryRelationPair, ...]:
     return tuple(
-        CrossDocumentRelationPair(
+        MemoryRelationPair(
             challenger=_subject(challenger, "Payroll runs weekly."),
             candidate=_subject(f"mem-candidate-{index}", f"Payroll statement {index}."),
         )
@@ -93,11 +93,11 @@ class _Client:
     def request_fits(self, prompt, *, response_format, model=None, images=(), reserve_correction=True):
         return self.request_budget(model).fits(len(prompt.split()), reserve_correction=reserve_correction)
 
-    async def classify_cross_document_relations(self, prompt, *, model=None):
+    async def classify_relation_candidates(self, prompt, *, model=None):
         self.prompts.append(prompt)
         if self.respond is not None:
             return self.respond(prompt)
-        return CrossDocumentRelationResponse(
+        return RelationCandidateResponse(
             decisions=[
                 {"pair_index": index, "label": self.label}
                 for index in _pair_indexes(prompt)
@@ -105,8 +105,8 @@ class _Client:
         )
 
 
-def _classifier(client: _Client) -> StructuredCrossDocumentRelationClassifier:
-    return StructuredCrossDocumentRelationClassifier(client=client, model=FIXTURE_MODEL)
+def _classifier(client: _Client) -> StructuredMemoryRelationClassifier:
+    return StructuredMemoryRelationClassifier(client=client, model=FIXTURE_MODEL)
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,7 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
 
     def respond(prompt):
         labels = ["contradicts", "none", "updates"]
-        return CrossDocumentRelationResponse(
+        return RelationCandidateResponse(
             decisions=[
                 {"pair_index": index, "label": labels[index]}
                 for index in reversed(_pair_indexes(prompt))
@@ -125,9 +125,9 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
     result = await _classifier(_Client(respond=respond)).classify(pairs)
 
     assert [(judgment.pair.key, judgment.label) for judgment in result.judgments] == [
-        (pairs[0].key, CrossDocumentRelationLabel.CONTRADICTS),
-        (pairs[1].key, CrossDocumentRelationLabel.NONE),
-        (pairs[2].key, CrossDocumentRelationLabel.UPDATES),
+        (pairs[0].key, MemoryRelationLabel.CONTRADICTS),
+        (pairs[1].key, MemoryRelationLabel.NONE),
+        (pairs[2].key, MemoryRelationLabel.UPDATES),
     ]
     assert result.llm_calls == 1
 
@@ -145,7 +145,7 @@ async def test_classifier_returns_one_judgment_per_pair_by_pair_index() -> None:
     ids=["missing_pair", "duplicate_hides_missing"],
 )
 async def test_classifier_fails_when_a_pair_is_left_without_exactly_one_label(decisions) -> None:
-    client = _Client(respond=lambda _prompt: CrossDocumentRelationResponse(decisions=decisions))
+    client = _Client(respond=lambda _prompt: RelationCandidateResponse(decisions=decisions))
 
     with pytest.raises(MemoryPairClassificationError) as error:
         await _classifier(client).classify(_pairs(2))
@@ -181,7 +181,7 @@ async def test_classifier_halves_a_request_that_exceeds_the_route_capacity() -> 
         attempts.append(len(indexes))
         if len(indexes) > 2:
             raise StructuredLlmError("context window", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED)
-        return CrossDocumentRelationResponse(
+        return RelationCandidateResponse(
             decisions=[{"pair_index": index, "label": "none"} for index in indexes]
         )
 
@@ -208,7 +208,7 @@ async def test_prompt_shows_statement_context_without_identity() -> None:
         evidence=(),
     )
 
-    await _classifier(client).classify((CrossDocumentRelationPair(challenger=challenger, candidate=candidate),))
+    await _classifier(client).classify((MemoryRelationPair(challenger=challenger, candidate=candidate),))
 
     [prompt] = client.prompts
     assert _section(prompt, "subject") == {
@@ -222,7 +222,7 @@ async def test_prompt_shows_statement_context_without_identity() -> None:
     assert _section(prompt, "questions") == [
         {
             "pair_index": 0,
-            "question": CROSS_DOCUMENT_RELATION_QUESTION,
+            "question": MEMORY_RELATION_CLASSIFIER_QUESTION,
             "candidate": {
                 "statement": "Payroll runs monthly.",
                 "memory_type": "decision",
@@ -262,7 +262,7 @@ async def test_a_split_request_states_its_challenger_again() -> None:
         indexes = _pair_indexes(prompt)
         if len(indexes) > 1:
             raise StructuredLlmError("context window", terminal_category="provider_error", error_code=INPUT_CAPACITY_EXCEEDED)
-        return CrossDocumentRelationResponse(decisions=[{"pair_index": index, "label": "none"} for index in indexes])
+        return RelationCandidateResponse(decisions=[{"pair_index": index, "label": "none"} for index in indexes])
 
     client = _Client(respond=respond)
 
@@ -276,16 +276,16 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
     subject = _subject("mem-subject", "Payroll runs weekly.")
     candidates = [(4, _subject("mem-a", "Payroll runs weekly.")), (9, _subject("mem-b", "Payroll runs weekly."))]
 
-    prompt = cross_document_relation_prompt(subject, candidates)
+    prompt = memory_relation_classifier_prompt(subject, candidates)
 
-    assert prompt.startswith(CROSS_DOCUMENT_RELATION_RULES)
-    assert CROSS_DOCUMENT_RELATION_QUESTION == "What is the relation of this candidate to the subject?"
+    assert prompt.startswith(MEMORY_RELATION_CLASSIFIER_RULES)
+    assert MEMORY_RELATION_CLASSIFIER_QUESTION == "What is the relation of this candidate to the subject?"
     assert [(question["pair_index"], question["question"]) for question in _section(prompt, "questions")] == [
-        (4, CROSS_DOCUMENT_RELATION_QUESTION),
-        (9, CROSS_DOCUMENT_RELATION_QUESTION),
+        (4, MEMORY_RELATION_CLASSIFIER_QUESTION),
+        (9, MEMORY_RELATION_CLASSIFIER_QUESTION),
     ]
     assert _section(prompt, "subject") == subject.prompt_payload()
-    framing = " ".join(prompt[len(CROSS_DOCUMENT_RELATION_RULES) :].split())
+    framing = " ".join(prompt[len(MEMORY_RELATION_CLASSIFIER_RULES) :].split())
     for sentence in (
         "Every question below asks for the relation between one candidate statement and the subject statement.",
         "The subject is one statement; each candidate is one other statement.",
@@ -297,16 +297,16 @@ def test_the_prompt_asks_one_question_per_candidate_about_the_subject_only() -> 
 
 
 def test_the_contract_is_v6_and_replays_only_cases_pinned_with_evidence_instants() -> None:
-    assert CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v6"
-    assert CROSS_DOCUMENT_RELATION_INPUT_VERSIONS == {"cross-document-relation-v6"}
-    rules = " ".join(CROSS_DOCUMENT_RELATION_RULES.split())
+    assert MEMORY_RELATION_CLASSIFIER_VERSION == "cross-document-relation-v6"
+    assert MEMORY_RELATION_INPUT_VERSIONS == {"cross-document-relation-v6"}
+    rules = " ".join(MEMORY_RELATION_CLASSIFIER_RULES.split())
     assert rules.startswith("Each pair holds two statements, taken from the same document or from different ones.")
     assert "evidence_time (the UTC time at which its source recorded the Evidence, null when unknown)" in rules
 
 
 def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> None:
-    rules = " ".join(CROSS_DOCUMENT_RELATION_RULES.lower().split())
-    for label in CrossDocumentRelationLabel:
+    rules = " ".join(MEMORY_RELATION_CLASSIFIER_RULES.lower().split())
+    for label in MemoryRelationLabel:
         assert f"- {label.value}:" in rules
     for condition in (
         "the same object",
@@ -340,10 +340,10 @@ def test_rules_define_the_same_situation_domain_neutrally_and_prefer_none() -> N
 
 
 def test_a_decision_is_the_pair_index_and_its_label_only() -> None:
-    assert set(CrossDocumentRelationDecision.model_fields) == {"pair_index", "label"}
+    assert set(RelationCandidateDecision.model_fields) == {"pair_index", "label"}
     with pytest.raises(ValidationError):
-        CrossDocumentRelationDecision.model_validate({"pair_index": 0, "label": "none", "reason": "text"})
-    assert "reason" not in CROSS_DOCUMENT_RELATION_PROMPT.lower()
+        RelationCandidateDecision.model_validate({"pair_index": 0, "label": "none", "reason": "text"})
+    assert "reason" not in MEMORY_RELATION_CLASSIFIER_PROMPT.lower()
 
 
 @pytest.mark.parametrize(
@@ -352,49 +352,49 @@ def test_a_decision_is_the_pair_index_and_its_label_only() -> None:
         (
             "2026-04-10T09:00:00+00:00",
             "2026-04-01T09:00:00+00:00",
-            CrossDocumentRelationLabel.UPDATES,
-            CrossDocumentRelationLabel.UPDATES,
+            MemoryRelationLabel.UPDATES,
+            MemoryRelationLabel.UPDATES,
         ),
         # Two statements of one day are ordered by the instants their sources recorded.
         (
             "2026-04-10T16:45:00+00:00",
             "2026-04-10T09:00:00+00:00",
-            CrossDocumentRelationLabel.UPDATES,
-            CrossDocumentRelationLabel.UPDATES,
+            MemoryRelationLabel.UPDATES,
+            MemoryRelationLabel.UPDATES,
         ),
         (
             "2026-04-10T09:00:00+00:00",
             "2026-04-10T09:00:00+00:00",
-            CrossDocumentRelationLabel.UPDATES,
-            CrossDocumentRelationLabel.CONTRADICTS,
+            MemoryRelationLabel.UPDATES,
+            MemoryRelationLabel.CONTRADICTS,
         ),
-        (None, "2026-04-01T09:00:00+00:00", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        (None, "2026-04-01T09:00:00+00:00", MemoryRelationLabel.UPDATES, MemoryRelationLabel.CONTRADICTS),
         # Times that hold only a date order a pair by date.
-        ("2026-04-10", "2026-04-01", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.UPDATES),
-        ("2026-04-10", "2026-04-10", CrossDocumentRelationLabel.UPDATES, CrossDocumentRelationLabel.CONTRADICTS),
+        ("2026-04-10", "2026-04-01", MemoryRelationLabel.UPDATES, MemoryRelationLabel.UPDATES),
+        ("2026-04-10", "2026-04-10", MemoryRelationLabel.UPDATES, MemoryRelationLabel.CONTRADICTS),
         (
             "2026-04-10T16:45:00+00:00",
             "2026-04-10",
-            CrossDocumentRelationLabel.UPDATES,
-            CrossDocumentRelationLabel.CONTRADICTS,
+            MemoryRelationLabel.UPDATES,
+            MemoryRelationLabel.CONTRADICTS,
         ),
-        (None, None, CrossDocumentRelationLabel.EQUIVALENT, CrossDocumentRelationLabel.EQUIVALENT),
-        (None, None, CrossDocumentRelationLabel.NONE, CrossDocumentRelationLabel.NONE),
+        (None, None, MemoryRelationLabel.EQUIVALENT, MemoryRelationLabel.EQUIVALENT),
+        (None, None, MemoryRelationLabel.NONE, MemoryRelationLabel.NONE),
     ],
 )
 def test_a_judgment_is_recorded_with_the_label_its_evidence_times_allow(
     challenger_time, candidate_time, label, recorded
 ) -> None:
-    pair = CrossDocumentRelationPair(
+    pair = MemoryRelationPair(
         challenger=replace(_subject("mem-z", "Payroll runs weekly."), evidence_time=challenger_time),
         candidate=replace(_subject("mem-a", "Payroll runs monthly."), evidence_time=candidate_time),
     )
 
-    judgment = CrossDocumentRelationJudgment(pair=pair, label=label)
+    judgment = MemoryRelationJudgment(pair=pair, label=label)
 
     assert judgment.recorded_label is recorded
-    if recorded is not CrossDocumentRelationLabel.NONE:
-        record = CrossDocumentRelationRecord.from_judgment(
+    if recorded is not MemoryRelationLabel.NONE:
+        record = MemoryRelationRecord.from_judgment(
             judgment, relation_run_id="run-1", discovery_work_id="work-1"
         )
         assert record.label is recorded
@@ -403,19 +403,19 @@ def test_a_judgment_is_recorded_with_the_label_its_evidence_times_allow(
 def test_record_orders_the_pair_and_binds_both_contents() -> None:
     challenger = _subject("mem-z", "Payroll runs weekly.")
     candidate = _subject("mem-a", "Payroll runs monthly.")
-    judgment = CrossDocumentRelationJudgment(
-        pair=CrossDocumentRelationPair(challenger=challenger, candidate=candidate),
-        label=CrossDocumentRelationLabel.CONTRADICTS,
+    judgment = MemoryRelationJudgment(
+        pair=MemoryRelationPair(challenger=challenger, candidate=candidate),
+        label=MemoryRelationLabel.CONTRADICTS,
     )
 
-    record = CrossDocumentRelationRecord.from_judgment(judgment, relation_run_id="run-1", discovery_work_id="work-1")
+    record = MemoryRelationRecord.from_judgment(judgment, relation_run_id="run-1", discovery_work_id="work-1")
 
     assert (record.memory_low_id, record.memory_high_id) == ("mem-a", "mem-z")
     assert (record.low_content_hash, record.high_content_hash) == (candidate.content_hash, challenger.content_hash)
     assert pair_key("mem-z", "mem-a") == ("mem-a", "mem-z")
     with pytest.raises(ValueError):
-        CrossDocumentRelationRecord.from_judgment(
-            CrossDocumentRelationJudgment(pair=judgment.pair, label=CrossDocumentRelationLabel.NONE),
+        MemoryRelationRecord.from_judgment(
+            MemoryRelationJudgment(pair=judgment.pair, label=MemoryRelationLabel.NONE),
             relation_run_id="run-1",
             discovery_work_id="work-1",
         )
@@ -425,17 +425,17 @@ def test_outcome_binds_every_judged_pair_to_the_contents_it_was_judged_on() -> N
     challenger = _subject("mem-m", "Payroll runs weekly.")
     judged = (_subject("mem-a", "Payroll runs monthly."), _subject("mem-z", "Payroll runs on Fridays."))
     judgments = (
-        CrossDocumentRelationJudgment(
-            pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[0]),
-            label=CrossDocumentRelationLabel.CONTRADICTS,
+        MemoryRelationJudgment(
+            pair=MemoryRelationPair(challenger=challenger, candidate=judged[0]),
+            label=MemoryRelationLabel.CONTRADICTS,
         ),
-        CrossDocumentRelationJudgment(
-            pair=CrossDocumentRelationPair(challenger=challenger, candidate=judged[1]),
-            label=CrossDocumentRelationLabel.NONE,
+        MemoryRelationJudgment(
+            pair=MemoryRelationPair(challenger=challenger, candidate=judged[1]),
+            label=MemoryRelationLabel.NONE,
         ),
     )
 
-    outcome = CrossDocumentRelationOutcome.from_judgments(
+    outcome = MemoryRelationOutcome.from_judgments(
         challenger, judgments, relation_run_id="run-1", discovery_work_id="work-1"
     )
 
@@ -443,7 +443,7 @@ def test_outcome_binds_every_judged_pair_to_the_contents_it_was_judged_on() -> N
     [record] = outcome.relations
     assert (record.memory_low_id, record.memory_high_id) == ("mem-a", "mem-m")
     with pytest.raises(ValueError, match="judged pair"):
-        CrossDocumentRelationOutcome(
+        MemoryRelationOutcome(
             challenger_id=challenger.memory_id,
             challenger_content_hash=challenger.content_hash,
             judged_content_hashes={"mem-a": "older-content"},
@@ -730,7 +730,7 @@ async def test_subjects_come_from_the_current_evidence_unit() -> None:
 
 
 class _RelationClient:
-    async def classify_cross_document_relations(self, prompt, **kwargs):
+    async def classify_relation_candidates(self, prompt, **kwargs):
         raise AssertionError("not called")
 
 
@@ -745,13 +745,13 @@ def test_engine_classifies_discovery_only_with_a_capable_client(client, expects_
     from memforge.memory.engine import MemoryEngine
 
     engine = MemoryEngine(
-        cross_document_candidates=None,  # type: ignore[arg-type]
+        relation_candidates=None,  # type: ignore[arg-type]
         db=None,  # type: ignore[arg-type]
         memory_store=None,  # type: ignore[arg-type]
         structured_llm_client=client,
     )
 
-    assert isinstance(engine.pair_classifier, StructuredCrossDocumentRelationClassifier) is expects_discovery
+    assert isinstance(engine.pair_classifier, StructuredMemoryRelationClassifier) is expects_discovery
     assert (engine.pair_classifier is None) is not expects_discovery
 
 
@@ -837,7 +837,7 @@ async def test_a_reask_states_the_same_single_subject_and_asks_only_its_rejected
         indexes = _pair_indexes(prompt)
         if "<correction>" not in prompt:
             indexes = [index for index in indexes if index != left_out]
-        return CrossDocumentRelationResponse(
+        return RelationCandidateResponse(
             decisions=[{"pair_index": index, "label": "none"} for index in indexes]
         )
 

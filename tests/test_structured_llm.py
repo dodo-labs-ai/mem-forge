@@ -773,7 +773,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "CandidateAdmissionResponse": '{"decisions":[]}',
         "MemoryRelationResponse": '{"decisions":[]}',
         "RefinementVerificationResponse": '{"decisions":[]}',
-        "CrossDocumentRelationResponse": '{"decisions":[]}',
+        "RelationCandidateResponse": '{"decisions":[]}',
         "EntityBatchValidationResponse": '{"decisions":[]}',
         "RerankResponse": '{"ranking":[]}',
             "OfflineSemanticJudgeResponse": (
@@ -806,7 +806,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
         "admit_candidates": lambda: client.admit_candidates("prompt"),
         "classify_memory_relations": lambda: client.classify_memory_relations("prompt"),
         "verify_refinements": lambda: client.verify_refinements("prompt"),
-        "classify_cross_document_relations": lambda: client.classify_cross_document_relations("prompt"),
+        "classify_relation_candidates": lambda: client.classify_relation_candidates("prompt"),
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "judge_offline_semantics": lambda: client.judge_offline_semantics(
@@ -2148,7 +2148,7 @@ def test_sap_route_uses_sdk_bedrock_metadata_and_preserves_operator_caps(monkeyp
         ("refusal", "cross_document_relation_response_incomplete"),
     ],
 )
-async def test_cross_document_relations_reject_a_refused_empty_reply(
+async def test_memory_relations_reject_a_refused_empty_reply(
     monkeypatch, finish_reason, error_code,
 ):
     response = CompletionResponse('{"decisions":[]}')
@@ -2164,7 +2164,7 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
         timeout_s=1.0, num_retries=1,
     ))
     with pytest.raises(StructuredLlmError) as error:
-        await client.classify_cross_document_relations("prompt")
+        await client.classify_relation_candidates("prompt")
     assert error.value.error_code == error_code
 
 
@@ -2177,14 +2177,14 @@ async def test_cross_document_relations_reject_a_refused_empty_reply(
         {"pair_index": -1, "label": "none"},
     ],
 )
-def test_cross_document_relation_schema_accepts_only_the_closed_labels(decision) -> None:
+def test_memory_relation_schema_accepts_only_the_closed_labels(decision) -> None:
     from pydantic import ValidationError
 
-    from memforge.llm.structured import CrossDocumentRelationResponse
+    from memforge.llm.structured import RelationCandidateResponse
 
     with pytest.raises(ValidationError):
-        CrossDocumentRelationResponse.model_validate({"decisions": [decision]})
-    assert CrossDocumentRelationResponse.model_validate(
+        RelationCandidateResponse.model_validate({"decisions": [decision]})
+    assert RelationCandidateResponse.model_validate(
         {"decisions": [{"pair_index": 0, "label": "updates"}]}
     ).decisions[0].label == "updates"
 

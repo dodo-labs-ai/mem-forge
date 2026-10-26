@@ -9,8 +9,8 @@ from memforge.memory.evidence import (
     build_candidate_universe,
 )
 from memforge.memory.relation_candidate_retrieval import (
-    CrossDocumentCandidateSelection,
-    CrossDocumentCandidateRetriever,
+    RelationCandidateSelection,
+    RelationCandidateRetriever,
     RelationCandidateRetrievalPolicy,
     RetrievedRelationCandidate,
     StaleCandidateSelectionError,
@@ -100,7 +100,7 @@ class _Vector:
 @pytest.mark.asyncio
 async def test_hybrid_discovery_reuses_lightweight_candidates_before_full_row_loading() -> None:
     relational = _Relational()
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=relational,
         keyword=_Keyword(),
         vector=_Vector(),
@@ -177,7 +177,7 @@ async def test_selected_ledger_fails_closed_when_one_full_row_disappears() -> No
             return loaded[:-1]
 
     relational = MissingFullRowRelational()
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=relational,
         keyword=_Keyword(),
         vector=_Vector(),
@@ -249,12 +249,12 @@ async def test_selection_revalidation_fails_when_current_support_changes() -> No
             }
 
     relational = SupportChangingRelational()
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=relational,  # type: ignore[arg-type]
         keyword=SimpleNamespace(),
         vector=SimpleNamespace(),
     )
-    selection = CrossDocumentCandidateSelection(
+    selection = RelationCandidateSelection(
         discovery=(
             RetrievedRelationCandidate(
                 memory=candidate,
@@ -290,7 +290,7 @@ async def test_worker_cancellation_is_not_downgraded_to_channel_failure() -> Non
             del entity_ids, scope, memory_types, limit, kwargs
             raise asyncio.CancelledError
 
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=CancelledRelational(),
         keyword=_Keyword(),
         vector=_Vector(),
@@ -326,7 +326,7 @@ async def test_failed_discovery_channel_is_audited_without_making_it_mandatory()
         async def search(self, query, scope, memory_types, limit):
             raise RuntimeError("keyword unavailable")
 
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=_Relational(),
         keyword=BrokenKeyword(),
         vector=_Vector(),
@@ -355,7 +355,7 @@ async def test_failed_discovery_channel_is_audited_without_making_it_mandatory()
     )
 
     assert selection.telemetry["channel_errors"] == [CandidateBucket.LEXICAL_BM25.value]
-    retry_selection = CrossDocumentCandidateSelection(
+    retry_selection = RelationCandidateSelection(
         discovery=selection.discovery,
         audit=selection.audit,
         telemetry={**selection.telemetry, "channel_errors": []},
@@ -414,7 +414,7 @@ async def test_exact_postfilter_preserves_only_access_compatible_provenance() ->
             del memory_id
             return None
 
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=ExactRelational(),
         keyword=EmptyKeyword(),
         vector=EmptyVector(),
@@ -474,7 +474,7 @@ async def test_memories_of_the_challengers_own_document_are_eligible_candidates(
             del memory_id
             return None
 
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=SameDocumentRelational(),
         keyword=EmptyKeyword(),
         vector=EmptyVector(),
@@ -546,7 +546,7 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
     relational = LargeRelational()
     keyword = LargeKeyword()
     vector = LargeVector()
-    retriever = CrossDocumentCandidateRetriever(
+    retriever = RelationCandidateRetriever(
         relational=relational,
         keyword=keyword,
         vector=vector,

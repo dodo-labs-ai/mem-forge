@@ -1,4 +1,4 @@
-"""Cross-document relation contract: one closed label per Memory pair.
+"""Memory relation contract: one closed label per Memory pair.
 
 Discovery compares a committed Memory with bounded candidates from any Source
 Unit, its own included, after commit. Each pair receives exactly one label. A relation annotates
@@ -16,7 +16,7 @@ from typing import Any, Protocol
 
 from memforge.llm.batch_runner import ItemTask, LlmBatchRunner, LlmRequest, RejectedRow
 from memforge.llm.decision_model import DecisionTask, decision_task_model
-from memforge.llm.structured import CrossDocumentRelationResponse
+from memforge.llm.structured import RelationCandidateResponse
 from memforge.memory.evidence import (
     EvidencePartKind,
     EvidenceRole,
@@ -37,27 +37,27 @@ from memforge.source_representation import representation_contract_for_profile
 from memforge.source_time import parse_source_time, reported_source_time
 
 
-class CrossDocumentRelationLabel(str, Enum):
+class MemoryRelationLabel(str, Enum):
     NONE = "none"
     EQUIVALENT = "equivalent"
     UPDATES = "updates"
     CONTRADICTS = "contradicts"
 
 
-class CrossDocumentRelationDecider(str, Enum):
+class MemoryRelationDecider(str, Enum):
     """Who decided a stored relation: the classifier or a person's confirmed Review."""
 
     CLASSIFIER = "classifier"
     REVIEW = "review"
 
 
-CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v6"
+MEMORY_RELATION_CLASSIFIER_VERSION = "cross-document-relation-v6"
 # Classifier contracts that read the current ``RelationSubject`` input. An
 # evaluation case pinned under any of them holds the input this contract reads
 # and is replayed under it; a contract that changes the input is evaluated on a
 # set seeded again under it.
-CROSS_DOCUMENT_RELATION_INPUT_VERSIONS = frozenset({CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION})
-CROSS_DOCUMENT_RELATION_TASK = DecisionTask("cross_document_relation", CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION)
+MEMORY_RELATION_INPUT_VERSIONS = frozenset({MEMORY_RELATION_CLASSIFIER_VERSION})
+MEMORY_RELATION_TASK = DecisionTask("cross_document_relation", MEMORY_RELATION_CLASSIFIER_VERSION)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +118,7 @@ class RelationSubject:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationPair:
+class MemoryRelationPair:
     challenger: RelationSubject
     candidate: RelationSubject
 
@@ -128,12 +128,12 @@ class CrossDocumentRelationPair:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationJudgment:
-    pair: CrossDocumentRelationPair
-    label: CrossDocumentRelationLabel
+class MemoryRelationJudgment:
+    pair: MemoryRelationPair
+    label: MemoryRelationLabel
 
     @property
-    def recorded_label(self) -> CrossDocumentRelationLabel:
+    def recorded_label(self) -> MemoryRelationLabel:
         """The label this judgment is recorded with; see ``recorded_relation_label``."""
 
         times = {subject.memory_id: subject.evidence_time for subject in (self.pair.challenger, self.pair.candidate)}
@@ -142,17 +142,17 @@ class CrossDocumentRelationJudgment:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationClassification:
-    judgments: tuple[CrossDocumentRelationJudgment, ...]
+class MemoryRelationClassification:
+    judgments: tuple[MemoryRelationJudgment, ...]
     llm_calls: int
     prompt_chars: int
 
 
-class CrossDocumentRelationClassifier(Protocol):
+class MemoryRelationClassifier(Protocol):
     async def classify(
         self,
-        pairs: tuple[CrossDocumentRelationPair, ...],
-    ) -> CrossDocumentRelationClassification: ...
+        pairs: tuple[MemoryRelationPair, ...],
+    ) -> MemoryRelationClassification: ...
 
 
 def pair_key(first_memory_id: str, second_memory_id: str) -> tuple[str, str]:
@@ -226,12 +226,12 @@ def newer_memory_by_evidence_time(
 
 
 def recorded_relation_label(
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     memory_low_id: str,
     memory_high_id: str,
     low_evidence_time: str | None,
     high_evidence_time: str | None,
-) -> CrossDocumentRelationLabel:
+) -> MemoryRelationLabel:
     """The label a relation is recorded with.
 
     The program, not the classifier, orders an ``updates`` pair, by the same
@@ -240,15 +240,15 @@ def recorded_relation_label(
     same, is recorded as ``contradicts``.
     """
 
-    if label is CrossDocumentRelationLabel.UPDATES and (
+    if label is MemoryRelationLabel.UPDATES and (
         newer_memory_by_evidence_time(memory_low_id, memory_high_id, low_evidence_time, high_evidence_time) is None
     ):
-        return CrossDocumentRelationLabel.CONTRADICTS
+        return MemoryRelationLabel.CONTRADICTS
     return label
 
 
 def _check_recorded_relation(
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     memory_low_id: str,
     memory_high_id: str,
     low_evidence_time: str | None,
@@ -256,14 +256,14 @@ def _check_recorded_relation(
 ) -> None:
     if memory_low_id >= memory_high_id:
         raise ValueError("a relation pair must be stored lower Memory id first")
-    if label is CrossDocumentRelationLabel.NONE:
+    if label is MemoryRelationLabel.NONE:
         raise ValueError("a none judgment is not stored as a relation")
     if recorded_relation_label(label, memory_low_id, memory_high_id, low_evidence_time, high_evidence_time) is not label:
         raise ValueError("an updates relation needs Evidence times that order the pair")
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationRecord:
+class MemoryRelationRecord:
     """One relation a discovery run found, bound to the two contents it judged.
 
     ``low_evidence_time`` and ``high_evidence_time`` are the Evidence times the
@@ -272,14 +272,14 @@ class CrossDocumentRelationRecord:
 
     memory_low_id: str
     memory_high_id: str
-    label: CrossDocumentRelationLabel
+    label: MemoryRelationLabel
     low_content_hash: str
     high_content_hash: str
     low_evidence_time: str | None
     high_evidence_time: str | None
     relation_run_id: str
     discovery_work_id: str
-    classifier_version: str = CROSS_DOCUMENT_RELATION_CLASSIFIER_VERSION
+    classifier_version: str = MEMORY_RELATION_CLASSIFIER_VERSION
 
     def __post_init__(self) -> None:
         _check_recorded_relation(
@@ -296,11 +296,11 @@ class CrossDocumentRelationRecord:
     @classmethod
     def from_judgment(
         cls,
-        judgment: CrossDocumentRelationJudgment,
+        judgment: MemoryRelationJudgment,
         *,
         relation_run_id: str,
         discovery_work_id: str,
-    ) -> CrossDocumentRelationRecord:
+    ) -> MemoryRelationRecord:
         by_id = {
             judgment.pair.challenger.memory_id: judgment.pair.challenger,
             judgment.pair.candidate.memory_id: judgment.pair.candidate,
@@ -321,7 +321,7 @@ class CrossDocumentRelationRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationOutcome:
+class MemoryRelationOutcome:
     """What one discovery run judged for its challenger.
 
     ``judged_content_hashes`` maps every judged candidate to the content it was
@@ -335,7 +335,7 @@ class CrossDocumentRelationOutcome:
     challenger_id: str
     challenger_content_hash: str
     judged_content_hashes: Mapping[str, str]
-    relations: tuple[CrossDocumentRelationRecord, ...] = ()
+    relations: tuple[MemoryRelationRecord, ...] = ()
 
     def __post_init__(self) -> None:
         judged = {self.challenger_id: self.challenger_content_hash, **self.judged_content_hashes}
@@ -351,11 +351,11 @@ class CrossDocumentRelationOutcome:
     def from_judgments(
         cls,
         challenger: RelationSubject,
-        judgments: Sequence[CrossDocumentRelationJudgment],
+        judgments: Sequence[MemoryRelationJudgment],
         *,
         relation_run_id: str,
         discovery_work_id: str,
-    ) -> CrossDocumentRelationOutcome:
+    ) -> MemoryRelationOutcome:
         if any(judgment.pair.challenger != challenger for judgment in judgments):
             raise ValueError("a discovery outcome judges pairs of one challenger")
         return cls(
@@ -366,13 +366,13 @@ class CrossDocumentRelationOutcome:
                 for judgment in judgments
             },
             relations=tuple(
-                CrossDocumentRelationRecord.from_judgment(
+                MemoryRelationRecord.from_judgment(
                     judgment,
                     relation_run_id=relation_run_id,
                     discovery_work_id=discovery_work_id,
                 )
                 for judgment in judgments
-                if judgment.label is not CrossDocumentRelationLabel.NONE
+                if judgment.label is not MemoryRelationLabel.NONE
             ),
         )
 
@@ -380,14 +380,14 @@ class CrossDocumentRelationOutcome:
 # Relations shown per Memory, most consequential label first.
 MAX_RELATIONS_PER_MEMORY = 10
 RELATION_READ_ORDER = (
-    CrossDocumentRelationLabel.CONTRADICTS,
-    CrossDocumentRelationLabel.UPDATES,
-    CrossDocumentRelationLabel.EQUIVALENT,
+    MemoryRelationLabel.CONTRADICTS,
+    MemoryRelationLabel.UPDATES,
+    MemoryRelationLabel.EQUIVALENT,
 )
 
 
 @dataclass(frozen=True, slots=True)
-class CurrentCrossDocumentRelation:
+class CurrentMemoryRelation:
     """A stored relation that is current for the caller.
 
     Current means both Memories are active and visible to the caller, both
@@ -399,12 +399,12 @@ class CurrentCrossDocumentRelation:
 
     memory_low_id: str
     memory_high_id: str
-    label: CrossDocumentRelationLabel
+    label: MemoryRelationLabel
     low_content_hash: str
     high_content_hash: str
     low_evidence_time: str | None
     high_evidence_time: str | None
-    decided_by: CrossDocumentRelationDecider
+    decided_by: MemoryRelationDecider
     decided_at: str
 
     def __post_init__(self) -> None:
@@ -430,7 +430,7 @@ class CurrentCrossDocumentRelation:
     def newer_memory_id(self) -> str | None:
         """The newer Memory of an ``updates`` pair; None for every other label."""
 
-        if self.label is not CrossDocumentRelationLabel.UPDATES:
+        if self.label is not MemoryRelationLabel.UPDATES:
             return None
         return newer_memory_by_evidence_time(
             self.memory_low_id,
@@ -441,13 +441,13 @@ class CurrentCrossDocumentRelation:
 
 
 @dataclass(frozen=True, slots=True)
-class CrossDocumentRelationDismissal:
+class MemoryRelationDismissal:
     """A person's record that one relation is wrong for both current contents."""
 
     id: str
     memory_low_id: str
     memory_high_id: str
-    label: CrossDocumentRelationLabel
+    label: MemoryRelationLabel
     low_content_hash: str
     high_content_hash: str
     dismissed_by: str
@@ -462,7 +462,7 @@ class RelationDismissalConflict(ValueError):
     """The dismissal names content or a relation that is no longer current."""
 
 
-CROSS_DOCUMENT_RELATION_RULES = """Each pair holds two statements, taken from the same document or from different
+MEMORY_RELATION_CLASSIFIER_RULES = """Each pair holds two statements, taken from the same document or from different
 ones. Each statement comes with its memory type, the source type and title of its
 document, evidence_time (the UTC time at which its source recorded the
 Evidence, null when unknown), and the Evidence text it was taken from. Use all of them
@@ -509,8 +509,8 @@ reader of both statements, while a missed one only omits a hint.
 # Every request states one challenger once, as the subject, and asks one
 # question per candidate. Candidates of one subject often repeat one another,
 # so the prompt says that such repetition tells nothing about the subject.
-CROSS_DOCUMENT_RELATION_QUESTION = "What is the relation of this candidate to the subject?"
-CROSS_DOCUMENT_RELATION_PROMPT = CROSS_DOCUMENT_RELATION_RULES + """
+MEMORY_RELATION_CLASSIFIER_QUESTION = "What is the relation of this candidate to the subject?"
+MEMORY_RELATION_CLASSIFIER_PROMPT = MEMORY_RELATION_CLASSIFIER_RULES + """
 Every question below asks for the relation between one candidate statement and the subject statement. \
 The subject is one statement; each candidate is one other statement.
 Many candidates repeat one another. Judge each candidate only against the subject: \
@@ -530,19 +530,19 @@ Return exactly one decision for every pair_index and no other pair_index.
 """
 
 
-def cross_document_relation_prompt(
+def memory_relation_classifier_prompt(
     subject: RelationSubject,
     questions: Sequence[tuple[int, RelationSubject]],
 ) -> str:
     """One request: the subject stated once and one question per ``(pair_index, candidate)``."""
 
-    return CROSS_DOCUMENT_RELATION_PROMPT.format(
+    return MEMORY_RELATION_CLASSIFIER_PROMPT.format(
         subject_json=json.dumps(subject.prompt_payload(), ensure_ascii=False),
         questions_json=json.dumps(
             [
                 {
                     "pair_index": pair_index,
-                    "question": CROSS_DOCUMENT_RELATION_QUESTION,
+                    "question": MEMORY_RELATION_CLASSIFIER_QUESTION,
                     "candidate": candidate.prompt_payload(),
                 }
                 for pair_index, candidate in questions
@@ -552,7 +552,7 @@ def cross_document_relation_prompt(
     )
 
 
-class StructuredCrossDocumentRelationClassifier:
+class StructuredMemoryRelationClassifier:
     """Label exact pairs with the Structured LLM; any pair left without a label fails the run.
 
     Pairs are asked about per challenger: every request holds the pairs of one
@@ -567,26 +567,26 @@ class StructuredCrossDocumentRelationClassifier:
         model: str,
     ) -> None:
         self._client = client
-        self._model = decision_task_model(client, CROSS_DOCUMENT_RELATION_TASK, model)
+        self._model = decision_task_model(client, MEMORY_RELATION_TASK, model)
 
     async def classify(
         self,
-        pairs: tuple[CrossDocumentRelationPair, ...],
-    ) -> CrossDocumentRelationClassification:
+        pairs: tuple[MemoryRelationPair, ...],
+    ) -> MemoryRelationClassification:
         runner = LlmBatchRunner(self._client, model=self._model)
         by_challenger: dict[str, list[int]] = {}
         for pair_index, pair in enumerate(pairs):
             by_challenger.setdefault(pair.challenger.memory_id, []).append(pair_index)
-        judgments: dict[int, CrossDocumentRelationJudgment] = {}
+        judgments: dict[int, MemoryRelationJudgment] = {}
         for pair_indexes in by_challenger.values():
             results = await run_pair_items(
                 runner,
                 self._challenger_task(pairs, pair_indexes),
                 pair_count=len(pairs),
-                label="cross-document relation classification",
+                label="memory relation classification",
             )
             judgments.update(zip(pair_indexes, results, strict=True))
-        return CrossDocumentRelationClassification(
+        return MemoryRelationClassification(
             judgments=tuple(judgments[pair_index] for pair_index in range(len(pairs))),
             llm_calls=runner.stats.calls,
             prompt_chars=runner.stats.prompt_chars,
@@ -594,7 +594,7 @@ class StructuredCrossDocumentRelationClassifier:
 
     def _challenger_task(
         self,
-        pairs: tuple[CrossDocumentRelationPair, ...],
+        pairs: tuple[MemoryRelationPair, ...],
         pair_indexes: Sequence[int],
     ) -> ItemTask:
         """The questions about one challenger's pairs, with the challenger as their shared context."""
@@ -603,29 +603,29 @@ class StructuredCrossDocumentRelationClassifier:
 
         def render(item_ids: tuple[str, ...], context: tuple[RelationSubject, ...]) -> LlmRequest:
             [subject] = context
-            prompt = cross_document_relation_prompt(
+            prompt = memory_relation_classifier_prompt(
                 subject,
                 [(int(item_id), asked[int(item_id)].candidate) for item_id in item_ids],
             )
-            return LlmRequest(prompt, CrossDocumentRelationResponse)
+            return LlmRequest(prompt, RelationCandidateResponse)
 
-        def decode(response: CrossDocumentRelationResponse, _item_ids: tuple[str, ...], _context: tuple):
+        def decode(response: RelationCandidateResponse, _item_ids: tuple[str, ...], _context: tuple):
             """Each decision is its pair's row; the runner rejects an unrequested pair_index."""
             for decision in response.decisions:
                 pair_index = int(decision.pair_index)
                 if pair_index not in asked:
                     yield str(pair_index), RejectedRow(f"pair_index {pair_index} was not requested")
                     continue
-                yield str(pair_index), CrossDocumentRelationJudgment(
+                yield str(pair_index), MemoryRelationJudgment(
                     pair=asked[pair_index],
-                    label=CrossDocumentRelationLabel(decision.label),
+                    label=MemoryRelationLabel(decision.label),
                 )
 
         return ItemTask(
             item_ids=tuple(str(pair_index) for pair_index in pair_indexes),
             render=render,
             decode=decode,
-            call=self._client.classify_cross_document_relations,
+            call=self._client.classify_relation_candidates,
             context=(pairs[pair_indexes[0]].challenger,),
             label=lambda item_id: f"pair_index {item_id}",
         )

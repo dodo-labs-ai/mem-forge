@@ -1,4 +1,4 @@
-"""Read Cross-Document Relations for a caller.
+"""Read Memory Relations for a caller.
 
 Storage returns the relations that are current for the caller, each with the
 label it was recorded with and the Evidence time of both Memories it was
@@ -14,11 +14,11 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Protocol
 
-from memforge.memory.cross_document_relation import (
+from memforge.memory.memory_relation import (
     RELATION_READ_ORDER,
-    CrossDocumentRelationDismissal,
-    CrossDocumentRelationLabel,
-    CurrentCrossDocumentRelation,
+    MemoryRelationDismissal,
+    MemoryRelationLabel,
+    CurrentMemoryRelation,
     RelationDismissalConflict,
 )
 from memforge.models import Memory, MemoryRelationContext, MemorySourceRef, RelatedMemory
@@ -26,11 +26,11 @@ from memforge.storage.adapters.context import AccessScope
 
 
 class RelationReadStore(Protocol):
-    async def list_cross_document_relations(
+    async def list_memory_relations(
         self,
         memory_ids: Sequence[str],
         scope: AccessScope,
-    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]: ...
+    ) -> Mapping[str, tuple[CurrentMemoryRelation, ...]]: ...
 
     async def list_memories_by_ids(self, memory_ids: Sequence[str]) -> list[Memory]: ...
 
@@ -42,26 +42,26 @@ class RelationReadStore(Protocol):
 
 
 class RelationViewStore(RelationReadStore, Protocol):
-    async def list_current_cross_document_relations(
+    async def list_current_memory_relations(
         self,
         scope: AccessScope,
         *,
-        labels: Collection[CrossDocumentRelationLabel] | None = None,
-    ) -> tuple[CurrentCrossDocumentRelation, ...]: ...
+        labels: Collection[MemoryRelationLabel] | None = None,
+    ) -> tuple[CurrentMemoryRelation, ...]: ...
 
 
 class RelationDismissalStore(RelationReadStore, Protocol):
-    async def record_cross_document_relation_dismissal(
+    async def record_memory_relation_dismissal(
         self,
         *,
         memory_id: str,
         counterpart_memory_id: str,
-        label: CrossDocumentRelationLabel,
+        label: MemoryRelationLabel,
         expected_content_hash: str,
         counterpart_expected_content_hash: str,
         actor: str,
         note: str | None = None,
-    ) -> CrossDocumentRelationDismissal: ...
+    ) -> MemoryRelationDismissal: ...
 
 
 class RelationRole(str, Enum):
@@ -72,7 +72,7 @@ class RelationRole(str, Enum):
     PEER = "peer"
 
 
-def relation_role(relation: CurrentCrossDocumentRelation, memory_id: str) -> RelationRole:
+def relation_role(relation: CurrentMemoryRelation, memory_id: str) -> RelationRole:
     newer_memory_id = relation.newer_memory_id
     if newer_memory_id is None:
         return RelationRole.PEER
@@ -83,9 +83,9 @@ def relation_role(relation: CurrentCrossDocumentRelation, memory_id: str) -> Rel
 class RelationGraph:
     """The current relations of a set of Memories."""
 
-    relations: Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]
+    relations: Mapping[str, tuple[CurrentMemoryRelation, ...]]
 
-    def relations_of(self, memory_id: str) -> tuple[CurrentCrossDocumentRelation, ...]:
+    def relations_of(self, memory_id: str) -> tuple[CurrentMemoryRelation, ...]:
         return self.relations.get(memory_id, ())
 
 
@@ -94,7 +94,7 @@ async def load_relation_graph(
     memory_ids: Sequence[str],
     scope: AccessScope,
 ) -> RelationGraph:
-    return RelationGraph(relations=await store.list_cross_document_relations(memory_ids, scope))
+    return RelationGraph(relations=await store.list_memory_relations(memory_ids, scope))
 
 
 def order_by_relations(memory_ids: Sequence[str], graph: RelationGraph) -> list[str]:
@@ -168,7 +168,7 @@ async def related_memories(
     }
 
 
-def _dated(memory: RelatedMemory, relation: CurrentCrossDocumentRelation) -> RelatedMemory:
+def _dated(memory: RelatedMemory, relation: CurrentMemoryRelation) -> RelatedMemory:
     return replace(memory, evidence_time=relation.evidence_time_of(memory.memory_id))
 
 
@@ -216,9 +216,9 @@ def relation_notice(contexts: Sequence[MemoryRelationContext]) -> str | None:
 
     notes: list[str] = []
     for context in contexts:
-        if context.label == CrossDocumentRelationLabel.CONTRADICTS.value:
+        if context.label == MemoryRelationLabel.CONTRADICTS.value:
             notes.append(f"Conflicts with {_describe(context.counterpart)}.")
-        elif context.label == CrossDocumentRelationLabel.UPDATES.value and context.role == RelationRole.OLDER.value:
+        elif context.label == MemoryRelationLabel.UPDATES.value and context.role == RelationRole.OLDER.value:
             notes.append(f"Updated by the newer {_describe(context.counterpart)}.")
     return " ".join(notes) or None
 
@@ -251,14 +251,14 @@ class DismissedRelationView:
 async def dismissed_relation_views(
     store: RelationReadStore,
     memory_id: str,
-    dismissals: Sequence[CrossDocumentRelationDismissal],
+    dismissals: Sequence[MemoryRelationDismissal],
     scope: AccessScope,
 ) -> tuple[DismissedRelationView, ...]:
     """Group one Memory's dismissals in force by pair, newest dismissal first."""
 
     if not dismissals:
         return ()
-    by_counterpart: dict[str, list[CrossDocumentRelationDismissal]] = {}
+    by_counterpart: dict[str, list[MemoryRelationDismissal]] = {}
     for dismissal in sorted(dismissals, key=lambda item: (item.dismissed_at, item.id), reverse=True):
         by_counterpart.setdefault(dismissal.counterpart_of(memory_id), []).append(dismissal)
     counterparts = await related_memories(store, tuple(by_counterpart), scope)
@@ -295,13 +295,13 @@ async def list_relation_pairs(
     store: RelationViewStore,
     scope: AccessScope,
     *,
-    label: CrossDocumentRelationLabel | None,
+    label: MemoryRelationLabel | None,
     limit: int,
     offset: int,
 ) -> tuple[tuple[RelationPairView, ...], int]:
     """One page of the relations current for the caller, and their total."""
 
-    relations = await store.list_current_cross_document_relations(
+    relations = await store.list_current_memory_relations(
         scope,
         labels=(label,) if label is not None else None,
     )
@@ -333,13 +333,13 @@ async def dismiss_relation(
     *,
     memory_id: str,
     counterpart_memory_id: str,
-    label: CrossDocumentRelationLabel,
+    label: MemoryRelationLabel,
     expected_content_hash: str,
     counterpart_expected_content_hash: str,
     actor: str,
     scope: AccessScope,
     note: str | None = None,
-) -> CrossDocumentRelationDismissal:
+) -> MemoryRelationDismissal:
     """Dismiss the relation the caller sees between two Memories.
 
     ``label`` is the label the caller saw. Raises LookupError when the caller
@@ -360,7 +360,7 @@ async def dismiss_relation(
         raise LookupError("relation not found")
     if shown.label is not label:
         raise RelationDismissalConflict("relation_label_changed")
-    return await store.record_cross_document_relation_dismissal(
+    return await store.record_memory_relation_dismissal(
         memory_id=memory_id,
         counterpart_memory_id=counterpart_memory_id,
         label=label,

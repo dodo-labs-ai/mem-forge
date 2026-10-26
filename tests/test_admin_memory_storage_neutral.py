@@ -43,7 +43,7 @@ class RelationFreeReader:
     async def get_memory_source_refs_many(self, memory_ids, scope):
         return {memory_id: self.source_refs.get(memory_id, ()) for memory_id in memory_ids}
 
-    async def list_cross_document_relations(self, memory_ids, scope):
+    async def list_memory_relations(self, memory_ids, scope):
         return {}
 
     async def list_memories_by_ids(self, memory_ids):

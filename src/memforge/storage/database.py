@@ -172,14 +172,14 @@ from memforge.memory.lifecycle_plan import (
     skipped_supports_by_memory_from_plan_payload,
 )
 from memforge.memory.origin import references_source_row
-from memforge.memory.cross_document_relation import (
+from memforge.memory.memory_relation import (
     MAX_RELATIONS_PER_MEMORY,
     RELATION_READ_ORDER,
-    CrossDocumentRelationDecider,
-    CrossDocumentRelationDismissal,
-    CrossDocumentRelationLabel,
-    CrossDocumentRelationOutcome,
-    CurrentCrossDocumentRelation,
+    MemoryRelationDecider,
+    MemoryRelationDismissal,
+    MemoryRelationLabel,
+    MemoryRelationOutcome,
+    CurrentMemoryRelation,
     RelationDismissalConflict,
     newest_evidence_unit_id,
     pair_key,
@@ -446,7 +446,7 @@ AGENT_SESSION_OUTCOME_NO_OUTPUT = "no_output"
 AGENT_SESSION_OUTCOME_FAILED = "failed"
 
 
-def _current_cross_document_relation_sql(scope) -> tuple[str, list[Any]]:
+def _current_memory_relation_sql(scope) -> tuple[str, list[Any]]:
     """FROM and WHERE for relations current for the caller, with the relation aliased ``r``.
 
     Both Memories are active and visible, both contents equal the judged
@@ -494,26 +494,26 @@ def _relation_read_order_sql(label_column: str) -> tuple[str, list[str]]:
     )
 
 
-def _row_to_current_cross_document_relation(row: Any) -> CurrentCrossDocumentRelation:
-    return CurrentCrossDocumentRelation(
+def _row_to_current_memory_relation(row: Any) -> CurrentMemoryRelation:
+    return CurrentMemoryRelation(
         memory_low_id=str(row["memory_low_id"]),
         memory_high_id=str(row["memory_high_id"]),
-        label=CrossDocumentRelationLabel(row["label"]),
+        label=MemoryRelationLabel(row["label"]),
         low_content_hash=str(row["low_content_hash"]),
         high_content_hash=str(row["high_content_hash"]),
         low_evidence_time=row["low_evidence_time"],
         high_evidence_time=row["high_evidence_time"],
-        decided_by=CrossDocumentRelationDecider(row["decided_by"]),
+        decided_by=MemoryRelationDecider(row["decided_by"]),
         decided_at=str(row["decided_at"]),
     )
 
 
-def _row_to_cross_document_relation_dismissal(row: Any) -> CrossDocumentRelationDismissal:
-    return CrossDocumentRelationDismissal(
+def _row_to_memory_relation_dismissal(row: Any) -> MemoryRelationDismissal:
+    return MemoryRelationDismissal(
         id=str(row["id"]),
         memory_low_id=str(row["memory_low_id"]),
         memory_high_id=str(row["memory_high_id"]),
-        label=CrossDocumentRelationLabel(row["label"]),
+        label=MemoryRelationLabel(row["label"]),
         low_content_hash=str(row["low_content_hash"]),
         high_content_hash=str(row["high_content_hash"]),
         dismissed_by=str(row["dismissed_by"]),
@@ -522,7 +522,7 @@ def _row_to_cross_document_relation_dismissal(row: Any) -> CrossDocumentRelation
     )
 
 
-# Relation rows that cross-document discovery wrote into the Evidence Unit
+# Relation rows that relation discovery wrote into the Evidence Unit
 # projection; Lifecycle writes are the projection's only owner.
 _LEGACY_DISCOVERY_RELATION_SQL = """er.is_authoritative_support = 0
 AND er.relation_run_id IN (
@@ -533,7 +533,7 @@ AND er.relation_run_id IN (
 
 def _relation_dismissal_audit_event(
     event_type: str,
-    dismissal: CrossDocumentRelationDismissal,
+    dismissal: MemoryRelationDismissal,
     *,
     memory_id: str,
     actor: str,
@@ -973,13 +973,13 @@ def _enabled_source_visibility_condition(
 # Schema (v1)
 # ---------------------------------------------------------------------------
 
-# Cross-document relations between two Memories, bound to both contents, and
+# Memory relations between two Memories, bound to both contents, and
 # the dismissals people record for them. A pair is stored lower Memory id first.
 # Each side keeps the Evidence time (a UTC date) the relation was decided on;
 # an updates pair is stored only when those dates order it. A classifier
 # relation names the discovery work that recorded it, and that work's next
 # completed run replaces it.
-_CROSS_DOCUMENT_RELATION_DDL = """
+_MEMORY_RELATION_DDL = """
 CREATE TABLE IF NOT EXISTS cross_document_relations (
     memory_low_id       TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     memory_high_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -2570,7 +2570,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_assessment_criterion
     ON agent_assessments(criterion, label, created_at);
 CREATE INDEX IF NOT EXISTS idx_agent_assessment_input_fingerprint
     ON agent_assessments(input_fingerprint, status, created_at, assessment_id);
-""" + _CROSS_DOCUMENT_RELATION_DDL
+""" + _MEMORY_RELATION_DDL
 
 # ---------------------------------------------------------------------------
 # Migrations - empty for v1; start from v2 onwards.
@@ -12289,7 +12289,7 @@ class Database:
         worker_id: str,
         lease_token: str,
         relation_run: RelationOutcomeBundle,
-        document_relations: CrossDocumentRelationOutcome,
+        memory_relations: MemoryRelationOutcome,
     ) -> None:
         """Atomically record one discovery run's relations and fence its leased work."""
 
@@ -12304,12 +12304,12 @@ class Database:
                 await self._assert_relation_discovery_outcome_current_unlocked(
                     row,
                     relation_run,
-                    document_relations,
+                    memory_relations,
                 )
                 bundle = _with_relation_snapshot_audit(relation_run)
                 if not await self._relation_run_recorded_unlocked(bundle):
                     await self._insert_relation_run_unlocked(bundle)
-                    await self._record_cross_document_relations_unlocked(work_id, document_relations)
+                    await self._record_memory_relations_unlocked(work_id, memory_relations)
                 completed_at = _now_iso()
                 cursor = await self.db.execute(
                     """UPDATE relation_discovery_work
@@ -12339,13 +12339,13 @@ class Database:
     async def _delete_work_classifier_relations_unlocked(self, work_id: str) -> None:
         await self.db.execute(
             "DELETE FROM cross_document_relations WHERE discovery_work_id = ? AND decided_by = ?",
-            (work_id, CrossDocumentRelationDecider.CLASSIFIER.value),
+            (work_id, MemoryRelationDecider.CLASSIFIER.value),
         )
 
-    async def _record_cross_document_relations_unlocked(
+    async def _record_memory_relations_unlocked(
         self,
         work_id: str,
-        outcome: CrossDocumentRelationOutcome,
+        outcome: MemoryRelationOutcome,
     ) -> None:
         """Make one discovery run the record of what its work decided.
 
@@ -12372,7 +12372,7 @@ class Database:
                     (
                         low_id,
                         high_id,
-                        CrossDocumentRelationDecider.REVIEW.value,
+                        MemoryRelationDecider.REVIEW.value,
                         hashes[low_id],
                         hashes[high_id],
                     ),
@@ -12412,9 +12412,9 @@ class Database:
                     record.classifier_version,
                     record.relation_run_id,
                     record.discovery_work_id,
-                    CrossDocumentRelationDecider.CLASSIFIER.value,
+                    MemoryRelationDecider.CLASSIFIER.value,
                     decided_at,
-                    CrossDocumentRelationDecider.REVIEW.value,
+                    MemoryRelationDecider.REVIEW.value,
                 ),
             )
 
@@ -12648,7 +12648,7 @@ class Database:
                             decision.high_content_hash,
                             decision.low_evidence_time,
                             decision.high_evidence_time,
-                            CrossDocumentRelationDecider.REVIEW.value,
+                            MemoryRelationDecider.REVIEW.value,
                             decision.resolved_at or applied_at,
                         ),
                     )
@@ -12900,7 +12900,7 @@ class Database:
         self,
         work_row,
         outcome: RelationOutcomeBundle,
-        document_relations: CrossDocumentRelationOutcome,
+        memory_relations: MemoryRelationOutcome,
     ) -> None:
         """Fence a run by the contents it judged and the challenger's current evidence.
 
@@ -12918,8 +12918,8 @@ class Database:
             challenger is None
             or challenger["status"] != "active"
             or challenger["content_hash"] != work_row["expected_content_hash"]
-            or document_relations.challenger_id != work_row["memory_id"]
-            or document_relations.challenger_content_hash != work_row["expected_content_hash"]
+            or memory_relations.challenger_id != work_row["memory_id"]
+            or memory_relations.challenger_content_hash != work_row["expected_content_hash"]
         ):
             raise ValueError("relation discovery challenger is stale")
         unit = outcome.evidence_unit
@@ -12944,7 +12944,7 @@ class Database:
         if current_unit is None or current_unit.id != unit.id:
             raise ValueError("relation discovery evidence is no longer current")
         candidate_ids = tuple(dict.fromkeys(candidate.memory_id for candidate in outcome.candidates))
-        if not set(document_relations.judged_content_hashes).issubset(candidate_ids):
+        if not set(memory_relations.judged_content_hashes).issubset(candidate_ids):
             raise ValueError("relation discovery judged a Memory outside its candidates")
         if not candidate_ids:
             return
@@ -12966,7 +12966,7 @@ class Database:
         by_id = {row["id"]: row for row in rows}
         for memory_id in candidate_ids:
             candidate = by_id.get(memory_id)
-            judged_content_hash = document_relations.judged_content_hashes.get(memory_id)
+            judged_content_hash = memory_relations.judged_content_hashes.get(memory_id)
             if (
                 candidate is None
                 or candidate["status"] != "active"
@@ -15793,18 +15793,18 @@ class Database:
                 )
         return {memory_id: tuple(refs) for memory_id, refs in grouped.items()}
 
-    async def list_cross_document_relations(
+    async def list_memory_relations(
         self,
         memory_ids: Sequence[str],
         scope,
-    ) -> Mapping[str, tuple[CurrentCrossDocumentRelation, ...]]:
+    ) -> Mapping[str, tuple[CurrentMemoryRelation, ...]]:
         """Return the current relations of each Memory, most consequential label first."""
 
         ordered_ids = tuple(dict.fromkeys(str(memory_id) for memory_id in memory_ids if memory_id))
-        relations: dict[str, list[CurrentCrossDocumentRelation]] = {
+        relations: dict[str, list[CurrentMemoryRelation]] = {
             memory_id: [] for memory_id in ordered_ids
         }
-        current_sql, current_params = _current_cross_document_relation_sql(scope)
+        current_sql, current_params = _current_memory_relation_sql(scope)
         order_sql, order_params = _relation_read_order_sql("sides.label")
         for start in range(0, len(ordered_ids), STORAGE_BIND_CHUNK_SIZE):
             batch = ordered_ids[start : start + STORAGE_BIND_CHUNK_SIZE]
@@ -15844,21 +15844,21 @@ class Database:
                 ],
             )
             for row in rows:
-                relations[str(row["memory_id"])].append(_row_to_current_cross_document_relation(row))
+                relations[str(row["memory_id"])].append(_row_to_current_memory_relation(row))
         return {memory_id: tuple(items) for memory_id, items in relations.items()}
 
-    async def list_current_cross_document_relations(
+    async def list_current_memory_relations(
         self,
         scope,
         *,
-        labels: Collection[CrossDocumentRelationLabel] | None = None,
-    ) -> tuple[CurrentCrossDocumentRelation, ...]:
+        labels: Collection[MemoryRelationLabel] | None = None,
+    ) -> tuple[CurrentMemoryRelation, ...]:
         """Every relation current for the caller, newest decision first.
 
         ``labels`` keeps the relations stored with one of these labels.
         """
 
-        current_sql, current_params = _current_cross_document_relation_sql(scope)
+        current_sql, current_params = _current_memory_relation_sql(scope)
         label_sql, label_params = "", []
         if labels is not None:
             label_sql = f"AND r.label IN ({', '.join('?' for _ in labels)})"
@@ -15868,26 +15868,26 @@ class Database:
                  ORDER BY r.decided_at DESC, r.memory_low_id, r.memory_high_id""",
             [*current_params, *label_params],
         )
-        return tuple(_row_to_current_cross_document_relation(row) for row in rows)
+        return tuple(_row_to_current_memory_relation(row) for row in rows)
 
-    async def record_cross_document_relation_dismissal(
+    async def record_memory_relation_dismissal(
         self,
         *,
         memory_id: str,
         counterpart_memory_id: str,
-        label: CrossDocumentRelationLabel,
+        label: MemoryRelationLabel,
         expected_content_hash: str,
         counterpart_expected_content_hash: str,
         actor: str,
         note: str | None = None,
-    ) -> CrossDocumentRelationDismissal:
+    ) -> MemoryRelationDismissal:
         """Dismiss one relation label for both Memories' current content.
 
         Dismissing the same label for the same content again returns the
         dismissal already in force.
         """
 
-        if label is CrossDocumentRelationLabel.NONE:
+        if label is MemoryRelationLabel.NONE:
             raise ValueError("a none label is not a relation to dismiss")
         low_id, high_id = pair_key(memory_id, counterpart_memory_id)
         expected = {
@@ -15911,8 +15911,8 @@ class Database:
                 )
                 if existing:
                     await self.db.rollback()
-                    return _row_to_cross_document_relation_dismissal(existing[0])
-                dismissal = CrossDocumentRelationDismissal(
+                    return _row_to_memory_relation_dismissal(existing[0])
+                dismissal = MemoryRelationDismissal(
                     id=f"rdm-{uuid.uuid4().hex}",
                     memory_low_id=low_id,
                     memory_high_id=high_id,
@@ -15955,13 +15955,13 @@ class Database:
                 raise
         return dismissal
 
-    async def restore_cross_document_relation_dismissals(
+    async def restore_memory_relation_dismissals(
         self,
         *,
         memory_id: str,
         counterpart_memory_id: str,
         actor: str,
-    ) -> tuple[CrossDocumentRelationDismissal, ...]:
+    ) -> tuple[MemoryRelationDismissal, ...]:
         """Undo the dismissals in force for one pair; returns the ones undone."""
 
         low_id, high_id = pair_key(memory_id, counterpart_memory_id)
@@ -15974,7 +15974,7 @@ class Database:
                         ORDER BY d.dismissed_at, d.id""",
                     (low_id, high_id),
                 )
-                restored = tuple(_row_to_cross_document_relation_dismissal(row) for row in rows)
+                restored = tuple(_row_to_memory_relation_dismissal(row) for row in rows)
                 restored_at = _now_iso()
                 for dismissal in restored:
                     await self.db.execute(
@@ -15997,13 +15997,13 @@ class Database:
                 raise
         return restored
 
-    async def list_active_cross_document_relation_dismissals(
+    async def list_active_memory_relation_dismissals(
         self,
         memory_id: str,
         scope,
         *,
         limit: int,
-    ) -> tuple[CrossDocumentRelationDismissal, ...]:
+    ) -> tuple[MemoryRelationDismissal, ...]:
         """The dismissals in force for one Memory's pairs, newest first.
 
         In force means not undone and bound to both current contents; both
@@ -16022,7 +16022,7 @@ class Database:
                  LIMIT ?""",
             (memory_id, *low_visibility_params, *high_visibility_params, limit),
         )
-        return tuple(_row_to_cross_document_relation_dismissal(row) for row in rows)
+        return tuple(_row_to_memory_relation_dismissal(row) for row in rows)
 
     async def _current_content_hashes_unlocked(self, memory_ids: Sequence[str]) -> dict[str, str]:
         hashes: dict[str, str] = {}

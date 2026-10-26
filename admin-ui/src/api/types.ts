@@ -35,14 +35,14 @@ export interface Memory {
    * correct single brand mark.
    */
   origin_client?: string | null;
-  /** Current Cross-Document Relations; present on Memory detail. */
+  /** Current Memory Relations; present on Memory detail. */
   relations?: MemoryRelation[];
   relation_notice?: string | null;
   /** Relation Dismissals in force that the caller can undo; present on Memory detail. */
   dismissed_relations?: DismissedRelation[];
 }
 
-// Cross-Document Relations
+// Memory Relations
 
 export type RelationLabel = "equivalent" | "updates" | "contradicts";
 

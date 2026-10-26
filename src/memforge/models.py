@@ -951,7 +951,7 @@ class MemorySourceRef:
 
 @dataclass(frozen=True, slots=True)
 class RelatedMemory:
-    """One Memory of a Cross-Document Relation, as the caller may see it."""
+    """One Memory of a Memory Relation, as the caller may see it."""
 
     memory_id: str
     summary: str
@@ -965,7 +965,7 @@ class RelatedMemory:
 
 @dataclass(frozen=True, slots=True)
 class MemoryRelationContext:
-    """One current Cross-Document Relation, read from one of its two Memories.
+    """One current Memory Relation, read from one of its two Memories.
 
     ``label`` is the recorded label. ``role`` is this Memory's side: ``newer``
     or ``older`` for ``updates``, ordered by the Evidence times the relation

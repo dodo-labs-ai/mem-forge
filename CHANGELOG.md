@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Relations between memories are named memory relations throughout, since
+  they connect memories of one document as well as of different ones. The
+  modules are `memforge.memory.memory_relation`,
+  `memforge.memory.memory_relation_reader` and
+  `memforge.evals.memory_relation_cases`; the types are `MemoryRelation*`
+  (`MemoryRelationLabel`, `MemoryRelationOutcome`, `CurrentMemoryRelation`,
+  `MemoryRelationDismissal`, `StructuredMemoryRelationClassifier` and the
+  rest), the candidate retriever is `RelationCandidateRetriever` (the
+  `MemoryEngine` argument `relation_candidates`), and the structured client
+  method is `classify_relation_candidates`. The storage protocol methods are
+  `list_memory_relations`, `list_current_memory_relations`,
+  `record_memory_relation_dismissal`, `restore_memory_relation_dismissals` and
+  `list_active_memory_relation_dismissals`, and
+  `complete_relation_discovery_work` takes `memory_relations`. The admin API's label schema is
+  `MemoryRelationLabel`, and the MCP tool descriptions say memory relations.
+  Stored tables, contract versions, audit events, error codes and HTTP and MCP
+  field names are unchanged, so no migration runs. Cloud: the HANA adapter, the
+  core-integration `WorkspaceDatabase` and the runtime provider take the new
+  names with the pin.
+
 - Relation discovery now orders two statements recorded on the same day by
   the exact time their sources recorded them, for example two comments of one
   Jira issue, two messages of one Teams chat, or two pages modified the same

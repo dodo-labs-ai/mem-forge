@@ -1,4 +1,4 @@
-"""Operator paths for cross-document discovery: exhausted work, re-runs and Review conversion."""
+"""Operator paths for relation discovery: exhausted work, re-runs and Review conversion."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.evals.cross_document_relation_cases import RELATION_CASE_POLICY_VERSION
-from memforge.memory.cross_document_relation import CrossDocumentRelationLabel, pair_key
+from memforge.evals.memory_relation_cases import RELATION_CASE_POLICY_VERSION
+from memforge.memory.memory_relation import MemoryRelationLabel, pair_key
 from memforge.memory.cross_source_conflict_reviews import CROSS_SOURCE_CONFLICT_REVIEW_KIND
 from memforge.memory.cross_source_review_conversion import (
     CONVERSION_APPLIED_EVENT,
@@ -555,8 +555,8 @@ async def test_conversion_apply_writes_relations_dismissals_reruns_once(db: Data
         "SELECT * FROM cross_document_relation_dismissals ORDER BY label"
     )
     assert [row["label"] for row in dismissals] == [
-        CrossDocumentRelationLabel.CONTRADICTS.value,
-        CrossDocumentRelationLabel.UPDATES.value,
+        MemoryRelationLabel.CONTRADICTS.value,
+        MemoryRelationLabel.UPDATES.value,
     ]
     for dismissal in dismissals:
         assert (dismissal["memory_low_id"], dismissal["memory_high_id"]) == ("c", "d")

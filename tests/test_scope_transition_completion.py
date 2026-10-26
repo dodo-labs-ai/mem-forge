@@ -18,7 +18,7 @@ import pytest
 
 from memforge.memory.engine import MemoryEngine
 from memforge.memory.lifecycle_plan import ProjectedLifecycleBlocker, ProjectedLifecycleDeferredError
-from memforge.memory.relation_candidate_retrieval import CrossDocumentCandidateRetriever
+from memforge.memory.relation_candidate_retrieval import RelationCandidateRetriever
 from memforge import runtime
 from memforge.genes.jira_gene import JiraQueryRejected
 from memforge.local_agent.document_identity import build_jira_doc_id
@@ -906,7 +906,7 @@ async def test_a_real_lifecycle_commit_records_its_member_only_when_its_deferred
     memory_store = OrchestratorMemoryStore(workspace.db)
     adapters = build_sqlite_adapters(workspace.db, object())
     workspace.engine = MemoryEngine(
-        cross_document_candidates=CrossDocumentCandidateRetriever(
+        relation_candidates=RelationCandidateRetriever(
             relational=adapters.relational,
             keyword=adapters.keyword,
             vector=adapters.vector,

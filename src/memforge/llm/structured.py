@@ -466,7 +466,7 @@ class RefinementVerificationResponse(StructuredResponseModel):
     decisions: list[RefinementVerificationDecision]
 
 
-class CrossDocumentRelationDecision(StructuredResponseModel):
+class RelationCandidateDecision(StructuredResponseModel):
     """One closed relation label for one application-issued pair slot."""
 
     model_config = ConfigDict(extra="forbid")
@@ -475,13 +475,13 @@ class CrossDocumentRelationDecision(StructuredResponseModel):
     label: Literal["none", "equivalent", "updates", "contradicts"]
 
 
-class CrossDocumentRelationResponse(StructuredResponseModel):
-    """Exactly one decision for every cross-document pair in the request."""
+class RelationCandidateResponse(StructuredResponseModel):
+    """Exactly one decision for every candidate pair in the request."""
 
     model_config = ConfigDict(extra="forbid")
     direct_answer = True
 
-    decisions: list[CrossDocumentRelationDecision]
+    decisions: list[RelationCandidateDecision]
 
 
 class RevisionAssessment(StructuredResponseModel):
@@ -1745,7 +1745,7 @@ _REFUSAL_FINISH_REASONS = frozenset({"content_filter", "refusal"})
 # refused reply must fail instead.
 _REFUSAL_ERROR_CODES: dict[type[BaseModel], str] = {
     ClaimRevisionWireResponse: "claim_response_incomplete",
-    CrossDocumentRelationResponse: "cross_document_relation_response_incomplete",
+    RelationCandidateResponse: "cross_document_relation_response_incomplete",
     SupportAssessmentWireResponse: "support_response_incomplete",
     ChangeImpactWireResponse: "change_impact_response_incomplete",
 }
@@ -2032,11 +2032,11 @@ class LiteLlmStructuredClient:
             model=model,
         )
 
-    async def classify_cross_document_relations(
+    async def classify_relation_candidates(
         self, prompt: str, *, model: str | None = None,
-    ) -> CrossDocumentRelationResponse:
+    ) -> RelationCandidateResponse:
         return await self._call_schema(
-            prompt=prompt, response_format=CrossDocumentRelationResponse, model=model,
+            prompt=prompt, response_format=RelationCandidateResponse, model=model,
         )
 
     async def validate_entity_batch(

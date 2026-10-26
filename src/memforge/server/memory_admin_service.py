@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from memforge.memory.cross_document_relation_reader import RelationReadStore, read_memory_relations
+from memforge.memory.memory_relation_reader import RelationReadStore, read_memory_relations
 from memforge.storage.adapters.context import AccessScope
 from memforge.server.review_admin_service import read_open_review_ids
 from memforge.storage.admin_review import ReviewAdminReader

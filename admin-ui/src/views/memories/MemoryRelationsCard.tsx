@@ -40,7 +40,7 @@ function CounterpartLine({ memory }: { memory: RelatedMemory }) {
 }
 
 /**
- * Current Cross-Document Relations of one Memory and the dismissals a person
+ * Current Memory Relations of one Memory and the dismissals a person
  * can undo. A relation is a hint for readers; dismissing it changes no Memory.
  */
 export function MemoryRelationsCard({ memory }: { memory: Memory }) {

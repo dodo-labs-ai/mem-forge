@@ -101,7 +101,7 @@ class ScriptedClient(RevisionClientFixture):
 
 def coordination_engine(db: Database, client, memory_store=None) -> MemoryEngine:
     return MemoryEngine(
-        cross_document_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
+        relation_candidates=_candidate_retriever(build_sqlite_adapters(db, object())),
         db=db,
         memory_store=memory_store or _AuditedOutboxDrainer(db),
         structured_llm_client=client,
