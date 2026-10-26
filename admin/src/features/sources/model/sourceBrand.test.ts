@@ -33,7 +33,7 @@ test("maps source types and clients to brand marks", () => {
   );
   assert.equal(CLIENT_MARK.codex, "codex");
   assert.equal(CLIENT_MARK["claude-code"], "claude");
-  assert.equal(sourceBrandKeysFor("agent_session", "codex"), undefined);
+  assert.deepEqual(sourceBrandKeysFor("jira", "codex"), ["jira"], "a client brands only a user_memory Source");
   assert.deepEqual(sourceBrandKeysFor("user_memory", "codex"), ["codex"]);
   assert.deepEqual(sourceBrandKeysFor("user_memory", "claude-code"), ["claude"]);
   assert.equal(sourceBrandKeysFor("user_memory", null), undefined);
