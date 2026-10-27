@@ -374,7 +374,7 @@ def test_packaged_plugin_version_is_consistent():
     root = Path(__file__).resolve().parents[1]
     # The plugins and their runtime copies spell the version as semver; the
     # package spells the same version as PEP 440.
-    version = "0.2.0-beta.2"
+    version = "0.2.0-beta.3"
     package = tomllib.loads((root / "pyproject.toml").read_text())
     canonical_mcp = (root / "src" / "memforge" / "plugin_mcp_proxy.py").read_text()
     canonical_hook = (root / "src" / "memforge" / "hook_adapter.py").read_text()

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0b3 - 2026-10-30
+
 - A new Jira source authenticates with a personal access token by default, so
   it needs no local daemon. Browser session stays a choice for deployments
   where a personal access token is not available, and local sync always uses
