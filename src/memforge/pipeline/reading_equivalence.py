@@ -23,6 +23,10 @@ This one relation decides what changed wherever incremental work depends on it:
 Each consumer applies its own rules (multiplicity, uniqueness, eligibility) to
 the same readings.
 
+Markdown and plain text are also compared by their complete structures: every
+Fragment of a structure that changed is changed, and every Fragment of a base
+structure the target no longer has is removed.
+
 Each revision is compiled under its own pinned profile. Whether a contextual
 field or framing line governs interpretation is decided by the target
 revision's declarations, so a representation upgrade that only declares a
@@ -30,6 +34,13 @@ field displayed is no change, and a field the target does not declare governs.
 A displayed-only field has no reading of its own. Raw bytes and source origins
 the reading never shows do not take part, and a tombstoned record has no
 reading.
+
+The whole target reads as changed when the comparison cannot say less: its
+profile is outside this relation (a binary Artifact), its structures cannot be
+compared with a base of another profile, or its base cannot be compiled under
+its own older profile. A record with nothing to read, such as a tombstoned
+one, changes nothing whatever its base. A revision that cannot be compiled under the target's profile is
+``ReadingUnavailable``.
 """
 
 from __future__ import annotations
@@ -37,13 +48,15 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Literal, Mapping
+from functools import cached_property
+from typing import Callable, Literal
 
 from memforge.pipeline.evidence_fragments import (
     EvidenceFragment,
-    _changed_material_keys,
     build_revision_fragment_index,
     canonical_record_is_tombstoned,
+    changed_material_keys,
+    revision_changed_structural_ranges,
 )
 from memforge.pipeline.revision_reading import RevisionReadingIndex, build_revision_reading_index
 from memforge.source_projection import SourceAnchor, SourceObservationRevision
@@ -51,6 +64,10 @@ from memforge.source_representation import CanonicalRecordSchema, representation
 
 # A comparable reading of one Fragment, equal across revisions and profiles when it reads the same.
 ReadingKey = tuple[object, ...]
+Range = tuple[int, int]
+
+_RANGE_ADDRESSABLE_PROFILES = frozenset({"markdown-structural", "plain-text"})
+_COMPARED_PROFILES = frozenset({"canonical-record", *_RANGE_ADDRESSABLE_PROFILES})
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,42 +76,87 @@ class _Reading:
     key: ReadingKey
 
 
+@dataclass(frozen=True, slots=True)
+class _Side:
+    """One compiled revision: every Fragment anchor in order, and the readings among them."""
+
+    revision: SourceObservationRevision
+    anchors: tuple[SourceAnchor, ...]
+    readings: dict[SourceAnchor, _Reading]
+    counts: Counter[ReadingKey]
+
+
+@dataclass(frozen=True, slots=True)
+class _Changes:
+    """The anchors of one side whose reading the other side lacks, and that side's changed structures."""
+
+    side: _Side
+    read: frozenset[SourceAnchor]
+    structures: tuple[Range, ...]
+
+    def anchors(self) -> tuple[SourceAnchor, ...]:
+        return tuple(
+            anchor for anchor in self.side.anchors
+            if anchor in self.read or any(_overlaps(anchor, structure) for structure in self.structures)
+        )
+
+
 class ReadingUnavailable(ValueError):
-    """One revision of a comparison cannot be compiled completely under its pinned profile."""
+    """One revision of a comparison cannot be compiled completely under the profile it is compared in."""
 
     def __init__(self, side: Literal["base", "target"], message: str) -> None:
         super().__init__(f"{side} revision: {message}")
-        self.side = side
 
 
 class ReadingComparison:
-    """The readings of a base and a target revision of one Observation."""
+    """The readings of a base and a target revision of one Observation.
 
-    __slots__ = ("_base", "_target", "_base_counts", "_target_counts")
+    Each revision is compiled on first use. ``changed``, ``removed`` and
+    ``changed_ranges`` return ``None`` when the whole Observation reads as
+    changed, and raise ``ReadingUnavailable`` when a revision cannot be
+    compiled.
+    """
 
-    def __init__(self, base: Mapping[SourceAnchor, _Reading], target: Mapping[SourceAnchor, _Reading]) -> None:
-        self._base = dict(base)
-        self._target = dict(target)
-        self._base_counts = Counter(reading.key for reading in self._base.values())
-        self._target_counts = Counter(reading.key for reading in self._target.values())
+    def __init__(
+        self,
+        base: SourceObservationRevision,
+        target: SourceObservationRevision,
+        reading_index: Callable[[SourceObservationRevision], RevisionReadingIndex],
+    ) -> None:
+        self._base = base
+        self._target = target
+        self._reading_index = reading_index
+        self._governs = _governs(_schema(target))
 
-    def changed(self, *, purpose: Literal["authority", "current"] = "authority") -> tuple[SourceAnchor, ...]:
-        """The target anchors whose reading changed, in target order.
+    def changed(self, *, purpose: Literal["authority", "current"] = "authority") -> tuple[SourceAnchor, ...] | None:
+        """The target anchors that read differently from the base, in target order.
 
-        For ``authority``, a reading changed when no base Fragment reads the
+        Every Fragment of a changed Markdown or plain-text structure counts as
+        changed. For ``authority``, a reading changed when no base Fragment reads the
         same: one more copy of unchanged text is no new assertion. For the
         ``current`` reading, every copy counts as changed when the number of
         copies changed.
         """
 
-        changed = _changed_material_keys(self._base_counts, self._target_counts, purpose=purpose)
-        return tuple(anchor for anchor, reading in self._target.items() if reading.key in changed)
+        changes = self._changes(purpose)
+        return changes.anchors() if changes is not None else None
 
-    def removed(self) -> tuple[SourceAnchor, ...]:
-        """The base anchors whose reading no target Fragment has, in base order."""
+    def removed(self) -> tuple[SourceAnchor, ...] | None:
+        """The base anchors the target no longer reads, in base order."""
 
-        removed = _changed_material_keys(self._target_counts, self._base_counts, purpose="removed")
-        return tuple(anchor for anchor, reading in self._base.items() if reading.key in removed)
+        changes = self._changes("removed")
+        return changes.anchors() if changes is not None else None
+
+    def changed_ranges(self) -> tuple[Range, ...] | None:
+        """The target ranges that may hold new assertions: changed structures and changed Fragments."""
+
+        changes = self._changes("authority")
+        if changes is None:
+            return None
+        return tuple(dict.fromkeys((*changes.structures, *(
+            (anchor.range_start, anchor.range_end) for anchor in changes.side.anchors
+            if anchor in changes.read and anchor.range_start is not None and anchor.range_end is not None
+        ))))
 
     def counterparts(self, base_anchor: SourceAnchor) -> tuple[tuple[SourceAnchor, ...], tuple[SourceAnchor, ...]]:
         """Every base and every target anchor with the same own reading as one base anchor.
@@ -103,13 +165,53 @@ class ReadingComparison:
         has no counterparts.
         """
 
-        reading = self._base.get(base_anchor)
+        base, target = self._base_side, self._target_side
+        reading = base.readings.get(base_anchor) if base is not None else None
         if reading is None:
             return (), ()
         return (
-            tuple(anchor for anchor, other in self._base.items() if other.own == reading.own),
-            tuple(anchor for anchor, other in self._target.items() if other.own == reading.own),
+            tuple(anchor for anchor, other in base.readings.items() if other.own == reading.own),
+            tuple(anchor for anchor, other in target.readings.items() if other.own == reading.own),
         )
+
+    def _changes(self, purpose: Literal["authority", "current", "removed"]) -> _Changes | None:
+        profile = self._target.evidence_profile
+        if profile is None or profile.name not in _COMPARED_PROFILES:
+            return None
+        structured = profile.name in _RANGE_ADDRESSABLE_PROFILES
+        if structured and self._base.evidence_profile != profile:
+            return None
+        target = self._target_side
+        if purpose != "removed" and not structured and not target.readings:
+            return _Changes(target, frozenset(), ())
+        base = self._base_side
+        if base is None:
+            return None
+        old, new = (target, base) if purpose == "removed" else (base, target)
+        keys = changed_material_keys(old.counts, new.counts, purpose=purpose)
+        return _Changes(
+            new,
+            frozenset(anchor for anchor, reading in new.readings.items() if reading.key in keys),
+            revision_changed_structural_ranges(old.revision, new.revision, purpose=purpose) if structured else (),
+        )
+
+    @cached_property
+    def _target_side(self) -> _Side:
+        try:
+            return _compile(self._target, self._reading_index, self._governs)
+        except ValueError as error:
+            raise ReadingUnavailable("target", str(error)) from error
+
+    @cached_property
+    def _base_side(self) -> _Side | None:
+        """The compiled base; ``None`` when it cannot be compiled under its own older profile."""
+
+        try:
+            return _compile(self._base, self._reading_index, self._governs)
+        except ValueError as error:
+            if self._base.evidence_profile != self._target.evidence_profile:
+                return None
+            raise ReadingUnavailable("base", str(error)) from error
 
 
 def compare_readings(
@@ -121,19 +223,14 @@ def compare_readings(
     """Compare two revisions of one Observation by what a model reads in each.
 
     ``reading_index`` supplies a revision's complete reading index, so that a
-    caller that already holds indexes reuses them; by default each revision is
-    compiled here. Raises ``ReadingUnavailable`` naming the side that cannot be
-    compiled completely under its pinned profile.
+    caller that already holds indexes reuses them and decides how a revision
+    that cannot be compiled fails; by default each revision is compiled here
+    and such a revision raises ``ValueError``.
     """
 
     if base.observation_id != target.observation_id:
         raise ValueError("reading comparison requires two revisions of one Observation")
-    index = reading_index or _complete_reading_index
-    governs = _governs(_schema(target))
-    return ReadingComparison(
-        _readings(base, index, governs, side="base"),
-        _readings(target, index, governs, side="target"),
-    )
+    return ReadingComparison(base, target, reading_index or _complete_reading_index)
 
 
 def _complete_reading_index(revision: SourceObservationRevision) -> RevisionReadingIndex:
@@ -149,45 +246,27 @@ def _schema(revision: SourceObservationRevision) -> CanonicalRecordSchema | None
 
 
 def _governs(schema: CanonicalRecordSchema | None) -> Callable[[str | None], bool]:
-    """Whether a declared pointer governs interpretation under one schema; undeclared pointers do."""
+    """Whether a pointer governs interpretation under one schema; a pointer it does not declare does."""
 
     displayed = tuple(
-        field.json_pointer.split("/") for field in (schema.fields if schema is not None else ())
-        if not field.governs_interpretation
+        field for field in (schema.fields if schema is not None else ()) if not field.governs_interpretation
     )
 
     def governs(pointer: str | None) -> bool:
-        if pointer is None:
-            return True
-        parts = pointer.split("/")
-        return not any(
-            len(pattern) == len(parts)
-            and all(
-                expected == value or expected == "*" and (value == "*" or value.isdecimal())
-                for expected, value in zip(pattern, parts, strict=True)
-            )
-            for pattern in displayed
-        )
+        return pointer is None or not any(field.names(pointer) for field in displayed)
 
     return governs
 
 
-def _readings(
+def _compile(
     revision: SourceObservationRevision,
     reading_index: Callable[[SourceObservationRevision], RevisionReadingIndex],
     governs: Callable[[str | None], bool],
-    *,
-    side: Literal["base", "target"],
-) -> dict[SourceAnchor, _Reading]:
+) -> _Side:
     schema = _schema(revision)
-    try:
-        if schema is not None and canonical_record_is_tombstoned(revision):
-            return {}
-        index = reading_index(revision)
-    except ValueError as error:
-        raise ReadingUnavailable(side, str(error)) from error
-    if any(fragment.reading is None for fragment in index.fragments):
-        raise ReadingUnavailable(side, "a Fragment was compiled without its reading")
+    if schema is not None and canonical_record_is_tombstoned(revision):
+        return _Side(revision, (), {}, Counter())
+    index = reading_index(revision)
     by_anchor = {fragment.anchor: fragment for fragment in index.fragments}
 
     def displayed_only(fragment: EvidenceFragment) -> bool:
@@ -213,7 +292,7 @@ def _readings(
             tuple(sorted(governing[fragment.anchor], key=json.dumps)),
             interpretation,
         ))
-    return readings
+    return _Side(revision, tuple(by_anchor), readings, Counter(reading.key for reading in readings.values()))
 
 
 def _own_reading(fragment: EvidenceFragment) -> ReadingKey:
@@ -221,3 +300,8 @@ def _own_reading(fragment: EvidenceFragment) -> ReadingKey:
 
     reading = fragment.reading
     return fragment.kind.value, fragment.fragment_type, reading.field, reading.role, reading.label, reading.core
+
+
+def _overlaps(anchor: SourceAnchor, structure: Range) -> bool:
+    start, end = anchor.range_start, anchor.range_end
+    return start is not None and end is not None and start < structure[1] and structure[0] < end

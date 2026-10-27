@@ -21,7 +21,6 @@ from memforge.pipeline.evidence_fragments import (
     build_revision_fragment_index,
     canonical_record_field_ranges,
     canonical_record_is_tombstoned,
-    revision_changed_structural_ranges,
     revision_structural_ranges,
     _revision_structural_identities,
 )
@@ -100,11 +99,6 @@ class SupportAssessment:
     # that read only a Candidate's Evidence never does, so it can keep a claim but
     # never retire one.
     complete_read: bool = False
-
-
-def _in_ranges(fragment: EvidenceFragment, ranges) -> bool:
-    start, end = fragment.anchor.range_start, fragment.anchor.range_end
-    return start is not None and end is not None and any(start < right and left < end for left, right in ranges)
 
 
 class RevisionAssessmentContext:
@@ -384,29 +378,17 @@ class RevisionAssessmentContext:
         return self._reading_comparisons[key]
 
     def _delta_anchors(self, previous, current, *, purpose) -> frozenset[SourceAnchor] | None:
-        """One Observation's changed anchors; ``None`` when its revisions are not comparable.
+        """One Observation's changed anchors; ``None`` when the whole Observation reads as changed.
 
-        For ``current``, the anchors of ``current`` whose reading ``previous``
-        lacks; for ``removed``, the anchors of ``previous`` whose reading
-        ``current`` lacks. Markdown and plain text also count every Fragment of
-        a changed complete structure.
+        For ``current``, the anchors of ``current`` that read differently from
+        ``previous``; for ``removed``, the anchors of ``previous`` that
+        ``current`` no longer reads (``reading_equivalence``).
         """
         if previous.id == current.id:
             return frozenset()
-        profile = current.evidence_profile
-        if profile is None or profile.name not in {"canonical-record", "markdown-structural", "plain-text"}:
-            return None
-        if profile.name != "canonical-record" and previous.evidence_profile != profile:
-            return None
         comparison = self.reading_comparison(previous, current)
-        if purpose == "current":
-            anchors, base, target = set(comparison.changed(purpose="current")), previous, current
-        else:
-            anchors, base, target = set(comparison.removed()), current, previous
-        if profile.name != "canonical-record":
-            structural = revision_changed_structural_ranges(base, target, purpose=purpose)
-            anchors.update(f.anchor for f in self.index(target).fragments if _in_ranges(f, structural))
-        return frozenset(anchors)
+        anchors = comparison.changed(purpose="current") if purpose == "current" else comparison.removed()
+        return frozenset(anchors) if anchors is not None else None
 
     def reading_groups(self, fragments) -> tuple[tuple[EvidenceFragment, ...], ...]:
         """Partition Fragments, in their order, into ReadingGroups: one outermost list, or one Fragment."""

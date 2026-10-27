@@ -108,6 +108,19 @@ class CanonicalRecordField:
         if not self.governs_interpretation and not self.contextual:
             raise ValueError("only a contextual field can be shown without governing interpretation")
 
+    def names(self, pointer: str) -> bool:
+        """Whether ``pointer`` is this field: its declared pointer or one occurrence of it.
+
+        A ``*`` segment of the declared pointer stands for any array index, so
+        ``/comments/*/body`` names ``/comments/3/body`` and itself.
+        """
+
+        declared, actual = self.json_pointer.split("/"), pointer.split("/")
+        return len(declared) == len(actual) and all(
+            expected == value or (expected == "*" and value.isdecimal())
+            for expected, value in zip(declared, actual, strict=True)
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class CanonicalRecordSchema:

@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 
 from memforge.memory.evidence import ActiveSupportEvidence, EvidenceRole
-from memforge.pipeline.evidence_fragments import build_revision_fragment_index
+from memforge.pipeline.evidence_fragments import build_revision_fragment_index, canonical_record_is_tombstoned
 from memforge.pipeline.projection_context import (
     CommittedSourceUnitSnapshot,
     ExtractionAuthority,
@@ -30,11 +30,11 @@ from memforge.source_adapters.contracts import (
     EvidenceRepresentationContract,
     canonical_record_profile,
 )
-from memforge.source_projection import SourceObservationRevision
-from memforge.source_representation import _SUPPORTED_REPRESENTATION_CONTRACTS
+from memforge.source_projection import AnchorKind, SourceAnchor, SourceObservationRevision
+from memforge.source_representation import PLAIN_TEXT_PROFILE, _SUPPORTED_REPRESENTATION_CONTRACTS
 from tests.test_confluence_native_evidence import projection as page
 from tests.test_reading_order_and_record_framing import CONVERSATION, _messages, _window
-from tests.test_revision_assessment import memory
+from tests.test_revision_assessment import memory, revisions
 
 
 def _plan(base, target, committed=None):
@@ -196,6 +196,65 @@ def test_a_base_that_cannot_compile_under_the_current_profile_is_a_planning_fail
 
     assert isinstance(failure, ProjectionEvidencePlanningFailure)
     assert failure.code is ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
+
+
+def test_a_deleted_record_authorizes_nothing_without_reading_its_base() -> None:
+    base = _window(_messages(CONVERSATION[:1]))
+    deleted = _messages(CONVERSATION[:1])
+    deleted[0]["deleted_at"] = "2026-07-14T11:00:00Z"
+    target = _window(deleted, base)
+    [current] = target.observation_revisions
+    assert canonical_record_is_tombstoned(current)
+
+    # A same-profile base that cannot be compiled does not matter: a deleted record reads nothing.
+    authority = _plan(base, target, _committed_with_base_profile(
+        base, current.evidence_profile, content=base.observation_revisions[0].content[:-1],
+    ))
+
+    assert authority == ExtractionAuthority({})
+
+
+def _document(base_content, target_content, *, base_profile=None):
+    """A Markdown document body edited between a committed base and the current revision."""
+    base, target = revisions(base_content, target_content)
+    if base_profile is not None:
+        pinned = replace(base.observation_revisions[0], evidence_profile=base_profile)
+        base = replace(base, observation_revisions=(pinned, *base.observation_revisions[1:]))
+    current = target.observation_revisions[0]
+    changed = SourceAnchor(
+        kind=AnchorKind.REVISION_RANGE, observation_id=current.observation_id,
+        observation_revision_id=current.id, range_start=0, range_end=len(current.content),
+    )
+    target = replace(target, deltas=(replace(target.deltas[0], added_observation_ids=(), changed_anchors=(changed,)),))
+    return base, target
+
+
+def test_authority_and_the_support_delta_read_the_same_changes_in_a_document() -> None:
+    base, target = _document(
+        "# Rules\n\n- Approve A7.\n- Audit B8.\n\nKeep every log.\n",
+        "# Rules\n\n- Approve A9.\n- Audit B8.\n\nKeep every log.\n",
+    )
+
+    authorized = _authorized(base, target)
+    changed, removed = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope").delta_fragments()
+
+    assert authorized == ["- Approve A9."]
+    assert [fragment.presentation_text for fragment in changed] == authorized
+    assert [fragment.presentation_text for fragment in removed] == ["- Approve A7."]
+
+
+def test_a_document_compared_with_a_base_of_another_profile_is_read_again_whole() -> None:
+    base, target = _document("Use approval before release.\n", "# Release\n\nUse approval before release.\n",
+                             base_profile=PLAIN_TEXT_PROFILE)
+    [primary, _context] = target.observation_revisions
+
+    authority = _plan(base, target)
+    changed, removed = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope").delta_fragments()
+
+    assert isinstance(authority, ExtractionAuthority)
+    assert authority.ranges_by_observation_id == {primary.observation_id: None}
+    assert [fragment.presentation_text for fragment in changed] == ["# Release", "Use approval before release."]
+    assert [fragment.presentation_text for fragment in removed] == ["Use approval before release."]
 
 
 _RECORD = {"body": "Approval is required.\n\nAudit every run.", "owner": "team_alpha", "note": "draft"}

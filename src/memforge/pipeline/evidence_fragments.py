@@ -144,22 +144,25 @@ def revision_changed_structural_ranges(
     target_units = revision_structural_ranges(target)
     base_counts = Counter(_revision_structural_identities(base, base_units))
     target_identities = _revision_structural_identities(target, target_units)
-    changed = _changed_material_keys(base_counts, Counter(target_identities), purpose=purpose)
+    changed = changed_material_keys(base_counts, Counter(target_identities), purpose=purpose)
     return tuple((unit.start, unit.end) for unit, identity
                  in zip(target_units, target_identities, strict=True) if identity in changed)
 
 
-def _changed_material_keys(base_counts, target_counts, *, purpose):
-    """Separate new-work authority from complete-reading population changes.
+def changed_material_keys(base_counts, target_counts, *, purpose):
+    """The keys of one multiset of material that count as changed against another.
 
-    Surviving equal copies do not identify an individually removed occurrence.
-    Current reading includes all copies when their population changes; exact
-    correspondence still applies its separate bilateral uniqueness checks.
+    Material is compared as counted keys: a structure's identity or a
+    Fragment's reading. For ``authority`` a key changed when the base has no
+    copy of it, since one more copy of unchanged material is no new assertion.
+    For ``current`` every copy changed when the number of copies changed, so
+    the whole new population is read. For ``removed``, called with the target
+    as base, a key changed when the target has no copy of it. Surviving equal
+    copies never identify an individually removed occurrence; exact
+    correspondence applies its own bilateral uniqueness checks.
     """
     if purpose not in {"authority", "current", "removed"}:
         raise ValueError("unknown source comparison purpose")
-    # Multiplicity changes require reading all current copies, but authorize no
-    # arbitrary copy as a new assertion. Independent new material remains work.
     return {key for key, count in target_counts.items()
             if base_counts[key] == 0 or (purpose == "current" and base_counts[key] != count)}
 
@@ -274,7 +277,7 @@ class EvidenceFragment:
     content_value: str | None = None
     interpretation_origins: tuple[tuple[int, int, str], ...] = ()
     text_view: TextEvidenceView | None = None
-    reading: FragmentReading | None = field(default=None, compare=False, repr=False)
+    reading: FragmentReading = field(kw_only=True, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,7 +755,6 @@ def _compile_canonical_record_profile(
             framing.append((pointer, label, _canonical_value_presentation(origin.value)))
             origins.append((origin.start, origin.end, _canonical_selection_value(
                 CanonicalRecordField(pointer), origin.value)))
-        assert candidate.reading is not None
         framed.append(replace(candidate,
             presentation_text="\n".join((*labels, candidate.presentation_text)),
             interpretation_origins=tuple(origins),
@@ -1557,16 +1559,11 @@ class _JsonDocument:
 def _canonical_descriptors(schema: CanonicalRecordSchema, document: _JsonDocument):
     """Bind array wildcards to concrete, revision-local JSON pointers."""
     for descriptor in schema.fields:
-        parts = descriptor.json_pointer.split("/")
-        if "*" not in parts:
+        if "*" not in descriptor.json_pointer.split("/"):
             yield descriptor
             continue
         for pointer in document.nodes:
-            actual = pointer.split("/")
-            if len(actual) == len(parts) and all(
-                expected == value or (expected == "*" and value.isdecimal())
-                for expected, value in zip(parts, actual, strict=True)
-            ):
+            if descriptor.names(pointer):
                 yield replace(descriptor, json_pointer=pointer)
 
 

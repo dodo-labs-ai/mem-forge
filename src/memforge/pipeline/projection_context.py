@@ -12,13 +12,11 @@ if TYPE_CHECKING:
 from memforge.pipeline.evidence_fragments import (
     EvidenceFragment,
     canonical_record_is_tombstoned,
-    revision_changed_structural_ranges,
 )
 from memforge.pipeline.reading_equivalence import ReadingUnavailable, compare_readings
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, source_artifact_inference_eligibility
 from memforge.source_projection import (
     RevisionDelta,
-    SourceAnchor,
     SourceObservationRevision,
     SourceProjection,
     SourceRelationType,
@@ -161,13 +159,12 @@ def plan_projection_evidence_work(
     """Plan current-work Primary authority before any request is planned.
 
     Provider adapters declare representation and change facts. A changed
-    Observation authorizes the Fragments whose reading differs from the
-    committed base (``reading_equivalence``), compiled under each side's pinned
-    profile, so a representation upgrade authorizes only what reads
-    differently. Markdown and plain text also authorize each changed complete
-    structure. A base that cannot be read under its own, older profile leaves
-    the whole Observation to be read again. Reading context and request
-    packing cannot widen authority.
+    Observation authorizes what reads differently from the committed base
+    (``reading_equivalence``), compiled under each side's pinned profile, so a
+    representation upgrade authorizes only what reads differently. When the
+    relation cannot say less, the whole Observation is read again; a revision
+    that cannot be compiled under the current profile is a planning failure.
+    Reading context and request packing cannot widen authority.
     """
 
     delta = projection.deltas[0]
@@ -228,38 +225,6 @@ def plan_projection_evidence_work(
                 observation_revision_id=revision.id,
                 representation_profile=None,
             )
-        if profile.name == "canonical-record":
-            base_revision = base_revisions.get(
-                anchor.observation_id
-            )
-            if base_revision is None:
-                return ProjectionEvidencePlanningFailure(
-                    code=(
-                        ProjectionEvidencePlanningFailureCode.INCREMENTAL_BASE_UNAVAILABLE
-                    ),
-                    observation_id=revision.observation_id,
-                    observation_revision_id=revision.id,
-                    representation_profile=profile.name,
-                )
-            try:
-                changed = compare_readings(base_revision, revision).changed()
-            except ReadingUnavailable as unavailable:
-                if unavailable.side == "base" and base_revision.evidence_profile != profile:
-                    authority[anchor.observation_id] = None
-                    continue
-                return ProjectionEvidencePlanningFailure(
-                    code=ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID,
-                    observation_id=revision.observation_id,
-                    observation_revision_id=revision.id,
-                    representation_profile=profile.name,
-                )
-            authority[anchor.observation_id] = _anchor_ranges(changed)
-            continue
-        if profile.name not in {
-            "markdown-structural",
-            "plain-text",
-        }:
-            continue
         base_revision = base_revisions.get(anchor.observation_id)
         if base_revision is None:
             return ProjectionEvidencePlanningFailure(
@@ -271,14 +236,13 @@ def plan_projection_evidence_work(
                 representation_profile=profile.name,
             )
         try:
-            authority[anchor.observation_id] = tuple(dict.fromkeys((
-                *revision_changed_structural_ranges(base_revision, revision),
-                *_anchor_ranges(compare_readings(base_revision, revision).changed()),
-            )))
-        except ValueError:
+            authority[anchor.observation_id] = compare_readings(base_revision, revision).changed_ranges()
+        except ReadingUnavailable:
             return ProjectionEvidencePlanningFailure(
                 code=(
-                    ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
+                    ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID
+                    if profile.name == "canonical-record"
+                    else ProjectionEvidencePlanningFailureCode.INCREMENTAL_AUTHORITY_UNMAPPABLE
                 ),
                 observation_id=revision.observation_id,
                 observation_revision_id=revision.id,
@@ -286,14 +250,6 @@ def plan_projection_evidence_work(
             )
 
     return _authority_or_failure(projection, authority)
-
-
-def _anchor_ranges(anchors: tuple[SourceAnchor, ...]) -> tuple[tuple[int, int], ...]:
-    return tuple(dict.fromkeys(
-        (anchor.range_start, anchor.range_end)
-        for anchor in anchors
-        if anchor.range_start is not None and anchor.range_end is not None
-    ))
 
 
 def whole_revision_extraction_authority(
