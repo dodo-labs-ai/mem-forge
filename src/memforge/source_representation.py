@@ -224,8 +224,12 @@ def declared_representation_profiles(
     """Every profile a new Observation Revision of one adapter contract may be stored under.
 
     That is the profile the contract declares and, for a canonical record, every
-    registered version of its schema, since a stored payload is read under the
-    schema it was collected under. A contract without a declaration has none.
+    registered version of its schema, since a stored payload may name any of
+    them as the schema it was collected under. The shared projector alone
+    decides which one a revision is read under
+    (``representation_profile_for_observation_contract``); storage checks only
+    that it is registered for the contract. A contract without a declaration
+    has none.
     """
 
     declared = representation_profile_for_observation_contract(

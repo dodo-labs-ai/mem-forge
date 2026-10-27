@@ -400,10 +400,11 @@ class RelationalStore(Protocol):
         semantic hash, Evidence Representation Profile, from which its id is
         derived) must match, otherwise ``ProjectionIdentityConflict`` is raised.
         A new revision is stored under one of its contract's
-        ``declared_representation_profiles``. The one permitted change to a
-        stored Observation Revision: when it was recorded without
-        ``observed_at`` and the projection gives one, the time is written once.
-        A stored ``observed_at`` is never replaced.
+        ``declared_representation_profiles``: the shared projector chooses the
+        profile, and the store refuses one its contract does not register. The
+        one permitted change to a stored Observation Revision: when it was
+        recorded without ``observed_at`` and the projection gives one, the time
+        is written once. A stored ``observed_at`` is never replaced.
         """
         ...
     async def get_source_projection(self, run_id: str) -> SourceProjection | None: ...
