@@ -12,6 +12,7 @@ from memforge.pipeline.revision_assessment import RevisionAssessmentContext
 from memforge.pipeline.projection_fragments import SupportRevalidationLimitation
 from memforge.source_projection import ProjectionCoverage
 from tests.revision_client_fixture import change_impact_response, continued, supported
+from tests.test_evidence_fragments import HEADED_DOCUMENT, HEADING_EDITS
 from tests.test_projection_fragments import _projection
 
 
@@ -148,6 +149,20 @@ async def test_first_part_includes_remote_exception_and_unchanged_heading():
     # The model reads text by ref and request-local source alias; no store identity is sent.
     assert set(request) == {"last", "current", "removed_historical", "removed_groups", "carried_witness_catalog", "works"}
     assert set(request["current"]) == {"primary_candidates", "required_only_candidates", "structural_groups"}
+
+
+@pytest.mark.parametrize("edit", HEADING_EDITS)
+def test_support_delta_lists_only_structures_whose_text_or_ancestry_changed(edit):
+    target, changed, removed = HEADING_EDITS[edit]
+    base, current = revisions(HEADED_DOCUMENT, target)
+    context = RevisionAssessmentContext(projection=current, base=base, access_context_hash="scope")
+
+    current_delta, removed_delta = context.delta_fragments()
+
+    assert [fragment.presentation_text for fragment in current_delta] == changed
+    assert [fragment.presentation_text for fragment in removed_delta] == removed
+    sibling = next(fragment for fragment in context.full_fragments if fragment.presentation_text == "## C")
+    assert context.heading_context(sibling) == ("# Policy",)
 
 
 @pytest.mark.asyncio

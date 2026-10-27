@@ -21,6 +21,7 @@ from memforge.source_artifacts import (
     StoredSourceArtifact,
 )
 from tests.llm_fixture import NoopMemoryExtractor
+from tests.test_evidence_fragments import HEADED_DOCUMENT, HEADING_EDITS
 from tests.conversation_fixture import teams_unit_payload
 
 
@@ -92,6 +93,30 @@ def _normalized_document_projection(body: str):
         item=item,
         raw=RawContent(item=item, body=body.encode(), content_type="text/markdown"),
         normalized=NormalizedContent(item=item, markdown_body=body),
+    )
+
+
+def _revised_document_projection(initial, body: str):
+    """The next version of a `_normalized_document_projection`, projected against it."""
+    item = ContentItem(
+        item_id="confluence-42",
+        title="Large design",
+        source_url="https://confluence.example.test/pages/42",
+        last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
+        version="8",
+        extra={"page_id": "42", "space_key": "ENG"},
+    )
+    return project_source_item(
+        source_id="src-c",
+        source_type="validation_normalized_document",
+        run_id="run-c-incremental",
+        item=item,
+        raw=RawContent(item=item, body=body.encode(), content_type="text/markdown"),
+        normalized=NormalizedContent(item=item, markdown_body=body),
+        prior_unit_revision=initial.source_unit_revisions[0],
+        prior_observation_revisions={
+            revision.observation_id: revision for revision in initial.observation_revisions
+        },
     )
 
 
@@ -240,50 +265,7 @@ The rollout starts on Monday.
         "The rollout starts on Tuesday.",
     )
     initial = _normalized_document_projection(initial_body)
-    target = project_source_item(
-        source_id="src-c",
-        source_type="validation_normalized_document",
-        run_id="run-c-incremental",
-        item=replace(
-            ContentItem(
-                item_id="confluence-42",
-                title="Large design",
-                source_url="https://confluence.example.test/pages/42",
-                last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc),
-                version="7",
-                extra={"page_id": "42", "space_key": "ENG"},
-            ),
-            version="8",
-        ),
-        raw=RawContent(
-            item=ContentItem(
-                item_id="confluence-42",
-                title="Large design",
-                source_url="https://confluence.example.test/pages/42",
-                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
-                version="8",
-                extra={"page_id": "42", "space_key": "ENG"},
-            ),
-            body=target_body.encode(),
-            content_type="text/markdown",
-        ),
-        normalized=NormalizedContent(
-            item=ContentItem(
-                item_id="confluence-42",
-                title="Large design",
-                source_url="https://confluence.example.test/pages/42",
-                last_modified=datetime(2026, 7, 16, tzinfo=timezone.utc),
-                version="8",
-                extra={"page_id": "42", "space_key": "ENG"},
-            ),
-            markdown_body=target_body,
-        ),
-        prior_unit_revision=initial.source_unit_revisions[0],
-        prior_observation_revisions={
-            revision.observation_id: revision
-            for revision in initial.observation_revisions
-        },
-    )
+    target = _revised_document_projection(initial, target_body)
     primary_text = "\n".join(
         fragment.presentation_text
         for fragment in _primary(_requests(target, base=initial, committed=_committed_snapshot(initial)))
@@ -291,6 +273,17 @@ The rollout starts on Monday.
 
     assert "The rollout starts on Tuesday." in primary_text
     assert "Keep the existing approval rule." not in primary_text
+
+
+@pytest.mark.parametrize("edit", HEADING_EDITS)
+def test_incremental_markdown_authorizes_no_structure_whose_text_and_ancestry_are_unchanged(edit: str) -> None:
+    target_body, changed, _removed = HEADING_EDITS[edit]
+    initial = _normalized_document_projection(HEADED_DOCUMENT)
+    target = _revised_document_projection(initial, target_body)
+
+    primary = _primary(_requests(target, base=initial, committed=_committed_snapshot(initial)))
+
+    assert [fragment.presentation_text for fragment in primary] == changed
 
 
 def test_v9_incremental_canonical_record_authorizes_only_changed_registered_field() -> None:

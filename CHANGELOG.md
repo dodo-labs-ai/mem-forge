@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Incremental extraction and Support revalidation of Markdown documents
+  compare each heading under its own ancestors. Appending a subsection,
+  renaming or deleting a section, or swapping two sections no longer makes
+  the following unchanged heading new work for extraction, nor lists it as
+  changed and removed for Support revalidation. Renaming a heading still makes
+  the blocks and subsections under it new work. Support requests show a
+  heading's ancestors as its `heading_context`, not the headings of the
+  section before it.
+
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
   `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or
   invitation page, show the same mark as the app. Cloud: its sign-in,
