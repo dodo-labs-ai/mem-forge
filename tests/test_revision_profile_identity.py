@@ -25,6 +25,7 @@ from memforge.pipeline.support_reading import EvidenceCorrespondence, SupportRou
 from memforge.source_adapters import jira as jira_adapter
 from memforge.source_adapters.contracts import MARKDOWN_STRUCTURAL_PROFILE, canonical_record_profile
 from memforge.source_artifacts import StoredSourceArtifact
+from memforge.source_projection import ProjectionIdentityConflict
 from memforge.storage.database import Database
 from tests.test_displayed_framing import _comment, _issue
 from tests.test_reading_equivalence import _plan, _support_item
@@ -129,6 +130,23 @@ async def test_a_comment_under_a_new_schema_is_a_new_revision_that_reads_the_sam
         assert (await db.get_source_observation_revisions((new.id,)))[new.id].evidence_profile == new.evidence_profile
     finally:
         await db.close()
+
+
+@pytest.mark.parametrize("corrupt", [
+    lambda revision: replace(revision, semantic_hash="0" * 64, content="tampered"),
+    lambda revision: replace(revision, evidence_profile=replace(revision.evidence_profile, schema_version=5)),
+], ids=["content", "profile"])
+def test_a_stored_revision_whose_identity_is_not_its_id_is_never_reused(corrupt) -> None:
+    base = _issue(_COMMENT)
+    stored = _revision(base, "jira-comment")
+    corrupted = replace(base, observation_revisions=tuple(
+        corrupt(revision) if revision.id == stored.id else revision for revision in base.observation_revisions
+    ))
+
+    with pytest.raises(ProjectionIdentityConflict) as conflict:
+        _issue(_COMMENT, prior=corrupted)
+
+    assert conflict.value.row_id == stored.id
 
 
 async def test_an_edited_message_collected_again_under_a_new_schema_reads_the_same() -> None:

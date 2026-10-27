@@ -32,6 +32,7 @@ from memforge.source_projection import (
     SourceUnit,
     SourceUnitRevision,
     incarnated_provider_key,
+    require_revision_identity,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
@@ -124,7 +125,9 @@ def project_source_item(
     (``observation_revision_id``). A projected revision whose id is already
     stored, as a current revision in ``prior_observation_revisions`` or any
     other revision in ``stored_observation_revisions`` (keyed by revision id),
-    is that stored row. An Observation changed when its revision did: new
+    is that stored row, once its identity is the projected one; a stored row
+    whose identity differs raises ``ProjectionIdentityConflict``. An
+    Observation changed when its revision did: new
     content, or the same content read under another profile, which the reading
     relation then compares.
 
@@ -231,26 +234,27 @@ def project_source_item(
                 locator=dict(value.locator),
             )
         )
-        # A stored revision is reused exactly, whatever metadata this projection
-        # derived; one recorded without a source time takes the one the source
-        # now gives, and a recorded source time is never replaced.
+        projected_revision = SourceObservationRevision(
+            id=revision_id,
+            observation_id=observation_id,
+            semantic_hash=semantic_hash,
+            content=value.content,
+            observed_at=value.observed_at,
+            metadata={**dict(value.metadata), "provider_key": value.provider_key},
+            evidence_profile=evidence_profile,
+        )
+        # A stored revision with this identity is reused exactly, whatever
+        # metadata this projection derived; one recorded without a source time
+        # takes the one the source now gives, and a recorded source time is
+        # never replaced.
         stored_revision = stored_by_id.get(revision_id)
         if stored_revision is None:
-            revisions.append(
-                SourceObservationRevision(
-                    id=revision_id,
-                    observation_id=observation_id,
-                    semantic_hash=semantic_hash,
-                    content=value.content,
-                    observed_at=value.observed_at,
-                    metadata={**dict(value.metadata), "provider_key": value.provider_key},
-                    evidence_profile=evidence_profile,
-                )
-            )
-        elif stored_revision.observed_at is None and value.observed_at is not None:
-            revisions.append(replace(stored_revision, observed_at=value.observed_at))
-        else:
-            revisions.append(stored_revision)
+            revisions.append(projected_revision)
+            continue
+        require_revision_identity(stored_revision, projected_revision)
+        if stored_revision.observed_at is None and value.observed_at is not None:
+            stored_revision = replace(stored_revision, observed_at=value.observed_at)
+        revisions.append(stored_revision)
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
         projected_observation_ids = {item.observation_id for item in revisions}
         for observation_id, revision in prior_observation_revisions.items():
