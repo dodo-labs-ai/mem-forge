@@ -10,13 +10,14 @@
   storage edit the reading never shows, such as a Confluence cell's grown
   `rowspan`, a non-breaking space at the edge of a paragraph, an empty macro
   parameter or a `<pre>` style, no longer sends unchanged content to
-  extraction or reassessment. A representation upgrade re-reads only what
-  reads differently instead of the whole Observation, and a Support whose
-  Evidence reads the same, and uniquely in its revision, is rebound without a
-  model call. A Confluence table row reads with its headers, so renaming a
-  header reassesses the Supports of its rows. For connector authors:
-  `CanonicalRecordField` takes `governs_interpretation` (default `True`, and
-  `False` only on a contextual field), and
+  extraction or reassessment. A canonical-record schema upgrade re-reads only
+  what reads differently instead of the whole Observation (a Markdown or
+  plain-text profile upgrade still reads the Observation whole), and a Support
+  whose Evidence reads the same, and uniquely in its revision, is rebound
+  without a model call. A Confluence table row reads with its headers, so
+  renaming a header reassesses the Supports of its rows. For connector
+  authors: `CanonicalRecordField` takes `governs_interpretation` (default
+  `True`, and `False` only on a contextual field), and
   `memforge.pipeline.reading_equivalence.compare_readings` replaces
   `canonical_record_changed_raw_ranges`, `canonical_nested_changed_raw_ranges`
   and `changed_interpretation_ranges`. Cloud: bump the OSS pin; the reading

@@ -7,7 +7,7 @@ which Units are new, which change and how, and which go.
 A Unit's change is told by its members: ``added`` and ``removed`` name the
 messages it gains and loses, and ``changed`` the members it keeps but stores
 differently, under another record revision, another record schema or other
-artifact bytes. That is what the Unit stores, not what the extraction model
+artifacts. That is what the Unit stores, not what the extraction model
 reads again: the run decides that when it projects the Unit's new revision, by
 the reading relation (:mod:`memforge.pipeline.reading_equivalence`), and a
 changed member, such as one whose edit time alone changed or one moved to a
