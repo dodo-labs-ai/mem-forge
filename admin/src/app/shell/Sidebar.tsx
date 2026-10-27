@@ -2,7 +2,7 @@ import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/cn";
 import { Separator } from "@/ui/separator";
 import { LocalSyncStatus } from "@/features/local-sync";
-import { BrandMark } from "../brand/BrandMark";
+import { BrandMark } from "@/patterns";
 import { findReservedRedirect, type ExtensionNavItem } from "../extension/contract";
 import { useExtension } from "../extension/ExtensionProvider";
 import { NAV_GROUPS, SETTINGS_NAV_ITEM, type NavItem } from "../navigation";

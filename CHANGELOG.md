@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
+  `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or
+  invitation page, show the same mark as the app. Cloud: its sign-in,
+  invitation and password-change pages use it instead of their copy of the
+  earlier mark.
+
 - Agent-session storage is removed. On upgrade, MemForge takes its recovery
   point, retires every remaining agent-session Source as Source deletion does
   (its Memories stop appearing in search and the vector index drops them;
