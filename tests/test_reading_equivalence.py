@@ -249,6 +249,24 @@ def test_authority_and_the_support_delta_read_the_same_changes_in_a_document() -
     assert [fragment.presentation_text for fragment in removed] == ["- Approve A7."]
 
 
+def test_deleting_a_list_lead_in_changes_every_item_it_governed() -> None:
+    base, target = _document(
+        "# Rules\n\nOnly when approved:\n\n- Approve A7.\n- Audit B8.\n\nKeep every log.\n",
+        "# Rules\n\n- Approve A7.\n- Audit B8.\n\nKeep every log.\n",
+    )
+
+    authorized = _authorized(base, target)
+    context, support = _support(base, target, "- Approve A7.")
+    changed, removed = context.delta_fragments()
+
+    assert authorized == ["- Approve A7.", "- Audit B8."]
+    assert [fragment.presentation_text for fragment in changed] == authorized
+    assert [fragment.presentation_text for fragment in removed] == ["Only when approved:", "- Approve A7.", "- Audit B8."]
+    # The item still says what it said; it is judged against the condition it lost.
+    assert support.parts[0].status is EvidenceCorrespondence.EXACT_UNCHANGED
+    assert support.route is SupportRoute.CHANGE_IMPACT
+
+
 def test_a_document_compared_with_a_base_of_another_profile_is_read_again_whole() -> None:
     base, target = _document("Use approval before release.\n", "# Release\n\nUse approval before release.\n",
                              base_profile=PLAIN_TEXT_PROFILE)

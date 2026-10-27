@@ -39,8 +39,8 @@ The whole target reads as changed when the comparison cannot say less: its
 profile is outside this relation (a binary Artifact), its structures cannot be
 compared with a base of another profile, or its base cannot be compiled under
 its own older profile. A record with nothing to read, such as a tombstoned
-one, changes nothing whatever its base. A revision that cannot be compiled under the target's profile is
-``ReadingUnavailable``.
+one, changes nothing whatever its base. A target, or a base under the target's
+profile, that cannot be compiled is ``ReadingUnavailable``.
 """
 
 from __future__ import annotations
@@ -113,8 +113,10 @@ class ReadingComparison:
 
     Each revision is compiled on first use. ``changed``, ``removed`` and
     ``changed_ranges`` return ``None`` when the whole Observation reads as
-    changed, and raise ``ReadingUnavailable`` when a revision cannot be
-    compiled.
+    changed, which includes a base that cannot be compiled under its own older
+    profile. A method that compiles the revisions raises ``ReadingUnavailable``
+    when the target cannot be compiled, or the base cannot be compiled under
+    the profile it shares with the target.
     """
 
     def __init__(
