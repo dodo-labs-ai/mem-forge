@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
@@ -213,18 +212,6 @@ class _NativeProjection:
     # None only when the payload tombstones the whole Unit.
     title: UnitTitle | None
     record_schema: str | None = None
-
-
-def _normalized_utc_timestamp(value: object) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _canonical_json(value: object) -> str:
