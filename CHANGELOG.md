@@ -38,10 +38,11 @@
   representation, such as a new record schema or a new Markdown or plain-text
   profile version, is a new revision, which the reading relation compares with
   the one before. One-time consequence on upgrade: the next time a Source Unit
-  is projected, every Observation, Artifacts included, gets a new revision id
-  with identical content, and its Unit a new revision; such a revision
-  authorizes no extraction and its Supports are rebound exactly, with no model
-  call. A conversation message is read under the record schema it was
+  is projected, every Observation it projects, Artifacts included, gets a new
+  revision id with identical content, and its Unit a new revision. Such a
+  revision authorizes no extraction; a Support whose Evidence reads uniquely
+  in its revision is rebound exactly without a model call, and one on text
+  the revision repeats is assessed. A conversation message is read under the record schema it was
   collected under: a Unit payload names its collection's `record_schema`, and
   a member carried from an earlier collection under another schema names its
   own, so a message the provider does not return again keeps its stored
