@@ -12,14 +12,15 @@
   parameter or a `<pre>` style, no longer sends unchanged content to
   extraction or reassessment. A representation upgrade re-reads only what
   reads differently instead of the whole Observation, and a Support whose
-  Evidence reads the same is rebound without a model call. A Confluence table
-  row reads with its headers, so renaming a header reassesses the Supports of
-  its rows. For connector authors: `CanonicalRecordField` takes
-  `governs_interpretation` (default `True`, and `False` only on a contextual
-  field), and `memforge.pipeline.reading_equivalence.compare_readings`
-  replaces `canonical_record_changed_raw_ranges`,
-  `canonical_nested_changed_raw_ranges` and `changed_interpretation_ranges`.
-  Cloud: bump the OSS pin; the reading relation itself needs no HANA change.
+  Evidence reads the same, and uniquely in its revision, is rebound without a
+  model call. A Confluence table row reads with its headers, so renaming a
+  header reassesses the Supports of its rows. For connector authors:
+  `CanonicalRecordField` takes `governs_interpretation` (default `True`, and
+  `False` only on a contextual field), and
+  `memforge.pipeline.reading_equivalence.compare_readings` replaces
+  `canonical_record_changed_raw_ranges`, `canonical_nested_changed_raw_ranges`
+  and `changed_interpretation_ranges`. Cloud: bump the OSS pin; the reading
+  relation itself needs no HANA change.
 
 - Jira comments (`jira-comment:6`) and Teams messages (`teams-message:3`)
   still show their edit time but no longer treat it as a change in what they
@@ -29,8 +30,14 @@
   reading under those versions and move to the new ones without being read
   again. Update the local agent with the server: the server refuses a Teams
   collection an earlier agent recorded as `teams-message:2`, and after the
-  update each stored message revises once to `teams-message:3`, extracting
-  nothing.
+  update each stored message the agent returns again revises once to
+  `teams-message:3`, extracting nothing, while a carried member, one the agent
+  does not return again, keeps `teams-message:2`. The conversation dry-run
+  plan (`POST /api/v1/sources/{id}/conversation-collection/plan`) no longer
+  says what extraction reads again, which only the run decides: a Unit's
+  `extracts` and the summary's `units_extracted_again` are removed. A Unit's
+  `changed` names the members it stores differently, such as one whose edit
+  time alone changed or one that moves to a new record schema.
 
 - An Observation Revision is identified by its Observation, its content and
   the Evidence Representation Profile it is read under, and only the shared
@@ -41,21 +48,21 @@
   is projected, every Observation it projects, Artifacts included, gets a new
   revision id with identical content, and its Unit a new revision. Such a
   revision authorizes no extraction; a Support whose Evidence reads uniquely
-  in its revision is rebound exactly without a model call, and one on text
-  the revision repeats is assessed. A conversation message is read under the record schema it was
-  collected under: a Unit payload names its collection's `record_schema`, and
-  a member carried from an earlier collection under another schema names its
-  own, so a message the provider does not return again keeps its stored
-  revision across a schema upgrade. A payload or member naming a schema its
-  contract does not register is refused.
-  For connector authors: `representation_profile_for_observation_contract`
-  takes a record's `record_schema`, `declared_representation_profiles` lists
-  every profile a new revision of a contract may be stored under, a
-  conversation `Member` takes the `record_schema` its record was collected
-  under, and `require_revision_identity` checks one stored revision against the
-  projected one. Cloud: the HANA adapter accepts a new Observation Revision
-  under any of `declared_representation_profiles` rather than only the current
-  declaration, as the SQLite adapter does.
+  in its revision is rebound exactly without a model call, and one on text the
+  revision repeats is assessed. A conversation message is read under the
+  record schema it was collected under: a Unit payload names its collection's
+  `record_schema`, and a member carried from an earlier collection under
+  another schema names its own, so a message the provider does not return
+  again keeps its stored revision across a schema upgrade. A payload or member
+  naming a schema its contract does not register is refused. For connector
+  authors: `representation_profile_for_observation_contract` takes a record's
+  `record_schema`, `declared_representation_profiles` lists every profile a
+  new revision of a contract may be stored under, a conversation `Member`
+  takes the `record_schema` its record was collected under, and
+  `require_revision_identity` checks one stored revision against the projected
+  one. Cloud: the HANA adapter accepts a new Observation Revision under any of
+  `declared_representation_profiles` rather than only the current declaration,
+  as the SQLite adapter does.
 
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
   `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or

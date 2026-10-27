@@ -713,10 +713,55 @@ async def test_a_dry_run_reports_the_plan_and_changes_nothing(workspace):
     report, _missing = await workspace.collect_and_sync(teams, dry_run=True)
 
     [unit] = report["units"]
-    assert (unit["change"], unit["added"], unit["changed"], unit["extracts"]) == ("changed", ["m4"], ["m3"], True)
+    assert (unit["change"], unit["added"], unit["removed"], unit["changed"]) == ("changed", ["m4"], [], ["m3"])
     assert [removal["reason"] for removal in report["removals"]] == ["absent_from_source"]
-    assert report["summary"] == {"new_units": 0, "changed_units": 1, "units_extracted_again": 1, "removed_units": 1}
+    assert report["summary"] == {"new_units": 0, "changed_units": 1, "removed_units": 1}
     assert set(await workspace.units()) == {f"{UnitKind.WINDOW.value}:m1", f"{UnitKind.WINDOW.value}:m3"}
+
+
+async def test_a_dry_run_reports_an_edit_time_alone_as_a_stored_change_and_claims_no_extraction(workspace):
+    teams = FakeTeams()
+    teams.post(CHAT, "m1", _ago(3), "first")
+    await workspace.collect_and_sync(teams)
+
+    teams.messages[CHAT]["m1"]["edited_time"] = _ago(1)
+    report, _missing = await workspace.collect_and_sync(teams, dry_run=True)
+
+    [unit] = report["units"]
+    assert (unit["change"], unit["added"], unit["changed"]) == ("changed", [], ["m1"])
+    assert "extracts" not in unit
+    assert report["summary"] == {"new_units": 0, "changed_units": 1, "removed_units": 0}
+
+    # The run decides what is read again: an edit time is displayed only.
+    workspace.extractor.fragment_calls.clear()
+    state, _missing = await workspace.collect_and_sync(teams)
+    assert state.last_sync_status == "success" and workspace.extractor.fragment_calls == []
+
+
+async def test_a_dry_run_reports_a_move_to_a_new_record_schema_as_a_stored_change_and_claims_no_extraction(
+    workspace, monkeypatch,
+):
+    earlier = teams_adapter.CANONICAL_RECORD_SCHEMAS[(MESSAGE_SCHEMA.name, 2)]
+    teams = FakeTeams()
+    teams.post(CHAT, "m1", _ago(3), "first")
+    with monkeypatch.context() as collected_under_earlier:
+        collected_under_earlier.setattr(teams_adapter, "MESSAGE_SCHEMA", earlier)
+        collected_under_earlier.setattr(TeamsGene, "record_schema", earlier.qualified_name)
+        collected_under_earlier.setattr(teams, "record_schema", earlier)
+        await workspace.collect_and_sync(teams)
+
+    report, _missing = await workspace.collect_and_sync(teams, dry_run=True)
+
+    [unit] = report["units"]
+    assert (unit["change"], unit["added"], unit["changed"]) == ("changed", [], ["m1"])
+    assert "extracts" not in unit
+    assert report["summary"] == {"new_units": 0, "changed_units": 1, "removed_units": 0}
+
+    # The message reads the same under the new schema, so the run reads nothing again.
+    workspace.extractor.fragment_calls.clear()
+    state, _missing = await workspace.collect_and_sync(teams)
+    assert state.last_sync_status == "success" and workspace.extractor.fragment_calls == []
+    assert await _message_schema_versions(workspace) == {"m1": MESSAGE_SCHEMA.version}
 
 
 async def test_rolling_retention_removes_a_window_once_its_latest_message_ages_out(workspace):
