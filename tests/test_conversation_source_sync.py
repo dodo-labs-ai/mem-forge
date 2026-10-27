@@ -45,6 +45,7 @@ from memforge.genes.teams_provider import TeamsConversationProvider, teams_conve
 from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.server.admin_api import create_admin_app
+from memforge.source_adapters import teams as teams_adapter
 from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.source_artifact_inputs import retain_artifact_input
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
@@ -879,3 +880,37 @@ async def test_a_message_stored_without_its_creation_time_is_carried_until_a_pol
     assert state.last_sync_status == "success"
     assert await workspace.units() == {f"{UnitKind.WINDOW.value}:m1": ["m1", "m2"]}
     assert (await _stored_records(workspace))["m1"]["time"] == _ago(3).isoformat()
+
+
+async def _message_schema_versions(workspace: TeamsWorkspace) -> dict[str, int]:
+    """The record schema version each current message revision is read under, by message id."""
+
+    async with workspace.db.db.execute(
+        "SELECT so.provider_key, sor.representation_schema_version FROM source_observations so "
+        "JOIN source_observation_revisions sor ON sor.id = so.current_revision_id WHERE so.observation_type = 'message'"
+    ) as cursor:
+        return {str(row[0]): int(row[1]) async for row in cursor}
+
+
+async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_under_it(workspace, monkeypatch):
+    earlier = teams_adapter.CANONICAL_RECORD_SCHEMAS[(MESSAGE_SCHEMA.name, 2)]
+    teams = FakeTeams()
+    teams.post(CHAT, "m1", _ago(3), "first")
+    with monkeypatch.context() as collected_under_earlier:
+        collected_under_earlier.setattr(teams_adapter, "MESSAGE_SCHEMA", earlier)
+        collected_under_earlier.setattr(TeamsGene, "record_schema", earlier.qualified_name)
+        collected_under_earlier.setattr(teams, "record_schema", earlier)
+        state, _missing = await workspace.collect_and_sync(teams)
+    assert state.last_sync_status == "success"
+    assert await _message_schema_versions(workspace) == {"m1": 2}
+
+    state = await workspace.reprocess(frozenset(await workspace.db.list_indexed_doc_ids(SOURCE_ID)))
+
+    assert state.last_sync_status == "success" and state.docs_failed == 0
+    assert await _message_schema_versions(workspace) == {"m1": 2}
+
+    state, missing = await workspace.collect_and_sync(teams)
+
+    assert state.last_sync_status == "success" and state.docs_failed == 0
+    assert [item.identity.message_id for item in missing] == ["m1"]
+    assert await _message_schema_versions(workspace) == {"m1": MESSAGE_SCHEMA.version}

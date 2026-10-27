@@ -58,8 +58,8 @@ def _authorized(base, target) -> list[str]:
     ]
 
 
-def _support(base, target, text):
-    """The Support plan of one claim whose Primary is the base Fragment that shows ``text``."""
+def _support_item(base, target, text) -> SupportWorkItem:
+    """The Support of one claim whose Primary is the base Fragment that shows ``text``, read at ``target``."""
     old = next(
         fragment for revision in base.observation_revisions
         for fragment in build_revision_fragment_index(revision).fragments
@@ -72,7 +72,13 @@ def _support(base, target, text):
         raw_content_sha256=old.raw_content_sha256, presentation_sha256=old.presentation_sha256,
         text_view=old.text_view,
     )
-    return context, plan_support_revision(context, [SupportWorkItem("w", memory(), (part,), context)]).supports[0]
+    return SupportWorkItem("w", memory(), (part,), context)
+
+
+def _support(base, target, text):
+    """The Support plan of one claim whose Primary is the base Fragment that shows ``text``."""
+    item = _support_item(base, target, text)
+    return item.context, plan_support_revision(item.context, [item]).supports[0]
 
 
 def _spanning(rows: int) -> str:

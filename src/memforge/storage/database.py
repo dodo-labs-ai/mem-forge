@@ -299,8 +299,7 @@ from memforge.source_projection import (
 )
 from memforge.source_representation import (
     EvidenceProfileBackfillReport,
-    representation_contract_for_profile,
-    representation_profile_for_observation_contract,
+    declared_representation_profiles,
 )
 from memforge.source_artifacts import (
     SOURCE_ARTIFACT_OBSERVATION_TYPE,
@@ -8071,24 +8070,20 @@ class Database:
             if revision.id in carried_revision_ids:
                 continue
             observation = observations[revision.observation_id]
-            expected_profile = representation_profile_for_observation_contract(
+            declared = declared_representation_profiles(
                 source_type=projection.source_type,
                 observation_type=observation.observation_type,
             )
-            if expected_profile is None:
+            if not declared:
                 raise ValueError(
                     "Source Observation contract has no registered representation declaration: "
                     f"{projection.source_type}/{observation.observation_type}"
                 )
-            if revision.evidence_profile != expected_profile:
+            if revision.evidence_profile not in declared:
                 raise ValueError(
                     "new Observation Revision does not match its registered representation declaration: "
                     f"{revision.id}"
                 )
-            if revision.evidence_profile is not None and representation_contract_for_profile(
-                revision.evidence_profile
-            ) is None:
-                raise ValueError(f"new Observation Revision uses an unsupported profile: {revision.id}")
 
     async def _resolve_carried_projection_revisions_unlocked(
         self,

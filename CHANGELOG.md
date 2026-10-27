@@ -32,6 +32,25 @@
   update each stored message revises once to `teams-message:3`, extracting
   nothing.
 
+- An Observation Revision is identified by its Observation, its content and
+  the Evidence Representation Profile it is read under, and only the shared
+  projector assigns that profile. Projecting unchanged content under a new
+  representation, such as a new record schema or a new Markdown or plain-text
+  profile version, now gives a new revision instead of failing with
+  `ProjectionIdentityConflict`. One-time consequence on upgrade: the next time
+  a Source Unit is projected, every Observation gets a new revision id with
+  identical content, and its Unit a new revision; such a revision authorizes
+  no extraction and its Supports are rebound exactly, with no model call. A
+  stored conversation Unit payload is read under the record schema it was
+  collected under (its `record_schema`), not the one the connector declares
+  today, and a payload naming a schema its contract does not register is
+  refused. For connector authors: `representation_profile_for_observation_contract`
+  takes a payload's `record_schema`, and `declared_representation_profiles`
+  lists every profile a new revision of a contract may be stored under. Cloud:
+  the HANA adapter accepts a new Observation Revision under any of
+  `declared_representation_profiles` rather than only the current
+  declaration, as the SQLite adapter does.
+
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
   `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or
   invitation page, show the same mark as the app. Cloud: its sign-in,

@@ -193,7 +193,14 @@ class _UnitEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class _NativeProjection:
-    """One provider payload as a Source Unit, its Observations and its Unit Title."""
+    """One provider payload as a Source Unit, its Observations and its Unit Title.
+
+    ``record_schema`` names the canonical record schema (``name:version``) a
+    stored payload's records were collected under, such as a conversation Unit
+    payload's. Its records are read under that schema rather than the one the
+    adapter declares today. A payload mapped from the provider's response by
+    the current adapter names none.
+    """
 
     unit_type: str
     provider_key: str
@@ -205,6 +212,7 @@ class _NativeProjection:
     locator: Mapping[str, object]
     # None only when the payload tombstones the whole Unit.
     title: UnitTitle | None
+    record_schema: str | None = None
 
 
 def _normalized_utc_timestamp(value: object) -> str | None:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -16,7 +15,7 @@ from memforge.pipeline.support_reading import EvidenceCorrespondence, SupportRou
 from memforge.source_adapters.contracts import canonical_record_profile
 from memforge.source_projection import SourceObservationRevision
 from memforge.source_representation import representation_contract_for_profile
-from tests.test_reading_equivalence import _authorized, _plan, _support
+from tests.test_reading_equivalence import _authorized, _support
 from tests.test_reading_order_and_record_framing import CONVERSATION, _messages, _window
 
 _ITEM = ContentItem(
@@ -90,65 +89,6 @@ def test_an_edit_time_alone_authorizes_nothing_and_changes_no_entry() -> None:
         context.catalog(context.full_fragments), support,
     )
     assert "Message edited: 2026-07-14T10:05:00Z" in rebound.memory.resolved_evidence_selection.parts[0].excerpt
-
-
-def _as_written_by(projection, schema_name: str, version: int):
-    """The projection as an earlier version of one record schema wrote the same records."""
-    revisions = []
-    for revision in projection.observation_revisions:
-        profile = revision.evidence_profile
-        if profile is not None and profile.schema_name == schema_name:
-            current = f'"{schema_name}:{profile.schema_version}"'
-            assert current in revision.content
-            revision = replace(
-                revision, id=f"{revision.id}-v{version}", semantic_hash=f"{revision.semantic_hash}-v{version}",
-                content=revision.content.replace(current, f'"{schema_name}:{version}"'),
-                evidence_profile=replace(profile, schema_version=version),
-            )
-        revisions.append(revision)
-    renamed = {old.id: new.id for old, new in zip(projection.observation_revisions, revisions, strict=True)}
-    unit = replace(projection.source_unit_revisions[0],
-                   observation_revision_ids=tuple(revision.id for revision in revisions))
-    deltas = tuple(
-        replace(delta, changed_anchors=tuple(
-            replace(anchor, observation_revision_id=renamed[anchor.observation_revision_id])
-            for anchor in delta.changed_anchors
-        ))
-        for delta in projection.deltas
-    )
-    return replace(projection, observation_revisions=tuple(revisions), source_unit_revisions=(unit,), deltas=deltas)
-
-
-_COMMENT = _comment(["Retain A7 for the payroll run.", "Cutoff is Friday."], "2026-07-02T09:00:00.000+0000")
-
-
-def _edited_messages():
-    messages = _messages(CONVERSATION[:2])
-    messages[1]["edited_time"] = "2026-07-14T10:05:00Z"
-    return messages
-
-
-@pytest.mark.parametrize("schema_name, earlier, current, text", [
-    ("jira-comment", 5, lambda prior: _issue(_COMMENT, prior=prior), "Cutoff is Friday."),
-    ("teams-message", 2, lambda prior: _window(_edited_messages(), prior), CONVERSATION[1][1]),
-])
-def test_an_upgrade_that_only_declares_the_edit_time_displayed_reads_the_same(
-    schema_name, earlier, current, text,
-) -> None:
-    base = _as_written_by(current(None), schema_name, earlier)
-    target = current(base)
-    changed = [
-        revision for revision in target.observation_revisions
-        if revision.evidence_profile.schema_name == schema_name
-    ]
-    assert changed and all(revision.id not in {r.id for r in base.observation_revisions} for revision in changed)
-
-    authority = _plan(base, target)
-    assert all(revision.observation_id not in authority.ranges_by_observation_id for revision in changed)
-    context, support = _support(base, target, text)
-    assert context.delta_fragments() == ((), ())
-    assert support.parts[0].status is EvidenceCorrespondence.EXACT_UNCHANGED
-    assert support.route is SupportRoute.REBIND_SUPPORT
 
 
 @pytest.mark.parametrize("schema_name, earlier, current, record", [

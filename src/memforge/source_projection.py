@@ -259,10 +259,9 @@ def require_stored_revision_identity(
     """Fail when a projected Observation Revision differs in identity from its stored row.
 
     An Observation Revision is content-addressed: its id is derived from its
-    Observation and semantic hash, and its Evidence Representation Profile
-    fixes how Evidence addresses its content. A stored row with the same id and
-    identity is the same revision whatever metadata either copy carries; a
-    stored row without a profile takes the declared one.
+    Observation, its semantic hash and the Evidence Representation Profile it is
+    read under. A stored row with the same id and identity is the same revision
+    whatever metadata either copy carries.
     """
 
     for revision in projection.observation_revisions:
@@ -272,7 +271,7 @@ def require_stored_revision_identity(
         if (
             stored.observation_id != revision.observation_id
             or stored.semantic_hash != revision.semantic_hash
-            or stored.evidence_profile not in {None, revision.evidence_profile}
+            or stored.evidence_profile != revision.evidence_profile
         ):
             raise ProjectionIdentityConflict("source_observation_revisions", revision.id)
 

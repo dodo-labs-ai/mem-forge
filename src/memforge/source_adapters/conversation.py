@@ -1,10 +1,11 @@
 """Conversation Units as Source Projection: each member message is one Observation.
 
 A message Observation's content is its record's canonical JSON, so a member
-carried unchanged keeps its Observation revision. A reply relates to the
-message it answers; any other message follows the one before it. The
-conversation layer decided every member, so a Unit is a complete snapshot of
-them.
+carried unchanged keeps its Observation revision. Its records are read under
+the record schema the payload names, the one they were collected under. A
+reply relates to the message it answers; any other message follows the one
+before it. The conversation layer decided every member, so a Unit is a
+complete snapshot of them.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
 
     if native.get("payload_version") != PAYLOAD_VERSION:
         raise ValueError(f"unsupported conversation Unit payload version: {native.get('payload_version')!r}")
+    record_schema = native.get("record_schema")
+    if not isinstance(record_schema, str) or not record_schema:
+        raise ValueError("a conversation Unit payload names the record schema of its members")
     unit = native["unit"]
     label = payload_label(native)
     conversation_id = label.conversation_id
@@ -81,4 +85,5 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
             ("Conversation", label.name),
             ("From", observed_from),
         ),
+        record_schema=record_schema,
     )
