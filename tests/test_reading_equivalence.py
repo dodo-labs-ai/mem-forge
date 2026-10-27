@@ -284,6 +284,18 @@ def test_a_document_compared_with_a_base_of_another_profile_is_read_again_whole(
     assert [fragment.presentation_text for fragment in removed] == ["Use approval before release."]
 
 
+def test_a_revision_without_a_profile_reads_the_same_only_as_its_own_content() -> None:
+    base, target = revisions("Use approval before release.\n", "Use approval after review.\n")
+    unpinned, edited = (
+        replace(projection.observation_revisions[0], evidence_profile=None) for projection in (base, target)
+    )
+
+    same = compare_readings(unpinned, unpinned)
+    assert (same.changed(), same.changed(purpose="current"), same.removed()) == ((), (), ())
+    different = compare_readings(unpinned, edited)
+    assert (different.changed(), different.removed()) == (None, None)
+
+
 _RECORD = {"body": "Approval is required.\n\nAudit every run.", "owner": "team_alpha", "note": "draft"}
 
 

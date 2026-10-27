@@ -36,14 +36,14 @@ the reading never shows do not take part, and a tombstoned record has no
 reading.
 
 Two revisions with the same content under the same profile read the same,
-whatever the profile, so a binary Artifact whose bytes are unchanged changes
-nothing. Otherwise the whole target reads as changed when the comparison
-cannot say less: its profile is outside this relation (a binary Artifact), its
-structures cannot be compared with a base of another profile, or its base
-cannot be compiled under its own older profile. A record with nothing to read,
-such as a tombstoned one, changes nothing whatever its base. A target, or a
-base under the target's profile, that cannot be compiled is
-``ReadingUnavailable``.
+whatever the profile and also when neither records one, so a binary Artifact
+whose bytes are unchanged changes nothing. Otherwise the whole target reads as
+changed when the comparison cannot say less: it records no profile, its
+profile is outside this relation (a binary Artifact), its structures cannot be
+compared with a base of another profile, or its base cannot be compiled under
+its own older profile. A record with nothing to read, such as a tombstoned
+one, changes nothing whatever its base. A target, or a base under the target's
+profile, that cannot be compiled is ``ReadingUnavailable``.
 """
 
 from __future__ import annotations
@@ -187,10 +187,10 @@ class ReadingComparison:
 
     def _changes(self, purpose: Literal["authority", "current", "removed"]) -> _Changes | None:
         profile = self._target.evidence_profile
-        if profile is None:
-            return None
         if self._base.evidence_profile == profile and self._base.semantic_hash == self._target.semantic_hash:
             return _NO_CHANGE
+        if profile is None:
+            return None
         if profile.name not in _COMPARED_PROFILES:
             return None
         structured = profile.name in _RANGE_ADDRESSABLE_PROFILES
