@@ -173,6 +173,7 @@ class TeamsWorkspace:
         self.db = db
         self.config = config
         self.engine = UnprojectableEngine(defer=False)
+        self.extractor = ProjectionFragmentRecordingExtractor()
         self.documents = documents
         self.app_config = app_config
         self.attempts = 0
@@ -280,7 +281,7 @@ class TeamsWorkspace:
         return GeneSyncOrchestrator(
             db=self.db,
             doc_store=self.documents,
-            memory_extractor=ProjectionFragmentRecordingExtractor(),
+            memory_extractor=self.extractor,
             memory_engine=self.engine,
             memory_store=RecordingDocumentDeleteMemoryStore(self.db),
             max_concurrent=1,
@@ -892,7 +893,9 @@ async def _message_schema_versions(workspace: TeamsWorkspace) -> dict[str, int]:
         return {str(row[0]): int(row[1]) async for row in cursor}
 
 
-async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_under_it(workspace, monkeypatch):
+async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_under_it_and_moves_unread(
+    workspace, monkeypatch,
+):
     earlier = teams_adapter.CANONICAL_RECORD_SCHEMAS[(MESSAGE_SCHEMA.name, 2)]
     teams = FakeTeams()
     teams.post(CHAT, "m1", _ago(3), "first")
@@ -901,7 +904,7 @@ async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_un
         collected_under_earlier.setattr(TeamsGene, "record_schema", earlier.qualified_name)
         collected_under_earlier.setattr(teams, "record_schema", earlier)
         state, _missing = await workspace.collect_and_sync(teams)
-    assert state.last_sync_status == "success"
+    assert state.last_sync_status == "success" and workspace.extractor.fragment_calls
     assert await _message_schema_versions(workspace) == {"m1": 2}
 
     state = await workspace.reprocess(frozenset(await workspace.db.list_indexed_doc_ids(SOURCE_ID)))
@@ -909,8 +912,11 @@ async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_un
     assert state.last_sync_status == "success" and state.docs_failed == 0
     assert await _message_schema_versions(workspace) == {"m1": 2}
 
+    workspace.extractor.fragment_calls.clear()
     state, missing = await workspace.collect_and_sync(teams)
 
     assert state.last_sync_status == "success" and state.docs_failed == 0
     assert [item.identity.message_id for item in missing] == ["m1"]
     assert await _message_schema_versions(workspace) == {"m1": MESSAGE_SCHEMA.version}
+    # The message reads the same under the new schema, so nothing is extracted again.
+    assert workspace.extractor.fragment_calls == []
