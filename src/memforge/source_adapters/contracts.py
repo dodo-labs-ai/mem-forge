@@ -154,6 +154,12 @@ class _ObservationInput:
     ``observed_at`` is the source's own time for this content (design 0.9):
     when the provider last changed it, or ``None`` when the provider records
     no usable time. It is never a discovery, fetch, submission or sync time.
+
+    ``record_schema`` names the canonical record schema (``name:version``) a
+    stored record was collected under, such as a conversation member's. The
+    record is read under that schema rather than the one the adapter declares
+    today. A record the current adapter maps from the provider's response names
+    none.
     """
 
     observation_type: str
@@ -164,6 +170,7 @@ class _ObservationInput:
     observed_at: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     semantic_hash: str | None = None
+    record_schema: str | None = None
 
     def __post_init__(self) -> None:
         # One UTC form for every provider's time, whatever format it reported.
@@ -192,14 +199,7 @@ class _UnitEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class _NativeProjection:
-    """One provider payload as a Source Unit, its Observations and its Unit Title.
-
-    ``record_schema`` names the canonical record schema (``name:version``) a
-    stored payload's records were collected under, such as a conversation Unit
-    payload's. Its records are read under that schema rather than the one the
-    adapter declares today. A payload mapped from the provider's response by
-    the current adapter names none.
-    """
+    """One provider payload as a Source Unit, its Observations and its Unit Title."""
 
     unit_type: str
     provider_key: str
@@ -211,7 +211,6 @@ class _NativeProjection:
     locator: Mapping[str, object]
     # None only when the payload tombstones the whole Unit.
     title: UnitTitle | None
-    record_schema: str | None = None
 
 
 def _canonical_json(value: object) -> str:

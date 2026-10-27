@@ -16,6 +16,7 @@ from memforge.conversations.units import Member, StoredUnit, UnitKind, UnitRef, 
 from memforge.source_projection import UnitRemovalReason
 
 SOURCE = "src-chat"
+RECORD_SCHEMA = "conversation-message:1"
 CONVERSATION = "c1"
 DAY = datetime(2026, 10, 20, tzinfo=timezone.utc)
 
@@ -32,6 +33,7 @@ def _member(message_id: str, hhmm: str, text: str = "hello") -> Member:
         created_at=_at(hhmm),
         record=record,
         revision=record_revision(record),
+        record_schema=RECORD_SCHEMA,
     )
 
 
@@ -280,7 +282,7 @@ def test_equal_message_ids_in_two_conversations_never_match():
     other = StoredUnit(
         ref=UnitRef(unit_id="u2", document_id="d2", provider_key="w2", kind=UnitKind.WINDOW, conversation_id="c2"),
         members=(
-            Member(identity=MessageIdentity("c2", "a"), created_at=_at("09:00"), record={}, revision="x"),
+            Member(identity=MessageIdentity("c2", "a"), created_at=_at("09:00"), record={}, revision="x", record_schema=RECORD_SCHEMA),
         ),
     )
 
@@ -331,6 +333,7 @@ def _undated(message_id: str, hhmm: str, text: str = "hello") -> Member:
         created_at=_at(hhmm),
         record=record,
         revision=record_revision(record),
+        record_schema=RECORD_SCHEMA,
     )
 
 

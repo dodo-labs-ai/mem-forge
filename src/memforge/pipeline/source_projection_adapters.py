@@ -214,7 +214,7 @@ def project_source_item(
         evidence_profile = representation_profile_for_observation_contract(
             source_type=source_type,
             observation_type=value.observation_type,
-            record_schema=native_projection.record_schema,
+            record_schema=value.record_schema,
         )
         if evidence_profile is None:
             raise ValueError(

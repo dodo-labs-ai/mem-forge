@@ -48,6 +48,7 @@ def teams_unit_payload(
                 created_at=record_created_at(record),
                 record=record,
                 revision=record_revision(record),
+                record_schema=record_schema,
             )
         )
     unit = PlannedUnit(

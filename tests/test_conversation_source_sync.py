@@ -920,3 +920,28 @@ async def test_a_unit_collected_under_an_earlier_record_schema_is_reprocessed_un
     assert await _message_schema_versions(workspace) == {"m1": MESSAGE_SCHEMA.version}
     # The message reads the same under the new schema, so nothing is extracted again.
     assert workspace.extractor.fragment_calls == []
+
+
+async def test_a_member_carried_from_a_collection_under_an_earlier_record_schema_keeps_it(workspace, monkeypatch):
+    earlier = teams_adapter.CANONICAL_RECORD_SCHEMAS[(MESSAGE_SCHEMA.name, 2)]
+    teams = FakeTeams()
+    teams.post(CHAT, "ancient", NOW - timedelta(days=60), "long ago")
+    teams.post(CHAT, "m1", _ago(30), "first")
+    with monkeypatch.context() as collected_under_earlier:
+        collected_under_earlier.setattr(teams_adapter, "MESSAGE_SCHEMA", earlier)
+        collected_under_earlier.setattr(TeamsGene, "record_schema", earlier.qualified_name)
+        collected_under_earlier.setattr(teams, "record_schema", earlier)
+        state, _missing = await workspace.collect_and_sync(teams)
+    assert state.last_sync_status == "success"
+    assert await _message_schema_versions(workspace) == {"m1": 2}
+
+    # The next poll reads only the new message before its budget runs out, so the window carries m1.
+    teams.post(CHAT, "m2", _ago(29.5), "follow-up")
+    teams.poll_limit = 1
+    state, missing = await workspace.collect_and_sync(teams)
+
+    assert state.last_sync_status == "success" and state.docs_failed == 0
+    assert [item.identity.message_id for item in missing] == ["m2"]
+    assert await workspace.units() == {f"{UnitKind.WINDOW.value}:m1": ["m1", "m2"]}
+    assert await _message_schema_versions(workspace) == {"m1": 2, "m2": MESSAGE_SCHEMA.version}
+    assert (await _stored_records(workspace))["m1"]["representation"] == earlier.qualified_name

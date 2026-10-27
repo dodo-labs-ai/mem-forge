@@ -31,6 +31,7 @@ from tests.test_displayed_framing import _comment, _issue
 from tests.test_reading_equivalence import _plan, _support_item
 from tests.test_reading_order_and_record_framing import CONVERSATION, _messages, _window, prior_of
 from tests.test_source_revision_time import _item, _project
+from tests.conversation_fixture import teams_unit_payload
 from tests.test_unit_title import NoModelClient
 
 _COMMENT = _comment(["Retain A7 for the payroll run.", "Cutoff is Friday."], "2026-07-02T09:00:00.000+0000")
@@ -170,6 +171,44 @@ def test_a_stored_conversation_payload_is_read_under_the_schema_it_was_collected
     assert _revision(base, "teams-message").evidence_profile == canonical_record_profile("teams-message", 2)
     assert again.observation_revisions == base.observation_revisions
     assert again.deltas[0].changed_anchors == ()
+
+
+def _window_with_carried_member(messages, base, *, carried_schema):
+    """A window collected under ``teams-message:3`` that carries its first message as ``base`` stored it."""
+    payload = teams_unit_payload(messages, record_schema="teams-message:3")
+    [stored] = [r for r in base.observation_revisions if r.metadata["provider_key"] == messages[0]["id"]]
+    payload["members"][0] = {**payload["members"][0], "record": json.loads(stored.content), "record_schema": carried_schema}
+    item = ContentItem(
+        item_id="window-1", title="Window", source_url="https://example.test/window-1",
+        last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="2",
+        extra={"conversation_id": "conv-1", "window_id": "window-1", "root_message_id": "msg-0"},
+    )
+    return project_source_item(
+        source_id="src-teams", source_type="teams", run_id="run-carried", item=item,
+        raw=RawContent(item=item, body=json.dumps(payload).encode(), content_type="application/json"),
+        normalized=NormalizedContent(item=item, markdown_body="window"), **prior_of(base),
+    )
+
+
+def test_a_member_carried_from_an_earlier_collection_is_read_under_the_schema_it_was_collected_under() -> None:
+    messages = _messages(CONVERSATION[:2])
+    base = _window(messages[:1], record_schema="teams-message:2")
+    [carried] = base.observation_revisions
+
+    target = _window_with_carried_member(messages, base, carried_schema="teams-message:2")
+
+    by_message = {r.metadata["provider_key"]: r for r in target.observation_revisions}
+    assert by_message["msg-0"] == carried
+    assert by_message["msg-1"].evidence_profile == canonical_record_profile("teams-message", 3)
+    assert [anchor.observation_id for anchor in target.deltas[0].changed_anchors] == [by_message["msg-1"].observation_id]
+
+
+def test_a_member_naming_a_schema_its_contract_does_not_register_is_not_read() -> None:
+    messages = _messages(CONVERSATION[:2])
+    base = _window(messages[:1], record_schema="teams-message:2")
+
+    with pytest.raises(ValueError, match="record schema"):
+        _window_with_carried_member(messages, base, carried_schema="jira-comment:6")
 
 
 @pytest.mark.parametrize("record_schema", ["teams-message:99", "jira-comment:6", "teams-message", None])
