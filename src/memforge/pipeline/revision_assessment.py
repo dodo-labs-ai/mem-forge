@@ -384,8 +384,6 @@ class RevisionAssessmentContext:
         ``previous``; for ``removed``, the anchors of ``previous`` that
         ``current`` no longer reads (``reading_equivalence``).
         """
-        if previous.id == current.id:
-            return frozenset()
         comparison = self.reading_comparison(previous, current)
         anchors = comparison.changed(purpose="current") if purpose == "current" else comparison.removed()
         return frozenset(anchors) if anchors is not None else None

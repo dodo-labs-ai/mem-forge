@@ -58,12 +58,15 @@ def _authorized(base, target) -> list[str]:
     ]
 
 
-def _support_item(base, target, text) -> SupportWorkItem:
-    """The Support of one claim whose Primary is the base Fragment that shows ``text``, read at ``target``."""
+def _support_item(base, target, text, *, kind=None) -> SupportWorkItem:
+    """The Support of one claim whose Primary is the base Fragment that shows ``text``, read at ``target``.
+
+    ``kind`` narrows the Fragment to one kind, such as an Artifact, which shows no text.
+    """
     old = next(
         fragment for revision in base.observation_revisions
         for fragment in build_revision_fragment_index(revision).fragments
-        if fragment.presentation_text.endswith(text)
+        if fragment.presentation_text.endswith(text) and kind in {None, fragment.kind}
     )
     context = RevisionAssessmentContext(projection=target, base=base, access_context_hash="scope")
     part = ActiveSupportEvidence(

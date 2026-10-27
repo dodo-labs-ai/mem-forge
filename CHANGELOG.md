@@ -34,13 +34,14 @@
 
 - An Observation Revision is identified by its Observation, its content and
   the Evidence Representation Profile it is read under, and only the shared
-  projector assigns that profile. Projecting unchanged content under a new
+  projector assigns that profile. Unchanged content read under a new
   representation, such as a new record schema or a new Markdown or plain-text
-  profile version, now gives a new revision instead of failing with
-  `ProjectionIdentityConflict`. One-time consequence on upgrade: the next time
-  a Source Unit is projected, every Observation gets a new revision id with
-  identical content, and its Unit a new revision; such a revision authorizes
-  no extraction and its Supports are rebound exactly, with no model call. A
+  profile version, is a new revision, which the reading relation compares with
+  the one before. One-time consequence on upgrade: the next time a Source Unit
+  is projected, every Observation, Artifacts included, gets a new revision id
+  with identical content, and its Unit a new revision; such a revision
+  authorizes no extraction and its Supports are rebound exactly, with no model
+  call. A
   stored conversation Unit payload is read under the record schema it was
   collected under (its `record_schema`), not the one the connector declares
   today, and a payload naming a schema its contract does not register is

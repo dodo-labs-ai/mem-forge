@@ -35,12 +35,15 @@ A displayed-only field has no reading of its own. Raw bytes and source origins
 the reading never shows do not take part, and a tombstoned record has no
 reading.
 
-The whole target reads as changed when the comparison cannot say less: its
-profile is outside this relation (a binary Artifact), its structures cannot be
-compared with a base of another profile, or its base cannot be compiled under
-its own older profile. A record with nothing to read, such as a tombstoned
-one, changes nothing whatever its base. A target, or a base under the target's
-profile, that cannot be compiled is ``ReadingUnavailable``.
+Two revisions with the same content under the same profile read the same,
+whatever the profile, so a binary Artifact whose bytes are unchanged changes
+nothing. Otherwise the whole target reads as changed when the comparison
+cannot say less: its profile is outside this relation (a binary Artifact), its
+structures cannot be compared with a base of another profile, or its base
+cannot be compiled under its own older profile. A record with nothing to read,
+such as a tombstoned one, changes nothing whatever its base. A target, or a
+base under the target's profile, that cannot be compiled is
+``ReadingUnavailable``.
 """
 
 from __future__ import annotations
@@ -88,17 +91,23 @@ class _Side:
 
 @dataclass(frozen=True, slots=True)
 class _Changes:
-    """The anchors of one side whose reading the other side lacks, and that side's changed structures."""
+    """The anchors of one side whose reading the other side lacks, and that side's changed structures.
 
-    side: _Side
+    ``order`` is every Fragment anchor of that side, in order.
+    """
+
+    order: tuple[SourceAnchor, ...]
     read: frozenset[SourceAnchor]
     structures: tuple[Range, ...]
 
     def anchors(self) -> tuple[SourceAnchor, ...]:
         return tuple(
-            anchor for anchor in self.side.anchors
+            anchor for anchor in self.order
             if anchor in self.read or any(_overlaps(anchor, structure) for structure in self.structures)
         )
+
+
+_NO_CHANGE = _Changes((), frozenset(), ())
 
 
 class ReadingUnavailable(ValueError):
@@ -156,7 +165,7 @@ class ReadingComparison:
         if changes is None:
             return None
         return tuple(dict.fromkeys((*changes.structures, *(
-            (anchor.range_start, anchor.range_end) for anchor in changes.side.anchors
+            (anchor.range_start, anchor.range_end) for anchor in changes.order
             if anchor in changes.read and anchor.range_start is not None and anchor.range_end is not None
         ))))
 
@@ -178,21 +187,25 @@ class ReadingComparison:
 
     def _changes(self, purpose: Literal["authority", "current", "removed"]) -> _Changes | None:
         profile = self._target.evidence_profile
-        if profile is None or profile.name not in _COMPARED_PROFILES:
+        if profile is None:
+            return None
+        if self._base.evidence_profile == profile and self._base.semantic_hash == self._target.semantic_hash:
+            return _NO_CHANGE
+        if profile.name not in _COMPARED_PROFILES:
             return None
         structured = profile.name in _RANGE_ADDRESSABLE_PROFILES
         if structured and self._base.evidence_profile != profile:
             return None
         target = self._target_side
         if purpose != "removed" and not structured and not target.readings:
-            return _Changes(target, frozenset(), ())
+            return _NO_CHANGE
         base = self._base_side
         if base is None:
             return None
         old, new = (target, base) if purpose == "removed" else (base, target)
         keys = changed_material_keys(old.counts, new.counts, purpose=purpose)
         return _Changes(
-            new,
+            new.anchors,
             frozenset(anchor for anchor, reading in new.readings.items() if reading.key in keys),
             revision_changed_structural_ranges(old.revision, new.revision, purpose=purpose) if structured else (),
         )
