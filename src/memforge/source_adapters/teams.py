@@ -33,6 +33,12 @@ MESSAGE_SCHEMA = replace(
     model_interpretation="Sender and message times are supplied source framing. Missing sender or a reported Unknown sender does not establish identity. Message time is not a rule effective date. An authenticated reply referent establishes a relationship; chronological adjacency alone does not.",
 )
 CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS, (MESSAGE_SCHEMA.name, MESSAGE_SCHEMA.version): MESSAGE_SCHEMA}
+# A message's edit time is shown with it but never changes what it says; its
+# creation time stays governing, since it anchors relative time in the content.
+MESSAGE_SCHEMA = replace(MESSAGE_SCHEMA, version=3, fields=tuple(
+    replace(field, governs_interpretation=False) if field.json_pointer == "/edited_time" else field
+    for field in MESSAGE_SCHEMA.fields))
+CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS, (MESSAGE_SCHEMA.name, MESSAGE_SCHEMA.version): MESSAGE_SCHEMA}
 CURRENT_OBSERVATION_PROFILES = {"message": canonical_record_profile(MESSAGE_SCHEMA.name, MESSAGE_SCHEMA.version)}
 LEGACY_OBSERVATION_PROFILES = {"message": canonical_record_profile(MESSAGE_SCHEMA.name, 1)}
 
