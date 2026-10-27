@@ -19,7 +19,7 @@
   field), and `memforge.pipeline.reading_equivalence.compare_readings`
   replaces `canonical_record_changed_raw_ranges`,
   `canonical_nested_changed_raw_ranges` and `changed_interpretation_ranges`.
-  Cloud: bump the OSS pin; no HANA or adapter change.
+  Cloud: bump the OSS pin; the reading relation itself needs no HANA change.
 
 - Jira comments (`jira-comment:6`) and Teams messages (`teams-message:3`)
   still show their edit time but no longer treat it as a change in what they
@@ -41,15 +41,19 @@
   is projected, every Observation, Artifacts included, gets a new revision id
   with identical content, and its Unit a new revision; such a revision
   authorizes no extraction and its Supports are rebound exactly, with no model
-  call. A
-  stored conversation Unit payload is read under the record schema it was
-  collected under (its `record_schema`), not the one the connector declares
-  today, and a payload naming a schema its contract does not register is
-  refused. For connector authors: `representation_profile_for_observation_contract`
-  takes a payload's `record_schema`, and `declared_representation_profiles`
-  lists every profile a new revision of a contract may be stored under. Cloud:
-  the HANA adapter accepts a new Observation Revision under any of
-  `declared_representation_profiles` rather than only the current
+  call. A conversation message is read under the record schema it was
+  collected under: a Unit payload names its collection's `record_schema`, and
+  a member carried from an earlier collection under another schema names its
+  own, so a message the provider does not return again keeps its stored
+  revision across a schema upgrade. A payload or member naming a schema its
+  contract does not register is refused.
+  For connector authors: `representation_profile_for_observation_contract`
+  takes a record's `record_schema`, `declared_representation_profiles` lists
+  every profile a new revision of a contract may be stored under, a
+  conversation `Member` takes the `record_schema` its record was collected
+  under, and `require_revision_identity` checks one stored revision against the
+  projected one. Cloud: the HANA adapter accepts a new Observation Revision
+  under any of `declared_representation_profiles` rather than only the current
   declaration, as the SQLite adapter does.
 
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
