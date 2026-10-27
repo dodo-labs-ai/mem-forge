@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Incremental extraction and Support revalidation decide what changed by what
+  a model reads. Two revisions of an Observation are compared Fragment by
+  Fragment: its presentation and the context that governs it (headings, list
+  lead-ins, table headers, record framing and the schema's interpretation),
+  each revision compiled under the representation it was stored with. A
+  storage edit the reading never shows, such as a Confluence cell's grown
+  `rowspan`, a non-breaking space at the edge of a paragraph, an empty macro
+  parameter or a `<pre>` style, no longer sends unchanged content to
+  extraction or reassessment. A representation upgrade re-reads only what
+  reads differently instead of the whole Observation, and a Support whose
+  Evidence reads the same is rebound without a model call. A Confluence table
+  row reads with its headers, so renaming a header reassesses the Supports of
+  its rows. For connector authors: `CanonicalRecordField` takes
+  `governs_interpretation` (default `True`, and `False` only on a contextual
+  field), and `memforge.pipeline.reading_equivalence.compare_readings`
+  replaces `canonical_record_changed_raw_ranges`,
+  `canonical_nested_changed_raw_ranges` and `changed_interpretation_ranges`.
+  Cloud: bump the OSS pin; no HANA or adapter change.
+
+- Jira comments (`jira-comment:6`) and Teams messages (`teams-message:3`)
+  still show their edit time but no longer treat it as a change in what they
+  say: editing one paragraph of a comment extracts only that paragraph, and a
+  message whose only change is its edit time is neither extracted nor
+  reassessed. Records stored as `jira-comment:5` or `teams-message:2` keep
+  reading under those versions and move to the new ones without being read
+  again. Update the local agent with the server: the server refuses a Teams
+  collection an earlier agent recorded as `teams-message:2`, and after the
+  update each stored message revises once to `teams-message:3`, extracting
+  nothing.
+
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
   `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or
   invitation page, show the same mark as the app. Cloud: its sign-in,
