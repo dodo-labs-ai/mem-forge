@@ -11,14 +11,14 @@ if TYPE_CHECKING:
 
 from memforge.pipeline.evidence_fragments import (
     EvidenceFragment,
-    canonical_record_changed_raw_ranges,
-    changed_interpretation_ranges,
     canonical_record_is_tombstoned,
     revision_changed_structural_ranges,
 )
+from memforge.pipeline.reading_equivalence import ReadingUnavailable, compare_readings
 from memforge.source_artifacts import SOURCE_ARTIFACT_OBSERVATION_TYPE, source_artifact_inference_eligibility
 from memforge.source_projection import (
     RevisionDelta,
+    SourceAnchor,
     SourceObservationRevision,
     SourceProjection,
     SourceRelationType,
@@ -26,7 +26,7 @@ from memforge.source_projection import (
 )
 
 
-PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 8
+PROJECTION_AUTHORITY_SEGMENTATION_POLICY_VERSION = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,9 +160,14 @@ def plan_projection_evidence_work(
 ) -> ExtractionAuthority | ProjectionEvidencePlanningFailure:
     """Plan current-work Primary authority before any request is planned.
 
-    Provider adapters declare representation and change facts. This compares
-    the committed base and staged target through representation-owned
-    structure; reading context and request packing cannot widen it.
+    Provider adapters declare representation and change facts. A changed
+    Observation authorizes the Fragments whose reading differs from the
+    committed base (``reading_equivalence``), compiled under each side's pinned
+    profile, so a representation upgrade authorizes only what reads
+    differently. Markdown and plain text also authorize each changed complete
+    structure. A base that cannot be read under its own, older profile leaves
+    the whole Observation to be read again. Reading context and request
+    packing cannot widen authority.
     """
 
     delta = projection.deltas[0]
@@ -237,24 +242,18 @@ def plan_projection_evidence_work(
                     representation_profile=profile.name,
                 )
             try:
-                if canonical_record_is_tombstoned(revision):
-                    authority[anchor.observation_id] = ()
-                    continue
-                # A representation upgrade is current reading, not a text diff
-                # between incompatible coordinate/interpretation contracts.
-                # Support independently reassesses pinned historical Evidence.
-                if base_revision.evidence_profile != profile:
+                changed = compare_readings(base_revision, revision).changed()
+            except ReadingUnavailable as unavailable:
+                if unavailable.side == "base" and base_revision.evidence_profile != profile:
                     authority[anchor.observation_id] = None
                     continue
-                changed_ranges = canonical_record_changed_raw_ranges(base_revision, revision)
-            except ValueError:
                 return ProjectionEvidencePlanningFailure(
                     code=ProjectionEvidencePlanningFailureCode.CANONICAL_FIELD_MAPPING_INVALID,
                     observation_id=revision.observation_id,
                     observation_revision_id=revision.id,
                     representation_profile=profile.name,
                 )
-            authority[anchor.observation_id] = tuple(dict.fromkeys(changed_ranges))
+            authority[anchor.observation_id] = _anchor_ranges(changed)
             continue
         if profile.name not in {
             "markdown-structural",
@@ -274,7 +273,7 @@ def plan_projection_evidence_work(
         try:
             authority[anchor.observation_id] = tuple(dict.fromkeys((
                 *revision_changed_structural_ranges(base_revision, revision),
-                *changed_interpretation_ranges(base_revision, revision),
+                *_anchor_ranges(compare_readings(base_revision, revision).changed()),
             )))
         except ValueError:
             return ProjectionEvidencePlanningFailure(
@@ -287,6 +286,14 @@ def plan_projection_evidence_work(
             )
 
     return _authority_or_failure(projection, authority)
+
+
+def _anchor_ranges(anchors: tuple[SourceAnchor, ...]) -> tuple[tuple[int, int], ...]:
+    return tuple(dict.fromkeys(
+        (anchor.range_start, anchor.range_end)
+        for anchor in anchors
+        if anchor.range_start is not None and anchor.range_end is not None
+    ))
 
 
 def whole_revision_extraction_authority(

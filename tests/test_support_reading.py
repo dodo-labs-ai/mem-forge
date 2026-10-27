@@ -301,7 +301,7 @@ def reading_texts(reading):
 
 def test_reading_order_puts_changed_removed_and_own_evidence_first():
     other = "Other rule."
-    old = f"Intro para.\n\n{RULE}\n\n{other}\n\nDeleted note.\n\n- item a\n- item b\n\nTail para.\n"
+    old = f"Intro para.\n\n{RULE}\n\nDeleted note.\n\n{other}\n\n- item a\n- item b\n\nTail para.\n"
     new = f"Intro para.\n\n{RULE}\n\n{other}\n\n- item a\n- item b\n- item c\n\nTail para.\n\nAdded note.\n"
     base, context = context_for(old, new)
     items = [
@@ -338,7 +338,7 @@ def test_without_usable_baseline_first_part_is_the_whole_revision():
 
 
 def test_changes_hold_changed_groups_then_removed_text():
-    old = f"Intro para.\n\n{RULE}\n\nDeleted note.\n\n- item a\n- item b\n\nTail para.\n"
+    old = f"Intro para.\n\nDeleted note.\n\n{RULE}\n\n- item a\n- item b\n\nTail para.\n"
     new = f"Intro para.\n\n{RULE}\n\n- item a\n- item b\n- item c\n\nTail para.\n\nAdded note.\n"
     base, context = context_for(old, new)
     revision_plan = plan_support_revision(context, [SupportWorkItem("w0", memory(), (part(base, RULE),), context)])

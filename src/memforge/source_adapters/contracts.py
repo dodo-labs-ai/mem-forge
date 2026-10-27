@@ -71,6 +71,22 @@ class DeclaredTextFormat:
 
 @dataclass(frozen=True, slots=True)
 class CanonicalRecordField:
+    """One field of a canonical record and how a reader is shown it.
+
+    A field is selectable: its value is a claim a Memory can cite as Primary
+    Evidence. A ``contextual`` field is shown with the selectable fields of its
+    record but is never cited as Primary, such as a comment's author or time.
+
+    ``governs_interpretation`` says whether a contextual field can change which
+    claim its record's selectable text supports: who said it, what it refers to,
+    its scope, or which field it belongs to. It holds by default. Declare
+    ``False`` only for a field a reader is shown but that never changes what the
+    text means, such as the time a comment was last edited; a change to that
+    field alone is then no change in what the record says. It decides only what
+    counts as changed between two revisions: the field is still shown, framed
+    and bound to the Evidence that displays it.
+    """
+
     json_pointer: str
     nested_profile: str | None = None
     comparison_keys: tuple[str, ...] = ()
@@ -80,6 +96,7 @@ class CanonicalRecordField:
     framing_fields: tuple[tuple[str, str], ...] = ()
     comparison_pointer: str | None = None
     presentation_keys: tuple[str, ...] = ()
+    governs_interpretation: bool = True
 
     def __post_init__(self) -> None:
         if self.nested_profile not in {None, "markdown-structural", "plain-text"}:
@@ -88,6 +105,8 @@ class CanonicalRecordField:
             raise ValueError("canonical text field must declare exactly one format")
         if self.label is not None and not self.label.strip():
             raise ValueError("canonical field label must not be blank")
+        if not self.governs_interpretation and not self.contextual:
+            raise ValueError("only a contextual field can be shown without governing interpretation")
 
 
 @dataclass(frozen=True, slots=True)
