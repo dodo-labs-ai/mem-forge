@@ -44,10 +44,12 @@ def readable(data):
 class Client:
     """Support the release rule unless a complete exception has been read."""
 
-    def __init__(self, limit=8000):
+    def __init__(self, limit=8000, correction_reserve=256):
         # Synthetic quotas preserve the source-data allowance when fixed instructions grow.
         from memforge.pipeline.extraction_contract import EVIDENCE_DISPLAY_RULES
         self.limit = limit + len(EVIDENCE_DISPLAY_RULES) + len("\nFor a supported result only:\n")
+        # Room kept in every first request for the correction of one row, as the route keeps it.
+        self.correction_reserve = correction_reserve
         self.prompts = []
         self.impact_prompts = []
         self.fail_at = None
@@ -57,7 +59,7 @@ class Client:
         return RequestBudget(model or "fixture", self.limit, self.limit * 8, 32768, 1, "fixture")
 
     def request_fits(self, prompt, *, reserve_correction=True, **kwargs):
-        return len(prompt) <= self.limit - (256 if reserve_correction else 0)
+        return len(prompt) <= self.limit - (self.correction_reserve if reserve_correction else 0)
 
     def request_tokens(self, prompt, **kwargs):
         return len(prompt)
@@ -422,19 +424,61 @@ async def test_section_deletion_is_unsupported_only_after_the_whole_order():
     [item] = work_items(f"# Other\n\n{notes}\n", old=f"# Release\n\n{RULE}\n\n# Other\n\n{notes}\n")
 
     class DeniedClient(Client):
-        def judge(self, prompt):
-            # Tries to conclude UNSUPPORTED early; the program ignores it until the last group.
-            return [unsupported(w) for w in payload(prompt)["works"]]
+        """Answers unsupported in every request; a corrected row continues."""
 
-    client, store = DeniedClient(limit=5000), Store()
+        def judge(self, prompt):
+            return [continued(w) if "<correction>" in prompt else unsupported(w) for w in payload(prompt)["works"]]
+
+    # An early unsupported is corrected with its rule, which needs a larger reserve.
+    client, store = DeniedClient(limit=5000, correction_reserve=512), Store()
     executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
     [result] = (await executor.assess_many([item])).values()
     assert result.supported is False and result.unresolved is None and result.complete_read
-    assert len(client.prompts) > 1
+    # Every request before the last is corrected once to continue; the last request concludes.
+    requests = [p for p in client.prompts if "<correction>" not in p]
+    corrections = [p for p in client.prompts if "<correction>" in p]
+    assert len(requests) > 1 and len(corrections) == len(requests) - 1
+    assert all("unsupported is allowed only when last is true" in p for p in corrections)
+    assert payload(requests[-1])["last"] and not any(payload(p)["last"] for p in corrections)
     total = len(reading_order([item]).parts)
     [receipt] = receipts(store)
     assert receipt.manifest["coverage"] == {"total": total, "read_parts": {"w0": total}}
     assert all(any(f"Other note {i}." in p for p in client.prompts) for i in range(60))
+
+
+@pytest.mark.asyncio
+async def test_opposing_text_of_a_corrected_early_unsupported_reaches_the_concluding_request():
+    filler = "\n\n".join(f"Routine execution note {i}: maintain settings." for i in range(100))
+    text = f"Cedar uses one reviewer.\n\n{filler}\n\nCedar means US releases.\n\n{filler}\n\n{RULE}"
+
+    class EarlyDenialClient(Client):
+        """Answers unsupported as soon as a request shows opposing text, before the order is complete."""
+
+        def judge(self, prompt):
+            data = payload(prompt)
+            results = super().judge(prompt)
+            if data["last"] or "<correction>" in prompt:
+                return results
+            current = data["current"]
+            shown = {row[0]: row[1] for row in (*current["primary_candidates"], *current["required_only_candidates"])}
+            opposed = any(term in text for text in shown.values() for term in EXCEPTION_TERMS)
+            return [unsupported(work) if opposed else row for work, row in zip(data["works"], results)]
+
+    [item] = work_items(text)
+    client, store = EarlyDenialClient(correction_reserve=512), Store()
+    executor = RevisionWorkExecutor(client=client, model="fixture", store=store, derivation_id="root")
+    [result] = (await executor.assess_many([item])).values()
+
+    # Without the carried exception the last request, which shows the rule, would support it.
+    assert result.supported is False and result.unresolved is None and result.complete_read
+    assert sum("<correction>" in p for p in client.prompts) == 2
+    [final] = [payload(p) for p in client.prompts if payload(p)["last"]]
+    carried = {row[0]: row[1] for row in final["carried_witness_catalog"]}
+    opposing = final["works"][0]["previous_state"]["opposing_witness_refs"]
+    assert sorted(carried[ref] for ref in opposing) == ["Cedar means US releases.", "Cedar uses one reviewer."]
+    total = len(reading_order([item]).parts)
+    [receipt] = receipts(store)
+    assert receipt.manifest["coverage"] == {"total": total, "read_parts": {"w0": total}}
 
 
 @pytest.mark.asyncio
