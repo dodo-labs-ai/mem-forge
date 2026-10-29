@@ -447,6 +447,25 @@ async def test_section_deletion_is_unsupported_only_after_the_whole_order():
 
 
 @pytest.mark.asyncio
+async def test_early_unsupported_that_survives_its_correction_is_unresolved():
+    notes = "\n\n".join(f"Other note {i}." for i in range(60))
+    [item] = work_items(f"# Other\n\n{notes}\n", old=f"# Release\n\n{RULE}\n\n# Other\n\n{notes}\n")
+
+    class InsistentClient(Client):
+        """Answers unsupported in every request, corrections included."""
+
+        def judge(self, prompt):
+            return [unsupported(w) for w in payload(prompt)["works"]]
+
+    client = InsistentClient(limit=5000, correction_reserve=512)
+    [result] = (await RevisionWorkExecutor(client=client, model="fixture").assess_many([item])).values()
+    # The first request is corrected once; a row still unsupported is an invalid response, not a verdict.
+    assert (result.supported, result.unresolved) == (None, "invalid_response")
+    assert len(client.prompts) == 2 and "<correction>" in client.prompts[1]
+    assert not payload(client.prompts[0])["last"]
+
+
+@pytest.mark.asyncio
 async def test_opposing_text_of_a_corrected_early_unsupported_reaches_the_concluding_request():
     filler = "\n\n".join(f"Routine execution note {i}: maintain settings." for i in range(100))
     text = f"Cedar uses one reviewer.\n\n{filler}\n\nCedar means US releases.\n\n{filler}\n\n{RULE}"
