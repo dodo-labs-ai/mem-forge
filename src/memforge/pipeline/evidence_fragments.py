@@ -192,23 +192,18 @@ def _revision_structural_identities(
         )
         level = int(token.tag.removeprefix("h"))
         headings[start] = (level, revision.content[start:end])
+    # A heading's ancestry is the open headings above its own level; it then
+    # opens the scope its following units sit under.
     path: list[str] = []
     identities = []
     for unit in units:
-        identities.append(
-            (
-                revision.content[unit.start : unit.end],
-                tuple(path),
-            )
-        )
-        heading = headings.get(unit.start)
-        if heading is None:
-            continue
-        level, heading_text = heading
-        del path[level - 1 :]
-        while len(path) < level - 1:
-            path.append("")
-        path.append(heading_text)
+        level, heading_text = headings.get(unit.start, (None, None))
+        if level is not None:
+            del path[level - 1 :]
+            path.extend([""] * (level - 1 - len(path)))
+        identities.append((revision.content[unit.start : unit.end], tuple(path)))
+        if heading_text is not None:
+            path.append(heading_text)
     return tuple(identities)
 
 
