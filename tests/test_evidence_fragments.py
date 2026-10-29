@@ -12,11 +12,11 @@ from memforge.pipeline.evidence_fragments import (
     FragmentCompilationError,
     FragmentCompilationErrorCode,
     build_revision_fragment_index,
-    changed_interpretation_ranges,
     compile_fragments,
     revision_changed_structural_ranges,
     verify_text_evidence_view,
 )
+from memforge.pipeline.reading_equivalence import compare_readings
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -265,9 +265,7 @@ def test_markdown_structures_keep_identity_while_their_heading_ancestry_is_uncha
     base = _revision(HEADED_DOCUMENT, MARKDOWN_PROFILE)
     target = replace(_revision(target_content, MARKDOWN_PROFILE), id="obsrev-2")
 
-    authority = dict.fromkeys(
-        (*revision_changed_structural_ranges(base, target), *changed_interpretation_ranges(base, target))
-    )
+    authority = compare_readings(base, target).changed_ranges()
     removed_ranges = revision_changed_structural_ranges(target, base, purpose="removed")
 
     assert [target.content[start:end] for start, end in authority] == changed
