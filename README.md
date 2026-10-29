@@ -3,8 +3,7 @@
 **Give every agent your team's brain on day one.**
 
 The memory layer for AI agents. Everything your team knows. Cited, and always
-up to date. Built from your docs, tickets and chat, plus what you ask your
-agents to remember.
+up to date. Built from your docs, tickets and chat.
 
 <p>
   <a href="https://github.com/dodo-labs-ai/mem-forge/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dodo-labs-ai/mem-forge/actions/workflows/ci.yml/badge.svg"></a>
@@ -19,82 +18,96 @@ agents to remember.
   </picture>
 </p>
 
-> **Status: beta.** APIs, storage formats and plugin packaging may still change.
-> A new release saves a recovery point of the database and vector index before
-> it upgrades them, rolls back a migration that fails, and refuses data a newer
-> release wrote; restoring the recovery point goes back
-> ([Upgrading](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#upgrading)).
-> The open-source build runs for one user on one machine.
-
-## Quick start
-
-You need Docker with Compose v2 and an API key for a model provider
-(OpenRouter, OpenAI or Anthropic), or a model server such as Ollama.
-
-```bash
-git clone https://github.com/dodo-labs-ai/mem-forge.git && cd mem-forge
-cp .env.example .env
-docker compose up --build
-```
-
-Open the admin UI at http://localhost:5174 and choose a generation model and an
-embedding model in Settings. Then install the agent plugin:
-
-```text
-# Claude Code (inside a session)
-/plugin marketplace add dodo-labs-ai/mem-forge
-/plugin install memory@memforge
-```
-
-```bash
-# Codex
-codex plugin marketplace add dodo-labs-ai/mem-forge
-codex plugin add memory@memforge
-```
-
-Open **Sources** in the admin UI to connect Confluence, Jira or another source,
-then start a new agent session and ask:
-
-```text
-Before you change this, check MemForge for decisions and conventions that
-apply, and show the source for each one you rely on.
-```
-
-When you settle something in a session, ask the agent to remember it. It shows
-you the memory first and saves it after you confirm.
-
-The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers model settings,
-[plugin routing](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#plugin-routing) for a hosted endpoint or
-more than one workspace, local folders, the host CLI and network details.
+<p align="center">
+  The open-source edition runs on your machine. The <b>Team Cloud Edition</b> is on the way:
+  we host it and provide the models, your team just subscribes.
+  <a href="https://github.com/dodo-labs-ai/mem-forge/discussions/13">Join the waitlist</a>.
+</p>
 
 ## Why MemForge
 
-**One memory for your docs and your decisions.** Confluence, Jira, Notion,
-GitHub and Teams land in one store and come back from one `search` call. When
-you tell Claude Code or Codex to remember a decision or a correction, it saves
-that one memory after you confirm, never a transcript. A decision you saved in
-Claude Code is there when you open Codex.
+**On day one, your agent knows what your team knows.** A new hire picks up a
+ticket, and their agent reads the code and guesses. The answer the team
+settled months ago sits in a Notion page nobody linked. With MemForge, the
+agent checks team memory before it acts and finds the convention, decision or
+known issue that applies, from Confluence, Jira, Notion, GitHub and Teams in
+one `search` call.
 
-**It follows the source.** When a page or ticket changes, the next sync
-rechecks the memories built on it. Each one is kept, replaced or retired, and
-earlier versions keep their history. Across
-documents, MemForge marks memories that repeat, update or contradict each
-other.
+**When a doc changes, memory follows.** The team changed a rule last week, and
+agents still repeat the old one. With MemForge, the next sync rechecks every
+memory built on the changed page: each is kept, replaced or retired, and the
+earlier version stays as history. Memories from different documents that
+repeat, update or contradict each other are linked, so the agent sees which
+one is current.
 
-**Every answer has a source.** `get_memory` returns the supporting text and a
-link back to the page, ticket or file. Where the source allows it, the citation
-is pinned to the revision and passage that was read, and `get_resource` opens
+**Every answer shows where it came from.** A confident answer you cannot check
+is a liability. With MemForge, each memory comes with its supporting text and
+a link to the page, ticket or file. Where the source allows it, the citation
+is pinned to the revision and passage that was read, and the agent can open
 the original. The supporting text can be the model's focused wording, not
 always a verbatim quote.
 
-**Runs on your machine.** Apache-2.0. `docker compose up` starts the service
-with local storage (SQLite, FTS5 and Chroma). You bring your own model
-endpoints and keys, and those providers receive what is sent for inference.
-The plugins send no session transcripts: an agent writes only the memory you
-confirm.
+**It runs on your machine.** Apache-2.0, with local storage (SQLite, FTS5 and
+Chroma). You bring your own model keys, and those providers receive only what
+is sent for inference. The plugins send no session transcripts.
 
 See [how MemForge compares](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/comparison.md) with Mem0, Zep, claude-mem and
 Unblocked.
+
+## Quick start
+
+> **Beta.** APIs, storage formats and plugin packaging may change. Each upgrade
+> saves a recovery point first
+> ([Upgrading](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#upgrading)).
+
+You need Docker with Compose v2 and an API key for OpenRouter, OpenAI or
+Anthropic.
+
+1. **Start MemForge.**
+
+   ```bash
+   git clone https://github.com/dodo-labs-ai/mem-forge.git && cd mem-forge
+   cp .env.example .env
+   docker compose up --build
+   ```
+
+   The admin UI is at http://localhost:5174.
+
+2. **Choose models.** In **Settings**, choose a generation model, which writes
+   the memories, and optionally an embedding model for semantic search. After
+   **Save and validate**, each one shows **Ready**.
+
+3. **Connect a source.** In **Sources**, add a Notion workspace, a Confluence
+   space, a Jira project or a GitHub repository, and run a sync. Turn on
+   **Sync automatically** to keep it current. The source shows the memories it
+   made as the sync runs.
+
+4. **Install the agent plugin.**
+
+   ```text
+   # Claude Code (inside a session)
+   /plugin marketplace add dodo-labs-ai/mem-forge
+   /plugin install memory@memforge
+   ```
+
+   ```bash
+   # Codex
+   codex plugin marketplace add dodo-labs-ai/mem-forge
+   codex plugin add memory@memforge
+   ```
+
+5. **Ask.** Start a new agent session in your project and ask:
+
+   ```text
+   Before you change this, check MemForge for decisions and conventions that
+   apply, and show the source for each one you rely on.
+   ```
+
+   The agent answers with the memories that apply and names the source of each.
+
+The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers every model provider,
+[plugin routing](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#plugin-routing) for a hosted endpoint or
+more than one workspace, local folders, the host CLI and network details.
 
 ## How it works
 
@@ -102,28 +115,28 @@ Unblocked.
 flowchart LR
   subgraph You["Your machine"]
     CC["Claude Code / Codex"]
-    Plugin["MemForge plugin<br/>MCP proxy"]
+    Plugin["MemForge plugin"]
   end
-  Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local Markdown"]
-  API["MemForge API"]
-  Extract["Extract memories<br/>with source Evidence"]
-  Recheck["Plan updates<br/>relate memories"]
-  Store[("SQLite + FTS5<br/>Chroma")]
+  Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local files"]
+  API["MemForge"]
+  Extract["Write short memories,<br/>each citing its source"]
+  Recheck["Recheck when a source changes,<br/>link related memories"]
+  Store[("Local storage")]
 
   CC --> Plugin
   Docs -- "sync" --> API
   API --> Extract --> Recheck --> Store
-  Plugin -- "search / get_memory / get_resource<br/>create_memory (confirmed)" --> API
+  Plugin -- "search, read a memory,<br/>open its source" --> API
   API -- "read" --> Store
 ```
 
-1. **Capture.** Connectors sync documents, and an agent saves a memory you ask
-   it to remember after you confirm it.
-2. **Extract.** An LLM turns each source into short memories with supporting
-   Evidence.
-3. **Reconcile.** When a source changes, affected memories are rechecked and
-   related ones are linked.
-4. **Recall.** Agents call `search`, `get_memory` and `get_resource` over MCP.
+1. **Sync.** Connectors read your docs, tickets and chat, on a schedule or
+   when you ask.
+2. **Extract.** A model turns each source into short memories, each citing the
+   passage it came from.
+3. **Recheck.** When a source changes, the memories built on it are kept,
+   replaced or retired, and related memories are linked.
+4. **Recall.** Agents search memory and open its sources over MCP.
 
 More detail: [architecture overview](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/architecture.md).
 
@@ -170,12 +183,14 @@ agents that do the work.
 
 [Add a source](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#4-add-a-source) lists what each one syncs and
 how to scope it. Need one that is missing?
-[Open an issue](https://github.com/dodo-labs-ai/mem-forge/issues).
+[Vote for the next source](https://github.com/dodo-labs-ai/mem-forge/discussions/12).
 
 ## Limits
 
-- The open-source build is single-user, has no authentication, and binds to
-  `127.0.0.1` only. Do not expose it on a network.
+- The open-source edition runs for one person on one machine. It has no
+  accounts or authentication and listens on `127.0.0.1` only, so do not expose
+  it on a network. For memory your whole team shares, join the
+  [Team Cloud Edition waitlist](https://github.com/dodo-labs-ai/mem-forge/discussions/13).
 - Model extraction and semantic judgments can miss useful knowledge or make
   mistakes. Check the cited Evidence before relying on a consequential claim.
 - A generation model is required; without one, syncs store content but create
