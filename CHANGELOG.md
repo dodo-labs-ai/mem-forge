@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Removed: `GET /api/v1/recent-changes` and `GET /api/v1/stats/detailed`. No
+  client read them. For recently updated Memories, use
+  `POST /api/v1/memories/recent` or the MCP `list_recent_memories` tool. The
+  source-document changelog feed has no replacement.
+
+  Every reader now reaches the store only through its methods, so every store
+  answers alike:
+  - the agent hook's recent changes come from the search engine's recent
+    listing, and their items no longer carry `status`;
+  - the runtime health counts audit failures with
+    `count_failed_memory_audit_events`;
+  - the index health check and repair read the SQLite rows they compare through
+    store methods.
+
+  A test refuses code outside `memforge.storage` that queries a store's
+  connection. Cloud: bump the OSS pin; the HANA store adds
+  `count_failed_memory_audit_events`.
+
 - A revised claim that restates one kept Memory and contradicts or replaces
   another is no longer lost. Each row of the Support and Relation combination
   table now replaces, adds or consumes a related Candidate, and a Candidate

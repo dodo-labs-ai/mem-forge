@@ -7,9 +7,10 @@ source state.
 Hook context is PERSONALIZED retrieval: the principal is supplied by the
 caller (the HTTP handler resolves it server-side, never from the body), and
 both the search and recent-changes paths apply the same default-deny access
-predicate as the rest of the retrieval engine. Search runs through the
-unified ``SearchEngine`` so there is exactly one predicate implementation;
-recent changes share the predicate via ``visible_sql``.
+predicate as the rest of the retrieval engine. Both run through the unified
+``SearchEngine`` so there is exactly one predicate implementation: search
+ranks Memories by the prompt, and recent changes list the active Memories
+updated in the last week.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.retrieval.access_predicate import visible_sql
+from memforge.retrieval.filters import MemoryTimeRange
 from memforge.storage.adapters.context import AccessScope
 from memforge.storage.database import Database
 
@@ -141,7 +142,7 @@ async def build_agent_hook_context(
     PERSONALIZED access predicate (``include_private=True`` for the principal),
     so the agent author sees their own private context but never another
     user's. ``search_engine`` is the unified retrieval engine; when omitted,
-    the search path is skipped so a non-HTTP caller cannot accidentally route
+    both paths are skipped so a non-HTTP caller cannot accidentally route
     around the engine.
     """
     max_memories = min(max(request.max_memories, 1), 10)
@@ -154,8 +155,8 @@ async def build_agent_hook_context(
         else []
     )
     recent_changes = (
-        await _recent_memory_changes(db, request, scope, limit=3)
-        if query_memory and request.include_recent_changes
+        await _recent_memory_changes(search_engine, scope, limit=3)
+        if query_memory and request.include_recent_changes and search_engine is not None
         else []
     )
     warnings = await _source_warnings(db)
@@ -223,36 +224,28 @@ async def _search_memories(
 
 
 async def _recent_memory_changes(
-    db: Database,
-    request: AgentHookContextRequest,
+    engine: "SearchEngine",
     scope: AccessScope,
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Return the recent-changes feed under the same access predicate the
-    search path uses. Visibility and any project narrowing both ride on
-    ``visible_sql(scope)``; this feed adds only the time window and the page
-    limit on top of it.
-    """
-    del request  # the access predicate already encodes the caller's project scope
-    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    predicate_sql, predicate_params = visible_sql(scope, "m")
-    conditions = [predicate_sql, "m.updated_at >= ?"]
-    params: list[Any] = list(predicate_params)
-    params.append(since)
-    params.append(limit)
-    query = f"""
-        SELECT m.id, m.memory_type, m.content, m.status, m.updated_at
-        FROM memories m
-        WHERE {" AND ".join(conditions)}
-        ORDER BY m.updated_at DESC
-        LIMIT ?
-    """
-    results: list[dict[str, Any]] = []
-    async with db.db.execute(query, params) as cursor:
-        async for row in cursor:
-            results.append(dict(row))
-    return results
+    """List the active Memories updated in the last week, newest first, under the request scope."""
+    now = datetime.now(timezone.utc)
+    page = await engine.list_recent_memories(
+        source_filter=None,
+        time_range=MemoryTimeRange(after=now - timedelta(days=7), before=now, date_type="memory_updated_at"),
+        page_size=limit,
+        request_scope=scope,
+    )
+    return [
+        {
+            "id": row["memory_id"],
+            "memory_type": row["memory_type"],
+            "content": row["summary"],
+            "updated_at": row["matched_at"],
+        }
+        for row in page["results"]
+    ]
 
 
 async def _source_warnings(db: Database) -> list[dict[str, Any]]:

@@ -202,7 +202,7 @@ from memforge.memory.relation_discovery_contract import (
     rerunnable_relation_discovery_work_sql,
     resolve_relation_discovery_actor_user_id,
 )
-from memforge.memory.audit import MemoryAuditEvent
+from memforge.memory.audit import AuditFailureCount, MemoryAuditEvent
 from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentQuery,
@@ -13916,30 +13916,51 @@ class Database:
 
         await self.db.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
         if normalize_memory_status(row["status"]) in search_visible_statuses:
-            entity_names: list[str] = []
-            async with self.db.execute(
-                """SELECT e.canonical_name
-                   FROM memory_entities me
-                   JOIN entities e ON me.entity_id = e.id
-                   WHERE me.memory_id = ?
-                   ORDER BY e.id""",
-                (memory_id,),
-            ) as entity_cursor:
-                async for entity_row in entity_cursor:
-                    entity_names.append(entity_row[0])
-
             await self.db.execute(
                 "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, ?)",
-                (memory_id, row["content"], " ".join(entity_names)),
+                (memory_id, row["content"], await self._memory_entities_text(memory_id)),
             )
         return True
 
+    async def _memory_entities_text(self, memory_id: str) -> str:
+        """The FTS entities text of one Memory: its entities' canonical names in entity order."""
+        async with self.db.execute(
+            """SELECT e.canonical_name
+               FROM memory_entities me
+               JOIN entities e ON me.entity_id = e.id
+               WHERE me.memory_id = ?
+               ORDER BY e.id""",
+            (memory_id,),
+        ) as cursor:
+            return " ".join([row[0] async for row in cursor])
+
+    async def memory_search_text(self, memory_id: str) -> dict[str, str] | None:
+        """The content and entities text one Memory's FTS row should hold, or ``None`` without the Memory."""
+        async with self.db.execute("SELECT content FROM memories WHERE id = ?", (memory_id,)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return {"content": row[0], "entities_text": await self._memory_entities_text(memory_id)}
+
+    async def list_memory_fts_entries(self) -> list[tuple[str, str, str]]:
+        """Every FTS row as (memory_id, content, entities_text), duplicates included."""
+        async with self.db.execute("SELECT memory_id, content, entities_text FROM memories_fts") as cursor:
+            return [(row[0], row[1], row[2]) async for row in cursor]
+
+    async def list_memory_ids(self) -> list[str]:
+        """Every persisted Memory id in id order, whatever its lifecycle status."""
+        return [str(row["id"]) for row in await self.db.execute_fetchall("SELECT id FROM memories ORDER BY id")]
+
+    async def list_memory_statuses(self) -> dict[str, str]:
+        """The lifecycle status of every persisted Memory, by id."""
+        return {
+            str(row["id"]): str(row["status"])
+            for row in await self.db.execute_fetchall("SELECT id, status FROM memories")
+        }
+
     async def _rebuild_all_memory_fts_unlocked(self) -> int:
         search_visible_statuses = set(allowed_search_statuses())
-        memory_ids = [
-            str(row["id"])
-            for row in await self.db.execute_fetchall("SELECT id FROM memories ORDER BY id")
-        ]
+        memory_ids = await self.list_memory_ids()
         for memory_id in memory_ids:
             await self._rebuild_memory_fts_unlocked(
                 memory_id,
@@ -20551,6 +20572,32 @@ class Database:
             async for row in cursor:
                 rows.append(self._row_to_audit_event(row))
         return rows
+
+    async def count_failed_memory_audit_events(
+        self,
+        event_types: Sequence[str],
+        *,
+        since: str,
+    ) -> list[AuditFailureCount]:
+        """Count the failed events of each given type at or after ``since``, in event type order."""
+        if not event_types:
+            return []
+        placeholders = ", ".join("?" for _ in event_types)
+        async with self.db.execute(
+            f"""SELECT event_type, COUNT(*), MAX(occurred_at)
+                FROM memory_audit_events
+                WHERE event_type IN ({placeholders})
+                  AND occurred_at >= ?
+                  AND (status = 'failed' OR error IS NOT NULL)
+                GROUP BY event_type
+                ORDER BY event_type""",
+            (*event_types, since),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            AuditFailureCount(event_type=str(row[0]), count=int(row[1]), last_seen_at=row[2])
+            for row in rows
+        ]
 
     async def redact_memory_audit_payloads(self, memory_id: str) -> None:
         """Remove sensitive payload fields for a purged memory while preserving event metadata."""

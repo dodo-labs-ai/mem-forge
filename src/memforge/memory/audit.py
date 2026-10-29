@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AuditContext",
+    "AuditFailureCount",
     "MemoryAuditEvent",
     "MemoryAuditLogger",
     "generate_audit_event_id",
@@ -60,6 +61,15 @@ class AuditContext:
         if "operation_id" not in values:
             values["operation_id"] = generate_operation_id()
         return replace(self, **values)
+
+
+@dataclass(frozen=True, slots=True)
+class AuditFailureCount:
+    """How many events of one type failed in a window, and when the latest did."""
+
+    event_type: str
+    count: int
+    last_seen_at: str | None
 
 
 @dataclass

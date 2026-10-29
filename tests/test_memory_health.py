@@ -37,20 +37,16 @@ class FailingCollection:
 
 
 class FailingFtsDatabase:
+    """A Database whose FTS rows cannot be read."""
+
     def __init__(self, wrapped: Database) -> None:
         self.wrapped = wrapped
 
-    @property
-    def db(self):
-        return self
+    def __getattr__(self, name):
+        return getattr(self.wrapped, name)
 
-    async def list_documents_missing_pdf(self, source_types):
-        return await self.wrapped.list_documents_missing_pdf(source_types)
-
-    def execute(self, sql, *args, **kwargs):
-        if "memories_fts" in sql:
-            raise RuntimeError("fts unavailable")
-        return self.wrapped.db.execute(sql, *args, **kwargs)
+    async def list_memory_fts_entries(self):
+        raise RuntimeError("fts unavailable")
 
 
 @pytest.fixture

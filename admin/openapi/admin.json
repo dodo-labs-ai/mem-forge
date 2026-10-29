@@ -15848,80 +15848,6 @@
         ]
       }
     },
-    "/api/v1/recent-changes": {
-      "get": {
-        "description": "Return recent source-document changes and optionally new or updated memories.",
-        "operationId": "recent_changes_api_v1_recent_changes_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "since",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Since"
-            }
-          },
-          {
-            "in": "query",
-            "name": "source",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Source"
-            }
-          },
-          {
-            "in": "query",
-            "name": "include_memories",
-            "required": false,
-            "schema": {
-              "default": true,
-              "title": "Include Memories",
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Recent Changes",
-        "tags": [
-          "recent-changes"
-        ]
-      }
-    },
     "/api/v1/relation-discovery/work": {
       "get": {
         "description": "List discovery work by state with its last error; exhausted work has no retry left.",
@@ -18208,23 +18134,6 @@
         "tags": [
           "health"
         ]
-      }
-    },
-    "/api/v1/stats/detailed": {
-      "get": {
-        "description": "Detailed system stats for observability \u2014 entity resolution, cache, memory growth.",
-        "operationId": "detailed_stats_api_v1_stats_detailed_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Detailed Stats"
       }
     },
     "/api/v1/workspaces": {

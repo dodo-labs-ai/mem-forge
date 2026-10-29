@@ -5409,7 +5409,6 @@ def create_admin_app(
     )
     source_list_router = APIRouter(prefix="/api/v1/source-list", tags=["sources"])
     hook_router = APIRouter(prefix="/api/v1/hooks", tags=["hooks"])
-    recent_change_router = APIRouter(prefix="/api/v1/recent-changes", tags=["recent-changes"])
     model_settings_router = build_model_settings_router(
         get_db=get_db,
         get_model_settings=get_model_settings,
@@ -8416,97 +8415,6 @@ def create_admin_app(
         )
         return {"sort_mode": req.sort_mode}
 
-    # ===================================================================
-    # 4b. Recent Changes
-    # ===================================================================
-
-    @recent_change_router.get("")
-    async def recent_changes(
-        since: str | None = None,
-        source: str | None = None,
-        include_memories: bool = True,
-        db: Database = Depends(get_db),
-    ):
-        """Return recent source-document changes and optionally new or updated memories."""
-        if since:
-            since_dt = datetime.fromisoformat(since)
-            if since_dt.tzinfo is None:
-                since_dt = since_dt.replace(tzinfo=timezone.utc)
-        else:
-            since_dt = datetime.now(timezone.utc) - timedelta(days=7)
-        since_iso = since_dt.isoformat()
-
-        changelog: list[dict[str, Any]] = []
-        try:
-            query = "SELECT * FROM changelog WHERE detected_at >= ?"
-            params: list[Any] = [since_iso]
-            if source:
-                query += " AND source = ?"
-                params.append(source)
-            query += " ORDER BY detected_at DESC LIMIT 100"
-
-            async with db.db.execute(query, params) as cursor:
-                async for row in cursor:
-                    d = dict(row)
-                    changelog.append(
-                        {
-                            "id": d["id"],
-                            "doc_id": d["doc_id"],
-                            "change_type": d["change_type"],
-                            "title": d.get("title"),
-                            "source": d.get("source"),
-                            "previous_version": d.get("previous_version"),
-                            "current_version": d.get("current_version"),
-                            "ai_change_summary": d.get("ai_change_summary"),
-                            "detected_at": d["detected_at"],
-                        }
-                    )
-        except Exception as e:
-            logger.warning("Failed to query changelog: %s", e)
-
-        recent_memories: list[dict[str, Any]] = []
-        if include_memories:
-            try:
-                mem_query = "SELECT * FROM memories WHERE updated_at >= ?"
-                mem_params: list[Any] = [since_iso]
-                if source:
-                    mem_query = (
-                        "SELECT DISTINCT m.* FROM memories m "
-                        "JOIN memory_sources ms ON m.id = ms.memory_id "
-                        "WHERE m.updated_at >= ? AND ms.source_id = ?"
-                    )
-                    mem_params = [since_iso, source]
-                    mem_query += " ORDER BY m.updated_at DESC LIMIT 50"
-                else:
-                    mem_query += " ORDER BY updated_at DESC LIMIT 50"
-
-                async with db.db.execute(mem_query, mem_params) as cursor:
-                    async for row in cursor:
-                        d = dict(row)
-                        recent_memories.append(
-                            {
-                                "id": d["id"],
-                                "memory_type": d["memory_type"],
-                                "content": d["content"],
-                                "status": d["status"],
-                                "corroboration_count": d["corroboration_count"],
-                                "updated_at": d.get("updated_at"),
-                                "created_at": d.get("created_at"),
-                            }
-                        )
-            except Exception as e:
-                logger.warning("Failed to query recent memories: %s", e)
-
-        result: dict[str, Any] = {
-            "since": since_iso,
-            "changelog_entries": changelog,
-            "total_changes": len(changelog),
-        }
-        if include_memories:
-            result["recent_memories"] = recent_memories
-            result["total_memories"] = len(recent_memories)
-        return result
-
     @source_router.post("", response_model=SourceCreatedResponse)
     async def create_source(
         request: Request,
@@ -9762,7 +9670,7 @@ def create_admin_app(
         }
 
     # ===================================================================
-    # 4c. Agent Hook Context
+    # 4b. Agent Hook Context
     # ===================================================================
 
     @hook_router.post("/context")
@@ -10791,54 +10699,9 @@ def create_admin_app(
     app.include_router(evaluation_router)
     app.include_router(source_list_router)
     app.include_router(hook_router)
-    app.include_router(recent_change_router)
     app.include_router(model_settings_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
-
-    # -- Detailed stats endpoint (observability) --
-
-    @app.get("/api/v1/stats/detailed")
-    async def detailed_stats(db: Database = Depends(get_db)):
-        """Detailed system stats for observability — entity resolution, cache, memory growth."""
-        stats: dict[str, Any] = {}
-
-        # Memory counts
-        async with db.db.execute("SELECT COUNT(*) FROM memories WHERE status = 'active'") as cur:
-            row = await cur.fetchone()
-            stats["active_memories"] = row[0] if row else 0
-
-        async with db.db.execute("SELECT COUNT(*) FROM entities") as cur:
-            row = await cur.fetchone()
-            stats["total_entities"] = row[0] if row else 0
-
-        async with db.db.execute("SELECT COUNT(*) FROM entity_aliases") as cur:
-            row = await cur.fetchone()
-            stats["total_aliases"] = row[0] if row else 0
-
-        # Alias sources breakdown
-        alias_sources: dict[str, int] = {}
-        async with db.db.execute("SELECT source, COUNT(*) FROM entity_aliases GROUP BY source") as cur:
-            async for row in cur:
-                alias_sources[row[0]] = row[1]
-        stats["alias_sources"] = alias_sources
-
-        # Memory growth (last 7 days)
-        async with db.db.execute(
-            "SELECT date(created_at) as day, COUNT(*) FROM memories "
-            "WHERE created_at >= datetime('now', '-7 days') "
-            "GROUP BY day ORDER BY day"
-        ) as cur:
-            growth = {}
-            async for row in cur:
-                growth[row[0]] = row[1]
-        stats["memory_growth_7d"] = growth
-
-        # Entity resolution stats (if available on app state)
-        if hasattr(app.state, "entity_resolver_stats"):
-            stats["entity_resolution"] = app.state.entity_resolver_stats
-
-        return stats
 
     return app
 

@@ -1564,26 +1564,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/recent-changes": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Recent Changes
-         * @description Return recent source-document changes and optionally new or updated memories.
-         */
-        get: operations["recent_changes_api_v1_recent_changes_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/relation-discovery/work": {
         parameters: {
             query?: never;
@@ -2481,26 +2461,6 @@ export interface paths {
          * @description Overall system statistics: memory counts, entity counts, source counts.
          */
         get: operations["stats_api_v1_stats_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/stats/detailed": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Detailed Stats
-         * @description Detailed system stats for observability — entity resolution, cache, memory growth.
-         */
-        get: operations["detailed_stats_api_v1_stats_detailed_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -9817,39 +9777,6 @@ export interface operations {
             };
         };
     };
-    recent_changes_api_v1_recent_changes_get: {
-        parameters: {
-            query?: {
-                since?: string | null;
-                source?: string | null;
-                include_memories?: boolean;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_relation_discovery_work_api_v1_relation_discovery_work_get: {
         parameters: {
             query: {
@@ -11337,26 +11264,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StatsResponse"];
-                };
-            };
-        };
-    };
-    detailed_stats_api_v1_stats_detailed_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
                 };
             };
         };

@@ -1814,37 +1814,6 @@ async def test_admin_memory_search_validates_source_ids_without_hydrating_admin_
 
 
 @pytest.mark.asyncio
-async def test_admin_recent_changes_endpoint_returns_memory_updates(db: Database, tmp_path: Path):
-    from memforge.server.admin_api import create_admin_app
-
-    now = datetime.now(timezone.utc).isoformat()
-    await _insert_document(db, doc_id="doc-recent-change")
-    memory = await _insert_memory(
-        db,
-        mem_id="mem-recent-change",
-        content="Recent changes are service-owned for MCP proxy clients.",
-    )
-    async with db.db.execute(
-        """INSERT INTO changelog
-           (doc_id, change_type, previous_version, current_version, detected_at, title, source)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        ("doc-recent-change", "updated", "v1", "v2", now, "Recent Change", "confluence"),
-    ):
-        pass
-    await db.db.commit()
-
-    app = create_admin_app(db=db, config=_config(tmp_path))
-    with TestClient(app) as client:
-        response = client.get("/api/v1/recent-changes", params={"include_memories": "true"})
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["total_changes"] == 1
-    assert payload["changelog_entries"][0]["doc_id"] == "doc-recent-change"
-    assert {item["id"] for item in payload["recent_memories"]} == {memory.id}
-
-
-@pytest.mark.asyncio
 async def test_admin_memory_list_search_accepts_fts_operator_text(db: Database, tmp_path: Path):
     from memforge.server.admin_api import create_admin_app
 

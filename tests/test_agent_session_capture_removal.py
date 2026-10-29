@@ -563,7 +563,6 @@ async def test_readers_of_a_retired_agent_session_source_handle_its_unregistered
             detail = client.get(f"/api/v1/memories/{CLAIM_MEMORY}")
             evidence = client.get(f"/api/v1/memories/{CLAIM_MEMORY}/evidence/{CLAIM_UNIT}/resource")
             document = client.get(f"/api/v1/documents/{CONCEPT_DOC}/content")
-            changes = client.get("/api/v1/recent-changes", params={"since": "2026-01-01T00:00:00+00:00"})
             lifecycle = client.get(f"/api/v1/sources/{AGENT_SOURCE}/memory-lifecycle")
             retire = client.post(
                 f"/api/v1/memories/{CLAIM_MEMORY}/retire",
@@ -591,7 +590,6 @@ async def test_readers_of_a_retired_agent_session_source_handle_its_unregistered
     assert (detail.json()["status"], detail.json()["retirement_reason"]) == ("retired", "source_deleted")
     assert evidence.status_code == 404, evidence.text
     assert document.status_code == 404, document.text
-    assert changes.status_code == 200, changes.text
     assert lifecycle.status_code == 404, lifecycle.text
     # Correction and retirement act on active Memories only; a retired one is refused as not found.
     assert retire.status_code == 404, retire.text
