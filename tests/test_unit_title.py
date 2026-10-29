@@ -202,19 +202,14 @@ async def database_with_stored_title(tmp_path, monkeypatch, stored) -> Database:
         id=stored.source_id, type=stored.source_type, name=stored.source_type, config_json="{}",
         access_policy="workspace", owner_user_id="owner-1",
     )
-    declared = database_module.representation_profile_for_observation_contract
-    supported_contract = database_module.representation_contract_for_profile
+    declared = database_module.declared_representation_profiles
     with monkeypatch.context() as stored_contracts:
         stored_contracts.setattr(
-            database_module, "representation_profile_for_observation_contract",
+            database_module, "declared_representation_profiles",
             lambda *, source_type, observation_type: (
-                LEGACY_TITLE_PROFILE if observation_type == LEGACY_TITLE_TYPE
+                frozenset({LEGACY_TITLE_PROFILE}) if observation_type == LEGACY_TITLE_TYPE
                 else declared(source_type=source_type, observation_type=observation_type)
             ),
-        )
-        stored_contracts.setattr(
-            database_module, "representation_contract_for_profile",
-            lambda profile: object() if profile == LEGACY_TITLE_PROFILE else supported_contract(profile),
         )
         await db.record_source_projection(stored)
     return db

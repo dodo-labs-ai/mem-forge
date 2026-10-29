@@ -17,6 +17,7 @@ from memforge.source_adapters.conversation import project_native
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 
 CHAT = "c1"
+RECORD_SCHEMA = "teams-message:2"
 LABEL = ConversationLabel(conversation_id=CHAT, kind="group_chat", name="Release crew")
 
 
@@ -26,17 +27,17 @@ def _at(hour: int) -> datetime:
 
 def _dated(message_id: str, hour: int) -> Member:
     record = {"content": f"dated {message_id}", "from": "Ada", "time": _at(hour).isoformat(), "conversation_id": CHAT}
-    return Member(MessageIdentity(CHAT, message_id), _at(hour), record, record_revision(record))
+    return Member(MessageIdentity(CHAT, message_id), _at(hour), record, record_revision(record), RECORD_SCHEMA)
 
 
 def _undated(message_id: str, hour: int) -> Member:
     record = {"attachments": [], "content": f"undated {message_id}", "deleted": False}
-    return Member(MessageIdentity(CHAT, message_id), _at(hour), record, record_revision(record))
+    return Member(MessageIdentity(CHAT, message_id), _at(hour), record, record_revision(record), RECORD_SCHEMA)
 
 
 def _projected(*members: Member):
     unit = PlannedUnit(UnitKind.WINDOW, "window-key", LABEL, members)
-    payload = unit_payload(unit, record_schema="teams-message:2")
+    payload = unit_payload(unit, record_schema=RECORD_SCHEMA)
     item = unit_content_item(unit, source_id="src")
     return payload, item, normalize_unit(unit_raw_content(item, payload, with_artifacts=False))
 
@@ -87,7 +88,7 @@ def test_whether_a_member_is_undated_is_derived_from_its_record_when_it_is_built
 
     # A message returned at the revision a Unit holds reuses the stored undated record.
     message = ManifestMessage(identity=undated.identity, revision=undated.revision, created_at=undated.created_at)
-    reused = _returned(message, {}, {}, {undated.identity: undated})
+    reused = _returned(message, {}, {}, {undated.identity: undated}, record_schema=RECORD_SCHEMA)
 
     assert reused is not None and reused.member.record is undated.record
     assert reused.member.undated

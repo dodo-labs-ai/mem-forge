@@ -42,7 +42,11 @@ def conversation_document_id(source_id: str, provider_key: str) -> str:
 
 
 def unit_payload(unit: PlannedUnit, *, record_schema: str) -> dict[str, Any]:
-    """The stored input of one planned Unit."""
+    """The stored input of one planned Unit, collected under ``record_schema``.
+
+    A member collected under another schema, such as one carried from an
+    earlier collection, names its own ``record_schema``.
+    """
 
     conversation = unit.conversation
     undated = undated_member_times((member.identity.message_id, member.record, member.created_at) for member in unit.members)
@@ -67,6 +71,7 @@ def unit_payload(unit: PlannedUnit, *, record_schema: str) -> dict[str, Any]:
             {
                 "message_id": member.identity.message_id,
                 "record": dict(member.record),
+                **({"record_schema": member.record_schema} if member.record_schema != record_schema else {}),
                 "artifacts": [
                     {
                         "provider_key": artifact.provider_key,

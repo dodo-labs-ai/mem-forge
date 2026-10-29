@@ -17,6 +17,7 @@ from memforge.models import (
     content_hash,
 )
 from memforge.pipeline.sync import GeneSyncOrchestrator
+from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.storage.database import Database
 from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 from tests.memory_store_fixture import OrchestratorMemoryStore
@@ -1133,7 +1134,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 source_id=source_id,
                 collection_attempt_id=attempt_id,
                 config_revision=leased["payload"]["source_config_revision"],
-                record_schema="teams-message:2",
+                record_schema=MESSAGE_SCHEMA.qualified_name,
                 conversations=[
                     ConversationEvidence(
                         conversation_id=conversation.conversation_id,

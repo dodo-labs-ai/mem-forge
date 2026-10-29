@@ -35,6 +35,7 @@ from memforge.source_projection import UnitRemovalReason
 from tests import conversation_attempts_fixture as attempts
 
 SOURCE = "src-chat"
+RECORD_SCHEMA = "conversation-message:1"
 NOW = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
 DAY = timedelta(days=1)
 HOUR = timedelta(hours=1)
@@ -100,7 +101,7 @@ def _record(conversation_id: str, message_id: str, at: datetime, text: str = "he
 
 def _member(conversation_id: str, message_id: str, at: datetime) -> Member:
     record = _record(conversation_id, message_id, at)
-    return Member(MessageIdentity(conversation_id, message_id), at, record, record_revision(record))
+    return Member(MessageIdentity(conversation_id, message_id), at, record, record_revision(record), RECORD_SCHEMA)
 
 
 def _window(key: str, conversation_id: str, *members: Member) -> StoredUnit:
@@ -137,7 +138,7 @@ def _manifest(*conversations: ConversationEvidence, messages=(), attempt: str = 
         source_id=SOURCE,
         collection_attempt_id=attempt,
         config_revision="cfg-1",
-        record_schema="conversation-message:1",
+        record_schema=RECORD_SCHEMA,
         received_at=NOW,
         conversations=conversations,
         messages=tuple(messages),

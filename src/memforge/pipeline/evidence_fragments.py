@@ -31,8 +31,6 @@ from memforge.source_projection import (
     SourceObservationRevision,
 )
 from memforge.source_representation import (
-    MARKDOWN_STRUCTURAL_PROFILE,
-    PLAIN_TEXT_PROFILE,
     CanonicalRecordField,
     CanonicalRecordSchema,
     EvidenceRepresentationContract,
@@ -97,7 +95,6 @@ class CanonicalFieldRange:
     end: int
     value: object
     comparison_value: object
-    comparison_identity: tuple[object, ...]
     string_boundaries: tuple[int, ...] | None = None
 
 
@@ -147,22 +144,25 @@ def revision_changed_structural_ranges(
     target_units = revision_structural_ranges(target)
     base_counts = Counter(_revision_structural_identities(base, base_units))
     target_identities = _revision_structural_identities(target, target_units)
-    changed = _changed_material_keys(base_counts, Counter(target_identities), purpose=purpose)
+    changed = changed_material_keys(base_counts, Counter(target_identities), purpose=purpose)
     return tuple((unit.start, unit.end) for unit, identity
                  in zip(target_units, target_identities, strict=True) if identity in changed)
 
 
-def _changed_material_keys(base_counts, target_counts, *, purpose):
-    """Separate new-work authority from complete-reading population changes.
+def changed_material_keys(base_counts, target_counts, *, purpose):
+    """The keys of one multiset of material that count as changed against another.
 
-    Surviving equal copies do not identify an individually removed occurrence.
-    Current reading includes all copies when their population changes; exact
-    correspondence still applies its separate bilateral uniqueness checks.
+    Material is compared as counted keys: a structure's identity or a
+    Fragment's reading. For ``authority`` a key changed when the base has no
+    copy of it, since one more copy of unchanged material is no new assertion.
+    For ``current`` every copy changed when the number of copies changed, so
+    the whole new population is read. For ``removed``, called with the target
+    as base, a key changed when the target has no copy of it. Surviving equal
+    copies never identify an individually removed occurrence; exact
+    correspondence applies its own bilateral uniqueness checks.
     """
     if purpose not in {"authority", "current", "removed"}:
         raise ValueError("unknown source comparison purpose")
-    # Multiplicity changes require reading all current copies, but authorize no
-    # arbitrary copy as a new assertion. Independent new material remains work.
     return {key for key, count in target_counts.items()
             if base_counts[key] == 0 or (purpose == "current" and base_counts[key] != count)}
 
@@ -239,6 +239,30 @@ class EvidenceCandidateRange:
 
 
 @dataclass(frozen=True, slots=True)
+class FragmentReading:
+    """What a model reads in one Fragment, in the parts the compiler shows it.
+
+    ``presentation_text`` is these parts joined for display and persistence.
+    This structure is never persisted and never part of a catalog digest; it
+    exists so that two revisions can be compared by what each shows.
+
+    ``core`` is the selection's own presentation before any label: the text of
+    a paragraph, a field's presented value, or an Artifact's byte digest.
+    ``field`` is the declared comparison pointer of the canonical field the
+    Fragment belongs to, and ``role`` whether that field is ``selectable`` or a
+    contextual field shown as record ``framing`` or as other ``context``.
+    ``label`` is the field's descriptor label and ``framing`` each framing line
+    shown with the Fragment as (declared pointer, label, value).
+    """
+
+    core: str
+    field: str | None = None
+    role: Literal["selectable", "framing", "context"] = "selectable"
+    label: str | None = None
+    framing: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceFragment:
     reference: str
     kind: EvidenceFragmentKind
@@ -253,6 +277,7 @@ class EvidenceFragment:
     content_value: str | None = None
     interpretation_origins: tuple[tuple[int, int, str], ...] = ()
     text_view: TextEvidenceView | None = None
+    reading: FragmentReading = field(kw_only=True, compare=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +359,7 @@ class _FragmentCandidate:
     raw_content_sha256: str | None = None
     content_value: str | None = None
     interpretation_origins: tuple[tuple[int, int, str], ...] = ()
+    reading: FragmentReading | None = None
 
     @property
     def primary_eligible(self) -> bool:
@@ -585,11 +611,22 @@ def _compile_canonical_record_profile(
 
     candidates: list[_FragmentCandidate] = []
     errors: list[FragmentCompilationError] = []
+    framing_pointers = {pointer for pointer, _label in schema.framing_fields}
     for descriptor in _canonical_descriptors(schema, document):
         node = document.nodes.get(descriptor.json_pointer)
         if node is None or node.value is None:
             continue
+        reading = FragmentReading(
+            core="",
+            field=descriptor.comparison_pointer or descriptor.json_pointer,
+            role=("selectable" if not descriptor.contextual
+                  else "framing" if descriptor.json_pointer in framing_pointers else "context"),
+            label=descriptor.label,
+        )
         if descriptor.nested_profile is None and descriptor.text_format is None:
+            core = _canonical_value_presentation(
+                {key: node.value[key] for key in descriptor.presentation_keys if key in node.value}
+                if descriptor.presentation_keys and isinstance(node.value, Mapping) else node.value)
             candidates.append(
                 _frame_canonical_field_candidate(replace(_text_candidate(
                     revision.content,
@@ -597,12 +634,10 @@ def _compile_canonical_record_profile(
                     node.start,
                     node.end,
                     _SUPPORTING_ROLES,
-                    (f"{descriptor.label}: " if descriptor.label else "")
-                    + _canonical_value_presentation(
-                        {key: node.value[key] for key in descriptor.presentation_keys if key in node.value}
-                        if descriptor.presentation_keys and isinstance(node.value, Mapping) else node.value),
+                    (f"{descriptor.label}: " if descriptor.label else "") + core,
                 ), content_value=_canonical_selection_value(descriptor,
-                    canonical_field_comparison_value(descriptor, node.value))), descriptor, document)
+                    canonical_field_comparison_value(descriptor, node.value)),
+                    reading=replace(reading, core=core)), descriptor, document)
             )
             continue
         if not isinstance(node.value, str) or node.string_boundaries is None:
@@ -683,7 +718,7 @@ def _compile_canonical_record_profile(
                 )), interpretation_origins=tuple(
                     (node.string_boundaries[start], node.string_boundaries[end], value)
                     for start, end, value in candidate.interpretation_origins
-                )), descriptor, document)
+                ), reading=replace(reading, core=candidate.presentation_text)), descriptor, document)
             )
         for nested_error in nested_errors:
             raw_start = (
@@ -709,7 +744,7 @@ def _compile_canonical_record_profile(
     framed = []
     for candidate in candidates:
         origins = list(candidate.interpretation_origins)
-        labels = []
+        labels, framing = [], []
         for pointer, label in schema.framing_fields:
             origin = document.nodes.get(pointer)
             if origin is None or origin.value is None or origin.value == "":
@@ -717,11 +752,13 @@ def _compile_canonical_record_profile(
             if candidate.start == origin.start and candidate.end == origin.end:
                 continue
             labels.append(f"{label}: {_canonical_value_presentation(origin.value)}")
+            framing.append((pointer, label, _canonical_value_presentation(origin.value)))
             origins.append((origin.start, origin.end, _canonical_selection_value(
                 CanonicalRecordField(pointer), origin.value)))
         framed.append(replace(candidate,
             presentation_text="\n".join((*labels, candidate.presentation_text)),
-            interpretation_origins=tuple(origins)))
+            interpretation_origins=tuple(origins),
+            reading=replace(candidate.reading, framing=(*framing, *candidate.reading.framing))))
     candidates = framed
     bound, authority_errors = _bind_candidates_to_authority(
         revision,
@@ -800,7 +837,7 @@ def _bound_field_framing(field: CanonicalRecordField):
 
 def _frame_canonical_field_candidate(candidate, field, document):
     """Bind declared sibling facts once for this selection, without catalog scans."""
-    labels = []
+    labels, framing = [], []
     origins = list(candidate.interpretation_origins)
     for pointer, label, comparison_pointer in _bound_field_framing(field):
         origin = document.nodes.get(pointer)
@@ -809,11 +846,13 @@ def _frame_canonical_field_candidate(candidate, field, document):
         if candidate.start == origin.start and candidate.end == origin.end:
             continue
         labels.append(f"{label}: {_canonical_value_presentation(origin.value)}")
+        framing.append((comparison_pointer, label, _canonical_value_presentation(origin.value)))
         origins.append((origin.start, origin.end, _canonical_selection_value(
             CanonicalRecordField(pointer, comparison_pointer=comparison_pointer), origin.value)))
     return replace(candidate,
         presentation_text="\n".join((*labels, candidate.presentation_text)),
-        interpretation_origins=tuple(origins))
+        interpretation_origins=tuple(origins),
+        reading=replace(candidate.reading, framing=tuple(framing)))
 
 
 _ProfileCompiler = Callable[
@@ -1520,16 +1559,11 @@ class _JsonDocument:
 def _canonical_descriptors(schema: CanonicalRecordSchema, document: _JsonDocument):
     """Bind array wildcards to concrete, revision-local JSON pointers."""
     for descriptor in schema.fields:
-        parts = descriptor.json_pointer.split("/")
-        if "*" not in parts:
+        if "*" not in descriptor.json_pointer.split("/"):
             yield descriptor
             continue
         for pointer in document.nodes:
-            actual = pointer.split("/")
-            if len(actual) == len(parts) and all(
-                expected == value or (expected == "*" and value.isdecimal())
-                for expected, value in zip(parts, actual, strict=True)
-            ):
+            if descriptor.names(pointer):
                 yield replace(descriptor, json_pointer=pointer)
 
 
@@ -1557,10 +1591,6 @@ def canonical_record_field_ranges(
                     descriptor,
                     node.value,
                 ),
-                comparison_identity=(descriptor.comparison_pointer or descriptor.json_pointer,
-                    tuple((pattern, json.dumps(document.nodes[pointer].value, sort_keys=True, ensure_ascii=False))
-                          for pointer, _, pattern in _bound_field_framing(descriptor)
-                          if pointer in document.nodes)),
                 string_boundaries=node.string_boundaries,
             )
         )
@@ -1583,115 +1613,6 @@ def canonical_record_is_tombstoned(revision: SourceObservationRevision) -> bool:
         and node.value is not None
         and node.value != ""
         and node.value is not False
-    )
-
-
-def canonical_record_changed_raw_ranges(
-    base: SourceObservationRevision,
-    target: SourceObservationRevision,
-    *,
-    purpose: Literal["authority", "current", "removed"] = "authority",
-) -> tuple[tuple[int, int], ...]:
-    """Use declared field identities/material for the complete record's work.
-
-    Physical array positions address bytes; they do not override an adapter's
-    semantic field role. Equal repeated values create no new work, while adding
-    an indistinguishable occurrence cannot authorize an arbitrary copy.
-    """
-    old = canonical_record_field_ranges(base)
-    current = canonical_record_field_ranges(target)
-    def material(field):
-        return field.comparison_identity, json.dumps(field.comparison_value, sort_keys=True, ensure_ascii=False)
-    old_counts = Counter(material(field) for field in old)
-    current_counts = Counter(material(field) for field in current)
-    changed_material = _changed_material_keys(old_counts, current_counts, purpose=purpose)
-    old_by_identity = {}
-    for old_field in old:
-        old_by_identity.setdefault(old_field.comparison_identity, []).append(old_field)
-    changed = []
-    for current_field in current:
-        if material(current_field) not in changed_material:
-            continue
-        if old_counts[material(current_field)]:
-            # Only current-reading population changes reach this branch. Equal
-            # nested text inside a newly repeated parent does not erase the
-            # parent's affected population; inspect every current field view.
-            changed.append((current_field.start, current_field.end))
-            continue
-        previous = old_by_identity.get(current_field.comparison_identity, ())
-        if len(previous) == 1 and (current_field.descriptor.nested_profile or current_field.descriptor.text_format):
-            changed.extend(canonical_nested_changed_raw_ranges(previous[0], current_field, purpose=purpose))
-        else:
-            changed.append((current_field.start, current_field.end))
-    changed.extend(changed_interpretation_ranges(base, target))
-    return tuple(dict.fromkeys(changed))
-
-
-def canonical_nested_changed_raw_ranges(
-    base: CanonicalFieldRange,
-    target: CanonicalFieldRange,
-    *,
-    purpose: Literal["authority", "current", "removed"] = "authority",
-) -> tuple[tuple[int, int], ...]:
-    """Map changed nested text structures back to exact canonical JSON ranges."""
-
-    native_format = target.descriptor.text_format
-    if native_format is not None:
-        base_format = base.descriptor.text_format
-        if (base_format is None or (base_format.name, base_format.version) != (native_format.name, native_format.version)
-                or not isinstance(base.value, str) or not isinstance(target.value, str)
-                or target.string_boundaries is None):
-            raise ValueError("declared native text pair has incompatible contracts")
-        old = base_format.parse(base.value).fragments
-        current = native_format.parse(target.value).fragments
-        def material(fragment):
-            return (fragment.kind, fragment.content_value,
-                    tuple(origin.content_value for origin in fragment.interpretation_origins))
-        old_counts = Counter(material(fragment) for fragment in old)
-        current_counts = Counter(material(fragment) for fragment in current)
-        changed_material = _changed_material_keys(old_counts, current_counts, purpose=purpose)
-        # Equal repeated material creates no new assertion. This does not attest
-        # an occurrence correspondence; Support retains its ambiguity checks.
-        return tuple((target.string_boundaries[fragment.start], target.string_boundaries[fragment.end])
-                     for fragment in current if material(fragment) in changed_material)
-    nested_profile = target.descriptor.nested_profile
-    if (
-        nested_profile is None
-        or nested_profile != base.descriptor.nested_profile
-        or not isinstance(base.value, str)
-        or not isinstance(target.value, str)
-        or target.string_boundaries is None
-    ):
-        raise ValueError("canonical nested text field cannot be mapped exactly")
-    nested_evidence_profile = (
-        MARKDOWN_STRUCTURAL_PROFILE
-        if nested_profile == "markdown-structural"
-        else PLAIN_TEXT_PROFILE
-    )
-    base_revision = SourceObservationRevision(
-        id="canonical-nested-base",
-        observation_id="canonical-nested",
-        semantic_hash="canonical-nested-base",
-        content=base.value,
-        evidence_profile=nested_evidence_profile,
-    )
-    target_revision = SourceObservationRevision(
-        id="canonical-nested-target",
-        observation_id="canonical-nested",
-        semantic_hash="canonical-nested-target",
-        content=target.value,
-        evidence_profile=nested_evidence_profile,
-    )
-    return tuple(
-        (
-            target.string_boundaries[start],
-            target.string_boundaries[end],
-        )
-        for start, end in revision_changed_structural_ranges(
-            base_revision,
-            target_revision,
-            purpose=purpose,
-        )
     )
 
 
@@ -1956,6 +1877,9 @@ def _materialize_fragment(
             if candidate.content_value is not None
             else raw_digest if candidate.kind is EvidenceFragmentKind.ARTIFACT
             else revision.content[candidate.start:candidate.end]
+        ),
+        reading=candidate.reading or FragmentReading(
+            core=raw_digest if candidate.kind is EvidenceFragmentKind.ARTIFACT else candidate.presentation_text,
         ),
     )
 
@@ -2230,40 +2154,3 @@ def verify_text_evidence_view(
     if (fragment.anchor != anchor or fragment.text_view != text_view or fragment.raw_content_sha256 != raw_content_sha256
             or fragment.presentation_sha256 != presentation_sha256 or fragment.presentation_text != excerpt):
         raise ValueError("text view core, interpretation or presentation integrity mismatch")
-
-
-def changed_interpretation_ranges(base: SourceObservationRevision, target: SourceObservationRevision) -> tuple[tuple[int, int], ...]:
-    """Authorize existing cores when source-declared interpretation or scope changes.
-
-    Reading groups define governing structure independently of citation origins.
-    A scope edit creates authorized claim work; an unchanged core may still match.
-    """
-    from memforge.pipeline.revision_reading import build_revision_reading_index
-
-    def indexed_material(revision):
-        index = build_revision_fragment_index(revision)
-        if not index.complete:
-            raise ValueError("interpretation comparison requires complete pinned representations")
-        materials = {f.anchor: (f.kind.value, f.fragment_type, f.content_value,
-                     tuple(value for _, _, value in f.interpretation_origins)) for f in index.fragments}
-        contexts = {f.anchor: set() for f in index.fragments}
-        for group in build_revision_reading_index(revision, index.fragments).groups:
-            for anchor in group.trigger_anchors:
-                contexts[anchor].update(materials[c] for c in group.governing_anchors if c != anchor)
-        return index, {f.anchor: (tuple(value for _, _, value in f.interpretation_origins),
-                                 tuple(sorted(contexts[f.anchor]))) for f in index.fragments}
-
-    old_index, old_interpretations = indexed_material(base)
-    new_index, new_interpretations = indexed_material(target)
-    old_material = {}
-    for fragment in old_index.fragments:
-        key = (fragment.kind, fragment.fragment_type, fragment.content_value)
-        old_material.setdefault(key, set()).add(old_interpretations[fragment.anchor])
-    changed = []
-    for fragment in new_index.fragments:
-        key = (fragment.kind, fragment.fragment_type, fragment.content_value)
-        prior = old_material.get(key)
-        if prior is not None and new_interpretations[fragment.anchor] not in prior:
-            if fragment.anchor.range_start is not None and fragment.anchor.range_end is not None:
-                changed.append((fragment.anchor.range_start, fragment.anchor.range_end))
-    return tuple(changed)

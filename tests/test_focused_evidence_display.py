@@ -22,7 +22,7 @@ from tests.test_evidence_unit_support import _seed_complete_unit_support
 from tests.test_projection_fragments import _projection, _compile
 from tests.test_revision_work import RULE, work_items
 from tests.unit_support_fixture import record_unit_support
-from tests.test_confluence_native_evidence import projection
+from tests.test_reading_order_and_record_framing import CONVERSATION, _messages, _window
 
 
 @pytest.mark.parametrize("displays", [[], [{"ref": "unknown", "text": "A rule."}],
@@ -67,23 +67,24 @@ async def test_program_rebind_preserves_display_only_for_unchanged_complete_pres
 
 
 def test_changed_interpretation_never_carries_old_display_to_the_new_revision():
-    native = '<table><tr><th>Rule</th></tr><tr><td>Require approval.</td></tr></table>'
-    base = projection(native)
-    target = projection(native.replace('Rule', 'Instruction'), base)
+    base = _window(_messages(CONVERSATION[:2]))
+    renamed = _messages(CONVERSATION[:2])
+    renamed[1]["from"] = "Benjamin"
+    target = _window(renamed, base)
     old_context = RevisionAssessmentContext(projection=base, base=None, access_context_hash='scope')
-    row = next(f for f in old_context.full_fragments if f.fragment_type.endswith('table-row'))
+    reply = next(f for f in old_context.full_fragments if f.presentation_text.endswith(CONVERSATION[1][1]))
     part = ActiveSupportEvidence(memory_id='memory', source_id=base.source_id, reference_id='ref',
-        evidence_unit_id='unit', role=EvidenceRole.PRIMARY, anchor=row.anchor, excerpt=row.presentation_text,
-        raw_content_sha256=row.raw_content_sha256, presentation_sha256=row.presentation_sha256,
-        text_view=row.text_view, display_text='Rule: Require approval.')
+        evidence_unit_id='unit', role=EvidenceRole.PRIMARY, anchor=reply.anchor, excerpt=reply.presentation_text,
+        raw_content_sha256=reply.raw_content_sha256, presentation_sha256=reply.presentation_sha256,
+        text_view=reply.text_view, display_text=f'Ben: {CONVERSATION[1][1]}')
     context = RevisionAssessmentContext(projection=target, base=base, access_context_hash='scope')
-    memory = Memory(id='memory', content='Approval is required.', memory_type='fact',
-                    content_hash=content_hash('Approval is required.'))
+    memory = Memory(id='memory', content='The export moves this week.', memory_type='fact',
+                    content_hash=content_hash('The export moves this week.'))
     item = SupportWorkItem('work', memory, (part,), context)
     plan = plan_support_revision(context, [item])
     rebound = RevisionWorkExecutor(client=None, model='unused')._rebound(plan.catalog, plan.supports[0])
     selected = rebound.memory.resolved_evidence_selection.parts[0]
-    assert selected.display_text is None and 'Instruction' in selected.excerpt
+    assert selected.display_text is None and 'Reported sender: Benjamin' in selected.excerpt
 
 
 @pytest.mark.asyncio

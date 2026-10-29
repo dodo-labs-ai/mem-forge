@@ -79,7 +79,7 @@ def test_support_weighs_opposing_text_anywhere_in_the_revision():
 
 
 def test_the_definition_raises_every_contract_whose_result_it_defines():
-    assert REVISION_SUPPORT_CONTRACT == "revision-support-v13"
+    assert REVISION_SUPPORT_CONTRACT == "revision-support-v14"
     assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v10"
     assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v7"
 

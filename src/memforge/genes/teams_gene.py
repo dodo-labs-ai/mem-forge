@@ -223,6 +223,7 @@ class TeamsGene(ConversationGene):
                     created_at=record_created_at(record),
                     record=record,
                     revision=record_revision(record),
+                    record_schema=self.record_schema,
                 )
             )
         unit = PlannedUnit(
