@@ -1,0 +1,549 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>README demo</title>
+<script src="/icons.js"></script>
+<style>
+@font-face { font-family: "Geist"; src: url(/admin/node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2) format("woff2"); font-weight: 100 900; }
+@font-face { font-family: "Geist Mono"; src: url(/admin/node_modules/@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2) format("woff2"); font-weight: 100 900; }
+
+:root {
+  --stage-bg: #ffffff;
+  --cap: #10182a;
+  --cap-accent: #ea580c;
+  --term-bg: #0f1524;
+  --term-fg: #e5e7eb;
+  --term-dim: #6b7280;
+  --term-border: #2a3347;
+  --term-ok: #22c55e;
+  --win-shadow: 0 24px 60px -18px rgb(15 23 42 / 0.28), 0 0 0 1px rgb(15 23 42 / 0.08);
+
+  /* Admin UI graphite theme */
+  --canvas: #f4f5f7; --background: #ffffff; --foreground: #0f1115; --surface: #ffffff; --surface-subtle: #fafafb;
+  --sidebar: #fbfbfc; --sidebar-foreground: #3a3f4a; --sidebar-accent: #eceef1; --sidebar-border: #e3e5ea;
+  --primary: #0f1115; --primary-foreground: #ffffff; --secondary: #eceef1; --muted: #eef0f3;
+  --muted-foreground: #5b616e; --subtle-foreground: #3a3f4a; --border: #e3e5ea; --border-strong: #d5d8de; --input: #d5d8de;
+  --brand: #f97316;
+  --ok: #059669; --ok-fg: #047857; --ok-soft: #ecfdf5;
+  --live: #2563eb; --live-fg: #1d4ed8; --live-soft: #eef3fd;
+  --idle-soft: #eceef1; --idle-fg: #3a3f4a;
+  --chrome: #eceef1;
+}
+body.dark {
+  --stage-bg: #0b1120;
+  --cap: #fefefe;
+  --cap-accent: #f97316;
+  --term-bg: #0d1322;
+  --term-border: #263049;
+  --win-shadow: 0 30px 70px -20px rgb(0 0 0 / 0.7), 0 0 0 1px rgb(255 255 255 / 0.08);
+
+  --canvas: #0b0c0f; --background: #111318; --foreground: #eceef1; --surface: #15171c; --surface-subtle: #1a1d23;
+  --sidebar: #0f1115; --sidebar-foreground: #c3c7cf; --sidebar-accent: #20232a; --sidebar-border: #262a31;
+  --primary: #f4f5f7; --primary-foreground: #0f1115; --secondary: #20232a; --muted: #20232a;
+  --muted-foreground: #9aa0ab; --subtle-foreground: #c3c7cf; --border: #262a31; --border-strong: #333842; --input: #333842;
+  --ok: #10b981; --ok-fg: #6ee7b7; --ok-soft: rgb(16 185 129 / 0.12);
+  --live: #3b82f6; --live-fg: #93c5fd; --live-soft: rgb(59 130 246 / 0.14);
+  --idle-soft: #20232a; --idle-fg: #c3c7cf;
+  --chrome: #1a1d23;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1280px; height: 720px; overflow: hidden; background: var(--stage-bg); }
+#stage { position: relative; width: 1280px; height: 720px; overflow: hidden; background: var(--stage-bg); }
+body.dark #stage { background: radial-gradient(1200px 520px at 50% 115%, #1b2233 0%, #0b1120 70%); }
+
+/* ---------- Captions ---------- */
+.cap {
+  position: absolute; left: 0; right: 0; top: 46px; text-align: center;
+  font: 700 46px/1.1 -apple-system, "SF Pro Display", "Helvetica Neue", Inter, sans-serif;
+  letter-spacing: -0.028em; color: var(--cap); opacity: 0; white-space: nowrap;
+}
+.cap em { font-style: normal; color: var(--cap-accent); }
+
+/* ---------- Windows ---------- */
+.window { position: absolute; left: 40px; top: 140px; width: 1200px; height: 560px; border-radius: 14px; overflow: hidden; box-shadow: var(--win-shadow); opacity: 0; }
+.viewport { position: absolute; left: 0; right: 0; top: 34px; bottom: 0; overflow: hidden; }
+.cam { position: absolute; left: 0; top: 0; width: 1200px; height: 526px; transform-origin: 0 0; }
+.titlebar { position: absolute; left: 0; right: 0; top: 0; height: 34px; display: flex; align-items: center; padding: 0 14px; gap: 8px; }
+.lights { display: flex; gap: 7px; }
+.lights i { width: 11px; height: 11px; border-radius: 50%; display: block; }
+.lights i:nth-child(1) { background: #ff5f57; } .lights i:nth-child(2) { background: #febc2e; } .lights i:nth-child(3) { background: #28c840; }
+
+/* Terminal */
+.term { background: var(--term-bg); }
+.term .titlebar { background: rgb(255 255 255 / 0.03); border-bottom: 1px solid var(--term-border); }
+.term .ttitle { position: absolute; left: 0; right: 0; text-align: center; font: 500 12px -apple-system, sans-serif; color: #8b93a5; }
+.tbody { position: absolute; inset: 0; padding: 22px 26px; font: 15px/1.6 "SF Mono", Menlo, "Geist Mono", monospace; color: var(--term-fg); white-space: pre; }
+.tline { min-height: 24px; }
+.tdim { color: var(--term-dim); }
+.tuser { background: rgb(255 255 255 / 0.06); border-radius: 4px; padding: 2px 8px; margin: 0 -8px 12px; display: inline-block; }
+.tool b { color: #f3f4f6; }
+.dot { display: inline-block; width: 1.3ch; }
+.dot.ok { color: var(--term-ok); }
+.dot.ans { color: #f3f4f6; }
+.tinput { border: 1px solid var(--term-border); border-radius: 6px; padding: 9px 12px; margin-top: 14px; }
+.thint { color: var(--term-dim); font-size: 12.5px; margin: 6px 4px 0; }
+.caret { display: inline-block; width: 0.6em; height: 1.1em; background: #9ca3af; vertical-align: -0.18em; margin-left: 1px; }
+.cite { position: relative; }
+.cite::after { content: ""; position: absolute; inset: -2px -6px; border: 2px solid var(--cap-accent); border-radius: 5px; opacity: var(--hl, 0); }
+.think { color: #f59e0b; }
+.stamp { display: inline-block; margin-left: 14px; padding: 1px 10px; border: 2px solid #f97316; color: #fb923c; border-radius: 6px; font: 600 14px -apple-system, sans-serif; vertical-align: 1px; }
+
+/* App window */
+.app { background: var(--canvas); }
+.app .titlebar { background: var(--chrome); border-bottom: 1px solid var(--border); }
+.ui { font-family: "Geist", -apple-system, sans-serif; color: var(--foreground); font-size: 13px; }
+.ui svg.ic { width: 15px; height: 15px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.sidebar { position: absolute; left: 0; top: 0; bottom: 0; width: 196px; background: var(--sidebar); border-right: 1px solid var(--sidebar-border); padding: 14px 10px; color: var(--sidebar-foreground); }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14px; color: var(--foreground); padding: 0 6px 14px; }
+.brand img { width: 24px; height: 24px; }
+.navsec { font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; color: var(--muted-foreground); padding: 12px 8px 6px; }
+.nav { display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+.nav.on { background: var(--sidebar-accent); color: var(--foreground); font-weight: 500; }
+.sidefoot { position: absolute; left: 10px; right: 10px; bottom: 12px; }
+.localsync { margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; display: flex; align-items: center; gap: 8px; font-size: 11.5px; background: var(--surface); color: var(--foreground); }
+.localsync .g { margin-left: auto; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+
+.page { position: absolute; left: 196px; top: 0; right: 0; bottom: 0; padding: 20px 22px; opacity: 0; }
+.h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+.desc { color: var(--muted-foreground); font-size: 12.5px; margin-top: 5px; max-width: 620px; line-height: 1.5; }
+.btn { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: 7px; font-size: 12.5px; font-weight: 500; border: 1px solid var(--border-strong); background: var(--surface); color: var(--foreground); }
+.btn.pri { background: var(--primary); color: var(--primary-foreground); border-color: var(--primary); }
+.back { display: flex; align-items: center; gap: 6px; color: var(--muted-foreground); font-size: 12.5px; margin-bottom: 14px; }
+
+/* Sources table */
+.toolbar { display: flex; align-items: center; gap: 8px; margin: 18px 0 12px; }
+.search { width: 300px; height: 30px; border: 1px solid var(--input); border-radius: 7px; display: flex; align-items: center; gap: 7px; padding: 0 10px; color: var(--muted-foreground); font-size: 12.5px; background: var(--surface); }
+.chip { height: 26px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 7px; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 500; background: var(--surface); }
+.chip span { color: var(--muted-foreground); font-weight: 400; }
+.table { border: 1px solid var(--border); border-radius: 9px; background: var(--surface); overflow: hidden; }
+.tr { display: grid; grid-template-columns: 1fr 150px 130px 210px 34px; align-items: center; padding: 0 12px; border-top: 1px solid var(--border); position: relative; }
+.tr.head { border-top: 0; height: 32px; font-size: 11.5px; color: var(--muted-foreground); }
+.tr.group { height: 34px; background: var(--surface-subtle); display: flex; gap: 10px; font-size: 12.5px; }
+.tr.group b { font-weight: 600; }
+.tr.group .gm { color: var(--muted-foreground); font-size: 11.5px; }
+.tr.group .gr { margin-left: auto; color: var(--muted-foreground); font-size: 11.5px; }
+.tr.row { height: 52px; }
+.srcname { display: flex; align-items: center; gap: 10px; }
+.srcicon { width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 7px; display: grid; place-items: center; background: var(--surface); }
+.srcicon img { width: 16px; height: 16px; }
+.srcname .n { font-weight: 500; font-size: 13px; }
+.srcname .k { font-size: 11.5px; color: var(--muted-foreground); }
+.runs { display: flex; align-items: center; gap: 6px; color: var(--subtle-foreground); font-size: 12.5px; }
+.mem { text-align: right; padding-right: 18px; }
+.mem .c { font-variant-numeric: tabular-nums; font-size: 13px; }
+.mem .f { font-size: 11px; color: var(--muted-foreground); }
+.last .r { font-size: 12.5px; color: var(--subtle-foreground); }
+.last .s { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted-foreground); margin-top: 2px; }
+.last .s svg.ic { width: 11px; height: 11px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 11.5px; font-weight: 500; background: var(--live-soft); color: var(--live-fg); }
+.badge .pd { width: 6px; height: 6px; border-radius: 50%; background: var(--live); }
+.badge.ok { background: var(--ok-soft); color: var(--ok-fg); }
+.badge.ok .pd { background: var(--ok); }
+.badge.idle { background: var(--idle-soft); color: var(--idle-fg); }
+.badge.idle .pd { background: var(--muted-foreground); }
+.pbar { width: 150px; height: 4px; border-radius: 4px; background: var(--muted); margin-top: 5px; overflow: hidden; }
+.pbar i { display: block; height: 100%; background: var(--live); width: 0; }
+.dots { color: var(--muted-foreground); text-align: center; }
+
+.toast { position: absolute; right: 18px; bottom: 18px; width: 380px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: 0 14px 34px -14px rgb(15 23 42 / 0.35); padding: 12px 14px; display: flex; gap: 11px; align-items: flex-start; opacity: 0; }
+.toast .t1 { font-weight: 600; font-size: 12.5px; }
+.toast .t2 { color: var(--muted-foreground); font-size: 12px; margin-top: 2px; line-height: 1.45; }
+.toast .btn { height: 26px; margin-left: auto; flex: none; }
+
+/* Memory detail */
+.mtop { display: flex; align-items: center; gap: 10px; }
+.tag { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 9px; border-radius: 999px; background: var(--secondary); font-size: 12px; font-weight: 500; }
+.tag svg.ic { width: 12px; height: 12px; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.status i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+.mtitle { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; margin: 12px 0 16px; position: relative; height: 28px; }
+.mtitle span { position: absolute; left: 0; top: 0; white-space: nowrap; }
+.mgrid { display: grid; grid-template-columns: 1fr 300px; gap: 18px; }
+.box { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); padding: 14px 16px; margin-bottom: 14px; }
+.box .bh { display: flex; justify-content: space-between; font-weight: 600; font-size: 13.5px; }
+.box .bh span { font-weight: 400; color: var(--muted-foreground); font-size: 12px; }
+.inner { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-top: 12px; }
+.lbl { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 500; background: var(--live-soft); color: var(--live-fg); }
+.lbl.gray { background: var(--secondary); color: var(--muted-foreground); }
+.oldm { font-weight: 500; font-size: 13.5px; margin: 9px 0 5px; }
+.meta { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted-foreground); }
+.meta img { width: 14px; height: 14px; }
+.excerpt { background: var(--surface-subtle); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.5; }
+.excerpt mark { background: transparent; color: inherit; box-shadow: inset 0 -0.55em 0 rgb(249 115 22 / var(--mk, 0)); }
+.det { display: grid; grid-template-columns: 80px 1fr; row-gap: 11px; font-size: 12.5px; margin-top: 12px; }
+.det .k { color: var(--muted-foreground); }
+.ptag { display: inline-flex; align-items: center; gap: 5px; }
+.ptag svg.ic { width: 13px; height: 13px; }
+
+/* End card */
+#end { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0; text-align: center; }
+#end .logo { display: flex; align-items: center; gap: 12px; font: 600 26px -apple-system, sans-serif; color: var(--cap); letter-spacing: -0.01em; }
+#end .logo img { width: 44px; height: 44px; }
+#end h2 { font: 700 56px/1.08 -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif; letter-spacing: -0.03em; color: var(--cap); margin-top: 26px; }
+#end h2 em { font-style: normal; color: var(--cap-accent); }
+#end p { font: 400 20px -apple-system, sans-serif; color: var(--muted-foreground); margin-top: 18px; }
+#end .url { margin-top: 30px; font: 500 17px "SF Mono", Menlo, monospace; color: var(--cap); border: 1px solid var(--border-strong); border-radius: 10px; padding: 10px 18px; display: inline-flex; gap: 10px; align-items: center; }
+#end .url b { color: var(--cap-accent); font-weight: 600; }
+#veil { position: absolute; inset: 0; background: var(--stage-bg); opacity: 0; z-index: 100; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="cap" id="c-day"><em>Day one.</em> First ticket.</div>
+  <div class="cap" id="c-hook">Your agent doesn't know what <em>your team knows</em>.</div>
+  <div class="cap" id="c-pay">With MemForge, it checks <em>team memory</em> first.</div>
+  <div class="cap" id="c-docs">Cited from <em>your docs</em>.</div>
+  <div class="cap" id="c-change">Even what <em>changed last week</em>.</div>
+  <div class="cap" id="c-sources">Connect your docs once. It syncs <em>on its own</em>.</div>
+  <div class="cap" id="c-memory">When a doc changes, <em>memory follows</em>.</div>
+
+  <!-- Terminal: the hook (no memory) and the payoff (with MemForge) -->
+  <div class="window term" id="term">
+    <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div><div class="ttitle">payments-api — claude</div></div>
+    <div class="viewport"><div class="cam" id="tcam">
+      <div class="tbody" id="hook"></div>
+      <div class="tbody" id="pay"></div>
+    </div></div>
+  </div>
+
+  <!-- Admin UI -->
+  <div class="window app ui" id="app">
+    <div class="titlebar"><div class="lights"><i></i><i></i><i></i></div></div>
+    <div class="viewport"><div class="cam" id="acam">
+      <div class="sidebar">
+        <div class="brand"><img src="/.github/assets/logo.svg" alt="">MemForge</div>
+        <div class="navsec">KNOWLEDGE</div>
+        <div class="nav" id="nav-mem" data-i="brain">Memories</div>
+        <div class="nav" data-i="tags">Entities</div>
+        <div class="navsec">CURATE</div>
+        <div class="nav" data-i="shield-check">Review</div>
+        <div class="nav" data-i="activity">Evaluation</div>
+        <div class="navsec">CONNECT</div>
+        <div class="nav" id="nav-src" data-i="files">Sources</div>
+        <div class="nav" data-i="kanban-square">Projects</div>
+        <div class="sidefoot">
+          <div class="nav" data-i="settings">Settings</div>
+          <div class="localsync"><span data-i="laptop"></span>Local sync online<span class="g"></span></div>
+        </div>
+      </div>
+
+      <!-- Sources -->
+      <div class="page" id="p-sources">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <div><div class="h1">Sources</div><div class="desc">Sources are the places MemForge reads from, such as wikis, issue trackers, chat and repositories. Each sync turns new and changed content into memories your agents can search.</div></div>
+          <div class="btn pri" id="btn-add"><span data-i="plus"></span>Add source</div>
+        </div>
+        <div class="toolbar">
+          <div class="search"><span data-i="search"></span>Search sources</div>
+          <div class="chip">All <span>4</span></div><div class="chip">Needs you <span>0</span></div><div class="chip">Pinned <span>0</span></div>
+        </div>
+        <div class="table">
+          <div class="tr head"><div>Source</div><div>Runs on</div><div class="mem" style="padding-right:18px">Memories</div><div>Last sync</div><div></div></div>
+          <div class="tr group"><span data-i="folder-kanban"></span><b>payments</b><span class="gm">Project memories for the Payments team</span><span class="gr" id="grp">4 sources, 219 memories</span></div>
+          <div class="tr row">
+            <div class="srcname"><div class="srcicon"><img data-theme-src="notion" alt=""></div><div><div class="n">Engineering handbook</div><div class="k">Notion</div></div></div>
+            <div class="runs"><span data-i="server"></span>Server</div>
+            <div class="mem"><div class="c">128</div><div class="f">from 64 items</div></div>
+            <div class="last"><div class="r" id="hb-last">2 h ago</div><div class="s"><span data-i="clock"></span>Daily</div></div><div class="dots" data-i="ellipsis"></div>
+          </div>
+          <div class="tr row" id="row-jira">
+            <div class="srcname"><div class="srcicon"><img src="/.github/assets/icons/jira.svg" alt=""></div><div><div class="n">Payments tickets</div><div class="k">Jira</div></div></div>
+            <div class="runs"><span data-i="server"></span>Server</div>
+            <div class="mem"><div class="c">37</div><div class="f">from 214 items</div></div>
+            <div class="last"><div class="r" id="jira-last">48 min ago</div><div class="s"><span data-i="clock"></span>Hourly</div></div><div class="dots" data-i="ellipsis"></div>
+          </div>
+          <div class="tr row">
+            <div class="srcname"><div class="srcicon"><img data-theme-src="github" alt=""></div><div><div class="n">payments-api docs</div><div class="k">GitHub Repository</div></div></div>
+            <div class="runs"><span data-i="laptop"></span>Local sync</div>
+            <div class="mem"><div class="c">54</div><div class="f">from 31 items</div></div>
+            <div class="last"><div class="r">12 min ago</div><div class="s"><span data-i="clock"></span>Daily</div></div><div class="dots" data-i="ellipsis"></div>
+          </div>
+          <div class="tr row" id="row-new">
+                        <div class="srcname"><div class="srcicon"><img data-theme-src="notion" alt=""></div><div><div class="n">Support playbook</div><div class="k">Notion</div></div></div>
+            <div class="runs"><span data-i="server"></span>Server</div>
+            <div class="mem"><div class="c" id="new-mem">0</div><div class="f" id="new-items">from 0 items</div></div>
+            <div class="last"><div class="r" id="new-done" style="display:none">Just now</div><div class="s" id="new-sched" style="display:none"><span data-i="clock"></span>Daily, next in 24 h</div><div id="new-live"><div><span class="badge" id="new-badge"><span class="pd"></span><span id="new-badge-t">Waiting to sync</span></span></div>
+              <div class="pbar" id="new-pbar"><i id="new-pfill"></i></div></div></div>
+            <div class="dots" data-i="ellipsis"></div>
+          </div>
+        </div>
+        <div class="toast" id="toast">
+          <img data-theme-src="notion" alt="" style="width:18px;height:18px;margin-top:1px">
+          <div><div class="t1">Engineering handbook synced</div><div class="t2">"Payments decision log" changed. 1 memory updated, the older one kept as history.</div></div>
+          <div class="btn">View</div>
+        </div>
+      </div>
+
+      <!-- Memory detail -->
+      <div class="page" id="p-memory">
+        <div class="back"><span data-i="arrow-left"></span>Memories</div>
+        <div class="mtop"><span class="tag"><span data-i="git-branch"></span>Decision</span><span class="status"><i></i>Active</span>
+          <span style="margin-left:auto" class="btn"><span data-i="pencil"></span>Propose correction</span></div>
+        <div class="mtitle"><span>Pending card holds drop after 1 day.</span></div>
+        <div class="mgrid">
+          <div>
+            <div class="box" id="box-rel"><div class="bh">Related memories in other documents<span>1 current</span></div>
+              <div class="inner"><span class="lbl">Update</span> <span style="color:var(--muted-foreground);font-size:12.5px;margin-left:4px">Updates the older</span>
+                <div class="oldm">Pending card holds drop after 7 days.</div>
+                <div class="meta"><img data-theme-src="notion" alt="">Support playbook <span style="margin-left:6px">Recorded 2026-06-12</span><span class="lbl gray" style="margin-left:auto">Superseded</span></div></div></div>
+            <div class="box" id="box-ev"><div class="bh">Evidence<span>1 document</span></div>
+              <div class="inner"><div class="meta" style="color:var(--foreground);font-size:13.5px;font-weight:500"><img data-theme-src="notion" alt="" style="width:16px;height:16px">Payments decision log</div>
+                <div class="excerpt" id="excerpt"><span class="lbl" style="margin-right:6px">Primary</span>Oct 6: We now <mark>release pending card holds after 1 day instead of 7</mark>.</div></div></div>
+          </div>
+          <div>
+            <div class="box"><div class="bh">Details</div>
+              <div class="det"><div class="k">Type</div><div><span class="tag"><span data-i="git-branch"></span>Decision</span></div>
+                <div class="k">Status</div><div class="status"><i></i>Active</div>
+                <div class="k">Access</div><div>Everyone in this workspace</div>
+                <div class="k">Project</div><div class="ptag"><span data-i="folder-kanban"></span>payments</div>
+                <div class="k">Sources</div><div>Engineering handbook</div>
+                <div class="k">Updated</div><div>Oct 6, 5:20 PM</div></div></div>
+          </div>
+        </div>
+      </div>
+
+    </div></div>
+  </div>
+
+  <div id="end">
+    <div class="logo"><img src="/.github/assets/logo.svg" alt="">MemForge</div>
+    <h2>Give every agent your team's<br>brain <em>on day one.</em></h2>
+    <p>The open-source memory layer for AI agents. Runs on your machine.</p>
+    <div class="url"><b>★</b>github.com/dodo-labs-ai/mem-forge</div>
+  </div>
+  <div id="veil"></div>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const theme = params.get("theme") === "dark" ? "dark" : "light";
+/** Reading holds are longer in the relaxed cut, which plays as a video with controls. */
+const HOLD = params.get("pace") === "relaxed" ? 1.8 : 1;
+document.body.classList.toggle("dark", theme === "dark");
+document.querySelectorAll("[data-theme-src]").forEach((img) => { img.src = `/.github/assets/icons/${img.dataset.themeSrc}-${theme}.svg`; });
+document.querySelectorAll("[data-i]").forEach((el) => {
+  el.insertAdjacentHTML("afterbegin", `<svg class="ic" viewBox="0 0 24 24">${LUCIDE[el.dataset.i]}</svg>`);
+});
+
+const $ = (id) => document.getElementById(id);
+const clamp = (x) => Math.min(1, Math.max(0, x));
+const prog = (t, a, b) => clamp((t - a) / (b - a));
+const ease = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+const between = (t, a, b) => t >= a && t < b;
+const typed = (text, t, a, b) => text.slice(0, Math.round(text.length * prog(t, a, b)));
+const lerp = (a, b, x) => a + (b - a) * x;
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+/** Piecewise eased interpolation over [time, ...values] keys. */
+function keyed(keys, t) {
+  if (t <= keys[0][0]) return keys[0].slice(1);
+  for (let i = 0; i < keys.length - 1; i++) {
+    const a = keys[i], b = keys[i + 1];
+    if (t <= b[0]) {
+      const x = ease(prog(t, a[0], b[0]));
+      return a.slice(1).map((v, j) => lerp(v, b[j + 1], x));
+    }
+  }
+  return keys[keys.length - 1].slice(1);
+}
+
+/* ---------- Scenes ----------
+ * Each scene runs on its own story clock. A hold freezes that clock at a
+ * moment worth reading; frozen frames cost almost nothing in a GIF.
+ */
+const SCENES = [
+  { id: "hook", story: 3.6, holds: [[3.6, 1.8]] },
+  { id: "pay", story: 6.6, holds: [[4.6, 1.2], [6.2, 2.2]] },
+  { id: "sources", story: 6.0, holds: [[5.25, 0.6], [6.0, 1.0]] },
+  { id: "memory", story: 4.6, holds: [[3.7, 2.2]] },
+  { id: "end", story: 2.4, holds: [[2.0, 0.8]] },
+];
+let elapsed = 0;
+for (const scene of SCENES) {
+  scene.holds = scene.holds.map(([at, d]) => [at, d * HOLD]);
+  scene.length = scene.story + scene.holds.reduce((sum, [, d]) => sum + d, 0);
+  scene.start = elapsed;
+  elapsed += scene.length;
+}
+const DURATION = elapsed;
+const SCENE = Object.fromEntries(SCENES.map((scene) => [scene.id, scene]));
+
+/** The scene's story time at `local` seconds into it. */
+function storyClock(scene, local) {
+  let shift = 0;
+  for (const [at, d] of scene.holds) {
+    if (local < at + shift) break;
+    if (local < at + shift + d) return at;
+    shift += d;
+  }
+  return Math.min(scene.story, local - shift);
+}
+/** Seconds into the scene at which its story clock reaches `t`. */
+function outputAt(scene, t) {
+  return t + scene.holds.reduce((sum, [at, d]) => (at < t ? sum + d : sum), 0);
+}
+/** Scene-local output time and story time for every scene. */
+function clocks(T) {
+  const out = {};
+  for (const scene of SCENES) {
+    const local = T - scene.start;
+    out[scene.id] = { local, t: storyClock(scene, Math.max(0, local)), length: scene.length, on: local >= 0 && local < scene.length };
+  }
+  return out;
+}
+
+/* ---------- Terminal ---------- */
+const QUESTION = 'Day one here. First ticket: "A customer says we\n  charged them twice." How do I fix it?';
+function inputBox(text) {
+  return `<div class="tinput">&gt; ${esc(text)}<span class="caret"></span></div><div class="thint">? for shortcuts</div>`;
+}
+function renderHook(t) {
+  let h = "";
+  const sent = t >= 1.6;
+  if (sent) h += `<div class="tuser">&gt; ${esc(QUESTION)}</div>\n`;
+  if (between(t, 1.7, 2.1)) h += `<div class="tline think">✻ Thinking…</div>`;
+  if (t >= 2.1) {
+    const a1 = "Looks like a race in the charge retry. I'll add a lock";
+    const a2 = "in payments/charge.ts and dedupe the charges.";
+    const n = Math.round((a1.length + a2.length) * prog(t, 2.1, 2.9));
+    const dim = t >= 3.1 ? ' style="color:#7c8496"' : "";
+    h += `<div class="tline"${dim}><span class="dot ans">●</span>${esc(a1.slice(0, n))}</div>`;
+    h += `<div class="tline"${dim}>  ${esc(a2.slice(0, Math.max(0, n - a1.length)))}</div>`;
+    if (t >= 3.1) h += `<div class="tline" style="margin-top:10px;opacity:${prog(t, 3.1, 3.35)}">  <span class="stamp">✗ Not a bug. The team sees this every week.</span></div>`;
+  }
+  h += inputBox(sent ? "" : typed(QUESTION, t, 0.4, 1.5));
+  $("hook").innerHTML = h;
+}
+function renderPay(t) {
+  let h = "";
+  const sent = t >= 1.3;
+  if (sent) h += `<div class="tuser">&gt; ${esc(QUESTION)}</div>\n`;
+  const tool = (at, name, args, res) => (t < at ? "" :
+    `<div class="tline tool"><span class="dot ok">●</span><b>plugin:memory:memforge - ${name}</b> (MCP)<span class="tdim">(${esc(args)})</span></div>`
+    + `<div class="tline tdim">  ⎿  ${esc(res)}</div>`);
+  h += tool(1.6, "search", 'query: "customer charged twice"', "5 memories, 2 from this project");
+  h += tool(2.1, "get_memory", 'memory_id: "mem-7c1e52a09b3f"', "convention · Support playbook");
+  h += tool(2.5, "get_memory", 'memory_id: "mem-2f90b6d4e83a"', "decision · Engineering handbook");
+  if (between(t, 1.8, 2.9)) h += `<div class="tline think">✻ Thinking…</div>`;
+  const line = (at, end, text) => (t >= at ? `<div class="tline">  ${esc(typed(text, t, at, end))}</div>` : "");
+  if (t >= 2.9) h += `<div class="tline" style="margin-top:8px"><span class="dot ans">●</span>${esc(typed("Not a bug. It's a pending card hold, not a second charge.", t, 2.9, 3.5))}</div>`;
+  h += line(3.5, 4.0, '1. Reply with the "Pending charge" macro. Don\'t refund it.');
+  if (t >= 4.0) h += `<div class="tline">     Source: <span class="cite" style="--hl:${t < 5.6 ? prog(t, 4.1, 4.3) : 0.35}">Support playbook in Notion</span></div>`;
+  h += line(5.0, 5.6, "2. Since Oct 6, holds drop after 1 day instead of 7.");
+  if (t >= 5.6) h += `<div class="tline">     Source: <span class="cite" style="--hl:${prog(t, 5.8, 6.0)}">Payments decision log in Notion</span></div>`;
+  h += inputBox(sent ? "" : typed(QUESTION, t, 0.3, 1.2));
+  $("pay").innerHTML = h;
+}
+
+/* ---------- Admin UI ---------- */
+const acam = $("acam");
+let ROW_Y = 0, TOAST_Y = 0;
+function layout() {
+  acam.style.transform = "none";
+  const cam = acam.getBoundingClientRect();
+  const mid = (id) => { const r = $(id).getBoundingClientRect(); return r.top - cam.top + r.height / 2; };
+  ROW_Y = mid("row-new");
+  TOAST_Y = mid("toast");
+}
+function camTransform(s, fx, fy, W = 1200, H = 526) {
+  const tx = Math.min(0, Math.max(W - W * s, W / 2 - fx * s));
+  const ty = Math.min(0, Math.max(H - H * s, H / 2 - fy * s));
+  acam.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+}
+function renderSources(t) {
+  $("row-new").style.background = `color-mix(in srgb, var(--live-soft) ${100 * (1 - prog(t, 0.2, 1.6))}%, transparent)`;
+  const read = prog(t, 0.8, 3.0), make = prog(t, 3.0, 5.2), done = t >= 5.2;
+  const items = Math.round(48 * read), mems = Math.round(41 * ease(make));
+  $("new-badge").className = "badge";
+  $("new-badge-t").textContent = t < 0.8 ? "Connecting to Support playbook" : t < 3.0 ? `Reading pages · ${items} of 48` : `Creating memories · ${mems} saved`;
+  $("new-done").style.display = done ? "block" : "none";
+  $("new-sched").style.display = done ? "flex" : "none";
+  $("new-live").style.display = done ? "none" : "block";
+  $("new-pbar").style.visibility = t >= 0.8 ? "visible" : "hidden";
+  $("new-pfill").style.width = `${(t < 3.0 ? read : make) * 100}%`;
+  $("new-pfill").style.background = t < 3.0 ? "var(--live)" : "var(--brand)";
+  $("new-mem").textContent = String(mems);
+  $("new-items").textContent = `from ${t < 3.0 ? items : 48} items`;
+  $("grp").textContent = `4 sources, ${219 + mems} memories`;
+  $("hb-last").textContent = t >= 5.6 ? "Just now" : "2 h ago";
+  $("toast").style.opacity = prog(t, 5.6, 5.85);
+  $("toast").style.transform = `translateY(${(1 - prog(t, 5.6, 5.9)) * 14}px)`;
+  const [s, fx, fy] = keyed([[0, 1, 600, 263], [1.3, 1, 600, 263], [1.9, 1.3, 690, ROW_Y], [5.4, 1.3, 690, ROW_Y], [5.9, 1.3, 860, TOAST_Y - 40]], t);
+  camTransform(s, fx, fy);
+}
+function renderMemory(t) {
+  $("box-rel").style.opacity = prog(t, 0.5, 0.8);
+  $("box-rel").style.transform = `translateY(${(1 - prog(t, 0.5, 0.8)) * 10}px)`;
+  $("box-ev").style.opacity = prog(t, 1.3, 1.6);
+  $("box-ev").style.transform = `translateY(${(1 - prog(t, 1.3, 1.6)) * 10}px)`;
+  $("excerpt").style.setProperty("--mk", 0.38 * prog(t, 3.0, 3.6));
+  camTransform(lerp(1.25, 1.28, prog(t, 0, 4.6)), 676, 272);
+}
+
+/* ---------- Frame ---------- */
+const CAPTIONS = [
+  ["c-day", "hook", 0, 2.0], ["c-hook", "hook", 2.0, Infinity],
+  ["c-pay", "pay", 0, 4.0], ["c-docs", "pay", 4.0, 5.0], ["c-change", "pay", 5.0, Infinity],
+  ["c-sources", "sources", 0, Infinity], ["c-memory", "memory", 0, Infinity],
+];
+const FADE = 0.25;
+function render(T) {
+  const c = clocks(T);
+
+  // Captions fade in and out over FADE seconds around their story span.
+  for (const [id, sceneId, a, b] of CAPTIONS) {
+    const scene = SCENE[sceneId], k = c[sceneId];
+    const from = outputAt(scene, a), to = b === Infinity ? scene.length : outputAt(scene, b);
+    const o = k.on ? Math.min(prog(k.local, from, from + FADE), 1 - prog(k.local, to - FADE, to)) : 0;
+    const el = $(id);
+    el.style.opacity = o;
+    el.style.transform = `translateY(${(1 - o) * 8}px)`;
+  }
+
+  // Windows: the terminal holds the hook and the payoff, the admin UI fades in over it, the end card closes.
+  const termO = c.hook.on ? prog(c.hook.local, 0, 0.35) : c.pay.on ? 1 : c.sources.on ? 1 - prog(c.sources.local, 0.35, 0.5) : 0;
+  const appO = c.sources.on ? prog(c.sources.local, 0, 0.4) : c.memory.on ? 1 - prog(c.memory.local, c.memory.length - 0.45, c.memory.length) : 0;
+  const endO = c.end.on ? prog(c.end.local, 0, 0.5) : c.memory.on ? prog(c.memory.local, c.memory.length - 0.45, c.memory.length) : 0;
+  $("term").style.opacity = termO;
+  $("term").style.transform = `scale(${0.985 + 0.015 * termO})`;
+  $("app").style.opacity = appO;
+  $("app").style.transform = `scale(${0.985 + 0.015 * appO})`;
+  $("end").style.opacity = endO;
+  $("end").style.transform = `translateY(${(1 - endO) * 12}px)`;
+  $("veil").style.opacity = prog(T, DURATION - 0.4, DURATION);
+
+  // Terminal content
+  const payOn = !c.hook.on;
+  $("hook").style.display = payOn ? "none" : "block";
+  $("pay").style.display = payOn ? "block" : "none";
+  if (payOn) {
+    renderPay(c.pay.t);
+    $("pay").style.opacity = prog(c.pay.local, 0, 0.3);
+    const [s, y] = keyed([[0, 1.45, 0], [2.2, 1.45, 0], [3.0, 1.45, 125], [4.0, 1.45, 205], [5.8, 1.45, 270]], c.pay.t);
+    $("tcam").style.transform = `translate(0px, ${-y}px) scale(${s})`;
+  } else {
+    renderHook(c.hook.t);
+    $("tcam").style.transform = "scale(1.45)";
+  }
+
+  // Admin UI pages cross-fade like a navigation
+  const memO = c.memory.on || c.end.on ? prog(c.memory.local, 0, 0.3) : 0;
+  $("p-sources").style.opacity = 1 - memO;
+  $("p-memory").style.opacity = memO;
+  const onMemory = memO >= 0.5;
+  $("nav-src").classList.toggle("on", !onMemory);
+  $("nav-mem").classList.toggle("on", onMemory);
+  if (onMemory) renderMemory(c.memory.t);
+  else renderSources(c.sources.t);
+}
+
+window.DURATION = DURATION;
+window.ready = document.fonts.ready
+  .then(() => Promise.all([...document.images].map((i) => i.decode().catch(() => {}))))
+  .then(() => { $("tcam").style.transformOrigin = "0 0"; render(0); layout(); render(0); });
+window.render = render;
+</script>
+</body>
+</html>

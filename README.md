@@ -15,7 +15,7 @@ agents to remember.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/demo-dark.gif">
-    <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/demo-light.gif" alt="A new hire asks a coding agent how to answer a support ticket. The agent searches MemForge and answers with two team rules, citing a GitHub Pages doc and a Jira ticket." width="100%">
+    <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/demo-light.gif" alt="On day one, a new hire asks a coding agent how to fix a ticket about a customer charged twice. Without team memory the agent starts patching the payment code. With MemForge it checks team memory first: not a bug, a pending card hold, citing the support playbook and the team's decision log in Notion. The admin UI shows the connected sources syncing on their own, and a memory the decision log updated." width="100%">
   </picture>
 </p>
 
@@ -80,10 +80,6 @@ rechecks the memories built on it. Each one is kept, replaced or retired, and
 earlier versions keep their history. Across
 documents, MemForge marks memories that repeat, update or contradict each
 other.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/.github/assets/memory-detail.png" alt="A memory in the admin UI: a decision from a Jira ticket that updates an older memory from the support playbook, shown with the ticket text it rests on." width="100%">
-</p>
 
 **Every answer has a source.** `get_memory` returns the supporting text and a
 link back to the page, ticket or file. Where the source allows it, the citation
