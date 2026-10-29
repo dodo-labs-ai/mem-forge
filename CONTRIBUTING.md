@@ -65,15 +65,27 @@ labelled facts into one memory; the memory is then expected unsupported when any
 of its terms is, since a claim holds only when all of it does. To test a new
 situation, add a document pair or a reconciliation file and list it in
 `cohort.json`.
+
 Maintainers also run the same evaluation over cases pinned from a real
 workspace, which stay in that workspace.
 
+The rubrics are written against one reference model, Claude Haiku 5.5, which
+is the default generation model of `compose_smoke.sh` with OpenRouter. The
+verdict your pull request needs is the one on that model, so today it needs an
+OpenRouter key. A run with `--ollama` or another `--generation-model` is still
+worth reporting, but it is advisory: a `fail` there may come from the model
+rather than your change. Name the provider and model of every run you paste.
+
 ### Provider keys for the smoke scripts
 
-`provider_smoke.py` checks every provider you have a key for and reports the
-rest as skipped; `compose_smoke.sh` uses OpenRouter for its model steps, or a
-local Ollama with `--ollama`. Keep your keys in one file instead of exporting
-them in every terminal:
+`provider_smoke.py` checks OpenRouter, OpenAI and Anthropic when you have their
+keys, and a local Ollama when it answers, and reports the rest as skipped. Add
+any other LiteLLM route with `--litellm-route`, with `--endpoint` when it needs
+one and `--kind embedding` for an embedding model.
+`compose_smoke.sh` configures its models through OpenRouter, or through a
+local Ollama with `--ollama`; with neither, it skips the model, sync and search
+steps, and your pull request should say so. Keep your keys in one file instead
+of exporting them in every terminal:
 
 ```bash
 cp .env.test.example .env.test
