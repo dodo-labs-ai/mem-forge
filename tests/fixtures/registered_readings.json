@@ -1,0 +1,82 @@
+{
+  "confluence-page-storage:1": {
+    "presentation": "5739bfb27b13f702fded8345202d10724fa81f3dc3c6284fb5422b6645730040",
+    "reading": "553b795317387a9d0522401349a09d30db83753c2c84b389441086b190b952e4"
+  },
+  "jira-changelog:1": {
+    "presentation": "61110873ea58e5995c0e98714ff107bebfe677aa8c36e534f68b8b1e169b4c6f",
+    "reading": "742b0610baddfb928350a140f627bcf225bfabd9dbfb746a1ea514ea395d83af"
+  },
+  "jira-changelog:2": {
+    "presentation": "d42edebf9bc8a9025c38a2f4b7d81870d092ea04195aa2ed481a9024855fb8ce",
+    "reading": "329ed5d4fbd49057c9732dc6bb0116d8fd4d82554b76a4940b5fdeda00f8f1bc"
+  },
+  "jira-changelog:3": {
+    "presentation": "204f48c6f4f3eecb08303567f2b74a16ea855aba217ed211359cac14e94cf7d4",
+    "reading": "9a5ee6a8b31a5dad9c82e8737cea95c7b1df030bf40f0054ba81e745dbf95644"
+  },
+  "jira-changelog:4": {
+    "presentation": "fe6e7e76f40a20bd306267542ea5e9a71dd787f4fb54a00ce0fc7291d6cfadbc",
+    "reading": "afdbdfa9d833c8de59273b96b38668b588e7a5f66b017d01d8b209e2da70da31"
+  },
+  "jira-comment:1": {
+    "presentation": "30551f5925c636e4096c8ac6e2f2df2d2a8a0c0a73b0d35bba5dcd4b0e3eac52",
+    "reading": "f1b96727b6c146560bf7fde18bbe1bdcdc44621def576b4c78541afa666f82db"
+  },
+  "jira-comment:2": {
+    "presentation": "8ce17252b6358418f829e2bb4181ff0b866f38b40e8ba5e0e3b9ef84fd5f0433",
+    "reading": "eeb68f257458edda72f71c7221772ada0bd366b1b63ec69ab5fe9e0e7f213e2c"
+  },
+  "jira-comment:3": {
+    "presentation": "2b53944d10b0864624a1943ed9f3a73585c6d9c89835e97843c8c89300c106bd",
+    "reading": "d035ec9f511239a288dc5802e9308c9bc4b9cee16e03e4e5fe15bdc7ec010b5f"
+  },
+  "jira-comment:4": {
+    "presentation": "73aca0e8bfd6839922bb11d009c33cc5ce84cba628998d8de96ef5de9a415f77",
+    "reading": "10934d1931a48ed469b85ee7af9956276311d3bc5b8bdfcc0c967123d5f192a0"
+  },
+  "jira-comment:5": {
+    "presentation": "41bed595cb82e2bf5d8e31eac2c231591cc13025450543abdee89ab00a328bf9",
+    "reading": "10934d1931a48ed469b85ee7af9956276311d3bc5b8bdfcc0c967123d5f192a0"
+  },
+  "jira-comment:6": {
+    "presentation": "41bed595cb82e2bf5d8e31eac2c231591cc13025450543abdee89ab00a328bf9",
+    "reading": "ca2770c916871f916630c5a37c6d984ff7d1b3eca627d9744933c9aa3d4953c3"
+  },
+  "jira-issue-core:1": {
+    "presentation": "521e0cf16e15e529c840c276eabda9d37882453ebd3bc4e3633199b2e8ee621d",
+    "reading": "391b1c02efb03117980a84f7ff8bbd52f9eb98d645367339bfd24fe74ef87e97"
+  },
+  "jira-issue-core:2": {
+    "presentation": "d1d006fd16922ea015e78c4daf53e89b730abc018f96c07d3da17ebaa6530d09",
+    "reading": "a7740a3985f93debc7dcb1f26def11e8d1212ee6515ea5bfeca3b611f720723d"
+  },
+  "jira-issue-core:3": {
+    "presentation": "ad42145f2c9bbc49c8c3ca5d58fc8003f1734991accf8c49bd65257392970755",
+    "reading": "7c7f913e3a34870a170d6a283fc476c2a62833e774dd540820bc1261a68d5f8d"
+  },
+  "jira-issue-core:4": {
+    "presentation": "cda0215e83c4bed7d0591723527e52991a1e14853880c568826bf92ae5b6465e",
+    "reading": "b2ec54da1ad12b4fbb45a94fc185d1c66339133ad2776c275e9197f9c3f59a6c"
+  },
+  "jira-issue-core:5": {
+    "presentation": "a0ffb848055e8e008fbfbd7d2e06c5f4fc55e04c8d0ef81631c8b31728ab0619",
+    "reading": "b2ec54da1ad12b4fbb45a94fc185d1c66339133ad2776c275e9197f9c3f59a6c"
+  },
+  "notion-row-properties:1": {
+    "presentation": "b983e022d0b108dacbf60d2d49689eee56c5d0b2f44e0f7aeac5a79fafac527f",
+    "reading": "5001e9d8a0e6786c61ad6bf2b2d51a3feb8c20c0193fc7d6a0af18e6e935382a"
+  },
+  "teams-message:1": {
+    "presentation": "25d7bb7244f3ac12fa9cb183344c7893a39f463eded7faf8266403bd933792ca",
+    "reading": "63840e99c15cf441f09e7343083e3f9cd231ac1e1fa5284d737e710bb749d7c1"
+  },
+  "teams-message:2": {
+    "presentation": "c719c303a75b60daed4da6776e5bdb018d696e8e340afeaff638c27df68fe7dd",
+    "reading": "de387dea16a5746c63bb5794e0e452e6cfdbd8a46b0a8020b8d279c95cff9bfb"
+  },
+  "teams-message:3": {
+    "presentation": "c719c303a75b60daed4da6776e5bdb018d696e8e340afeaff638c27df68fe7dd",
+    "reading": "0b300b5b90d63b4f6e60dd9d2cb6e61722e7fc9bb9cb0d3c211680982199cb92"
+  }
+}

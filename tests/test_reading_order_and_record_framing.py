@@ -41,20 +41,25 @@ def _messages(rows=CONVERSATION) -> list[dict[str, object]]:
     ]
 
 
-def _window(messages, base=None):
+def prior_of(base) -> dict[str, object]:
+    """The prior revisions a projection of the next revision of ``base``'s Unit is given; none without a base."""
+    return {} if base is None else {
+        "prior_unit_revision": base.source_unit_revisions[0],
+        "prior_observation_revisions": {r.observation_id: r for r in base.observation_revisions},
+    }
+
+
+def _window(messages, base=None, **unit):
+    """One Teams window of ``messages``, projected after ``base``; ``unit`` shapes its payload."""
     item = ContentItem(
         item_id="window-1", title="Window", source_url="https://example.test/window-1",
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
         extra={"conversation_id": "conv-1", "window_id": "window-1", "root_message_id": "msg-0"},
     )
-    raw = teams_unit_raw(item, messages)
-    prior = {} if base is None else {
-        "prior_unit_revision": base.source_unit_revisions[0],
-        "prior_observation_revisions": {r.observation_id: r for r in base.observation_revisions},
-    }
     return project_source_item(
-        source_id="src-teams", source_type="teams", run_id=f"run-{len(messages)}", item=item, raw=raw,
-        normalized=NormalizedContent(item=item, markdown_body="window"), **prior,
+        source_id="src-teams", source_type="teams", run_id=f"run-{len(messages)}", item=item,
+        raw=teams_unit_raw(item, messages, **unit),
+        normalized=NormalizedContent(item=item, markdown_body="window"), **prior_of(base),
     )
 
 

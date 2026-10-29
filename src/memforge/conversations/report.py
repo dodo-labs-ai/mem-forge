@@ -3,6 +3,15 @@
 A dry run plans one attempt as the sync run would and reports each Unit it
 would project or remove, so the outcome can be checked before it is applied:
 which Units are new, which change and how, and which go.
+
+A Unit's change is told by its members: ``added`` and ``removed`` name the
+messages it gains and loses, and ``changed`` the members it keeps but stores
+differently, under another record revision, another record schema or other
+artifacts. That is what the Unit stores, not what the extraction model
+reads again: the run decides that when it projects the Unit's new revision, by
+the reading relation (:mod:`memforge.pipeline.reading_equivalence`), and a
+changed member, such as one whose edit time alone changed or one moved to a
+new record schema, can leave nothing to read again.
 """
 
 from __future__ import annotations
@@ -38,8 +47,6 @@ def plan_report(plan: SourcePlan, *, source_id: str) -> dict[str, Any]:
                 "added": sorted(identity.message_id for identity in planned.keys() - stored.keys()),
                 "removed": sorted(identity.message_id for identity in stored.keys() - planned.keys()),
                 "changed": changed_records,
-                # New or changed member content is read by the extraction model again.
-                "extracts": bool(planned.keys() - stored.keys() or changed_records),
             }
         )
     return {
@@ -60,7 +67,6 @@ def plan_report(plan: SourcePlan, *, source_id: str) -> dict[str, Any]:
         "summary": {
             "new_units": sum(1 for unit in units if unit["change"] == "new"),
             "changed_units": sum(1 for unit in units if unit["change"] == "changed"),
-            "units_extracted_again": sum(1 for unit in units if unit["extracts"]),
             "removed_units": len(plan.removals),
         },
     }

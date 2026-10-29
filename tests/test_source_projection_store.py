@@ -48,13 +48,7 @@ MARKDOWN_PROFILE = EvidenceRepresentationProfile(
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
 PAGE_PROFILE = representation_profile_for_observation_contract(source_type="confluence", observation_type="page_body")
-TEAMS_PROFILE = EvidenceRepresentationProfile(
-    name="canonical-record",
-    version=1,
-    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
-    schema_name="teams-message",
-    schema_version=2,
-)
+TEAMS_PROFILE = representation_profile_for_observation_contract(source_type="teams", observation_type="message")
 
 
 @pytest_asyncio.fixture
@@ -618,7 +612,7 @@ async def test_legacy_jira_profile_backfill_keeps_original_format_and_content(db
     assert revision.content == content and revision.semantic_hash == "historical-hash"
     assert revision.evidence_profile.schema_name == schema_name
     assert revision.evidence_profile.schema_version == 1
-    assert representation_profile_for_observation_contract(source_type="jira", observation_type=observation_type).schema_version == (4 if observation_type == "changelog" else 5)
+    assert representation_profile_for_observation_contract(source_type="jira", observation_type=observation_type).schema_version == {"issue_core": 5, "comment": 6, "changelog": 4}[observation_type]
 
 
 @pytest.mark.asyncio

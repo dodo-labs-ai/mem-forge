@@ -69,6 +69,11 @@ class MemberArtifact:
 class Member:
     """One message of a Unit: its identity, creation time, canonical record and stored artifacts.
 
+    ``record_schema`` names the canonical record schema (``name:version``) the
+    record was collected under: the attempt's for a message it returned, and
+    the stored one for a member carried from an earlier collection, which keeps
+    being read under it.
+
     ``undated`` says whether ``record`` carries no creation time of its own
     (:mod:`~memforge.conversations.undated`); it is derived from the record
     when the member is built.
@@ -79,6 +84,7 @@ class Member:
     record: Mapping[str, object]
     # The revision of ``record``, as the manifest names it.
     revision: str
+    record_schema: str
     artifacts: tuple[MemberArtifact, ...] = ()
     undated: bool = field(init=False, compare=False, repr=False)
 
@@ -86,10 +92,10 @@ class Member:
         object.__setattr__(self, "undated", is_undated(self.record))
 
     @property
-    def content_identity(self) -> tuple[str, tuple[tuple[str, str, str], ...]]:
-        """What a Unit revision depends on for this member: its record and the bytes of its artifacts."""
+    def content_identity(self) -> tuple[str, str, tuple[tuple[str, str, str], ...]]:
+        """What a Unit revision depends on for this member: its record, the schema it is read under and its artifacts' bytes."""
 
-        return self.revision, tuple(
+        return self.revision, self.record_schema, tuple(
             sorted((artifact.provider_key, artifact.provider_revision, artifact.sha256) for artifact in self.artifacts)
         )
 

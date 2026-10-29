@@ -20,9 +20,9 @@ from memforge.source_adapters.contracts import (
 from memforge.source_projection import (
     AnchorKind,
     DeltaAxis,
+    EvidenceRepresentationProfile,
     ProjectionCoverage,
     ProjectionEnvelope,
-    ProjectionIdentityConflict,
     RevisionDelta,
     SourceAnchor,
     SourceObservation,
@@ -32,6 +32,7 @@ from memforge.source_projection import (
     SourceUnit,
     SourceUnitRevision,
     incarnated_provider_key,
+    require_revision_identity,
 )
 from memforge.source_time import (
     SOURCE_UPDATED_AT_KEY,
@@ -54,10 +55,6 @@ from memforge.source_artifacts import (
 
 
 _REVISION_SEMANTIC_METADATA_KEYS = ("claim_evidence_scope",)
-
-
-
-
 
 
 def _observation_semantic_hash(value: _ObservationInput) -> str:
@@ -123,10 +120,16 @@ def project_source_item(
     enclosing manifest projection; a unit projection never claims another unit
     was deleted merely because it was not part of this call.
 
-    Observation Revisions are content-addressed by Observation and semantic
-    hash. A projected revision whose id is already stored, as a current
-    revision in ``prior_observation_revisions`` or any other revision in
-    ``stored_observation_revisions`` (keyed by revision id), is that stored row.
+    An Observation Revision is its Observation's content as read under one
+    Evidence Representation Profile, and its id is derived from all three
+    (``observation_revision_id``). A projected revision whose id is already
+    stored, as a current revision in ``prior_observation_revisions`` or any
+    other revision in ``stored_observation_revisions`` (keyed by revision id),
+    is that stored row, once its identity is the projected one; a stored row
+    whose identity differs raises ``ProjectionIdentityConflict``. An
+    Observation changed when its revision did: new
+    content, or the same content read under another profile, which the reading
+    relation then compares.
 
     Only prior revisions in the current representation are compared with this
     projection or carried by it. A prior Observation outside it is no member of
@@ -211,6 +214,7 @@ def project_source_item(
         evidence_profile = representation_profile_for_observation_contract(
             source_type=source_type,
             observation_type=value.observation_type,
+            record_schema=value.record_schema,
         )
         if evidence_profile is None:
             raise ValueError(
@@ -219,7 +223,7 @@ def project_source_item(
             )
         observation_id = _stable_id("obs", unit_id, value.observation_type, value.provider_key)
         semantic_hash = _observation_semantic_hash(value)
-        revision_id = _stable_id("obsrev", observation_id, semantic_hash)
+        revision_id = observation_revision_id(observation_id, semantic_hash, evidence_profile)
         observations.append(
             SourceObservation(
                 id=observation_id,
@@ -239,26 +243,18 @@ def project_source_item(
             metadata={**dict(value.metadata), "provider_key": value.provider_key},
             evidence_profile=evidence_profile,
         )
+        # A stored revision with this identity is reused exactly, whatever
+        # metadata this projection derived; one recorded without a source time
+        # takes the one the source now gives, and a recorded source time is
+        # never replaced.
         stored_revision = stored_by_id.get(revision_id)
-        # Revision identity is semantic. A stored revision with this id is
-        # reused exactly, whatever metadata this projection derived; a revision
-        # recorded without a source time takes the one the source now gives,
-        # and a recorded source time is never replaced.
-        if stored_revision is not None:
-            if (
-                stored_revision.observation_id != observation_id
-                or stored_revision.semantic_hash != semantic_hash
-                or stored_revision.evidence_profile not in {None, evidence_profile}
-            ):
-                raise ProjectionIdentityConflict("source_observation_revisions", revision_id)
-            reused = stored_revision
-            if reused.evidence_profile is None:
-                reused = replace(reused, evidence_profile=evidence_profile)
-            if reused.observed_at is None and value.observed_at is not None:
-                reused = replace(reused, observed_at=value.observed_at)
-            revisions.append(reused)
-        else:
+        if stored_revision is None:
             revisions.append(projected_revision)
+            continue
+        require_revision_identity(stored_revision, projected_revision)
+        if stored_revision.observed_at is None and value.observed_at is not None:
+            stored_revision = replace(stored_revision, observed_at=value.observed_at)
+        revisions.append(stored_revision)
     if coverage is ProjectionCoverage.PARTIAL_PROJECTION:
         projected_observation_ids = {item.observation_id for item in revisions}
         for observation_id, revision in prior_observation_revisions.items():
@@ -266,8 +262,8 @@ def project_source_item(
                 continue
             revisions.append(revision)
             carried_revision_ids.append(revision.id)
-    observation_hashes = sorted((item.observation_id, item.semantic_hash) for item in revisions)
-    semantic_hash = _canonical_hash(observation_hashes)
+    # What the Unit's Observations read as: their revisions, each its content under its profile.
+    semantic_hash = _canonical_hash(sorted(item.id for item in revisions))
     location_hash = _canonical_hash(unit.locator)
     membership_hash = _canonical_hash(sorted(item.observation_id for item in revisions))
     access_hash = projection_access_fingerprint(access_context) if access_context else None
@@ -333,7 +329,7 @@ def project_source_item(
         observation_id
         for observation_id, revision in current_by_observation.items()
         if observation_id not in prior_observation_revisions
-        or prior_observation_revisions[observation_id].semantic_hash != revision.semantic_hash
+        or prior_observation_revisions[observation_id].id != revision.id
     }
     changed_anchors = tuple(
         SourceAnchor(
@@ -494,6 +490,29 @@ def _native_payload(raw: RawContent) -> object:
         except json.JSONDecodeError:
             return text
     return text
+
+
+def observation_revision_id(
+    observation_id: str,
+    semantic_hash: str,
+    evidence_profile: EvidenceRepresentationProfile,
+) -> str:
+    """The id of an Observation Revision: its Observation, its content and the profile it is read under.
+
+    The profile is identified by its name and version, its record schema and
+    version, and the coordinate space it addresses Evidence in. The same content
+    read under another profile is another revision, so a representation upgrade
+    revises every Observation it covers once, and the reading relation decides
+    what, if anything, then reads differently.
+    """
+
+    profile = {
+        "name": evidence_profile.name,
+        "version": evidence_profile.version,
+        "schema": [evidence_profile.schema_name, evidence_profile.schema_version],
+        "coordinate_space": evidence_profile.coordinate_space.value,
+    }
+    return _stable_id("obsrev", observation_id, semantic_hash, _canonical_json(profile))
 
 
 def _canonical_hash(value: object) -> str:

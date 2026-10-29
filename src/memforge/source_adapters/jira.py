@@ -159,6 +159,14 @@ CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS,
     **{(schema.name, schema.version): schema for schema in (ISSUE_SCHEMA, COMMENT_SCHEMA)}}
 
 
+# A comment's edit time is shown with it but never changes what it says; its
+# creation time stays governing, since it anchors relative time in the body.
+COMMENT_SCHEMA = replace(COMMENT_SCHEMA, version=6, fields=tuple(
+    replace(field, governs_interpretation=False) if field.json_pointer == "/updated" else field
+    for field in COMMENT_SCHEMA.fields))
+CANONICAL_RECORD_SCHEMAS = {**CANONICAL_RECORD_SCHEMAS, (COMMENT_SCHEMA.name, COMMENT_SCHEMA.version): COMMENT_SCHEMA}
+
+
 CURRENT_OBSERVATION_PROFILES = {
     observation_type: canonical_record_profile(schema.name, schema.version)
     for observation_type, schema in (

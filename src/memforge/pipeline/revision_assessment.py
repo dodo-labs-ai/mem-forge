@@ -20,12 +20,11 @@ from memforge.pipeline.evidence_fragments import (
     RevisionFragmentIndex,
     build_revision_fragment_index,
     canonical_record_field_ranges,
-    canonical_record_changed_raw_ranges,
     canonical_record_is_tombstoned,
-    revision_changed_structural_ranges,
     revision_structural_ranges,
     _revision_structural_identities,
 )
+from memforge.pipeline.reading_equivalence import ReadingComparison, compare_readings
 from memforge.pipeline.projection_context import (
     observation_is_inference_eligible,
     preceding_observation_id,
@@ -37,7 +36,7 @@ from memforge.pipeline.projection_fragments import (
     SupportRevalidationLimitationCode,
     _compose_projection_fragment_catalog,
 )
-from memforge.source_projection import SourceAnchor, SourceObservationRevision, SourceProjection
+from memforge.source_projection import SourceAnchor, SourceProjection
 from memforge.source_representation import (
     in_current_representation,
     representation_contract_for_profile,
@@ -46,7 +45,7 @@ from memforge.source_representation import (
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v12"
+REVISION_SUPPORT_CONTRACT = "revision-support-v13"
 # Versions how revision Fragments are compiled into catalogs and ordered, what
 # every reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.
@@ -102,25 +101,6 @@ class SupportAssessment:
     complete_read: bool = False
 
 
-def _changed_ranges(base: SourceObservationRevision, target: SourceObservationRevision, *, purpose="current"):
-    if base.id == target.id:
-        return ()
-    profile = target.evidence_profile
-    if base.evidence_profile == profile and profile is not None:
-        if profile.name in {"markdown-structural", "plain-text"}:
-            return revision_changed_structural_ranges(base, target, purpose=purpose)
-        if profile.name == "canonical-record":
-            return canonical_record_changed_raw_ranges(base, target, purpose=purpose)
-    return None
-
-
-def _in_ranges(fragment: EvidenceFragment, ranges) -> bool:
-    if ranges is None:
-        return True
-    start, end = fragment.anchor.range_start, fragment.anchor.range_end
-    return start is not None and end is not None and any(start < right and left < end for left, right in ranges)
-
-
 class RevisionAssessmentContext:
     """Own one Unit's indexes and net delta; consumers own semantic judgments."""
 
@@ -161,6 +141,7 @@ class RevisionAssessmentContext:
         self.indexes: dict[str, RevisionFragmentIndex] = indexes if indexes is not None else {}
         self._selection_indexes = {}
         self.reading_indexes = {}
+        self._reading_comparisons: dict[tuple[str, str], ReadingComparison] = {}
         self._images = {}
         self.current = {
             r.observation_id: r
@@ -217,7 +198,7 @@ class RevisionAssessmentContext:
                 if interpretation:
                     self.format_interpretations[revision.id] = interpretation
         self._entries = {revision.id: self._catalog_entries(revision) for revision in self.current.values()}
-        self.full_fragments = tuple(f for entries, _framing in self._entries.values() for f in entries)
+        self.full_fragments = tuple(f for entries in self._entries.values() for f in entries)
         # Both sides, so removed old text keeps its heading path too.
         for revision in {r.id: r for r in (*self.previous.values(), *self.current.values())}.values():
             if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
@@ -227,23 +208,24 @@ class RevisionAssessmentContext:
                     (unit.start, unit.end, identity[1]) for unit, identity in zip(units, identities, strict=True)
                 )
 
-    def _catalog_entries(self, revision) -> tuple[tuple[EvidenceFragment, ...], frozenset[SourceAnchor]]:
-        """The Fragments every catalog lists for one current revision, and the anchors of its record framing.
+    def _catalog_entries(self, revision) -> tuple[EvidenceFragment, ...]:
+        """The Fragments every catalog lists for one current revision.
 
         A contextual record field is context of its record's other fields: it is
         never Primary and never read as an entry of its own. The record framing
         already shows its framing fields on every entry, so those are not listed
-        again; a change to one of them is a change to every entry that shows it.
+        again; a change to one that governs interpretation changes the reading
+        of every entry that shows it.
         """
         fragments = self.index(revision).fragments
         contextual = tuple(
             field for field in self.canonical_fields.get(revision.id, ()) if field.descriptor.contextual
         )
         if not contextual:
-            return fragments, frozenset()
+            return fragments
         schema = representation_contract_for_profile(revision.evidence_profile).canonical_schema
         framing_pointers = {pointer for pointer, _label in schema.framing_fields}
-        entries, framing = [], set()
+        entries = []
         for fragment in fragments:
             start, end = fragment.anchor.range_start, fragment.anchor.range_end
             owner = next(
@@ -253,11 +235,9 @@ class RevisionAssessmentContext:
             )
             if owner is None:
                 entries.append(fragment)
-            elif owner.descriptor.json_pointer in framing_pointers:
-                framing.add(fragment.anchor)
-            else:
+            elif owner.descriptor.json_pointer not in framing_pointers:
                 entries.append(replace(fragment, primary_eligible=False))
-        return tuple(entries), frozenset(framing)
+        return tuple(entries)
 
     def canonical_context(self, fragment):
         """Keep field and event identity on both sides of a canonical delta."""
@@ -372,18 +352,12 @@ class RevisionAssessmentContext:
         return self.indexes[revision.id]
 
     def selection_index(self, revision):
-        """Exact anchors and bilateral material occurrences, indexed once per revision."""
+        """The Fragments at each exact anchor of one revision, indexed once per revision."""
         if revision.id not in self._selection_indexes:
             anchors = {}
-            material = {}
             for fragment in self.index(revision).fragments:
                 anchors.setdefault(fragment.anchor, []).append(fragment)
-                key = (fragment.kind, fragment.fragment_type, fragment.content_value)
-                material.setdefault(key, []).append(fragment)
-            self._selection_indexes[revision.id] = (
-                {key: tuple(value) for key, value in anchors.items()},
-                {key: tuple(value) for key, value in material.items()},
-            )
+            self._selection_indexes[revision.id] = {key: tuple(value) for key, value in anchors.items()}
         return self._selection_indexes[revision.id]
 
     def reading_index(self, revision):
@@ -395,6 +369,24 @@ class RevisionAssessmentContext:
                 revision, self.index(revision).fragments
             )
         return self.reading_indexes[revision.id]
+
+    def reading_comparison(self, base, target) -> ReadingComparison:
+        """The readings of two revisions of one Observation, compared once per operation."""
+        key = (base.id, target.id)
+        if key not in self._reading_comparisons:
+            self._reading_comparisons[key] = compare_readings(base, target, reading_index=self.reading_index)
+        return self._reading_comparisons[key]
+
+    def _delta_anchors(self, previous, current, *, purpose) -> frozenset[SourceAnchor] | None:
+        """One Observation's changed anchors; ``None`` when the whole Observation reads as changed.
+
+        For ``current``, the anchors of ``current`` that read differently from
+        ``previous``; for ``removed``, the anchors of ``previous`` that
+        ``current`` no longer reads (``reading_equivalence``).
+        """
+        comparison = self.reading_comparison(previous, current)
+        anchors = comparison.changed(purpose="current") if purpose == "current" else comparison.removed()
+        return frozenset(anchors) if anchors is not None else None
 
     def reading_groups(self, fragments) -> tuple[tuple[EvidenceFragment, ...], ...]:
         """Partition Fragments, in their order, into ReadingGroups: one outermost list, or one Fragment."""
@@ -443,7 +435,9 @@ class RevisionAssessmentContext:
     def delta_fragments(self) -> tuple[tuple[EvidenceFragment, ...], tuple[EvidenceFragment, ...]]:
         """The added or modified current Fragments, and the baseline Fragments this revision removed.
 
-        Changed record framing changes every entry of that record.
+        A Fragment changed when its reading changed (``reading_equivalence``):
+        changed governing record framing changes every entry of that record,
+        and framing that is only displayed changes none.
         """
         if self._delta is not None:
             return self._delta
@@ -455,16 +449,14 @@ class RevisionAssessmentContext:
         changed, removed = [], []
         for key, current in self.current.items():
             old = self.previous.get(key)
-            ranges = _changed_ranges(old, current) if old else None
-            touched = {f.anchor for f in self.index(current).fragments if _in_ranges(f, ranges)}
-            entries, framing = self._entries[current.id]
-            changed.extend(entries if touched & framing else (f for f in entries if f.anchor in touched))
+            touched = self._delta_anchors(old, current, purpose="current") if old else None
+            changed.extend(f for f in self._entries[current.id] if touched is None or f.anchor in touched)
         for key, old in self.previous.items():
             current = self.current.get(key)
             if key in self.members and current is None and key not in self.tombstoned:
                 continue
-            ranges = _changed_ranges(current, old, purpose="removed") if current else None
-            removed.extend(f for f in self.index(old).fragments if _in_ranges(f, ranges))
+            lost = self._delta_anchors(old, current, purpose="removed") if current else None
+            removed.extend(f for f in self.index(old).fragments if lost is None or f.anchor in lost)
         self._delta = tuple(changed), tuple(removed)
         return self._delta
 

@@ -391,7 +391,7 @@ def test_list_content_between_items_stays_in_reading_order():
 
 def test_schema_cutover_keeps_historical_profile_truth():
     for key, profile in CURRENT_OBSERVATION_PROFILES.items():
-        assert profile.schema_version == (4 if key == "changelog" else 5)
+        assert profile.schema_version == {"issue_core": 5, "comment": 6, "changelog": 4}[key]
         legacy = LEGACY_OBSERVATION_PROFILES[key]
         assert legacy.schema_version == 1
         schema = CANONICAL_RECORD_SCHEMAS[(legacy.schema_name, legacy.schema_version)]

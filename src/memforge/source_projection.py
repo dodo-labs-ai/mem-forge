@@ -252,29 +252,38 @@ class ProjectionIdentityConflict(ValueError):
         self.row_id = row_id
 
 
+def require_revision_identity(
+    stored: SourceObservationRevision,
+    projected: SourceObservationRevision,
+) -> None:
+    """Fail when a stored Observation Revision is not the projected revision whose id it has.
+
+    An Observation Revision is content-addressed: its id is derived from its
+    Observation, its semantic hash and the Evidence Representation Profile it is
+    read under. A stored row with the same id and identity is the same revision
+    whatever metadata either copy carries; one whose identity differs is a
+    corrupt row, never reused.
+    """
+
+    if (
+        stored.id != projected.id
+        or stored.observation_id != projected.observation_id
+        or stored.semantic_hash != projected.semantic_hash
+        or stored.evidence_profile != projected.evidence_profile
+    ):
+        raise ProjectionIdentityConflict("source_observation_revisions", projected.id)
+
+
 def require_stored_revision_identity(
     projection: SourceProjection,
     stored_revisions: Mapping[str, SourceObservationRevision],
 ) -> None:
-    """Fail when a projected Observation Revision differs in identity from its stored row.
-
-    An Observation Revision is content-addressed: its id is derived from its
-    Observation and semantic hash, and its Evidence Representation Profile
-    fixes how Evidence addresses its content. A stored row with the same id and
-    identity is the same revision whatever metadata either copy carries; a
-    stored row without a profile takes the declared one.
-    """
+    """Fail when a projected Observation Revision differs in identity from its stored row (``require_revision_identity``)."""
 
     for revision in projection.observation_revisions:
         stored = stored_revisions.get(revision.id)
-        if stored is None:
-            continue
-        if (
-            stored.observation_id != revision.observation_id
-            or stored.semantic_hash != revision.semantic_hash
-            or stored.evidence_profile not in {None, revision.evidence_profile}
-        ):
-            raise ProjectionIdentityConflict("source_observation_revisions", revision.id)
+        if stored is not None:
+            require_revision_identity(stored, revision)
 
 
 UNIT_INCARNATION_SEPARATOR = "#incarnation:"

@@ -215,7 +215,9 @@ class ConversationLayer:
         messages = manifest.messages_of(evidence.conversation_id)
         state = await self._state(manifest.source_id, evidence.conversation_id, coverage.intervals, messages)
         held = {member.identity: member for unit in state.units for member in unit.members}
-        returned = {message.identity: _returned(message, bodies, uploaded_artifacts, held) for message in messages}
+        returned = {message.identity: _returned(message, bodies, uploaded_artifacts, held, record_schema=manifest.record_schema)
+            for message in messages
+        }
         plan = plan_conversation(
             source_id=manifest.source_id,
             conversation=evidence.ref,
@@ -309,8 +311,13 @@ def _returned(
     bodies: Mapping[MessageIdentity, Mapping[str, object]],
     uploaded_artifacts: Mapping[MessageIdentity, tuple[MemberArtifact, ...]],
     held: Mapping[MessageIdentity, Member],
+    *,
+    record_schema: str,
 ) -> ReturnedMessage | None:
     """A manifest message with its body and artifacts: collected in this attempt, or already held.
+
+    The attempt returned it, so its record is read under the attempt's
+    ``record_schema``, also when intake waived a body the Source already held.
 
     ``None`` when neither holds its record: intake waived the body of a
     message a Unit held at this revision, and an earlier run has changed that
@@ -337,6 +344,7 @@ def _returned(
             created_at=message.created_at,
             record=record,
             revision=message.revision,
+            record_schema=record_schema,
             artifacts=tuple(
                 available[(artifact.provider_key, artifact.provider_revision)]
                 for artifact in message.artifacts

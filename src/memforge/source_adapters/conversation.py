@@ -1,7 +1,9 @@
 """Conversation Units as Source Projection: each member message is one Observation.
 
 A message Observation's content is its record's canonical JSON, so a member
-carried unchanged keeps its Observation revision. A reply relates to the
+carried unchanged keeps its Observation revision. Each record is read under
+the record schema it was collected under: the payload's, unless its member,
+collected earlier under another schema, names its own. A reply relates to the
 message it answers; any other message follows the one before it. The
 conversation layer decided every member, so a Unit is a complete snapshot of
 them.
@@ -26,6 +28,7 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
 
     if native.get("payload_version") != PAYLOAD_VERSION:
         raise ValueError(f"unsupported conversation Unit payload version: {native.get('payload_version')!r}")
+    collected_under = _record_schema(native, "a conversation Unit payload")
     unit = native["unit"]
     label = payload_label(native)
     conversation_id = label.conversation_id
@@ -40,6 +43,9 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
     for member in members:
         message_id = str(member["message_id"])
         record = member["record"]
+        record_schema = (
+            _record_schema(member, f"member {message_id}") if "record_schema" in member else collected_under
+        )
         created_at, source_time, _shown = payload_member_times(native, member)
         times.append(created_at)
         inputs.append(
@@ -51,6 +57,7 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
                 {"conversation_id": conversation_id},
                 source_time,
                 {"claim_evidence_scope": "atomic"},
+                record_schema=record_schema,
             )
         )
         reply_to = record.get("reply_to_id")
@@ -82,3 +89,10 @@ def project_native(*, item: ContentItem, native: Mapping[str, Any]) -> _NativePr
             ("From", observed_from),
         ),
     )
+
+
+def _record_schema(value: Mapping[str, Any], owner: str) -> str:
+    record_schema = value.get("record_schema")
+    if not isinstance(record_schema, str) or not record_schema:
+        raise ValueError(f"{owner} names the record schema of its records")
+    return record_schema
