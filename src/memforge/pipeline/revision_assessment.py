@@ -45,7 +45,7 @@ from memforge.source_representation import (
 
 # Versions how a fixed Support is revalidated against a revision: it enters the
 # reconciliation manifest and each revalidated Support's ``support_validation``.
-REVISION_SUPPORT_CONTRACT = "revision-support-v13"
+REVISION_SUPPORT_CONTRACT = "revision-support-v14"
 # Versions how revision Fragments are compiled into catalogs and ordered, what
 # every reading adds as context, and Claim Extraction's reading scope. Every catalog
 # this context composes, for extraction or for Support, carries it in its identity.

@@ -14,8 +14,8 @@ import pytest
 from memforge.memory import candidate_admission
 from memforge.memory.candidate_admission import CANDIDATE_ADMISSION_CONTRACT, admit_candidates
 from memforge.models import RawMemory
-from memforge.pipeline import revision_work
-from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION
+from memforge.pipeline import claim_revision, revision_work
+from memforge.pipeline.complete_support import COMPLETE_SUPPORT_DEFINITION, DIRECTIONAL_SUPPORT_RULE
 from memforge.pipeline.revision_assessment import REVISION_SUPPORT_CONTRACT, RevisionAssessmentContext
 from memforge.pipeline.revision_work import SUPPORT_ASSESSMENT_CONTRACT, RevisionWorkExecutor
 from memforge.pipeline.unit_title import UNIT_TITLE_DEFINITION, render_unit_title
@@ -63,9 +63,24 @@ def test_support_assessment_uses_whole_support_and_admission_has_no_entailment_r
     assert COMPLETE_SUPPORT_DEFINITION not in revision_work.CHANGE_IMPACT_PROMPT
 
 
+def test_support_and_claim_revision_state_one_directional_rule_in_the_same_words():
+    assert revision_work.ASSESS_PROMPT.count(DIRECTIONAL_SUPPORT_RULE) == 1
+    assert claim_revision.CLAIM_REVISION_INSTRUCTIONS.count(DIRECTIONAL_SUPPORT_RULE) == 1
+    assert DIRECTIONAL_SUPPORT_RULE == "An added requirement over the same cases does not revoke an older one."
+
+
+def test_support_weighs_opposing_text_anywhere_in_the_revision():
+    prompt = " ".join(revision_work.ASSESS_PROMPT.split())
+    assert (
+        "Text anywhere in the revision that replaces a value the claim states, even with a stricter one, "
+        "or that excepts or narrows the cases it covers, opposes the claim even when the claim's own "
+        "sentence is unchanged."
+    ) in prompt
+
+
 def test_the_definition_raises_every_contract_whose_result_it_defines():
-    assert REVISION_SUPPORT_CONTRACT == "revision-support-v13"
-    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v9"
+    assert REVISION_SUPPORT_CONTRACT == "revision-support-v14"
+    assert SUPPORT_ASSESSMENT_CONTRACT == "support-ordered-reading-v10"
     assert CANDIDATE_ADMISSION_CONTRACT == "candidate-admission-v7"
 
 

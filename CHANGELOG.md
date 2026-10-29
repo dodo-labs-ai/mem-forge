@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Support Assessment judges a claim unsupported when text anywhere in the
+  current revision replaces a value the claim states, even with a stricter one,
+  or excepts or narrows the cases it covers, even when the claim's own sentence
+  is unchanged: a later "keep logs for 14 days" means "keep logs for 30 days"
+  no longer holds. An added requirement over the same cases still does not
+  revoke an older one; Support Assessment and claim revision state that rule in
+  the same words. In the ordered reading, an `unsupported` row before the last
+  request is an invalid row, corrected once like any other: the claim
+  continues, and the opposing text that request showed is carried to the
+  request that concludes. Contracts: `support-ordered-reading-v10`,
+  `revision-support-v14` and `claim-revision-v9-sparse-catalog`. Cloud: bump
+  the OSS pin; no HANA schema, storage protocol, configuration or model route
+  change.
+
 - Incremental extraction and Support revalidation of Markdown documents
   compare each heading under its own ancestors. Appending a subsection,
   renaming or deleting a section, or swapping two sections no longer makes
