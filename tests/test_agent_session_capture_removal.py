@@ -307,7 +307,7 @@ def _make_prior_release(path: Path) -> None:
                ) VALUES ('hook-1', 'codex', 'session-1', 'Stop', '/workspace', ?, ?)""",
             (now, now),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = ?", (REMOVAL,))
+        connection.execute("DELETE FROM schema_migrations WHERE version >= ?", (REMOVAL,))
         connection.commit()
 
 

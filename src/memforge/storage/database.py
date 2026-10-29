@@ -2088,19 +2088,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_building
     ON vector_indexes(state) WHERE state = 'building';
 
 -- ---------------------------------------------------------------
--- Users
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    username        TEXT UNIQUE NOT NULL,
-    display_name    TEXT,
-    password_hash   TEXT NOT NULL,
-    role            TEXT NOT NULL DEFAULT 'viewer',
-    last_login      TEXT,
-    created_at      TEXT DEFAULT (datetime('now'))
-);
-
--- ---------------------------------------------------------------
 -- Projects: per-row metadata for the relevance bucket on each memory.
 -- SHARED is the team-wide bucket (never down-weighted, always satisfies
 -- the access predicate). UNSORTED is the unmapped backlog (open and
@@ -5065,6 +5052,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS agent_session_receipts",
             "DROP TABLE IF EXISTS agent_hook_receipts",
         ],
+    ),
+    (
+        132,
+        "Remove the password user table",
+        # Callers reach the Admin API as the principal the deployment
+        # resolves; the service keeps no accounts or password hashes.
+        ["DROP TABLE IF EXISTS users"],
     ),
 ]
 
@@ -23048,51 +23042,6 @@ class Database:
                 "DELETE FROM vector_indexes WHERE id = ? AND state IN ('retired', 'failed')",
                 (index_id,),
             )
-            await self.db.commit()
-
-    # ==================================================================
-    # Users
-    # ==================================================================
-
-    async def create_user(
-        self,
-        username: str,
-        display_name: str | None,
-        password_hash: str,
-        role: str = "viewer",
-    ) -> int:
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                """INSERT INTO users (username, display_name, password_hash, role)
-                   VALUES (?, ?, ?, ?)""",
-                (username, display_name, password_hash, role),
-            )
-            await self.db.commit()
-            return cursor.lastrowid or 0
-
-    async def get_user_by_username(self, username: str) -> dict | None:
-        async with self.db.execute("SELECT * FROM users WHERE username = ?", (username,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["created_at"] = _parse_dt(d.get("created_at"))
-            d["last_login"] = _parse_dt(d.get("last_login"))
-            return d
-
-    async def list_users(self) -> list[dict]:
-        results: list[dict] = []
-        async with self.db.execute("SELECT * FROM users ORDER BY id") as cursor:
-            async for row in cursor:
-                d = dict(row)
-                d["created_at"] = _parse_dt(d.get("created_at"))
-                d["last_login"] = _parse_dt(d.get("last_login"))
-                results.append(d)
-        return results
-
-    async def delete_user(self, user_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await self.db.commit()
 
     # ==================================================================

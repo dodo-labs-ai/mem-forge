@@ -31,7 +31,6 @@ from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, 
 from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from memforge.api_target import CAPABILITY_PATH, Edition, capability_document
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -1047,16 +1046,6 @@ class RelationListResponse(BaseModel):
     total: int
     limit: int
     offset: int
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class LoginResponse(BaseModel):
-    token: str
-    expires_in: int = 86400
 
 
 class RelationDismissalRequest(BaseModel):
@@ -5235,54 +5224,8 @@ def create_admin_app(
         allow_headers=["*"],
     )
 
-    # -- JWT Authentication --
-    _security = HTTPBearer(auto_error=False)
-
-    async def verify_jwt(
-        credentials: HTTPAuthorizationCredentials | None = Depends(_security),
-    ) -> dict:
-        """Verify JWT token from Authorization header. Returns decoded payload."""
-        import jwt as pyjwt
-
-        if not config.server.jwt_secret or config.server.jwt_secret == "dev-secret-change-me":
-            # Dev mode: skip auth when no secret is configured
-            return {"sub": "dev", "role": "admin"}
-
-        if credentials is None:
-            raise HTTPException(status_code=401, detail="Missing authorization header")
-
-        try:
-            payload = pyjwt.decode(
-                credentials.credentials,
-                config.server.jwt_secret,
-                algorithms=["HS256"],
-            )
-            return payload
-        except pyjwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token expired")
-        except pyjwt.InvalidTokenError:
-            raise HTTPException(status_code=401, detail="Invalid token")
-
     # -- Auth endpoints --
     auth_router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
-
-    @auth_router.post("/login", response_model=LoginResponse)
-    async def login(req: LoginRequest, db: Database = Depends(get_db)):
-        """Authenticate and return a JWT token."""
-        import bcrypt
-        import jwt as pyjwt
-
-        user = await db.get_user_by_username(req.username)
-        if not user or not bcrypt.checkpw(req.password.encode(), user["password_hash"].encode()):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        payload = {
-            "sub": req.username,
-            "role": user.get("role", "admin"),
-            "exp": datetime.now(timezone.utc).timestamp() + 86400,
-        }
-        token = pyjwt.encode(payload, config.server.jwt_secret, algorithm="HS256")
-        return LoginResponse(token=token)
 
     @auth_router.get("/jira-session", response_model=JiraSessionStatusResponse)
     async def get_jira_session(base_url: str, db: Database = Depends(get_db)):

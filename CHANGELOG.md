@@ -20,6 +20,15 @@
   connection. Cloud: bump the OSS pin; the HANA store adds
   `count_failed_memory_audit_events`.
 
+- Removed: password sign-in. `POST /api/v1/auth/login` issued a token that no
+  route checked, so `memforge init` no longer asks for an admin password, and
+  migration 132 drops the `users` table. The recovery point taken before the
+  upgrade still holds it until that point is pruned. The Admin API serves the
+  principal the deployment resolves. `PyJWT` and `bcrypt` are no longer direct
+  dependencies. `MEMFORGE_JWT_SECRET` remains the key that signs Review
+  decision manifests. Cloud: bump the OSS pin and refresh its lock; no adapter
+  change.
+
 - A revised claim that restates one kept Memory and contradicts or replaces
   another is no longer lost. Each row of the Support and Relation combination
   table now replaces, adds or consumes a related Candidate, and a Candidate
