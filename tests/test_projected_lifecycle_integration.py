@@ -1902,6 +1902,51 @@ async def test_projected_create_persists_validity_as_dates(db: Database) -> None
 
 
 @pytest.mark.asyncio
+async def test_assertions_stated_by_one_ref_commit_as_memories_sharing_that_primary(db: Database) -> None:
+    paragraph = "Build logs are stored in object storage and are kept for 30 days."
+    projection = _projection(run_id="projection-shared-primary", body=paragraph)
+    revision = _body_revision(projection)
+    raws = [
+        RawMemory(content=content, memory_type="fact", evidence_quote=paragraph)
+        for content in ("Build logs are stored in object storage.", "Build logs are kept for 30 days.")
+    ]
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relation_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    )
+
+    stats = await engine.prepare_and_commit_projected_lifecycle(
+        projection=projection,
+        doc_id="confluence-123",
+        raw_memories=_selected(projection, raws),
+        doc_type="document",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content=revision.content,
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+
+    memories = await db.list_memories()
+    assert stats["added"] == 2
+    assert sorted(memory.content for memory in memories) == sorted(raw.content for raw in raws)
+    units = [await db.get_active_memory_support_unit_ids(memory.id) for memory in memories]
+    assert all(len(unit_ids) == 1 for unit_ids in units) and units[0] != units[1]
+    primaries = await db.db.execute_fetchall(
+        f"""SELECT observation_revision_id, range_start, range_end FROM evidence_references
+            WHERE role = 'primary' AND evidence_unit_id IN ({",".join("?" * len(units))})""",
+        tuple(unit_ids[0] for unit_ids in units),
+    )
+    # Each Memory has its own Evidence Unit, and both cite the same Fragment.
+    assert len(primaries) == 2 and len({tuple(row) for row in primaries}) == 1
+
+
+@pytest.mark.asyncio
 async def test_entity_resolution_reads_each_mention_with_its_own_memory_text(db: Database) -> None:
     projection = _projection(
         run_id="projection-entity-context",

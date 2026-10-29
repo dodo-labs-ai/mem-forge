@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Extraction splits claims by assertion, not by ref: assertions that could be
+  revised independently, such as where build logs are stored and how long they
+  are kept, become separate Memories even when one paragraph states them
+  together, and those Memories share that paragraph as their Primary. What
+  changes together stays together: a decision with its reason, a rule with its
+  condition or exception, the steps of one procedure, the items of one list or
+  schedule, a definition with its scope and the values of one table row. A
+  later revision that changes one of the assertions can then revise that Memory
+  alone. Contract: `projection-extraction-v25`; unapplied derivations under v24
+  are superseded and re-extracted. Cloud: bump the OSS pin; no HANA schema,
+  storage protocol, configuration or model route change.
+
 - Support Assessment judges a claim unsupported when text anywhere in the
   current revision replaces a value the claim states, even with a stricter one,
   or excepts or narrows the cases it covers, even when the claim's own sentence

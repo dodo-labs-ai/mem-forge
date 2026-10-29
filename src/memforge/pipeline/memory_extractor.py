@@ -61,7 +61,7 @@ Only the following application-owned Evidence Fragments may support a Memory:
 Use the supplied response schema. Within each Memory choose primary_ref, write
 final content and metadata, then select required_refs in the same response.
 
-Do not return Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs.
+Do not return Observation or Revision IDs, offsets, hashes, profile names, catalog digests, Context refs, or lifecycle actions. Split a candidate that would otherwise need multiple independently claim-bearing Primary refs. One ref that states several independently changeable assertions also yields several Memories; they may share that primary_ref.
 
 """ + MEMORY_CLAIM_EVIDENCE_RULES + DURABLE_MEMORY_QUALITY_RULES + EVIDENCE_DISPLAY_RULES + """`required_only_candidates` may be selected as Required but never as Primary. Do not originate a Memory whose central assertion is stated only by required_only_candidates; a primary_candidates reply that agrees with, answers or decides on such content states its own stance and is that Memory's Primary. Preserve other useful claims with eligible Primary evidence. Fragment refs are valid only in this catalog. Never invent or transform a ref.
 

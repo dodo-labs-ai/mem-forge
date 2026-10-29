@@ -15,7 +15,7 @@ __all__ = [
 
 # Recorded on every Source derivation and hashed into its batch identities.
 # Stored derivations with any other value are superseded, never resumed.
-PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v24"
+PROJECTION_EXTRACTION_CONTRACT_VERSION = "projection-extraction-v25"
 PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION = 11
 CONTRACT_SUPERSEDED = "CONTRACT_SUPERSEDED"
 
@@ -37,8 +37,15 @@ MEMORY_CLAIM_EVIDENCE_RULES = """Extract independently useful claims from the au
 Preserve material scope, conditions, exceptions, order and modality: proposal,
 requirement, expectation, observation or completed change. State uncertainty as
 the source states it; do not invent resolutions, attribution or effective dates.
-A connected procedure or inseparable decision/reason can stay together; separate
-independently changing conclusions. Keep known material qualifications in each
+Split by assertion, not by ref: assertions that could change independently, such
+as a storage choice and a separate retention period, are separate claims even
+when one ref states them together.
+Keep together what changes together: a decision with its reason, a rule with
+its condition or exception, the steps of one procedure, the items of one list or
+schedule, a definition with its scope, and the values of one table row. A
+qualification limits when or to what an assertion applies; a further
+requirement about the same subject is another assertion, whose Memory restates
+the subject it needs to stand alone. Keep known material qualifications in each
 claim even when a supplementary citation is omitted.
 
 Choose one eligible Primary directly supporting the central conclusion. It need
@@ -65,7 +72,7 @@ DURABLE_MEMORY_QUALITY_RULES = MEMORY_VALUE_DEFINITION + """
 Cover the independently useful knowledge throughout the authorized source. Do not sample representative claims or replace useful specifics with an overview. Similar wording is not duplication when scope, conditions, branches, outcomes or reasons differ. Exact repetitions and details that establish no lasting knowledge may be omitted.
 Distinct defensive conditions, rejections and no-op behavior are useful knowledge even when their verification outcome is unknown. Preserve the expected rule and any material uncertainty; lack of a completed observation is not a reason to omit the rule.
 
-ONE CLAIM, ONE MEMORY. Preserve each independently useful conclusion without reworded duplicates. Fold a rejected alternative into the chosen decision when it explains that same decision.
+ONE CLAIM, ONE MEMORY. A claim is one assertion that could be revised on its own, not a ref, sentence or paragraph: a ref that states several such assertions yields one Memory for each, all citing that primary_ref. Preserve each independently useful conclusion without reworded duplicates. Fold a rejected alternative into the chosen decision when it explains that same decision.
 
 NO META-MEMORIES. Preserve durable system/domain knowledge rather than commit structure, diff splitting, tool use, validation output or whether a project rule was followed.
 

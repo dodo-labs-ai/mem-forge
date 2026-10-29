@@ -72,8 +72,8 @@ def test_extraction_contract_version_names_one_extraction_prompt() -> None:
     digest = hashlib.sha256(PROJECTION_FRAGMENT_EXTRACTION_PROMPT.encode()).hexdigest()
 
     assert (PROJECTION_EXTRACTION_CONTRACT_VERSION, digest) == (
-        "projection-extraction-v24",
-        "42618632901d695e695e5cbfa9dbcfb76ae09bd63ab6915487ebd66aef8f505d",
+        "projection-extraction-v25",
+        "b283dd18198f4a03ad20f93c19bd809d120e9157c4a4e505c74183dc89cc979d",
     )
 
 
