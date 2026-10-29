@@ -36,9 +36,9 @@ one `search` call.
 **When a doc changes, memory follows.** The team changed a rule last week, and
 agents still repeat the old one. With MemForge, the next sync rechecks every
 memory built on the changed page: each is kept, replaced or retired, and the
-earlier version stays as history. Memories from different documents that
-repeat, update or contradict each other are linked, so the agent sees which
-one is current.
+earlier version stays as history. Memories that repeat, update or contradict
+each other are linked, so the agent sees which one replaced another and where
+two disagree.
 
 **Every answer shows where it came from.** A confident answer you cannot check
 is a liability. With MemForge, each memory comes with its supporting text and
@@ -56,12 +56,25 @@ Unblocked.
 
 ## Quick start
 
-> **Beta.** APIs, storage formats and plugin packaging may change. Each upgrade
-> saves a recovery point first
+> **Beta.** APIs, storage formats and plugin packaging may change. An upgrade
+> that migrates your data saves a recovery point first
 > ([Upgrading](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#upgrading)).
 
 You need Docker with Compose v2 and an API key for OpenRouter, OpenAI or
 Anthropic.
+
+**Let your agent set it up.** Paste this into Claude Code or Codex:
+
+```text
+Set up MemForge for me. Fetch this guide with curl and follow it exactly:
+https://raw.githubusercontent.com/dodo-labs-ai/mem-forge/main/docs/agent-setup.md
+```
+
+The agent starts MemForge and installs its plugin, then hands you the admin UI
+to enter your model key and connect a source, so your keys never pass through
+the agent.
+
+**Or set it up yourself:**
 
 1. **Start MemForge.**
 
@@ -77,7 +90,7 @@ Anthropic.
    the memories, and optionally an embedding model for semantic search. After
    **Save and validate**, each one shows **Ready**.
 
-3. **Connect a source.** In **Sources**, add a Notion workspace, a Confluence
+3. **Connect a source.** In **Sources**, add Notion pages, a Confluence
    space, a Jira project or a GitHub repository, and run a sync. Turn on
    **Sync automatically** to keep it current. The source shows the memories it
    made as the sync runs.
@@ -106,8 +119,7 @@ Anthropic.
    The agent answers with the memories that apply and names the source of each.
 
 The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers every model provider,
-[plugin routing](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#plugin-routing) for a hosted endpoint or
-more than one workspace, local folders, the host CLI and network details.
+local folders, the host CLI and network details.
 
 ## How it works
 
@@ -116,12 +128,12 @@ flowchart LR
   subgraph You["Your machine"]
     CC["Claude Code / Codex"]
     Plugin["MemForge plugin"]
+    API["MemForge"]
+    Extract["Write short memories,<br/>each citing its source"]
+    Recheck["Recheck when a source changes,<br/>link related memories"]
+    Store[("Local storage")]
   end
   Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local files"]
-  API["MemForge"]
-  Extract["Write short memories,<br/>each citing its source"]
-  Recheck["Recheck when a source changes,<br/>link related memories"]
-  Store[("Local storage")]
 
   CC --> Plugin
   Docs -- "sync" --> API
