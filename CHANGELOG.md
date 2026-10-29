@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A revised claim that restates one kept Memory and contradicts or replaces
+  another is no longer lost. Each row of the Support and Relation combination
+  table now replaces, adds or consumes a related Candidate, and a Candidate
+  takes its strongest treatment across old Memories: replaces, then added, then
+  consumed. Before, "alerts go to Slack and must be acknowledged within 10
+  minutes" was consumed as an equivalent of the kept Slack rule while it
+  contradicted a kept 15-minute rule, or withheld when it replaced an
+  unsupported one; it is now added, or becomes that rule's successor. The
+  Relation request states the same strict label definitions as the pair review,
+  so a Candidate that adds a material fact is a refinement, not an equivalent.
+  Contract: `claim-revision-v10-sparse-catalog`. Cloud: bump the OSS pin; no
+  HANA schema, storage protocol, configuration or model route change.
+
 - Support Assessment judges a claim unsupported when text anywhere in the
   current revision replaces a value the claim states, even with a stricter one,
   or excepts or narrows the cases it covers, even when the claim's own sentence
