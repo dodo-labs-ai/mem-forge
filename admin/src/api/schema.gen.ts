@@ -481,26 +481,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/auth/login": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Login
-         * @description Authenticate and return a JWT token.
-         */
-        post: operations["login_api_v1_auth_login_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/documents/{doc_id}/artifacts": {
         parameters: {
             query?: never;
@@ -1564,26 +1544,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/recent-changes": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Recent Changes
-         * @description Return recent source-document changes and optionally new or updated memories.
-         */
-        get: operations["recent_changes_api_v1_recent_changes_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/relation-discovery/work": {
         parameters: {
             query?: never;
@@ -2481,26 +2441,6 @@ export interface paths {
          * @description Overall system statistics: memory counts, entity counts, source counts.
          */
         get: operations["stats_api_v1_stats_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/stats/detailed": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Detailed Stats
-         * @description Detailed system stats for observability — entity resolution, cache, memory growth.
-         */
-        get: operations["detailed_stats_api_v1_stats_detailed_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4262,23 +4202,6 @@ export interface components {
             title?: string | null;
             /** Vault Id */
             vault_id?: string | null;
-        };
-        /** LoginRequest */
-        LoginRequest: {
-            /** Password */
-            password: string;
-            /** Username */
-            username: string;
-        };
-        /** LoginResponse */
-        LoginResponse: {
-            /**
-             * Expires In
-             * @default 86400
-             */
-            expires_in: number;
-            /** Token */
-            token: string;
         };
         /** MemoryCorrectionProposalRequest */
         MemoryCorrectionProposalRequest: {
@@ -8004,39 +7927,6 @@ export interface operations {
             };
         };
     };
-    login_api_v1_auth_login_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LoginRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LoginResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_document_artifact_manifest_api_v1_documents__doc_id__artifacts_get: {
         parameters: {
             query?: never;
@@ -9817,39 +9707,6 @@ export interface operations {
             };
         };
     };
-    recent_changes_api_v1_recent_changes_get: {
-        parameters: {
-            query?: {
-                since?: string | null;
-                source?: string | null;
-                include_memories?: boolean;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_relation_discovery_work_api_v1_relation_discovery_work_get: {
         parameters: {
             query: {
@@ -11337,26 +11194,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StatsResponse"];
-                };
-            };
-        };
-    };
-    detailed_stats_api_v1_stats_detailed_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
                 };
             };
         };

@@ -202,7 +202,7 @@ from memforge.memory.relation_discovery_contract import (
     rerunnable_relation_discovery_work_sql,
     resolve_relation_discovery_actor_user_id,
 )
-from memforge.memory.audit import MemoryAuditEvent
+from memforge.memory.audit import AuditFailureCount, MemoryAuditEvent
 from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentQuery,
@@ -2086,19 +2086,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_active
     ON vector_indexes(state) WHERE state = 'active';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vector_indexes_one_building
     ON vector_indexes(state) WHERE state = 'building';
-
--- ---------------------------------------------------------------
--- Users
--- ---------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    username        TEXT UNIQUE NOT NULL,
-    display_name    TEXT,
-    password_hash   TEXT NOT NULL,
-    role            TEXT NOT NULL DEFAULT 'viewer',
-    last_login      TEXT,
-    created_at      TEXT DEFAULT (datetime('now'))
-);
 
 -- ---------------------------------------------------------------
 -- Projects: per-row metadata for the relevance bucket on each memory.
@@ -5065,6 +5052,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS agent_session_receipts",
             "DROP TABLE IF EXISTS agent_hook_receipts",
         ],
+    ),
+    (
+        132,
+        "Remove the password user table",
+        # Callers reach the Admin API as the principal the deployment
+        # resolves; the service keeps no accounts or password hashes.
+        ["DROP TABLE IF EXISTS users"],
     ),
 ]
 
@@ -13916,30 +13910,51 @@ class Database:
 
         await self.db.execute("DELETE FROM memories_fts WHERE memory_id = ?", (memory_id,))
         if normalize_memory_status(row["status"]) in search_visible_statuses:
-            entity_names: list[str] = []
-            async with self.db.execute(
-                """SELECT e.canonical_name
-                   FROM memory_entities me
-                   JOIN entities e ON me.entity_id = e.id
-                   WHERE me.memory_id = ?
-                   ORDER BY e.id""",
-                (memory_id,),
-            ) as entity_cursor:
-                async for entity_row in entity_cursor:
-                    entity_names.append(entity_row[0])
-
             await self.db.execute(
                 "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, ?)",
-                (memory_id, row["content"], " ".join(entity_names)),
+                (memory_id, row["content"], await self._memory_entities_text(memory_id)),
             )
         return True
 
+    async def _memory_entities_text(self, memory_id: str) -> str:
+        """The FTS entities text of one Memory: its entities' canonical names in entity order."""
+        async with self.db.execute(
+            """SELECT e.canonical_name
+               FROM memory_entities me
+               JOIN entities e ON me.entity_id = e.id
+               WHERE me.memory_id = ?
+               ORDER BY e.id""",
+            (memory_id,),
+        ) as cursor:
+            return " ".join([row[0] async for row in cursor])
+
+    async def memory_search_text(self, memory_id: str) -> dict[str, str] | None:
+        """The content and entities text one Memory's FTS row should hold, or ``None`` without the Memory."""
+        async with self.db.execute("SELECT content FROM memories WHERE id = ?", (memory_id,)) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return {"content": row[0], "entities_text": await self._memory_entities_text(memory_id)}
+
+    async def list_memory_fts_entries(self) -> list[tuple[str, str, str]]:
+        """Every FTS row as (memory_id, content, entities_text), duplicates included."""
+        async with self.db.execute("SELECT memory_id, content, entities_text FROM memories_fts") as cursor:
+            return [(row[0], row[1], row[2]) async for row in cursor]
+
+    async def list_memory_ids(self) -> list[str]:
+        """Every persisted Memory id in id order, whatever its lifecycle status."""
+        return [str(row["id"]) for row in await self.db.execute_fetchall("SELECT id FROM memories ORDER BY id")]
+
+    async def list_memory_statuses(self) -> dict[str, str]:
+        """The lifecycle status of every persisted Memory, by id."""
+        return {
+            str(row["id"]): str(row["status"])
+            for row in await self.db.execute_fetchall("SELECT id, status FROM memories")
+        }
+
     async def _rebuild_all_memory_fts_unlocked(self) -> int:
         search_visible_statuses = set(allowed_search_statuses())
-        memory_ids = [
-            str(row["id"])
-            for row in await self.db.execute_fetchall("SELECT id FROM memories ORDER BY id")
-        ]
+        memory_ids = await self.list_memory_ids()
         for memory_id in memory_ids:
             await self._rebuild_memory_fts_unlocked(
                 memory_id,
@@ -14741,76 +14756,6 @@ class Database:
                 return memory.id
             current = memory.superseded_by
         return None
-
-    async def promote_quarantined_challenger(
-        self,
-        *,
-        incumbent_id: str,
-        challenger: Memory,
-        replacement_reason: str | None = None,
-        replacement_kind: ReplacementKind,
-    ) -> None:
-        """Promote a pending_review challenger to active and supersede the incumbent.
-
-        The challenger row already exists in SQLite (it was inserted as part of
-        reconciliation). This rewires lifecycle metadata and the FTS5 index so
-        default retrieval picks up the challenger and drops the incumbent.
-
-        ``entities_text`` is derived from ``memory_entities`` so the rebuilt
-        FTS row keeps the entity coverage that was wired up at extraction
-        time, even when the caller passed a Memory loaded via ``get_memory``
-        (which leaves ``entity_refs`` empty by design).
-        """
-        replacement_kind = _validate_replacement_kind(replacement_kind)
-        async with self._write_transaction():
-            now = _now_iso()
-            await self.db.execute(
-                """UPDATE memories SET
-                    status = 'active', retirement_reason = NULL, retired_at = NULL,
-                    updated_at = ?
-                   WHERE id = ?""",
-                (now, challenger.id),
-            )
-            await self.db.execute(
-                """UPDATE memories SET
-                    status = 'superseded', superseded_by = ?, superseded_at = ?,
-                    valid_until = ?, replacement_reason = ?, replacement_kind = ?, updated_at = ?
-                   WHERE id = ?""",
-                (
-                    challenger.id,
-                    now,
-                    _today_iso(),
-                    replacement_reason,
-                    replacement_kind,
-                    now,
-                    incumbent_id,
-                ),
-            )
-            await self.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?",
-                (incumbent_id,),
-            )
-            await self.db.execute(
-                "DELETE FROM memories_fts WHERE memory_id = ?",
-                (challenger.id,),
-            )
-            entity_names: list[str] = []
-            async with self.db.execute(
-                """SELECT e.canonical_name
-                   FROM memory_entities me
-                   JOIN entities e ON me.entity_id = e.id
-                   WHERE me.memory_id = ?
-                   ORDER BY e.id""",
-                (challenger.id,),
-            ) as cursor:
-                async for row in cursor:
-                    entity_names.append(row[0])
-            entities_text = " ".join(entity_names)
-            await self.db.execute(
-                "INSERT INTO memories_fts (memory_id, content, entities_text) VALUES (?, ?, ?)",
-                (challenger.id, challenger.content, entities_text),
-            )
-            await self.db.commit()
 
     async def list_memories(
         self,
@@ -20552,6 +20497,32 @@ class Database:
                 rows.append(self._row_to_audit_event(row))
         return rows
 
+    async def count_failed_memory_audit_events(
+        self,
+        event_types: Sequence[str],
+        *,
+        since: str,
+    ) -> list[AuditFailureCount]:
+        """Count the failed events of each given type at or after ``since``, in event type order."""
+        if not event_types:
+            return []
+        placeholders = ", ".join("?" for _ in event_types)
+        async with self.db.execute(
+            f"""SELECT event_type, COUNT(*), MAX(occurred_at)
+                FROM memory_audit_events
+                WHERE event_type IN ({placeholders})
+                  AND occurred_at >= ?
+                  AND (status = 'failed' OR error IS NOT NULL)
+                GROUP BY event_type
+                ORDER BY event_type""",
+            (*event_types, since),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            AuditFailureCount(event_type=str(row[0]), count=int(row[1]), last_seen_at=row[2])
+            for row in rows
+        ]
+
     async def redact_memory_audit_payloads(self, memory_id: str) -> None:
         """Remove sensitive payload fields for a purged memory while preserving event metadata."""
         async with self._write_lock:
@@ -23071,51 +23042,6 @@ class Database:
                 "DELETE FROM vector_indexes WHERE id = ? AND state IN ('retired', 'failed')",
                 (index_id,),
             )
-            await self.db.commit()
-
-    # ==================================================================
-    # Users
-    # ==================================================================
-
-    async def create_user(
-        self,
-        username: str,
-        display_name: str | None,
-        password_hash: str,
-        role: str = "viewer",
-    ) -> int:
-        async with self._write_lock:
-            cursor = await self.db.execute(
-                """INSERT INTO users (username, display_name, password_hash, role)
-                   VALUES (?, ?, ?, ?)""",
-                (username, display_name, password_hash, role),
-            )
-            await self.db.commit()
-            return cursor.lastrowid or 0
-
-    async def get_user_by_username(self, username: str) -> dict | None:
-        async with self.db.execute("SELECT * FROM users WHERE username = ?", (username,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["created_at"] = _parse_dt(d.get("created_at"))
-            d["last_login"] = _parse_dt(d.get("last_login"))
-            return d
-
-    async def list_users(self) -> list[dict]:
-        results: list[dict] = []
-        async with self.db.execute("SELECT * FROM users ORDER BY id") as cursor:
-            async for row in cursor:
-                d = dict(row)
-                d["created_at"] = _parse_dt(d.get("created_at"))
-                d["last_login"] = _parse_dt(d.get("last_login"))
-                results.append(d)
-        return results
-
-    async def delete_user(self, user_id: int) -> None:
-        async with self._write_lock:
-            await self.db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             await self.db.commit()
 
     # ==================================================================

@@ -625,7 +625,7 @@ async def check_runtime_health(db: "Database", config: AppConfig) -> RuntimeHeal
 
     audit_failures: RuntimeHealthComponent | None = None
     try:
-        audit_failures = await _recent_audit_failure_health(db)
+        audit_failures = await recent_audit_failure_health(db)
     except Exception as exc:
         audit_failures = RuntimeHealthComponent(status="warning", detail=str(exc))
 
@@ -688,38 +688,26 @@ async def failed_item_health(store: Any) -> RuntimeHealthComponent:
     )
 
 
-async def _recent_audit_failure_health(db: "Database") -> RuntimeHealthComponent:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=AUDIT_HEALTH_WINDOW_HOURS)
-    since = cutoff.isoformat()
-    placeholders = ", ".join("?" for _ in AUDIT_HEALTH_FAILURE_EVENTS)
-    params: list[Any] = [*AUDIT_HEALTH_FAILURE_EVENTS, since]
-    async with db.db.execute(
-        f"""SELECT event_type, COUNT(*), MAX(occurred_at)
-            FROM memory_audit_events
-            WHERE event_type IN ({placeholders})
-              AND occurred_at >= ?
-              AND (status = 'failed' OR error IS NOT NULL)
-            GROUP BY event_type
-            ORDER BY event_type""",
-        params,
-    ) as cursor:
-        rows = await cursor.fetchall()
+async def recent_audit_failure_health(store: Any) -> RuntimeHealthComponent:
+    """Count the failed lifecycle and index audit events of the last day; any is a warning."""
 
-    counts_by_event_type = {str(row[0]): int(row[1]) for row in rows}
+    since = (datetime.now(timezone.utc) - timedelta(hours=AUDIT_HEALTH_WINDOW_HOURS)).isoformat()
+    counts = await store.count_failed_memory_audit_events(AUDIT_HEALTH_FAILURE_EVENTS, since=since)
+    counts_by_event_type = {count.event_type: count.count for count in counts}
     payload = {
         "window_hours": AUDIT_HEALTH_WINDOW_HOURS,
         "since": since,
         "counts_by_event_type": counts_by_event_type,
         "total": sum(counts_by_event_type.values()),
-        "last_seen_at": max((row[2] for row in rows if row[2]), default=None),
+        "last_seen_at": max((count.last_seen_at for count in counts if count.last_seen_at), default=None),
     }
-    if not rows:
+    if not counts:
         return RuntimeHealthComponent(
             status="ok",
             detail=f"No audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h",
             payload=payload,
         )
-    summary = ", ".join(f"{row[0]}={row[1]}" for row in rows)
+    summary = ", ".join(f"{count.event_type}={count.count}" for count in counts)
     return RuntimeHealthComponent(
         status="warning",
         detail=f"Recent audit failures in the last {AUDIT_HEALTH_WINDOW_HOURS}h: {summary}",

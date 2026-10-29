@@ -914,17 +914,12 @@ async def _refused_writes(db: Database) -> dict:
         "status": lambda: db.update_memory_status("mem-held", "retired", reason="obsolete"),
         "purge": lambda: db.purge_memory("mem-1"),
         "snapshot": lambda: db.restore_memory_snapshot(held, search_visible_statuses={"active"}),
-        "promotion": lambda: db.promote_quarantined_challenger(
-            incumbent_id="mem-held",
-            challenger=held,
-            replacement_kind="revision",
-        ),
         "expiry": db.retire_expired_memories,
         "support": lambda: db.refresh_memory_support_state("mem-held"),
     }
 
 
-@pytest.mark.parametrize("write", ["content", "status", "purge", "snapshot", "promotion", "expiry", "support"])
+@pytest.mark.parametrize("write", ["content", "status", "purge", "snapshot", "expiry", "support"])
 async def test_a_refused_memory_write_leaves_nothing_behind_on_its_connection(
     db, config, settings, models, write
 ) -> None:

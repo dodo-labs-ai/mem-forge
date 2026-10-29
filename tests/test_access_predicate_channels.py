@@ -333,19 +333,27 @@ async def test_agent_hook_uses_personalized_predicate(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_agent_hook_recent_changes_excludes_other_users_private(db):
-    # build_agent_hook_context also returns _recent_memory_changes when memory
-    # context is enabled. It currently reads memories directly with only
-    # status='active' and an optional repo filter, which would leak U2's private
-    # rows into U1's hook context. The recent-changes path must apply the same
-    # access predicate as _search_memories. The hook receives the principal
-    # explicitly: a non-HTTP caller cannot fall back to body-derived identity.
+    # The hook's recent changes list through the SearchEngine under the same
+    # PERSONALIZED scope as its search, so U2's private rows never reach U1.
+    # The hook receives the principal explicitly: a non-HTTP caller cannot
+    # fall back to body-derived identity.
     from memforge.agent_hooks import (
         AgentHookContextRequest,
         build_agent_hook_context,
     )
+    from memforge.config import RetrievalConfig
+    from memforge.retrieval.search import SearchEngine
 
     await db.insert_memory(_mem("rc-shared", "team change", visibility=WORKSPACE))
     await db.insert_memory(_mem("rc-priv", "private change", visibility=PRIVATE, owner="u-2"))
+    adapters = build_sqlite_adapters(db, _Coll())
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embedding=unconfigured_embedding(),
+        config=RetrievalConfig(),
+    )
     request = AgentHookContextRequest(
         client="codex",
         hook="SessionStart",
@@ -355,7 +363,7 @@ async def test_agent_hook_recent_changes_excludes_other_users_private(db):
         include_recent_changes=True,
         max_memories=5,
     )
-    ctx = await build_agent_hook_context(db, request, principal_user_id="u-1")
+    ctx = await build_agent_hook_context(db, request, principal_user_id="u-1", search_engine=engine)
     ids = {row["id"] for row in ctx.get("recent_changes", [])}
     assert "rc-priv" not in ids
     assert "rc-shared" in ids

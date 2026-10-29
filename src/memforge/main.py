@@ -1590,7 +1590,7 @@ def _install_interactive_dependencies(workspace: Path) -> None:
 @cli.command()
 @click.pass_context
 def init(ctx):
-    """Create directories, initialise the database, and create an admin user."""
+    """Create directories and initialise the database."""
     config: AppConfig = ctx.obj["config"]
     base = config.base_dir
 
@@ -1605,33 +1605,11 @@ def init(ctx):
         d.mkdir(parents=True, exist_ok=True)
         console.print(f"  [dim]Created {d}[/]")
 
-    async def _seed():
-        import bcrypt
-
+    async def _initialise_database():
         db = await _get_db(config)
-
-        # Check for existing admin user
-        existing = await db.get_user_by_username("admin")
-        if existing:
-            console.print("Admin user already exists.")
-        else:
-            password = click.prompt(
-                "Set admin password",
-                hide_input=True,
-                confirmation_prompt=True,
-            )
-            pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-            await db.create_user(
-                username="admin",
-                display_name="Admin",
-                password_hash=pw_hash,
-                role="admin",
-            )
-            console.print("[green]Created admin user.[/]")
-
         await db.close()
 
-    asyncio.run(_seed())
+    asyncio.run(_initialise_database())
 
     console.print(f"\n[bold green]Initialised MemForge at {base}[/]")
     console.print("\nNext steps:")

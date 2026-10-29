@@ -11,6 +11,7 @@ from memforge.memory.index_payloads import (
     memory_embedding_text,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
+from memforge.models import Memory
 from memforge.source_types import registered_source_types
 
 __all__ = ["MemoryIndexHealthChecker", "MemoryIndexHealthIssue", "MemoryIndexHealthReport"]
@@ -45,7 +46,7 @@ class MemoryIndexHealthChecker:
         self.memory_collection = memory_collection
 
     async def check(self) -> MemoryIndexHealthReport:
-        statuses = await self._memory_statuses()
+        statuses = await self.db.list_memory_statuses()
         try:
             fts_records, duplicate_fts_ids = await self._fts_records()
             fts_ids = set(fts_records)
@@ -114,7 +115,7 @@ class MemoryIndexHealthChecker:
 
             fts_record = fts_records.get(memory_id)
             if search_visible and fts_record:
-                expected = await self._memory_search_text(memory_id)
+                expected = await self.db.memory_search_text(memory_id)
                 if expected and fts_record.get("content") != expected["content"]:
                     issues.append(MemoryIndexHealthIssue(
                         kind="fts_content_mismatch",
@@ -146,7 +147,8 @@ class MemoryIndexHealthChecker:
                     detail=f"SQLite status {status!r} differs from Chroma metadata {metadata_status!r}",
                 ))
             metadata_content_hash = chroma_records.get(memory_id, {}).get("content_hash")
-            memory_content_hash = await self._memory_content_hash(memory_id)
+            memory = await self.db.get_memory(memory_id)
+            memory_content_hash = memory.content_hash if memory else None
             if search_visible and memory_content_hash and not metadata_content_hash:
                 issues.append(MemoryIndexHealthIssue(
                     kind="chroma_content_hash_missing",
@@ -166,7 +168,7 @@ class MemoryIndexHealthChecker:
                     detail="SQLite content hash differs from Chroma metadata",
                 ))
             metadata_embedding_text_hash = chroma_records.get(memory_id, {}).get("embedding_text_hash")
-            memory_embedding_text_hash = await self._memory_embedding_text_hash(memory_id)
+            memory_embedding_text_hash = await self._memory_embedding_text_hash(memory)
             if search_visible and memory_embedding_text_hash and not metadata_embedding_text_hash:
                 issues.append(MemoryIndexHealthIssue(
                     kind="chroma_embedding_text_hash_missing",
@@ -231,65 +233,19 @@ class MemoryIndexHealthChecker:
 
         return MemoryIndexHealthReport(issues=issues)
 
-    async def _memory_statuses(self) -> dict[str, str]:
-        statuses: dict[str, str] = {}
-        async with self.db.db.execute("SELECT id, status FROM memories") as cursor:
-            async for row in cursor:
-                statuses[row[0]] = row[1]
-        return statuses
-
     async def _fts_records(self) -> tuple[dict[str, dict[str, str]], set[str]]:
         records: dict[str, dict[str, str]] = {}
         duplicate_ids: set[str] = set()
-        async with self.db.db.execute(
-            "SELECT memory_id, content, entities_text FROM memories_fts"
-        ) as cursor:
-            async for row in cursor:
-                if row[0] in records:
-                    duplicate_ids.add(row[0])
-                records[row[0]] = {
-                    "content": row[1],
-                    "entities_text": row[2],
-                }
+        for memory_id, content, entities_text in await self.db.list_memory_fts_entries():
+            if memory_id in records:
+                duplicate_ids.add(memory_id)
+            records[memory_id] = {"content": content, "entities_text": entities_text}
         return records, duplicate_ids
 
-    async def _memory_content_hash(self, memory_id: str) -> str | None:
-        async with self.db.db.execute(
-            "SELECT content_hash FROM memories WHERE id = ?",
-            (memory_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
-
-    async def _memory_search_text(self, memory_id: str) -> dict[str, str] | None:
-        async with self.db.db.execute(
-            "SELECT content FROM memories WHERE id = ?",
-            (memory_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if not row:
-            return None
-        entity_names: list[str] = []
-        async with self.db.db.execute(
-            """SELECT e.canonical_name
-               FROM memory_entities me
-               JOIN entities e ON me.entity_id = e.id
-               WHERE me.memory_id = ?
-               ORDER BY e.id""",
-            (memory_id,),
-        ) as cursor:
-            async for entity_row in cursor:
-                entity_names.append(entity_row[0])
-        return {
-            "content": row[0],
-            "entities_text": " ".join(entity_names),
-        }
-
-    async def _memory_embedding_text_hash(self, memory_id: str) -> str | None:
-        memory = await self.db.get_memory(memory_id)
+    async def _memory_embedding_text_hash(self, memory: Memory | None) -> str | None:
         if memory is None:
             return None
-        entity_names = await self.db.get_memory_entity_names(memory_id)
+        entity_names = await self.db.get_memory_entity_names(memory.id)
         return embedding_text_hash(memory_embedding_text(memory, entity_names))
 
     def _collection_records(

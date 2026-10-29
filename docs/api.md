@@ -21,7 +21,6 @@ Default base URL: `http://127.0.0.1:8765`.
 | Memories | `GET /api/memories` | Search and filter memories |
 | Memories | `POST /api/memories/search` | Service-owned ranked memory search for agent MCP proxies |
 | Memories | `GET /api/memories/{memory_id}` | Inspect memory detail and provenance |
-| Recent changes | `GET /api/recent-changes` | List changed source documents and optionally changed memories |
 | Source Units | `GET /api/source-units/{source_unit_id}/artifacts` | List the artifacts one Source stored for its Unit's current revision |
 | Source Units | `GET /api/source-units/{source_unit_id}/artifacts/{kind}` | Fetch an explicit artifact such as `normalized_markdown`, `raw_source`, or `pdf` |
 | Source Units | `GET /api/source-units/{source_unit_id}/content` | Fetch the Unit's normalized source content from service storage |

@@ -4282,42 +4282,6 @@
         "title": "LocalSourcePackageRequest",
         "type": "object"
       },
-      "LoginRequest": {
-        "properties": {
-          "password": {
-            "title": "Password",
-            "type": "string"
-          },
-          "username": {
-            "title": "Username",
-            "type": "string"
-          }
-        },
-        "required": [
-          "username",
-          "password"
-        ],
-        "title": "LoginRequest",
-        "type": "object"
-      },
-      "LoginResponse": {
-        "properties": {
-          "expires_in": {
-            "default": 86400,
-            "title": "Expires In",
-            "type": "integer"
-          },
-          "token": {
-            "title": "Token",
-            "type": "string"
-          }
-        },
-        "required": [
-          "token"
-        ],
-        "title": "LoginResponse",
-        "type": "object"
-      },
       "MemoryCorrectionProposalRequest": {
         "additionalProperties": false,
         "properties": {
@@ -13121,48 +13085,6 @@
         ]
       }
     },
-    "/api/v1/auth/login": {
-      "post": {
-        "description": "Authenticate and return a JWT token.",
-        "operationId": "login_api_v1_auth_login_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LoginRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoginResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Login",
-        "tags": [
-          "auth"
-        ]
-      }
-    },
     "/api/v1/documents/{doc_id}/artifacts": {
       "get": {
         "description": "List service-readable artifacts of the newest readable copy of a Document that still has any.",
@@ -15848,80 +15770,6 @@
         ]
       }
     },
-    "/api/v1/recent-changes": {
-      "get": {
-        "description": "Return recent source-document changes and optionally new or updated memories.",
-        "operationId": "recent_changes_api_v1_recent_changes_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "since",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Since"
-            }
-          },
-          {
-            "in": "query",
-            "name": "source",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Source"
-            }
-          },
-          {
-            "in": "query",
-            "name": "include_memories",
-            "required": false,
-            "schema": {
-              "default": true,
-              "title": "Include Memories",
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Recent Changes",
-        "tags": [
-          "recent-changes"
-        ]
-      }
-    },
     "/api/v1/relation-discovery/work": {
       "get": {
         "description": "List discovery work by state with its last error; exhausted work has no retry left.",
@@ -18208,23 +18056,6 @@
         "tags": [
           "health"
         ]
-      }
-    },
-    "/api/v1/stats/detailed": {
-      "get": {
-        "description": "Detailed system stats for observability \u2014 entity resolution, cache, memory growth.",
-        "operationId": "detailed_stats_api_v1_stats_detailed_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Detailed Stats"
       }
     },
     "/api/v1/workspaces": {

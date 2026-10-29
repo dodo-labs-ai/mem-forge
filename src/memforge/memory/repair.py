@@ -69,14 +69,7 @@ class MemoryIndexRepairer:
         return result
 
     async def _memories(self) -> list[Memory]:
-        rows: list[Memory] = []
-        async with self.db.db.execute("SELECT id FROM memories ORDER BY id") as cursor:
-            ids = [row["id"] async for row in cursor]
-        for memory_id in ids:
-            memory = await self.db.get_memory(memory_id)
-            if memory:
-                rows.append(memory)
-        return rows
+        return await self.db.list_memories_by_ids(await self.db.list_memory_ids())
 
     async def _rebuild_memory_fts(self, memories: list[Memory]) -> int:
         rebuilt = 0
