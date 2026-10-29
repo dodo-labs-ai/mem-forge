@@ -68,7 +68,7 @@ from memforge.source_artifacts import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["JiraGene"]
+__all__ = ["JiraGene", "jira_auth_mode"]
 
 DEFAULT_ISSUE_TYPES = ["Epic", "Story", "Bug", "Task"]
 JIRA_AUTH_MODE_COOKIE = "browser_cookie"
@@ -307,11 +307,23 @@ def _request_interval_seconds(config: dict) -> float:
         return DEFAULT_REQUEST_INTERVAL_MS / 1000.0
 
 
+def jira_auth_mode(config: Mapping[str, Any]) -> str:
+    """The configured authentication method, else the one a new Source of its sync location uses.
+
+    A new Source authenticates with a personal access token. Local sync offers
+    only a browser session, so a local Source without a method uses that.
+    """
+
+    configured = str(config.get("auth_mode") or "").strip().lower()
+    if configured:
+        return configured
+    if str(config.get("sync_mode") or "").strip().lower() == "local_agent":
+        return JIRA_AUTH_MODE_COOKIE
+    return JIRA_AUTH_MODE_PAT
+
+
 def _auth_mode(config: dict) -> str:
-    configured = config.get("auth_mode")
-    if configured is None and (config.get("pat") or config.get("pat_encrypted")):
-        return JIRA_AUTH_MODE_PAT
-    mode = str(configured or JIRA_AUTH_MODE_COOKIE).strip().lower()
+    mode = jira_auth_mode(config)
     if mode not in {JIRA_AUTH_MODE_COOKIE, JIRA_AUTH_MODE_PAT}:
         raise ValueError("Jira Authentication Method must be Browser session or Personal access token")
     return mode
@@ -471,7 +483,7 @@ class JiraGene(DocumentGene):
             display_name="Jira",
             description="Tickets, decisions, and work items",
             default_sync_interval_minutes=360,  # 6 hours
-            auth_method="browser_cookie",
+            auth_method="pat",
             data_shape="ticket",
             execution_kinds=("server", "local_agent"),
         )
@@ -519,21 +531,21 @@ class JiraGene(DocumentGene):
                     key="auth_mode", label="Authentication Method",
                     field_type=ConfigFieldType.SELECT, required=True,
                     choices=[
-                        ConfigOption(JIRA_AUTH_MODE_COOKIE, "Browser session"),
                         ConfigOption(
                             JIRA_AUTH_MODE_PAT,
                             "Personal access token",
                             visible_when=(ConfigCondition("sync_mode", ("cloud",)),),
                         ),
+                        ConfigOption(JIRA_AUTH_MODE_COOKIE, "Browser session"),
                     ],
-                    default=JIRA_AUTH_MODE_COOKIE,
+                    default=JIRA_AUTH_MODE_PAT,
                     help_text=(
-                        "Browser session uses the local CLI adapter "
-                        "(`memforge adapter auth jira refresh --base-url ...`) to "
-                        "capture cookies from your signed-in browser. Use this for "
-                        "Enterprise Jira where REST API quota is not available. PAT "
-                        "mode is only for Jira deployments that grant the user REST API "
-                        "quota."
+                        "A personal access token, from Jira Data Center or Server, is sent "
+                        "as a bearer token and needs no local daemon. Browser session is "
+                        "for deployments where a personal access token is not available: "
+                        "the local CLI adapter (`memforge adapter auth jira refresh "
+                        "--base-url ...`) captures cookies from your signed-in browser. "
+                        "Local sync always uses a browser session."
                     ),
                     group="connection", order=2,
                 ),

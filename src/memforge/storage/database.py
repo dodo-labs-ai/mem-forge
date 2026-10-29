@@ -5060,6 +5060,13 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # resolves; the service keeps no accounts or password hashes.
         ["DROP TABLE IF EXISTS users"],
     ),
+    (
+        133,
+        "Name each Jira Source's authentication method",
+        # A Jira configuration names its authentication method; a new Source
+        # defaults to a personal access token.
+        [],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5396,6 +5403,21 @@ class Database:
             if bounded is not None:
                 await self.db.execute("UPDATE sources SET config = ? WHERE id = ?", (json.dumps(bounded), row["id"]))
 
+    async def _name_jira_auth_modes_unlocked(self) -> None:
+        """Write into each stored Jira configuration the authentication method it uses."""
+
+        from memforge.local_agent.source_contract import jira_config_with_auth_mode
+
+        rows = await self.db.execute_fetchall("SELECT id, config FROM sources WHERE type = 'jira'")
+        for row in rows:
+            try:
+                config = json.loads(row["config"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Jira source {row['id']} has invalid JSON config") from exc
+            named = jira_config_with_auth_mode(config) if isinstance(config, dict) else None
+            if named is not None:
+                await self.db.execute("UPDATE sources SET config = ? WHERE id = ?", (json.dumps(named), row["id"]))
+
     async def _retire_agent_session_sources_unlocked(self) -> None:
         """Retire every agent-session Source that is not retired, as Source deletion does.
 
@@ -5632,6 +5654,8 @@ class Database:
             await self._bound_teams_initial_history_unlocked()
         if version == 131:
             await self._retire_agent_session_sources_unlocked()
+        if version == 133:
+            await self._name_jira_auth_modes_unlocked()
         for sql in statements:
             try:
                 await self.db.execute(sql)

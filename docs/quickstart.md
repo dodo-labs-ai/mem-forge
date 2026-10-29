@@ -488,6 +488,20 @@ Confluence PDF artifacts are rendered with WeasyPrint. When running the Python
 service directly on macOS, install WeasyPrint's native text-rendering libraries
 with `brew install pango`. The Docker image already includes them.
 
+### Jira
+
+A Jira source authenticates with a personal access token by default. In Jira
+Data Center or Server, create one under your profile's **Personal Access
+Tokens**, and paste it into **Personal Access Token**; MemForge sends it as a
+bearer token, so the source works from the Docker quickstart with no local
+daemon.
+
+Choose **Browser session** instead for deployments where a personal access
+token is not available. MemForge then reads Jira with your signed-in browser's
+session, which the local daemon captures with
+`memforge adapter auth jira refresh --base-url <Jira URL>`. **Local sync**,
+which reads Jira from the daemon's machine, always uses a browser session.
+
 ### Notion
 
 The service reads Notion with an internal connection token, so a Notion source

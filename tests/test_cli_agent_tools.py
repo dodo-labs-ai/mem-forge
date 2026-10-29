@@ -3295,3 +3295,28 @@ def test_adapter_jira_watch_command_is_registered():
     result = CliRunner().invoke(cli, ["adapter", "auth", "jira", "watch", "--help"])
     assert result.exit_code == 0, result.output
     assert "--interval-seconds" in result.output
+
+
+@pytest.mark.parametrize(
+    ("payload", "refused"),
+    [
+        ({"sync_mode": "local_agent"}, False),
+        ({"sync_mode": "local_agent", "auth_mode": "browser_cookie"}, False),
+        ({"sync_mode": "local_agent", "auth_mode": "pat"}, True),
+    ],
+)
+def test_local_jira_sync_reads_jira_with_the_browser_session(payload, refused):
+    job_payload = {"base_url": "https://jira.example.test/", "projects": ["PAY"], "pat": "kept-out", **payload}
+
+    if refused:
+        with pytest.raises(click.ClickException, match="requires browser-session authentication"):
+            main._jira_cloud_config_from_job_payload(job_payload)
+        return
+    config = main._jira_cloud_config_from_job_payload(job_payload)
+
+    assert (config["auth_mode"], config["sync_mode"], config["base_url"]) == (
+        "browser_cookie",
+        "cloud",
+        "https://jira.example.test",
+    )
+    assert "pat" not in config

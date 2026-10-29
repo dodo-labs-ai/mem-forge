@@ -85,7 +85,7 @@ def test_jira_schema_hides_runtime_transport_fields_from_ui():
     fields = {field.key: field for field in JiraGene.config_schema().fields}
 
     assert fields["auth_mode"].required is True
-    assert fields["auth_mode"].default == "browser_cookie"
+    assert fields["auth_mode"].default == "pat"
     assert "jira_cookie" not in fields
     assert fields["pat"].required is True
     assert fields["pat"].visible_when == (ConfigCondition("auth_mode", ("pat",)),)

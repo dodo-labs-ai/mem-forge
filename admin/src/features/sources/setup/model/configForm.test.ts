@@ -63,16 +63,43 @@ describe("config form", () => {
     }
   });
 
+  test("a new Jira source defaults to a personal access token", () => {
+    const schema = sourceTypeSchema("jira");
+    const state: ConfigFormState = { values: defaultValues(schema) };
+
+    expect(effectiveValue(field(schema, "auth_mode"), state)).toBe("pat");
+    expect(visibleKeys(schema, state)).toContain("pat");
+    expect(missingRequired(schema, state).map((candidate) => candidate.key)).toContain("pat");
+  });
+
   test("Jira hides the PAT option for local sync and resets auth to browser session", () => {
     const schema = sourceTypeSchema("jira");
     let state: ConfigFormState = { values: { sync_mode: "cloud", auth_mode: "pat" } };
-    expect(visibleChoices(schema, field(schema, "auth_mode"), state).map((choice) => choice.value)).toEqual(["browser_cookie", "pat"]);
+    expect(visibleChoices(schema, field(schema, "auth_mode"), state).map((choice) => choice.value)).toEqual(["pat", "browser_cookie"]);
     expect(visibleKeys(schema, state)).toContain("pat");
 
     state = change(schema, state, "sync_mode", "local_agent");
 
     expect(visibleChoices(schema, field(schema, "auth_mode"), state).map((choice) => choice.value)).toEqual(["browser_cookie"]);
     expect(state.values.auth_mode).toBe("browser_cookie");
+    expect(visibleKeys(schema, state)).not.toContain("pat");
+  });
+
+  test("Jira local sync moves the default PAT to browser session", () => {
+    const schema = sourceTypeSchema("jira");
+    const state = change(schema, { values: defaultValues(schema) }, "sync_mode", "local_agent");
+
+    expect(state.values.auth_mode).toBe("browser_cookie");
+    expect(visibleKeys(schema, state)).not.toContain("pat");
+  });
+
+  test("a stored Jira browser session keeps its method", () => {
+    const schema = sourceTypeSchema("jira");
+    const stored = { base_url: "https://jira.example.com", sync_mode: "cloud", auth_mode: "browser_cookie", projects: ["PAY"] };
+    const state: ConfigFormState = { values: defaultValues(schema, stored), stored };
+
+    expect(effectiveValue(field(schema, "auth_mode"), state)).toBe("browser_cookie");
+    expect(serializeConfig(schema, state.values).auth_mode).toBe("browser_cookie");
     expect(visibleKeys(schema, state)).not.toContain("pat");
   });
 

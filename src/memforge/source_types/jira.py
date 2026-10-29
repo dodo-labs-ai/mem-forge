@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import jira as adapter
-from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_has_value, secret_replaced
+from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_replaced
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
 _SOURCE_OWNED_COOKIE_FIELDS = (
@@ -35,45 +35,30 @@ def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
     return str(config.get("sync_mode") or "").strip().lower() == "local_agent"
 
 
-def jira_auth_mode(config: Mapping[str, Any], existing_config: Mapping[str, Any] | None = None) -> str:
-    """The configured authentication method; a stored token without one means a token."""
-
-    existing_config = existing_config or {}
-    configured_auth_mode = config.get("auth_mode") or existing_config.get("auth_mode")
-    if configured_auth_mode is None and secret_has_value("pat", config, existing_config):
-        return "pat"
-    return str(configured_auth_mode or "browser_cookie").strip().lower()
-
-
 def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Carry the immutable ``sync_mode`` over, and name the authentication method a token implies.
+    """Carry the immutable ``sync_mode`` and the authentication method over, and name the method.
 
-    A blank ``auth_mode`` becomes ``pat`` when a token is supplied or already
-    stored; otherwise it stays blank and reads as the declared default,
-    ``browser_cookie``.
+    A blank ``sync_mode`` or ``auth_mode`` keeps the stored one. A new Source
+    without ``auth_mode`` gets the method its sync location uses
+    (:func:`~memforge.genes.jira_gene.jira_auth_mode`), so every stored
+    configuration names its method.
     """
 
+    from memforge.genes.jira_gene import jira_auth_mode
+
     existing_config = existing_config or {}
-    if not str(config.get("sync_mode") or "").strip():
-        sync_mode = str(existing_config.get("sync_mode") or "").strip()
-        if sync_mode:
-            config["sync_mode"] = sync_mode
-    if not str(config.get("auth_mode") or "").strip() and secret_has_value("pat", config, existing_config):
-        config["auth_mode"] = "pat"
+    for key in ("sync_mode", "auth_mode"):
+        if not str(config.get(key) or "").strip():
+            stored = str(existing_config.get(key) or "").strip()
+            if stored:
+                config[key] = stored
+    config["auth_mode"] = jira_auth_mode(config)
     return config
 
 
 def _validate_config(config: dict[str, Any], existing_config: Mapping[str, Any]) -> None:
     if any(key in config for key in ("jira_cookie", "jira_cookie_encrypted")):
         raise ValueError("Jira browser sessions are managed by shared auth sessions, not source config")
-
-
-def _public_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Name the effective authentication method of a Source stored without one."""
-
-    if not str(config.get("auth_mode") or "").strip():
-        config["auth_mode"] = "pat" if config.get("pat_configured") else "browser_cookie"
-    return config
 
 
 def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -91,10 +76,12 @@ def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
 
 
 def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
+    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
+
     # Browser sessions belong to the shared auth sessions, never to one Source.
     for key in _SOURCE_OWNED_COOKIE_FIELDS:
         config.pop(key, None)
-    if jira_auth_mode(config) == "browser_cookie":
+    if jira_auth_mode(config) == JIRA_AUTH_MODE_COOKIE:
         for key in _PAT_FIELDS:
             config.pop(key, None)
     if _read_by_local_agent(config):
@@ -105,10 +92,12 @@ def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, 
 
 
 def _credentials_changed(config: dict[str, Any], existing_config: Mapping[str, Any]) -> bool:
-    auth_mode = jira_auth_mode(config, existing_config)
+    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
+
+    auth_mode = jira_auth_mode(_complete_config(dict(config), "", existing_config))
     if auth_mode != jira_auth_mode(existing_config):
         return True
-    if auth_mode == "browser_cookie":
+    if auth_mode == JIRA_AUTH_MODE_COOKIE:
         return False
     return secret_replaced("pat", config, existing_config)
 
@@ -151,7 +140,6 @@ DESCRIPTOR = SourceTypeDescriptor(
         complete=_complete_config,
         validate=_validate_config,
         store=_store_config,
-        public=_public_config,
         credentials_changed=_credentials_changed,
         facts=_facts,
     ),

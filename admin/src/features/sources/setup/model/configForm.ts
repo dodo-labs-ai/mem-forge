@@ -23,10 +23,11 @@ import type { components } from "@/api/schema.gen";
  * - **Required while visible.** A required field is checked only while its
  *   conditions hold, and a hidden field is otherwise ignored.
  *
- * Example: Jira declares `auth_mode` with the choices `browser_cookie` and
- * `pat`, the second visible only when `sync_mode` is `cloud`. Choosing local
- * sync hides that choice, and `reconcileHiddenChoices` moves a chosen `pat`
- * to `browser_cookie`, which also hides the `pat` field.
+ * Example: Jira declares `auth_mode` with the choices `pat`, visible only
+ * when `sync_mode` is `cloud`, and `browser_cookie`, and the default `pat`.
+ * Choosing local sync hides that choice, and `reconcileHiddenChoices` moves
+ * the form off `pat`, chosen or default, to `browser_cookie`, which also
+ * hides the `pat` field.
  */
 
 export type ConfigSchema = components["schemas"]["GeneConfigSchemaResponse"];

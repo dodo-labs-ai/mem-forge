@@ -36,14 +36,15 @@ def test_the_response_carries_labelled_choices_and_conditions(client):
     fields = _fields(_schema(client, "jira"))
 
     assert fields["auth_mode"]["choices"] == [
-        {"value": "browser_cookie", "label": "Browser session", "help_text": "", "visible_when": []},
         {
             "value": "pat",
             "label": "Personal access token",
             "help_text": "",
             "visible_when": [{"field": "sync_mode", "values": ["cloud"]}],
         },
+        {"value": "browser_cookie", "label": "Browser session", "help_text": "", "visible_when": []},
     ]
+    assert fields["auth_mode"]["default"] == "pat"
     assert fields["pat"]["visible_when"] == [{"field": "auth_mode", "values": ["pat"]}]
     assert fields["pat"]["required"] is True
 

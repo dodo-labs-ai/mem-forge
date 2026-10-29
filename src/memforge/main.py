@@ -4392,9 +4392,10 @@ async def _confirm_unlisted_jira_issues(
 
 
 def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE
+    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 
     config = {key: value for key, value in payload.items() if key not in LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS}
+    auth_mode = jira_auth_mode(config)
     config.pop("local_agent_documents_dir", None)
     config.pop("pat", None)
     config.pop("pat_encrypted", None)
@@ -4403,7 +4404,6 @@ def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, An
     base_url = str(config.get("base_url") or "").strip().rstrip("/")
     if not base_url:
         raise click.ClickException("Jira base_url is required")
-    auth_mode = str(config.get("auth_mode") or JIRA_AUTH_MODE_COOKIE).strip().lower()
     if auth_mode != JIRA_AUTH_MODE_COOKIE:
         raise click.ClickException("Jira local sync requires browser-session authentication")
     config["base_url"] = base_url

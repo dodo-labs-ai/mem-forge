@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- A new Jira source authenticates with a personal access token by default, so
+  it needs no local daemon. Browser session stays a choice for deployments
+  where a personal access token is not available, and local sync always uses
+  it. Every Jira configuration now names its method: migration 133 writes
+  `auth_mode` into each stored Jira source, `browser_cookie` for local sync or
+  a source without a token and `pat` otherwise, so every existing source
+  authenticates as before, and a save without `auth_mode` keeps the stored
+  one.
+
 - Removed: `GET /api/v1/recent-changes` and `GET /api/v1/stats/detailed`. No
   client read them. For recently updated Memories, use
   `POST /api/v1/memories/recent` or the MCP `list_recent_memories` tool. The
