@@ -274,10 +274,8 @@ def _correspond(
     if not _readable_as_stored(part, context):
         return PartCorrespondence(part, EvidenceCorrespondence.UNKNOWN)
     old_selection = ()
-    old_material = {}
     if old_revision is not None:
-        old_anchors, old_material = context.selection_index(old_revision)
-        old_selection = old_anchors.get(part.anchor, ())
+        old_selection = context.selection_index(old_revision).get(part.anchor, ())
         if part.text_view is not None and (len(old_selection) != 1 or part.text_view != old_selection[0].text_view):
             raise SupportRevalidationLimitation(
                 SupportRevalidationLimitationCode.EVIDENCE_INTEGRITY,
@@ -311,9 +309,8 @@ def _correspond(
         # authority missing here forbids exact reuse, not a fresh assessment.
         return PartCorrespondence(part, EvidenceCorrespondence.MODIFIED)
     if len(old_selection) == 1 and part.raw_content_sha256 is not None:
-        old_fragment = old_selection[0]
         target_revision = context.current.get(observation_id)
-        if target_revision is not None and old_revision.evidence_profile == target_revision.evidence_profile:
+        if target_revision is not None:
             current_by_anchor = by_observation.get(observation_id, {})
             if old_revision.id == target_revision.id:
                 # An exact pinned occurrence needs no cross-version disambiguation.
@@ -321,13 +318,14 @@ def _correspond(
                 candidates = (match,) if match is not None else ()
                 unique_old = True
             else:
-                key = (old_fragment.kind, old_fragment.fragment_type, old_fragment.content_value)
-                unique_old = len(old_material.get(key, ())) == 1
-                _, target_material = context.selection_index(target_revision)
-                matches = target_material.get(key, ())
+                # The part is unchanged where the current revision shows the same
+                # reading of it, under whichever profile each revision is pinned to.
+                old_counterparts, matches = context.reading_comparison(old_revision, target_revision).counterparts(
+                    part.anchor
+                )
+                unique_old = len(old_counterparts) == 1
                 # Catalog refs are request-local; rebind indexed source anchors.
-                candidates = tuple(current_by_anchor[fragment.anchor] for fragment in matches
-                                   if fragment.anchor in current_by_anchor)
+                candidates = tuple(current_by_anchor[anchor] for anchor in matches if anchor in current_by_anchor)
             if candidates and (not unique_old or len(candidates) > 1):
                 return PartCorrespondence(part, EvidenceCorrespondence.AMBIGUOUS, candidates)
             if len(candidates) == 1 and (

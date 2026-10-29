@@ -25,21 +25,30 @@ def teams_unit_payload(
     provider_key: str = "window-1",
     kind: UnitKind = UnitKind.WINDOW,
     thread_root_id: str | None = None,
+    record_schema: str = TEAMS_RECORD_SCHEMA,
 ) -> dict[str, object]:
-    """The conversation Unit payload of Teams window messages, each recorded as Teams records it."""
+    """The conversation Unit payload of Teams window messages, each recorded as Teams records it.
+
+    ``record_schema`` is the schema the messages were collected under, which
+    each record also names.
+    """
 
     conversation = teams_conversation_label(
         {"id": conversation_id, "topic": conversation_name, "type": conversation_type}
     )
     members = []
     for message in messages:
-        record = message_record(message, conversation_id=conversation_id, conversation_name=conversation_name)
+        record = {
+            **message_record(message, conversation_id=conversation_id, conversation_name=conversation_name),
+            "representation": record_schema,
+        }
         members.append(
             Member(
                 identity=MessageIdentity(conversation_id, str(message["id"])),
                 created_at=record_created_at(record),
                 record=record,
                 revision=record_revision(record),
+                record_schema=record_schema,
             )
         )
     unit = PlannedUnit(
@@ -49,7 +58,7 @@ def teams_unit_payload(
         members=tuple(members),
         thread_root_id=thread_root_id if kind is UnitKind.THREAD else None,
     )
-    return unit_payload(unit, record_schema=TEAMS_RECORD_SCHEMA)
+    return unit_payload(unit, record_schema=record_schema)
 
 
 def teams_unit_raw(item: ContentItem, messages: Sequence[Mapping[str, object]], **unit) -> RawContent:

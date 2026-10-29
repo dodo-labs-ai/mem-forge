@@ -189,15 +189,61 @@ def representation_profile_for_observation_contract(
     *,
     source_type: str,
     observation_type: str,
+    record_schema: str | None = None,
 ) -> EvidenceRepresentationProfile | None:
-    """Declare a stored adapter contract without inspecting content or MIME."""
+    """The profile an Observation of one adapter contract is read under, without inspecting content or MIME.
+
+    It is the profile the contract declares today, unless the payload names the
+    canonical record schema it was collected under (``record_schema``, as
+    ``name:version``). The payload is then read under that schema, which must be
+    one of the contract's ``declared_representation_profiles``; any other
+    schema cannot be read, and raises ``ValueError``.
+    """
 
     if observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return BINARY_ARTIFACT_PROFILE
     if observation_type == "document_content":
         # The extension-safe projection fallback is explicitly normalized Markdown.
         return MARKDOWN_STRUCTURAL_PROFILE
-    return _REPRESENTATION_CONTRACTS.get((source_type, observation_type))
+    declared = _REPRESENTATION_CONTRACTS.get((source_type, observation_type))
+    if record_schema is None or declared is None:
+        return declared
+    name, _, version = record_schema.rpartition(":")
+    profile = canonical_record_profile(name, int(version)) if name and version.isdecimal() else None
+    if profile not in declared_representation_profiles(source_type=source_type, observation_type=observation_type):
+        raise ValueError(
+            f"{source_type}/{observation_type} cannot be read under record schema {record_schema!r}: "
+            "it is not a registered version of the schema the contract declares"
+        )
+    return profile
+
+
+def declared_representation_profiles(
+    *, source_type: str, observation_type: str,
+) -> frozenset[EvidenceRepresentationProfile]:
+    """Every profile a new Observation Revision of one adapter contract may be stored under.
+
+    That is the profile the contract declares and, for a canonical record, every
+    registered version of its schema, since a stored payload may name any of
+    them as the schema it was collected under. The shared projector alone
+    decides which one a revision is read under
+    (``representation_profile_for_observation_contract``); storage checks only
+    that it is registered for the contract. A contract without a declaration
+    has none.
+    """
+
+    declared = representation_profile_for_observation_contract(
+        source_type=source_type, observation_type=observation_type,
+    )
+    if declared is None:
+        return frozenset()
+    if declared.schema_name is None:
+        return frozenset({declared})
+    return frozenset(
+        canonical_record_profile(name, version)
+        for name, version in _CANONICAL_RECORD_SCHEMAS
+        if name == declared.schema_name
+    )
 
 
 def legacy_representation_profile_for_observation_contract(

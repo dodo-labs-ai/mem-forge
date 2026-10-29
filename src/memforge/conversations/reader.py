@@ -221,7 +221,7 @@ def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> 
     Unit at the next projection.
     """
 
-    records: dict[str, tuple[str, Mapping[str, object], str | None]] = {}
+    records: dict[str, tuple[str, Mapping[str, object], str | None, str]] = {}
     artifacts: dict[str, list[MemberArtifact]] = {}
     for revision in revisions:
         provider_key = str(revision.metadata.get("provider_key") or "")
@@ -254,7 +254,13 @@ def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> 
         elif "source_artifact" in revision.metadata:
             raise ValueError(f"Source Artifact revision {revision.id} of Unit {ref.unit_id} cannot be read")
         elif provider_key and revision.evidence_profile is not None and revision.evidence_profile.schema_name:
-            records[revision.observation_id] = (provider_key, json.loads(revision.content), revision.observed_at)
+            profile = revision.evidence_profile
+            records[revision.observation_id] = (
+                provider_key,
+                json.loads(revision.content),
+                revision.observed_at,
+                f"{profile.schema_name}:{profile.schema_version}",
+            )
         else:
             raise ValueError(f"Observation revision {revision.id} of Unit {ref.unit_id} is not a message record")
     members = [
@@ -263,8 +269,9 @@ def _members(ref: UnitRef, revisions: Collection[SourceObservationRevision]) -> 
             created_at=stored_member_time(record, observed_at=observed_at),
             record=record,
             revision=record_revision(record),
+            record_schema=record_schema,
             artifacts=tuple(sorted(artifacts.get(observation_id, ()), key=lambda artifact: artifact.provider_key)),
         )
-        for observation_id, (message_id, record, observed_at) in records.items()
+        for observation_id, (message_id, record, observed_at, record_schema) in records.items()
     ]
     return tuple(sorted(members, key=lambda member: (member.created_at, member.identity.message_id)))
