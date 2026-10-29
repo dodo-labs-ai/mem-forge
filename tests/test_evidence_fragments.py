@@ -16,6 +16,7 @@ from memforge.pipeline.evidence_fragments import (
     revision_changed_structural_ranges,
     verify_text_evidence_view,
 )
+from memforge.pipeline.reading_equivalence import compare_readings
 from memforge.source_projection import (
     AnchorKind,
     EvidenceCoordinateSpace,
@@ -219,6 +220,56 @@ def test_markdown_move_under_another_heading_is_changed_authority() -> None:
 
     assert "Shared rule." in changed_text
     assert "Other rule." not in changed_text
+
+
+HEADED_DOCUMENT = (
+    "# Policy\n\n## A\n\nBody A.\n\n### A.1\n\nSub A.\n\n## B\n\nBody B.\n\n## C\n\nBody C.\n"
+)
+# Each edit of HEADED_DOCUMENT, with the current structures it changes and the
+# base structures it removes. A structure is unchanged exactly when its text and
+# its true heading ancestry are, whatever happens to the sections around it.
+HEADING_EDITS = {
+    "append last subsection": (
+        HEADED_DOCUMENT.replace("Sub A.\n", "Sub A.\n\n### A.2\n\nSub A2.\n"),
+        ["### A.2", "Sub A2."],
+        [],
+    ),
+    "rename sibling heading": (
+        HEADED_DOCUMENT.replace("## B\n", "## B2\n"),
+        ["## B2", "Body B."],
+        ["## B", "Body B."],
+    ),
+    "rename heading with subsections": (
+        HEADED_DOCUMENT.replace("## A\n", "## A2\n"),
+        ["## A2", "Body A.", "### A.1", "Sub A."],
+        ["## A", "Body A.", "### A.1", "Sub A."],
+    ),
+    "delete section": (
+        HEADED_DOCUMENT.replace("## B\n\nBody B.\n\n", ""),
+        [],
+        ["## B", "Body B."],
+    ),
+    "swap sections": (
+        HEADED_DOCUMENT.replace(
+            "## B\n\nBody B.\n\n## C\n\nBody C.\n", "## C\n\nBody C.\n\n## B\n\nBody B.\n"
+        ),
+        [],
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("edit", HEADING_EDITS)
+def test_markdown_structures_keep_identity_while_their_heading_ancestry_is_unchanged(edit: str) -> None:
+    target_content, changed, removed = HEADING_EDITS[edit]
+    base = _revision(HEADED_DOCUMENT, MARKDOWN_PROFILE)
+    target = replace(_revision(target_content, MARKDOWN_PROFILE), id="obsrev-2")
+
+    authority = compare_readings(base, target).changed_ranges()
+    removed_ranges = revision_changed_structural_ranges(target, base, purpose="removed")
+
+    assert [target.content[start:end] for start, end in authority] == changed
+    assert [base.content[start:end] for start, end in removed_ranges] == removed
 
 
 def test_commonmark_raw_html_compiles_duplicate_list_items_by_exact_offset() -> None:
