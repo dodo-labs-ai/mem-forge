@@ -338,24 +338,37 @@ def test_capacity_takes_precedence_over_both_edges() -> None:
     assert kept.support_revalidation_skipped
 
 
-def test_a_candidate_treated_differently_by_two_old_memories_leaves_the_component_unresolved() -> None:
+def test_a_candidate_restating_a_kept_claim_still_replaces_an_unsupported_one() -> None:
     candidate, unrelated = _candidate("Two reviewers approve payroll."), _candidate("Retention is seven years.")
     first, second, third = _old("mem-a"), _old("mem-b"), _old("mem-c")
-    # Consumed as an equivalent by mem-a, but the replacement of an unsupported mem-b.
+    # An equivalent of mem-a, and the one contradiction of an unsupported mem-b.
     relations = [_edge(0, EQUIVALENT, "mem-a"), _edge(0, CONTRADICTS, "mem-b")]
     coordination = _coordinate([candidate, unrelated], relations, {
         "mem-a": _support(SUPPORTED), "mem-b": _support(UNSUPPORTED), "mem-c": _support(UNSUPPORTED),
     }, incumbents=[first, second, third])
 
     by_memory = _by_memory(coordination.operations)
-    for memory_id in ("mem-a", "mem-b"):
-        assert by_memory[memory_id].action is ReconcileAction.NOOP
-    # The supported claim keeps its own Support result; the unsupported one stays unchanged.
-    assert by_memory["mem-a"].memory is REBOUND and not by_memory["mem-a"].support_revalidation_skipped
-    assert by_memory["mem-b"].memory is None and by_memory["mem-b"].support_revalidation_skipped
+    assert by_memory["mem-a"].action is ReconcileAction.NOOP and by_memory["mem-a"].memory is REBOUND
+    assert by_memory["mem-b"].action is ReconcileAction.SUPERSEDE and by_memory["mem-b"].memory is candidate
     assert by_memory["mem-c"].action is ReconcileAction.DELETE
     assert _additions(coordination.operations) == [unrelated]
-    assert coordination.unresolved_candidate_count == 1
+    assert coordination.unresolved_candidate_count == 0
+
+
+@pytest.mark.parametrize("contradicted", [SUPPORTED, UNAFFECTED, PARTIAL])
+def test_a_candidate_restating_one_kept_claim_and_contradicting_another_is_added(contradicted) -> None:
+    # "Alerts go to Slack and must be acknowledged within 10 minutes" restates the Slack
+    # rule and contradicts a 15-minute rule that keeps its Memory.
+    candidate = _candidate("Alerts go only to Slack and must be acknowledged within 10 minutes.")
+    relations = [_edge(0, EQUIVALENT, "mem-slack"), _edge(0, CONTRADICTS, "mem-15")]
+    coordination = _coordinate([candidate], relations, {
+        "mem-slack": _support(SUPPORTED), "mem-15": _support(contradicted),
+    }, incumbents=[_old("mem-slack"), _old("mem-15")])
+
+    by_memory = _by_memory(coordination.operations)
+    assert all(by_memory[memory_id].action is ReconcileAction.NOOP for memory_id in ("mem-slack", "mem-15"))
+    assert _additions(coordination.operations) == [candidate]
+    assert coordination.unresolved_candidate_count == 0
 
 
 def test_a_candidate_contradicting_two_kept_claims_is_added_once() -> None:
@@ -371,7 +384,53 @@ def test_a_candidate_contradicting_two_kept_claims_is_added_once() -> None:
     assert coordination.unresolved_candidate_count == 0
 
 
-def test_a_candidate_merging_several_kept_claims_leaves_each_on_its_verified_evidence() -> None:
+def test_a_candidate_restating_a_kept_claim_and_refining_another_without_revising_it_is_added() -> None:
+    # No eligible revision proof for mem-b: the old Memory stays and the Candidate is added.
+    candidate = _candidate("Two reviewers from distinct teams approve payroll.")
+    relations = [
+        _edge(0, EQUIVALENT, "mem-a"),
+        _edge(0, REFINES, "mem-b", direction=RelationDirection.CHALLENGER_TO_CANDIDATE),
+    ]
+    coordination = _coordinate([candidate], relations, {
+        "mem-a": _support(SUPPORTED), "mem-b": _support(SUPPORTED),
+    }, incumbents=[_old("mem-a"), _old("mem-b")])
+
+    by_memory = _by_memory(coordination.operations)
+    assert all(by_memory[memory_id].action is ReconcileAction.NOOP for memory_id in ("mem-a", "mem-b"))
+    assert _additions(coordination.operations) == [candidate]
+
+
+def test_a_candidate_restating_a_kept_claim_and_contradicting_an_unsupported_one_with_rivals_is_added() -> None:
+    # Two contradictions of an unsupported mem-b name no single successor: each Candidate stands on its own.
+    restating, rival = _candidate("Alerts go to Slack within 10 minutes."), _candidate("Alerts go to Slack within 5 minutes.")
+    relations = [_edge(0, EQUIVALENT, "mem-a"), _edge(0, CONTRADICTS, "mem-b"), _edge(1, CONTRADICTS, "mem-b")]
+    coordination = _coordinate([restating, rival], relations, {
+        "mem-a": _support(SUPPORTED), "mem-b": _support(UNSUPPORTED),
+    }, incumbents=[_old("mem-a"), _old("mem-b")])
+
+    by_memory = _by_memory(coordination.operations)
+    assert by_memory["mem-a"].action is ReconcileAction.NOOP
+    assert by_memory["mem-b"].action is ReconcileAction.DELETE
+    assert _additions(coordination.operations) == [restating, rival]
+
+
+def test_a_candidate_revising_one_kept_claim_and_contradicting_another_is_created_once_as_the_revision() -> None:
+    candidate = _candidate("Two reviewers from distinct teams approve payroll within one day.")
+    relations = [
+        _edge(0, REFINES, "mem-a", direction=RelationDirection.CHALLENGER_TO_CANDIDATE),
+        _edge(0, CONTRADICTS, "mem-b"),
+    ]
+    coordination = _coordinate([candidate], relations, {
+        "mem-a": _support(SUPPORTED), "mem-b": _support(SUPPORTED),
+    }, incumbents=[_old("mem-a"), _old("mem-b")], proofs=[RevisionCompositionProof(0, "mem-a", True, True, True)])
+
+    by_memory = _by_memory(coordination.operations)
+    assert by_memory["mem-a"].action is ReconcileAction.UPDATE and by_memory["mem-a"].memory is candidate
+    assert by_memory["mem-b"].action is ReconcileAction.NOOP
+    assert _additions(coordination.operations) == []
+
+
+def test_a_candidate_restating_kept_claims_still_revises_the_one_it_refines() -> None:
     # One Candidate restates three old claims and losslessly refines a fourth.
     merged = _candidate("Two reviewers from distinct teams approve payroll and retention is seven years.")
     memory_ids = ("mem-a", "mem-b", "mem-c", "mem-d")
@@ -385,11 +444,12 @@ def test_a_candidate_merging_several_kept_claims_leaves_each_on_its_verified_evi
         incumbents=[_old(memory_id) for memory_id in memory_ids], proofs=[proof],
     )
 
-    for operation in coordination.operations:
-        assert operation.action is ReconcileAction.NOOP and operation.memory is REBOUND
-        assert not operation.support_revalidation_skipped
+    by_memory = _by_memory(coordination.operations)
+    for memory_id in memory_ids[:3]:
+        assert by_memory[memory_id].action is ReconcileAction.NOOP and by_memory[memory_id].memory is REBOUND
+    assert by_memory["mem-d"].action is ReconcileAction.UPDATE and by_memory["mem-d"].memory is merged
     assert _additions(coordination.operations) == []
-    assert coordination.unresolved_candidate_count == 1
+    assert coordination.unresolved_candidate_count == 0
 
 
 @pytest.mark.parametrize("result", [SUPPORTED, UNAFFECTED])
@@ -505,7 +565,7 @@ def test_every_revision_the_table_would_apply_is_verified_and_a_dropped_one_is_n
     refines = dict(direction=RelationDirection.CHALLENGER_TO_CANDIDATE)
     candidates = [_candidate("c refines m1"), _candidate("d refines m2")]
     incumbents = [_old("m1"), _old("m2"), _old("m3")]
-    # c also restates m2, so a divided treatment would hold c back; d's revision of m2 is still verified.
+    # c also restates m2, which d refines; both revisions are verified.
     relations = [
         _edge(0, REFINES, "m1", **refines), _edge(0, EQUIVALENT, "m2"), _edge(1, REFINES, "m2", **refines),
         _edge(1, CONTRADICTS, "m3"),

@@ -31,12 +31,21 @@ result, so an UNSUPPORTED one loses this source's Support and the Candidate is
 added, and a partially covered one stays unchanged with the Candidate consumed.
 A normal-order re-check yields an ordinary Support result that enters the table
 again. REFINES and uncertain edges keep the local unresolved relationship
-rules; a refinement revises only an old Memory no Candidate contradicts. A
-Candidate that receives different treatments across old Memories leaves its
-whole related component unresolved: consumed this round, with no ADD and no
-destructive action. An unresolved relationship withholds only what a Candidate
-would do. An old Memory of the component whose own Support result keeps it is
-still bound to its verified current Evidence; the others stay unchanged. A
+rules; a refinement revises only an old Memory no Candidate contradicts.
+
+Each row treats each related Candidate in one of three ways: the Candidate
+replaces the old Memory (UPDATE or SUPERSEDE); it is added beside it (it
+contradicts a claim that keeps the old Memory or refines it without revising
+it, or it relates to an UNSUPPORTED claim it does not replace); or it is
+consumed (it is equivalent to a claim that keeps the old Memory). A Candidate
+takes its strongest treatment across old Memories, replaces before added before
+consumed: a Candidate that restates one kept claim and replaces or contradicts
+another carries knowledge the kept claim lacks, so its equivalence never
+discards it.
+
+An unresolved relationship withholds only what a Candidate would do. An old
+Memory of the component whose own Support result keeps it is still bound to its
+verified current Evidence; the others stay unchanged. A
 Candidate the Relation line could not judge even alone is consumed the same
 way; its missing row leaves the Relation line incomplete, so
 DestructiveValidation withholds every destructive decision of the Unit.
@@ -244,8 +253,14 @@ class Coordination:
 
 
 class _Treatment(str, Enum):
+    # Declared from weakest to strongest; a Candidate takes its strongest treatment.
     CONSUMED = "consumed"
+    ADDED = "added"
     REPLACES = "replaces"
+
+    @property
+    def strength(self) -> int:
+        return list(_Treatment).index(self)
 
 
 @dataclass(frozen=True)
@@ -375,8 +390,7 @@ def revisions_to_verify(
     The table revises an old Memory whose final Support result keeps it, that no
     Candidate contradicts and that exactly one Candidate refines with an
     eligible proof, unless the old Memory is in an unresolved component. Every
-    such pair is verified, also one whose Candidate a later divided treatment
-    might hold back, so no revision is released unverified.
+    such pair is verified, so no revision is released unverified.
     """
     ledger = _ledger(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
@@ -419,33 +433,23 @@ def coordinate(
         candidates=candidates, incumbents=incumbents, relations=relations, proofs=proofs, supports=supports,
         unjudged_candidates=unjudged_candidates, unverified_revisions=unverified_revisions,
     )
-    seeds = _seeds(ledger)
-    _, unresolved = _unresolved_component(ledger, seeds)
-    decided = {memory.id: _decide(ledger, memory) for memory in ledger.incumbents if memory.id not in unresolved}
+    component_candidates, unresolved = _unresolved_component(ledger, _seeds(ledger))
 
-    # A Candidate treated differently by different old Memories has no single decision.
-    treatments: dict[int, set[_Treatment]] = {}
-    for decision in decided.values():
-        for index, treatment in decision.treatments:
-            treatments.setdefault(index, set()).add(treatment)
-    divided = {index for index, kinds in treatments.items() if len(kinds) > 1}
-    if divided:
-        seeds |= {
-            (entry.candidate_index, entry.incumbent_id) for entry in ledger.relations
-            if entry.candidate_index in divided and entry.relation_type is not SameUnitRelationType.UNRELATED
-        }
-    component_candidates, unresolved = _unresolved_component(ledger, seeds)
-
-    consumed = set(component_candidates)
+    strongest: dict[int, _Treatment] = {}
     operations: list[ReconcileOperation] = []
     for memory in ledger.incumbents:
         support = ledger.supports[memory.id]
         if memory.id in unresolved:
             operations.append(replace(_kept_undecided(support), memory_id=memory.id))
             continue
-        decision = decided[memory.id]
-        consumed.update(index for index, _ in decision.treatments)
+        decision = _decide(ledger, memory)
+        for index, treatment in decision.treatments:
+            if index not in strongest or treatment.strength > strongest[index].strength:
+                strongest[index] = treatment
         operations.append(replace(decision.operation, memory_id=memory.id))
+    consumed = set(component_candidates) | {
+        index for index, treatment in strongest.items() if treatment is not _Treatment.ADDED
+    }
     additions = [
         ReconcileOperation(action=ReconcileAction.ADD, memory=raw, reason="independent current claim")
         for index, raw in enumerate(ledger.candidates)
@@ -492,11 +496,16 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
                     ),
                     (*_consumed(equivalents), (refiner.candidate_index, _Treatment.REPLACES)),
                 )
-        return _Decision(_kept(support, equivalents[0].reason if equivalents else None), _consumed(equivalents))
+        return _Decision(
+            _kept(support, equivalents[0].reason if equivalents else None),
+            (*_consumed(equivalents), *_added((*contradictions, *refiners))),
+        )
 
     if support.result is SupportResult.UNRESOLVED_PARTIAL_COVERAGE:
-        # Its unknown part keeps the old Memory; an equivalent restates it, a contradiction is added.
-        return _Decision(_kept_unchanged(support.reason), _consumed(equivalents))
+        # Its unknown part keeps the old Memory; an equivalent restates it, any other Candidate is added.
+        return _Decision(
+            _kept_unchanged(support.reason), (*_consumed(equivalents), *_added((*contradictions, *refiners))),
+        )
 
     # UNSUPPORTED after the whole reading order.
     if len(contradictions) == 1 and len(related) == 1:
@@ -510,9 +519,10 @@ def _decide(ledger: _Ledger, memory: Memory) -> _Decision:
             ((challenger.candidate_index, _Treatment.REPLACES),),
         )
     # Several contradicting Candidates name no single successor: each stands on its own.
-    return _Decision(ReconcileOperation(
-        action=ReconcileAction.DELETE, reason=support.reason or "support removed",
-    ))
+    return _Decision(
+        ReconcileOperation(action=ReconcileAction.DELETE, reason=support.reason or "support removed"),
+        _added((*equivalents, *contradictions, *refiners)),
+    )
 
 
 def _kept(support: MemorySupport, reason: str | None = None) -> ReconcileOperation:
@@ -546,6 +556,10 @@ def _kept_unchanged(reason: str) -> ReconcileOperation:
 
 def _consumed(entries: Sequence[RelationLedgerEntry]) -> tuple[tuple[int, _Treatment], ...]:
     return tuple((entry.candidate_index, _Treatment.CONSUMED) for entry in entries)
+
+
+def _added(entries: Sequence[RelationLedgerEntry]) -> tuple[tuple[int, _Treatment], ...]:
+    return tuple((entry.candidate_index, _Treatment.ADDED) for entry in entries)
 
 
 def _seeds(ledger: _Ledger) -> set[tuple[int, str]]:
