@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -248,12 +249,12 @@ def test_without_model_options_the_plan_is_openrouter_with_its_key_or_none() -> 
     plan = _plan(OPENROUTER_API_KEY="sk-or")
 
     assert plan.kinds == {
-        "generation": smoke.KindPlan("openrouter", "anthropic/claude-haiku-5.5", None, "OPENROUTER_API_KEY"),
-        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None, "OPENROUTER_API_KEY"),
+        "generation": smoke.KindPlan("openrouter", "anthropic/claude-haiku-5.5", None),
+        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None),
     }
     assert _plan("--generation-model", "openai/gpt-5-mini", OPENROUTER_API_KEY="sk-or").kinds[
         "generation"
-    ] == smoke.KindPlan("openrouter", "openai/gpt-5-mini", None, "OPENROUTER_API_KEY")
+    ] == smoke.KindPlan("openrouter", "openai/gpt-5-mini", None)
 
 
 def test_ollama_serves_both_kinds_at_the_ollama_url_even_with_an_openrouter_key() -> None:
@@ -263,7 +264,7 @@ def test_ollama_serves_both_kinds_at_the_ollama_url_even_with_an_openrouter_key(
         "generation": ("ollama", "qwen3:0.6b", smoke.DEFAULT_OLLAMA_URL),
         "embedding": ("ollama", "nomic-embed-text", smoke.DEFAULT_OLLAMA_URL),
     }
-    moved = _plan("--ollama", "--ollama-url", "http://gpu-box:11434")
+    moved = _plan("--ollama", "--ollama-url", "http://gpu-box:11434/")
     assert {item.endpoint for item in moved.kinds.values()} == {"http://gpu-box:11434"}
 
 
@@ -272,7 +273,7 @@ def test_each_kind_takes_its_own_provider() -> None:
 
     assert plan.kinds == {
         "generation": smoke.KindPlan("openai_compatible", "gpt-6-luna", "https://llm.example.com/v1", "TEAM_LLM_KEY"),
-        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None, "OPENROUTER_API_KEY"),
+        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None),
     }
     assert plan.label == (
         "generation openai_compatible: gpt-6-luna; embedding openrouter: openai/text-embedding-3-small"
@@ -286,9 +287,13 @@ def test_a_direct_anthropic_key_reaches_the_reference_model() -> None:
     plan = _plan("--generation-provider", "anthropic", "--embedding-provider", "openai")
 
     assert plan.kinds == {
-        "generation": smoke.KindPlan("anthropic", "claude-haiku-5-5", None, "ANTHROPIC_API_KEY"),
-        "embedding": smoke.KindPlan("openai", "text-embedding-3-small", None, "OPENAI_API_KEY"),
+        "generation": smoke.KindPlan("anthropic", "claude-haiku-5-5", None),
+        "embedding": smoke.KindPlan("openai", "text-embedding-3-small", None),
     }
+    assert [smoke.provider_key_variable(item.provider) for item in plan.kinds.values()] == [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -301,11 +306,36 @@ def test_a_direct_anthropic_key_reaches_the_reference_model() -> None:
             "--generation-model is required",
         ),
         (SPLIT_OPTIONS, {}, "TEAM_LLM_KEY, named by --generation-key-env, is not set"),
+        (
+            [*SPLIT_OPTIONS[:6], "--generation-key-env", "sk-or-v1-0123"],
+            {},
+            "--generation-key-env takes the name of an environment variable, not a key",
+        ),
     ],
 )
 def test_an_incomplete_plan_is_refused(options: list[str], environ: dict[str, str], message: str) -> None:
-    with pytest.raises(smoke.PlanError, match=re.escape(message)):
+    with pytest.raises(smoke.PlanError, match=re.escape(message)) as refused:
         _plan(*options, **environ)
+
+    assert "sk-or" not in str(refused.value)
+
+
+def test_a_refused_plan_exits_2_and_prints_its_reason_to_stderr(capsys) -> None:
+    assert smoke.main(["model-plan", "--generation-provider", "openai_compatible"]) == 2
+
+    printed = capsys.readouterr()
+    assert printed.out == ""
+    assert "--generation-model is required" in printed.err
+
+
+def test_the_plan_names_each_ollama_server_once() -> None:
+    plan = _plan("--generation-provider", "anthropic", "--embedding-provider", "ollama")
+    assert smoke.shell_plan(plan).splitlines()[-1] == f"ollama_endpoints={smoke.DEFAULT_OLLAMA_URL}"
+
+    both = _plan("--ollama", "--embedding-endpoint", "http://gpu-box:11434")
+    assert smoke.shell_plan(both).splitlines()[-1] == (
+        f"ollama_endpoints='http://gpu-box:11434 {smoke.DEFAULT_OLLAMA_URL}'"
+    )
 
 
 def test_the_shell_reads_the_plan_without_any_key(tmp_path: Path) -> None:
@@ -416,10 +446,10 @@ def test_each_kind_is_saved_through_its_own_provider(tmp_path: Path, monkeypatch
 @pytest.mark.parametrize(
     ("kind", "plan", "message"),
     [
-        ("generation", smoke.KindPlan("openai_compatible", "m", None, "KEY"), "pass --generation-endpoint"),
-        ("embedding", smoke.KindPlan("anthropic", "m", None, "KEY"), "Anthropic serves no embedding models"),
-        ("generation", smoke.KindPlan("openrouter", "m", None, "OPENROUTER_API_KEY"), "set OPENROUTER_API_KEY"),
-        ("generation", smoke.KindPlan("bedrock", "m", None, "KEY"), "bedrock is not a provider Settings offers"),
+        ("generation", smoke.KindPlan("openai_compatible", "m", None), "pass --generation-endpoint"),
+        ("embedding", smoke.KindPlan("anthropic", "m", None), "Anthropic serves no embedding models"),
+        ("generation", smoke.KindPlan("openrouter", "m", None), "set OPENROUTER_API_KEY"),
+        ("generation", smoke.KindPlan("bedrock", "m", None), "bedrock is not a provider Settings offers"),
     ],
 )
 def test_a_model_settings_would_refuse_is_refused_before_it_is_saved(kind: str, plan, message: str) -> None:
@@ -429,14 +459,40 @@ def test_a_model_settings_would_refuse_is_refused_before_it_is_saved(kind: str, 
         smoke._binding(kind, plan, descriptors, {})
 
 
-def test_a_keyless_provider_is_bound_without_a_key() -> None:
+def test_a_local_ollama_is_sent_a_key_only_when_one_is_named() -> None:
     descriptors = {descriptor["id"]: descriptor for descriptor in _provider_descriptors()}
-    plan = smoke.KindPlan("ollama", "qwen3:0.6b", smoke.DEFAULT_OLLAMA_URL, "OLLAMA_API_KEY")
+    environ = {"OLLAMA_API_KEY": "ollama-cloud-secret", "GPU_BOX_KEY": "gpu-secret"}
+    plan = _plan("--ollama", **environ).kinds["generation"]
 
-    binding = smoke._binding("generation", plan, descriptors, {})
+    binding = smoke._binding("generation", plan, descriptors, environ)
 
     assert (binding.auth_strategy, binding.api_key) == ("none", None)
     assert "api_key" not in smoke._candidate(binding, {})
+    named = smoke._binding("generation", replace(plan, key_variable="GPU_BOX_KEY"), descriptors, environ)
+    assert (named.auth_strategy, named.api_key) == ("api_key", "gpu-secret")
+
+
+def test_a_keyless_openai_compatible_server_and_a_litellm_route_with_a_named_key() -> None:
+    descriptors = {descriptor["id"]: descriptor for descriptor in _provider_descriptors()}
+    local = smoke.KindPlan("openai_compatible", "local-model", "http://host.docker.internal:8000/v1")
+    route = smoke.KindPlan("litellm", "voyage/voyage-3", None, "VOYAGE_API_KEY")
+
+    assert smoke._binding("generation", local, descriptors, {}).auth_strategy == "none"
+    assert smoke._binding("embedding", route, descriptors, {"VOYAGE_API_KEY": "pa-1"}).api_key == "pa-1"
+
+
+def test_a_model_the_endpoint_does_not_list_is_entered_by_hand(monkeypatch) -> None:
+    plan = smoke.KindPlan("openai_compatible", "local-model", "http://host.docker.internal:8000/v1")
+    binding = smoke.Binding("generation", plan, "none")
+    monkeypatch.setattr(
+        smoke, "api_json", lambda *args, **kwargs: {"ok": True, "models_supported": False, "models": []}
+    )
+
+    assert smoke._listed_model("http://api", binding) == {}
+    assert smoke._candidate(binding, {})["token_limits"] == {
+        "context_window_tokens": smoke.DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "max_output_tokens": smoke.DEFAULT_MAX_OUTPUT_TOKENS,
+    }
 
 
 def test_the_restart_check_compares_each_kind_with_its_own_provider(tmp_path: Path, monkeypatch) -> None:

@@ -419,13 +419,18 @@ DEFAULT_OLLAMA_URL = "http://host.docker.internal:11434"
 # The model a kind uses when only its provider is named: the reference
 # generation model, Claude Haiku 5.5, wherever the provider serves it; the same
 # small embedding model on the hosted providers that serve it; and for Ollama
-# the small local pair the quickstart suggests.
+# the small local pair the quickstart suggests. ``scripts/provider_smoke.py``
+# states its own defaults in ``PROVIDERS``; this helper runs without the
+# checkout environment and cannot import them.
 DEFAULT_MODELS: dict[str, dict[str, str]] = {
     "openrouter": {"generation": "anthropic/claude-haiku-5.5", "embedding": "openai/text-embedding-3-small"},
     "anthropic": {"generation": "claude-haiku-5-5"},
     "openai": {"embedding": "text-embedding-3-small"},
     "ollama": {"generation": "qwen3:0.6b", "embedding": "nomic-embed-text"},
 }
+
+
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class PlanError(Exception):
@@ -439,9 +444,9 @@ class KindPlan:
     provider: str
     model: str
     endpoint: str | None
-    # The environment variable the API key is read from; a variable that holds
-    # nothing means the binding sends no key.
-    key_variable: str
+    # The environment variable named for the API key; ``None`` reads the
+    # provider's own ``<PROVIDER>_API_KEY`` when its descriptor asks for a key.
+    key_variable: str | None = None
 
     @property
     def label(self) -> str:
@@ -457,7 +462,8 @@ class ModelPlan:
         return "; ".join(f"{kind} {self.kinds[kind].label}" for kind in MODEL_KINDS)
 
 
-def _key_variable(provider: str) -> str:
+def provider_key_variable(provider: str) -> str:
+    """The variable a provider's API key is read from when no other is named."""
     return re.sub(r"[^A-Z0-9]+", "_", provider.upper()) + "_API_KEY"
 
 
@@ -486,10 +492,14 @@ def plan_models(options: argparse.Namespace, environ: dict[str, str]) -> ModelPl
         if not model:
             raise PlanError(f"--{kind}-model is required with the {provider} provider")
         key_variable = getattr(options, f"{kind}_key_env")
-        if key_variable and not environ.get(key_variable, "").strip():
-            raise PlanError(f"{key_variable}, named by --{kind}-key-env, is not set")
+        if key_variable is not None:
+            if not _VARIABLE_NAME.fullmatch(key_variable):
+                # The value may be the key itself, so it is not repeated.
+                raise PlanError(f"--{kind}-key-env takes the name of an environment variable, not a key")
+            if not environ.get(key_variable, "").strip():
+                raise PlanError(f"{key_variable}, named by --{kind}-key-env, is not set")
         endpoint = getattr(options, f"{kind}_endpoint") or (options.ollama_url if provider == "ollama" else None)
-        kinds[kind] = KindPlan(provider, model, endpoint, key_variable or _key_variable(provider))
+        kinds[kind] = KindPlan(provider, model, endpoint.rstrip("/") if endpoint else None, key_variable)
     return ModelPlan(kinds)
 
 
@@ -515,7 +525,6 @@ class Binding:
     plan: KindPlan
     auth_strategy: str
     api_key: str | None = field(default=None, repr=False)
-    lists_models: bool = True
 
     def with_key(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.api_key:
@@ -532,19 +541,25 @@ def _binding(kind: str, plan: KindPlan, descriptors: dict[str, dict[str, Any]], 
         raise CheckFailed(f"{descriptor.get('label')} serves no {kind} models")
     if descriptor.get("endpoint_required") and not plan.endpoint:
         raise CheckFailed(f"{descriptor.get('label')} needs an endpoint: pass --{kind}-endpoint")
-    api_key = environ.get(plan.key_variable, "").strip() or None
+    strategies = descriptor.get("auth_strategies", [])
+    # A provider that proposes no key, such as a local Ollama, is sent one only when it is named.
+    key_variable = plan.key_variable
+    if key_variable is None and strategies[:1] == ["api_key"]:
+        key_variable = provider_key_variable(plan.provider)
+    api_key = (environ.get(key_variable, "").strip() or None) if key_variable else None
     auth_strategy = "api_key" if api_key else "none"
-    if auth_strategy not in descriptor.get("auth_strategies", []):
+    if auth_strategy not in strategies:
         raise CheckFailed(
-            f"{descriptor.get('label')} needs an API key: set {plan.key_variable} or name one with --{kind}-key-env"
+            f"{descriptor.get('label')} needs an API key: set {key_variable} or name one with --{kind}-key-env"
         )
-    return Binding(kind, plan, auth_strategy, api_key, bool(descriptor.get("lists_models")))
+    return Binding(kind, plan, auth_strategy, api_key)
 
 
 def _listed_model(api: str, binding: Binding) -> dict[str, Any]:
-    """The listing's entry for the planned model; an endpoint that lists no models gives none."""
-    if not binding.lists_models:
-        return {}
+    """The listing's entry for the planned model; an endpoint that lists no models gives none.
+
+    Where nothing is listed, the model is entered by hand, as Settings then asks.
+    """
     kind, plan = binding.kind, binding.plan
     discovery = api_json(
         api,
@@ -556,6 +571,8 @@ def _listed_model(api: str, binding: Binding) -> dict[str, Any]:
     )
     if not discovery.get("ok"):
         raise CheckFailed(f"listing the {kind} models of {plan.provider} failed: {discovery.get('message')}")
+    if discovery.get("models_supported") is False:
+        return {}
     # Ollama lists a model pulled without a tag under its ``latest`` tag.
     wanted = {plan.model, f"{plan.model}:latest"}
     for option in discovery.get("models", []):
@@ -574,6 +591,8 @@ def _candidate(binding: Binding, listed: dict[str, Any]) -> dict[str, Any]:
         "auth_strategy": binding.auth_strategy,
     }
     if binding.kind == "generation":
+        # Validation needs the model's token limits; a model listed without
+        # them takes the ones the quickstart suggests for a local model.
         body["token_limits"] = {
             "context_window_tokens": listed.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS,
             "max_output_tokens": listed.get("max_output_tokens") or DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1121,17 +1140,19 @@ def run(args: argparse.Namespace) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    # The shell evaluates what model-plan prints, so its reasons go to stderr.
+    reasons = sys.stderr if args.command == "model-plan" else sys.stdout
     try:
         print(run(args))
     except PlanError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     except CheckFailed as exc:
-        print(str(exc))
+        print(str(exc), file=reasons)
         return 1
     except Exception as exc:  # an unexpected answer still ends as one report line
         traceback.print_exc()
-        print(f"{args.command} stopped on {type(exc).__name__}: {exc}")
+        print(f"{args.command} stopped on {type(exc).__name__}: {exc}", file=reasons)
         return 1
     return 0
 

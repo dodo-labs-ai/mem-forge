@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Contributors: `scripts/compose_smoke.sh` configures the generation and the
+  embedding model each through its own provider, as Settings does:
+  `--generation-provider` and `--embedding-provider` take any provider Settings
+  offers, with `--KIND-model`, `--KIND-endpoint` and `--KIND-key-env`. A kind
+  left unnamed still uses OpenRouter, or Ollama with `--ollama`. The report,
+  the `--quality` summary and the model usage line name each kind's provider
+  and model.
+
 - A local daemon whose release collects conversation messages in an earlier
   record schema than the server reads, such as `teams-message:2` against
   `teams-message:3`, is told to upgrade: the server answers its manifest

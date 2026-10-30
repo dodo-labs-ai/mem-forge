@@ -36,7 +36,8 @@
 #                           ollama defaults to --ollama-url.
 #   --KIND-key-env NAME     The environment variable holding the provider's API
 #                           key (default <PROVIDER>_API_KEY, e.g.
-#                           OPENAI_COMPATIBLE_API_KEY).
+#                           OPENAI_COMPATIBLE_API_KEY; a local Ollama is sent
+#                           a key only when one is named).
 #   --no-models             Skip the model steps even when a provider is available.
 #   --sync-timeout SECONDS  How long the source sync may take (default 900).
 #   --report FILE           Also write the Markdown report to FILE.
@@ -432,7 +433,7 @@ quality_checks() {
     say "needs a synced source"
     return "$SKIPPED"
   fi
-  quality_summary="- Models: $models_label"$'\n\n'
+  quality_summary=
   for kind in derivation support reconciliation; do
     command=seed-$kind-cases
     run_spec="$work_dir/quality-run-$kind.json"
@@ -449,6 +450,7 @@ quality_checks() {
     summary=$(compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
       memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
     status=$?
+    [ -n "$quality_summary" ] || quality_summary="- Models: $models_label"$'\n\n'
     quality_summary+="### $kind cases"$'\n\n'"$summary"$'\n\n'
     [ -n "$outputs_dir" ] && save_quality_outputs "$kind" "$summary"
     case $status in
