@@ -122,7 +122,8 @@
           "min": 1
         },
         "required_terms": [
-          "timeout"
+          "timeout",
+          "kestrel-webhook-audit"
         ]
       }
     },
@@ -146,7 +147,8 @@
           "min": 1
         },
         "required_terms": [
-          "Grafana"
+          "Grafana",
+          "99.9%"
         ]
       }
     },
@@ -235,6 +237,7 @@
       "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
       "rubric": {
         "expected_support_terms": {
+          "kestrel-webhook-audit": "unsupported",
           "20 seconds": "unsupported"
         }
       }
@@ -253,7 +256,7 @@
       "title": "Kestrel dashboard migration",
       "rubric": {
         "expected_support_terms": {
-          "two weeks": "unsupported"
+          "99.9%": "unsupported"
         }
       }
     },

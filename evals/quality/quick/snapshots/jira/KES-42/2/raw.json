@@ -15,17 +15,14 @@
       "name": "Kestrel"
     },
     "status": {
-      "id": "10001",
-      "name": "Done"
+      "id": "3",
+      "name": "In Progress"
     },
     "priority": {
       "id": "2",
       "name": "High"
     },
-    "resolution": {
-      "id": "1",
-      "name": "Fixed"
-    },
+    "resolution": null,
     "assignee": {
       "name": "lena.ortiz",
       "key": "lena.ortiz",
@@ -40,7 +37,7 @@
       "webhooks"
     ],
     "created": "2026-10-20T09:30:00.000+0000",
-    "updated": "2026-10-22T14:05:00.000+0000",
+    "updated": "2026-10-22T14:02:00.000+0000",
     "attachment": [
       {
         "id": "20077",
@@ -64,7 +61,7 @@
   "changelog": {
     "startAt": 0,
     "maxResults": 100,
-    "total": 4,
+    "total": 3,
     "histories": [
       {
         "id": "40001",
@@ -122,33 +119,6 @@
             "toString": "Kestrel webhook deliveries time out after 5 seconds, and receivers behind the acme gateway need up to 15 seconds.\n\n*Decision:* raise the webhook delivery timeout to 30 seconds. A timed-out delivery is retried at most 3 times ({{webhook.max_redeliveries}})."
           }
         ]
-      },
-      {
-        "id": "40004",
-        "author": {
-          "name": "lena.ortiz",
-          "key": "lena.ortiz",
-          "displayName": "Lena Ortiz"
-        },
-        "created": "2026-10-22T14:05:00.000+0000",
-        "items": [
-          {
-            "field": "status",
-            "fieldtype": "jira",
-            "from": "3",
-            "fromString": "In Progress",
-            "to": "10001",
-            "toString": "Done"
-          },
-          {
-            "field": "resolution",
-            "fieldtype": "jira",
-            "from": null,
-            "fromString": null,
-            "to": "1",
-            "toString": "Fixed"
-          }
-        ]
       }
     ]
   },
@@ -166,10 +136,10 @@
         "key": "priya.nair",
         "displayName": "Priya Nair"
       },
-      "body": "Please also log every timed-out delivery to the {{kestrel-webhook-audit}} stream, so support can answer tenants without reading the worker logs.",
-      "renderedBody": "<p>Please also log every timed-out delivery to the <tt>kestrel-webhook-audit</tt> stream, so support can answer tenants without reading the worker logs.</p>",
+      "body": "*Triage decision:* every timed-out delivery is logged to the {{kestrel-delivery-audit}} stream, so support can answer tenants without reading the worker logs.",
+      "renderedBody": "<p><b>Triage decision:</b> every timed-out delivery is logged to the <tt>kestrel-delivery-audit</tt> stream, so support can answer tenants without reading the worker logs.</p>",
       "created": "2026-10-20T10:15:00.000+0000",
-      "updated": "2026-10-20T10:15:00.000+0000"
+      "updated": "2026-10-22T13:50:00.000+0000"
     },
     {
       "id": "30102",

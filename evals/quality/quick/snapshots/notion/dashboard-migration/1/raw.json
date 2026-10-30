@@ -3,6 +3,11 @@
   "markdown": "## Plan\n\n1. Rebuild the panels of the Grafana board `kestrel-overview` on the built-in status page.\n2. Keep both running for two weeks.\n3. Retire the Grafana board after the comparison.\n",
   "properties": [
     {
+      "name": "Constraint",
+      "type": "rich_text",
+      "value": "The status page keeps the 99.9% availability panel."
+    },
+    {
       "name": "Decision",
       "type": "rich_text",
       "value": "Replace the Grafana board kestrel-overview with the built-in status page."

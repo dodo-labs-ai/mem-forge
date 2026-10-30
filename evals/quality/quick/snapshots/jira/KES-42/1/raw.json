@@ -117,8 +117,8 @@
         "key": "priya.nair",
         "displayName": "Priya Nair"
       },
-      "body": "Please also log every timed-out delivery to the {{kestrel-webhook-audit}} stream, so support can answer tenants without reading the worker logs.",
-      "renderedBody": "<p>Please also log every timed-out delivery to the <tt>kestrel-webhook-audit</tt> stream, so support can answer tenants without reading the worker logs.</p>",
+      "body": "*Triage decision:* every timed-out delivery is logged to the {{kestrel-webhook-audit}} stream, so support can answer tenants without reading the worker logs.",
+      "renderedBody": "<p><b>Triage decision:</b> every timed-out delivery is logged to the <tt>kestrel-webhook-audit</tt> stream, so support can answer tenants without reading the worker logs.</p>",
       "created": "2026-10-20T10:15:00.000+0000",
       "updated": "2026-10-20T10:15:00.000+0000"
     },

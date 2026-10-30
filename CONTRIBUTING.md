@@ -174,9 +174,13 @@ uv run pytest tests/test_quality_snapshots.py -q
 
 Then run `scripts/compose_smoke.sh --quality --quality-outputs DIR` with the
 reference model, which saves every case's pinned input, rubric and model output
-in `DIR`, and read your type's cases to set their rubrics. A Support term must
-name a fact the model writes into a memory on every run: a property or a
-comment it leaves out of its memories can never be judged. Replay is off
+in `DIR`, and read your type's cases to set their rubrics. A Support rubric
+labels every fact the revision changes, so write each one as something a
+reader would keep: a stated decision, a limit or a constraint, not an aside.
+Reword or drop a term only when the rubric itself is wrong, for example when
+the term is not in the source or a paraphrase is just as right. Never drop
+one because the model left out a fact that matters: that is the regression
+the case exists to catch. Replay is off
 in every other deployment: a Source that names a snapshot is refused unless
 `MEMFORGE_EVALUATION_SNAPSHOT_ROOT` names the folder its set lies below, which
 only `--quality` sets.
