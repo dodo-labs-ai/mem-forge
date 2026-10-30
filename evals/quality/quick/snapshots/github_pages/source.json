@@ -1,0 +1,8 @@
+{
+  "name": "Quality snapshot: github_pages",
+  "config": {
+    "auth_mode": "none",
+    "sync_mode": "single_page",
+    "page_url": "https://acme.github.io/kestrel/handbook/on-call/"
+  }
+}

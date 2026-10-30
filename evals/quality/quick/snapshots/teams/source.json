@@ -1,0 +1,9 @@
+{
+  "name": "Quality snapshot: teams",
+  "config": {
+    "conversation_ids": [
+      "19:kestrel-release-crew@thread.v2"
+    ],
+    "initial_history_days": 30
+  }
+}

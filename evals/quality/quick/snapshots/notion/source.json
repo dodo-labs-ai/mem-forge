@@ -1,0 +1,9 @@
+{
+  "name": "Quality snapshot: notion",
+  "config": {
+    "token": "evaluation-snapshot",
+    "databases": [
+      "9a8b7c6d5e4f40312a1b0c9d8e7f6a5b"
+    ]
+  }
+}

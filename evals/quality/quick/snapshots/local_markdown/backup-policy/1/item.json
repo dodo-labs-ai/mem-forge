@@ -1,0 +1,22 @@
+{
+  "item": {
+    "item_id": "local-md-quality-snapshot-ops-backup-policy-txt",
+    "title": "Kestrel backup policy",
+    "source_url": "local-adapter://quality-snapshot/kestrel-notes/ops/backup-policy.txt",
+    "last_modified": "2026-10-21T08:00:00+00:00",
+    "content_type": "text/plain",
+    "space_or_project": "kestrel-notes",
+    "version": "559920e4d8c91509ace0f95ade3b0aeb1b2661abfb26c7c732576a728d4fb895",
+    "author": null,
+    "labels": [
+      "local_markdown"
+    ],
+    "extra": {
+      "relative_path": "ops/backup-policy.txt"
+    }
+  },
+  "raw": {
+    "file": "raw.json",
+    "content_type": "application/json"
+  }
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -79,6 +80,7 @@ COHORT = ROOT / "evals" / "quality" / "quick" / "cohort.json"
 
 
 QUICK = ROOT / "evals" / "quality" / "quick"
+REPLAYED_AT = "2026-10-30T12:00:00+00:00"
 
 
 def _current_titles() -> dict[str, str]:
@@ -102,15 +104,19 @@ def test_every_quality_case_names_a_document_the_smoke_syncs() -> None:
     titles = set(_current_titles().values())
 
     for list_name, _command in smoke.QUALITY_CASE_KINDS.values():
-        assert {case["title"] for case in cohort[list_name]} <= titles, list_name
-    assert len({case["title"] for case in cohort["cases"]}) == len(cohort["cases"])
+        assert {case["title"] for case in cohort[list_name] if "snapshot" not in case} <= titles, list_name
+    assert len({(case.get("snapshot"), case["title"]) for case in cohort["cases"]}) == len(cohort["cases"])
 
 
 def test_every_revised_document_has_its_support_case() -> None:
     import json
 
     revised = {_current_titles()[path.name] for path in (QUICK / "revisions").glob("*.md")}
-    support_titles = {case["title"] for case in json.loads(COHORT.read_text(encoding="utf-8"))["support_cases"]}
+    support_titles = {
+        case["title"]
+        for case in json.loads(COHORT.read_text(encoding="utf-8"))["support_cases"]
+        if "snapshot" not in case
+    }
 
     assert revised == support_titles
     assert all((QUICK / "docs" / path.name).exists() for path in (QUICK / "revisions").glob("*.md"))
@@ -130,15 +136,39 @@ def test_the_seed_request_names_each_document_within_the_smoke_source(tmp_path: 
 
     state = smoke.State(tmp_path / "state.json")
     state.set(source_id="src-smoke")
+    sets = [path.name for path in (QUICK / "snapshots").iterdir() if path.is_dir()]
+    state.set(snapshot_sources={name: {"id": f"src-{name}", "replayed_at": REPLAYED_AT} for name in sets})
 
     spec = json.loads(smoke.quality_seed_spec(COHORT, state, kind))
 
     assert (spec["selection_policy_version"], spec["role"]) == (f"public-quick-v1-{kind}", "sentinel")
-    assert spec["cases"] and {case["source_id"] for case in spec["cases"]} == {"src-smoke"}
+    expected_sources = {"src-smoke"} | ({f"src-{name}" for name in sets} if kind != "reconciliation" else set())
+    assert spec["cases"] and {case["source_id"] for case in spec["cases"]} == expected_sources
+    assert all("snapshot" not in case for case in spec["cases"])
     if kind == "reconciliation":
         assert all(set(case) == {"title", "source_id", "input", "rubric"} for case in spec["cases"])
     with pytest.raises(smoke.CheckFailed, match="no source"):
         smoke.quality_seed_spec(COHORT, smoke.State(tmp_path / "empty.json"), kind)
+    if kind != "reconciliation":
+        unreplayed = smoke.State(tmp_path / "unreplayed.json")
+        unreplayed.set(source_id="src-smoke")
+        with pytest.raises(smoke.CheckFailed, match="which no source replays"):
+            smoke.quality_seed_spec(COHORT, unreplayed, kind)
+
+
+def test_a_conversation_case_names_its_unit_by_the_replayed_date() -> None:
+    teams = QUICK / "snapshots" / "teams"
+
+    # The set's newest message, 2026-10-21T10:40, moves nine whole days, to before 11:00 on the replay's day.
+    assert smoke._replayed_title("Kestrel release crew thread from 2026-10-21T10:00", teams, REPLAYED_AT) == (
+        "Kestrel release crew thread from 2026-10-30T10:00"
+    )
+    assert smoke._replayed_title(
+        "Kestrel release crew thread from 2026-10-21T10:00", teams, "2026-10-30T12:00:00Z"
+    ) == "Kestrel release crew thread from 2026-10-30T10:00"
+    assert smoke._replayed_title("Kestrel queue tiers", QUICK / "snapshots" / "confluence", REPLAYED_AT) == (
+        "Kestrel queue tiers"
+    )
 
 
 def test_a_revision_sync_waits_past_the_run_that_finished_before(tmp_path: Path, monkeypatch) -> None:
@@ -167,3 +197,27 @@ def test_the_run_spec_needs_every_case_pinned() -> None:
     assert "code_revision" not in spec["candidate_manifest"] and "model" not in spec["candidate_manifest"]
     with pytest.raises(smoke.CheckFailed, match="not pinned completely"):
         smoke.quality_run_spec(COHORT, {"cohort_id": "aeo-1", "skipped": {"document_not_found": ["src:Missing"]}})
+
+
+def test_model_usage_totals_the_tokens_of_each_logged_generation_call() -> None:
+    def call(operation: str, prompt: int | None, completion: int | None) -> str:
+        payload = {"event": "structured_llm_call", "operation": operation}
+        if prompt is not None:
+            payload |= {"prompt_tokens": prompt, "completion_tokens": completion}
+        return f"api-1  | 2026-10-30 INFO memforge.llm.structured structured_llm_call {json.dumps(payload)}"
+
+    lines = [call("derive", 1200, 300), "api-1  | unrelated", call("derive", 800, 200), call("support", None, None)]
+
+    assert smoke.model_usage(lines) == (
+        "3 generation calls, 2000 input and 500 output tokens; 1 without reported usage (derive 2, support 1)"
+    )
+    with pytest.raises(smoke.CheckFailed, match="no generation model call"):
+        smoke.model_usage(["api-1  | unrelated"])
+
+
+def test_quality_outputs_reads_the_case_outputs_of_the_run(monkeypatch) -> None:
+    requests = []
+    monkeypatch.setattr(smoke, "api_json", lambda api, method, path: requests.append((method, path)) or {"cases": []})
+
+    assert json.loads(smoke.quality_outputs("http://api", "aer-1")) == {"cases": []}
+    assert requests == [("GET", "/api/v1/agent-evaluations/runs/aer-1/case-outputs")]

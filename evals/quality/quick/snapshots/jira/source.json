@@ -1,0 +1,12 @@
+{
+  "name": "Quality snapshot: jira",
+  "config": {
+    "base_url": "https://jira.example.test",
+    "auth_mode": "pat",
+    "pat": "evaluation-snapshot",
+    "query_mode": "simple",
+    "projects": [
+      "KES"
+    ]
+  }
+}

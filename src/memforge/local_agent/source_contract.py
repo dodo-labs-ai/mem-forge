@@ -339,10 +339,21 @@ def local_agent_sync_operation(
     source_type: str,
     config: Mapping[str, Any] | str | None,
 ) -> str | None:
-    """Return the daemon sync operation for a canonical source configuration."""
+    """Return the daemon sync operation for a canonical source configuration.
+
+    A document Source that replays an evaluation snapshot set runs on the
+    server with its snapshot Gene, whoever collects its type otherwise; a
+    conversation Source replays its set through the device executor.
+    """
+    from memforge.evals.source_snapshots import SNAPSHOT_CONFIG_FIELD
+    from memforge.genes.family import CollectionFamilyKind
+
     descriptor = source_type_descriptor(str(source_type or "").strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
-    if collection is None or not collection.collects(_source_config(config)):
+    source_config = _source_config(config)
+    if collection is None or not collection.collects(source_config):
+        return None
+    if SNAPSHOT_CONFIG_FIELD in source_config and descriptor.family is CollectionFamilyKind.DOCUMENT:
         return None
     return collection.operation
 
@@ -381,15 +392,25 @@ def local_agent_job_config(
     source_type: str,
     config: Mapping[str, Any] | str | None,
 ) -> dict[str, Any]:
-    """Return connector config safe and useful for the owner's daemon."""
+    """Return connector config safe and useful for the owner's daemon.
+
+    A Source that replays an evaluation snapshot set also hands the device
+    the set it replays.
+    """
     descriptor = source_type_descriptor(str(source_type or "").strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
     if collection is None:
         return {}
+    from memforge.evals.source_snapshots import SNAPSHOT_CONFIG_FIELD
+
     source_config = dict(_source_config(config))
     if collection.job_config_defaults is not None:
         source_config = collection.job_config_defaults(source_config)
-    return {key: value for key, value in source_config.items() if key in collection.job_config_fields}
+    return {
+        key: value
+        for key, value in source_config.items()
+        if key in collection.job_config_fields or key == SNAPSHOT_CONFIG_FIELD
+    }
 
 
 LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD = "projection_scope_transition"

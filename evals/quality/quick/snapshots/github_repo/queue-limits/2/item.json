@@ -1,0 +1,39 @@
+{
+  "item": {
+    "item_id": "github-repo-docs-queue-limits-md-5f0c1e2a9b3d",
+    "title": "queue-limits",
+    "source_url": "https://github.com/acme/kestrel/blob/main/docs/queue-limits.md",
+    "last_modified": "2026-10-22T09:00:00+00:00",
+    "content_type": "text/markdown",
+    "space_or_project": "acme/kestrel",
+    "version": "7ba221fb38679696c45e6d4f2cb79de794916050",
+    "author": null,
+    "labels": [
+      "github_repo"
+    ],
+    "extra": {
+      "connection_mode": "cloud_pull",
+      "file_identity_contract": "repository_path",
+      "repo_url": "https://github.com/acme/kestrel",
+      "repo_host": "github.com",
+      "repo_owner": "acme",
+      "repo_name": "kestrel",
+      "repo_ref": "main",
+      "relative_path": "docs/queue-limits.md",
+      "blob_sha": "7ba221fb38679696c45e6d4f2cb79de794916050",
+      "blob_size": 229,
+      "file_mode": "100644",
+      "logical_file_mode": "100644",
+      "symlink_chain": [],
+      "resolved_relative_path": "docs/queue-limits.md",
+      "commit_sha": "2c4c6cb67abab6e6cb46d0e94b6b646c8523ebf6",
+      "root_tree_sha": "457300360bb30eee3960181ef976c2ef6b30714f",
+      "repo_blob_url": "https://api.github.com/repos/acme/kestrel/git/blobs/7ba221fb38679696c45e6d4f2cb79de794916050",
+      "last_commit_at": "2026-10-22T09:00:00+00:00"
+    }
+  },
+  "raw": {
+    "file": "raw.md",
+    "content_type": "text/markdown"
+  }
+}

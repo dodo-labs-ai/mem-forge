@@ -1,0 +1,17 @@
+{
+  "conversation": {
+    "conversation_id": "19:kestrel-release-crew@thread.v2",
+    "kind": "group_chat",
+    "name": "Kestrel release crew",
+    "title_kind": "Teams conversation",
+    "title_fields": [
+      [
+        "Conversation type",
+        "group_chat"
+      ]
+    ],
+    "message_link": "https://teams.microsoft.com/l/message/19:kestrel-release-crew@thread.v2/{message_id}"
+  },
+  "threading": "inline",
+  "poll_includes_replies": true
+}

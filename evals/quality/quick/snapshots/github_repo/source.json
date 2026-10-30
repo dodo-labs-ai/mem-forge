@@ -1,0 +1,8 @@
+{
+  "name": "Quality snapshot: github_repo",
+  "config": {
+    "connection_mode": "cloud_pull",
+    "repo_url": "https://github.com/acme/kestrel",
+    "ref": "main"
+  }
+}

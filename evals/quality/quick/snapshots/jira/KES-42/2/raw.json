@@ -1,0 +1,183 @@
+{
+  "id": "10042",
+  "key": "KES-42",
+  "self": "https://jira.example.test/rest/api/2/issue/10042",
+  "fields": {
+    "summary": "Webhook delivery timeout is too short for slow receivers",
+    "description": "Kestrel webhook deliveries time out after 5 seconds, and receivers behind the acme gateway need up to 15 seconds.\n\n*Decision:* raise the webhook delivery timeout to 30 seconds. A timed-out delivery is retried at most 3 times ({{webhook.max_redeliveries}}).",
+    "issuetype": {
+      "id": "10004",
+      "name": "Task"
+    },
+    "project": {
+      "id": "10100",
+      "key": "KES",
+      "name": "Kestrel"
+    },
+    "status": {
+      "id": "3",
+      "name": "In Progress"
+    },
+    "priority": {
+      "id": "2",
+      "name": "High"
+    },
+    "resolution": null,
+    "assignee": {
+      "name": "lena.ortiz",
+      "key": "lena.ortiz",
+      "displayName": "Lena Ortiz"
+    },
+    "reporter": {
+      "name": "priya.nair",
+      "key": "priya.nair",
+      "displayName": "Priya Nair"
+    },
+    "labels": [
+      "webhooks"
+    ],
+    "created": "2026-10-20T09:30:00.000+0000",
+    "updated": "2026-10-22T14:02:00.000+0000",
+    "attachment": [
+      {
+        "id": "20077",
+        "self": "https://jira.example.test/rest/api/2/attachment/20077",
+        "filename": "webhook-latency.png",
+        "author": {
+          "name": "marco.bianchi",
+          "key": "marco.bianchi",
+          "displayName": "Marco Bianchi"
+        },
+        "created": "2026-10-20T11:30:00.000+0000",
+        "size": 17764,
+        "mimeType": "image/png",
+        "content": "https://jira.example.test/secure/attachment/20077/webhook-latency.png"
+      }
+    ]
+  },
+  "renderedFields": {
+    "description": "<p>Kestrel webhook deliveries time out after 5 seconds, and receivers behind the acme gateway need up to 15 seconds.</p>\n\n<p><b>Decision:</b> raise the webhook delivery timeout to 30 seconds. A timed-out delivery is retried at most 3 times (<tt>webhook.max_redeliveries</tt>).</p>"
+  },
+  "changelog": {
+    "startAt": 0,
+    "maxResults": 100,
+    "total": 3,
+    "histories": [
+      {
+        "id": "40001",
+        "author": {
+          "name": "priya.nair",
+          "key": "priya.nair",
+          "displayName": "Priya Nair"
+        },
+        "created": "2026-10-20T09:40:00.000+0000",
+        "items": [
+          {
+            "field": "status",
+            "fieldtype": "jira",
+            "from": "1",
+            "fromString": "Open",
+            "to": "3",
+            "toString": "In Progress"
+          }
+        ]
+      },
+      {
+        "id": "40002",
+        "author": {
+          "name": "priya.nair",
+          "key": "priya.nair",
+          "displayName": "Priya Nair"
+        },
+        "created": "2026-10-20T09:41:00.000+0000",
+        "items": [
+          {
+            "field": "priority",
+            "fieldtype": "jira",
+            "from": "3",
+            "fromString": "Medium",
+            "to": "2",
+            "toString": "High"
+          }
+        ]
+      },
+      {
+        "id": "40003",
+        "author": {
+          "name": "lena.ortiz",
+          "key": "lena.ortiz",
+          "displayName": "Lena Ortiz"
+        },
+        "created": "2026-10-22T14:02:00.000+0000",
+        "items": [
+          {
+            "field": "description",
+            "fieldtype": "jira",
+            "from": null,
+            "fromString": "Kestrel webhook deliveries time out after 5 seconds, and receivers behind the acme gateway need up to 15 seconds.\n\n*Decision:* raise the webhook delivery timeout to 20 seconds. A timed-out delivery is retried at most 3 times ({{webhook.max_redeliveries}}).",
+            "to": null,
+            "toString": "Kestrel webhook deliveries time out after 5 seconds, and receivers behind the acme gateway need up to 15 seconds.\n\n*Decision:* raise the webhook delivery timeout to 30 seconds. A timed-out delivery is retried at most 3 times ({{webhook.max_redeliveries}})."
+          }
+        ]
+      }
+    ]
+  },
+  "_comments": [
+    {
+      "id": "30101",
+      "self": "https://jira.example.test/rest/api/2/issue/10042/comment/30101",
+      "author": {
+        "name": "priya.nair",
+        "key": "priya.nair",
+        "displayName": "Priya Nair"
+      },
+      "updateAuthor": {
+        "name": "priya.nair",
+        "key": "priya.nair",
+        "displayName": "Priya Nair"
+      },
+      "body": "*Triage decision:* every timed-out delivery is logged to the {{kestrel-delivery-audit}} stream, so support can answer tenants without reading the worker logs.",
+      "renderedBody": "<p><b>Triage decision:</b> every timed-out delivery is logged to the <tt>kestrel-delivery-audit</tt> stream, so support can answer tenants without reading the worker logs.</p>",
+      "created": "2026-10-20T10:15:00.000+0000",
+      "updated": "2026-10-22T13:50:00.000+0000"
+    },
+    {
+      "id": "30102",
+      "self": "https://jira.example.test/rest/api/2/issue/10042/comment/30102",
+      "author": {
+        "name": "marco.bianchi",
+        "key": "marco.bianchi",
+        "displayName": "Marco Bianchi"
+      },
+      "updateAuthor": {
+        "name": "marco.bianchi",
+        "key": "marco.bianchi",
+        "displayName": "Marco Bianchi"
+      },
+      "body": "Latency graph from the acme gateway: !webhook-latency.png|thumbnail!",
+      "renderedBody": "<p>Latency graph from the acme gateway: <span class=\"image-wrap\"><a id=\"20077_thumb\" href=\"/secure/attachment/20077/webhook-latency.png\"><img src=\"/secure/thumbnail/20077/webhook-latency.png\" alt=\"webhook-latency.png\"></a></span></p>",
+      "created": "2026-10-20T11:31:00.000+0000",
+      "updated": "2026-10-20T11:31:00.000+0000"
+    },
+    {
+      "id": "30103",
+      "self": "https://jira.example.test/rest/api/2/issue/10042/comment/30103",
+      "author": {
+        "name": "lena.ortiz",
+        "key": "lena.ortiz",
+        "displayName": "Lena Ortiz"
+      },
+      "updateAuthor": {
+        "name": "lena.ortiz",
+        "key": "lena.ortiz",
+        "displayName": "Lena Ortiz"
+      },
+      "body": "The load test showed batch receivers need up to 25 seconds, so the timeout is now 30 seconds.",
+      "renderedBody": "<p>The load test showed batch receivers need up to 25 seconds, so the timeout is now 30 seconds.</p>",
+      "created": "2026-10-22T14:00:00.000+0000",
+      "updated": "2026-10-22T14:00:00.000+0000"
+    }
+  ],
+  "_comments_total": 3,
+  "_comments_included": true
+}
