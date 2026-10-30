@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "description": "MemForge memory for Claude Code: session-start guidance and MCP memory tools.",
   "author": {
     "name": "MemForge Team"

@@ -2,7 +2,7 @@
 
 This plugin connects Claude Code to a MemForge API through a thin local MCP proxy
 for memory tools, and adds MemForge usage guidance when a session starts.
-The packaged runtime and plugin version is `0.2.0-beta.2`.
+The packaged runtime and plugin version is `0.2.0-beta.3`.
 
 With no routing variables, the plugin targets local OSS at
 `http://127.0.0.1:8765/api/v1`. Otherwise put the target in the top-level `env`

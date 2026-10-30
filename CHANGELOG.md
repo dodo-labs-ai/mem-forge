@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0b3 - 2026-10-30
+
 - A new Jira source authenticates with a personal access token by default, so
   it needs no local daemon. Browser session stays a choice for deployments
   where a personal access token is not available, and local sync always uses
@@ -26,8 +28,7 @@
     store methods.
 
   A test refuses code outside `memforge.storage` that queries a store's
-  connection. Cloud: bump the OSS pin; the HANA store adds
-  `count_failed_memory_audit_events`.
+  connection.
 
 - Removed: password sign-in. `POST /api/v1/auth/login` issued a token that no
   route checked, so `memforge init` no longer asks for an admin password, and
@@ -35,8 +36,7 @@
   upgrade still holds it until that point is pruned. The Admin API serves the
   principal the deployment resolves. `PyJWT` and `bcrypt` are no longer direct
   dependencies. `MEMFORGE_JWT_SECRET` remains the key that signs Review
-  decision manifests. Cloud: bump the OSS pin and refresh its lock; no adapter
-  change.
+  decision manifests.
 
 - A revised claim that restates one kept Memory and contradicts or replaces
   another is no longer lost. Each row of the Support and Relation combination
@@ -48,8 +48,7 @@
   unsupported one; it is now added, or becomes that rule's successor. The
   Relation request states the same strict label definitions as the pair review,
   so a Candidate that adds a material fact is a refinement, not an equivalent.
-  Contract: `claim-revision-v10-sparse-catalog`. Cloud: bump the OSS pin; no
-  HANA schema, storage protocol, configuration or model route change.
+  Contract: `claim-revision-v10-sparse-catalog`.
 
 - Support Assessment judges a claim unsupported when text anywhere in the
   current revision replaces a value the claim states, even with a stricter one,
@@ -61,9 +60,7 @@
   request is an invalid row, corrected once like any other: the claim
   continues, and the opposing text that request showed is carried to the
   request that concludes. Contracts: `support-ordered-reading-v10`,
-  `revision-support-v14` and `claim-revision-v9-sparse-catalog`. Cloud: bump
-  the OSS pin; no HANA schema, storage protocol, configuration or model route
-  change.
+  `revision-support-v14` and `claim-revision-v9-sparse-catalog`.
 
 - Incremental extraction and Support revalidation of Markdown documents
   compare each heading under its own ancestors. Appending a subsection,
@@ -92,8 +89,7 @@
   `True`, and `False` only on a contextual field), and
   `memforge.pipeline.reading_equivalence.compare_readings` replaces
   `canonical_record_changed_raw_ranges`, `canonical_nested_changed_raw_ranges`
-  and `changed_interpretation_ranges`. Cloud: bump the OSS pin; the reading
-  relation itself needs no HANA change.
+  and `changed_interpretation_ranges`.
 
 - Jira comments (`jira-comment:6`) and Teams messages (`teams-message:3`)
   still show their edit time but no longer treat it as a change in what they
@@ -133,15 +129,11 @@
   new revision of a contract may be stored under, a conversation `Member`
   takes the `record_schema` its record was collected under, and
   `require_revision_identity` checks one stored revision against the projected
-  one. Cloud: the HANA adapter accepts a new Observation Revision under any of
-  `declared_representation_profiles` rather than only the current declaration,
-  as the SQLite adapter does.
+  one.
 
 - Admin: `BrandMark`, the MemForge mark in the sidebar, is exported from
   `@memforge/admin/patterns`, so an extension's own pages, such as a sign-in or
-  invitation page, show the same mark as the app. Cloud: its sign-in,
-  invitation and password-change pages use it instead of their copy of the
-  earlier mark.
+  invitation page, show the same mark as the app.
 
 - Agent-session storage is removed. On upgrade, MemForge takes its recovery
   point, retires every remaining agent-session Source as Source deletion does
@@ -164,10 +156,7 @@
   authors: `agent_session` is no longer a registered source type, the storage
   protocols drop `apply_agent_claim_source_projection_lifecycle` and
   `get_candidate_memories_by_agent_claim`, and `Database` drops its agent
-  claim, concept and receipt methods. Cloud: drop the HANA store's
-  agent claim, concept and receipt methods and their protocol entries, the
-  `clients` facet, and the capture tables, retiring the remaining agent-session
-  Sources in the same migration.
+  claim, concept and receipt methods.
 
 - The admin UI is served at `/`, and the previous admin UI (V1, `admin-ui/`)
   moves to `/v1/`. A link to a page under `/v2/`, where the admin UI ran beside
@@ -176,10 +165,7 @@
   are served for this release only and are removed with V1 in the next. In
   development, `npm run dev` in `admin/` serves the admin UI at
   `http://localhost:5175` and forwards `/v1/` to the V1 dev server on port
-  5174. Cloud: its composed build must emit V2 at the dist root and V1 under
-  `v1/` with the `/v1/` base, mount them at `/` and `/v1/`, redirect `/v2/*`
-  to `/*`, and hand the frozen V1 shell's Cloud pages over to `/`; no API,
-  schema or configuration change.
+  5174.
 
 - Breaking: `POST /api/v1/sources/{source_id}/memory-lifecycle/reviews/{review_id}/approve`
   and `/reject` are removed. A script that called them now gets `404`; decide
@@ -204,13 +190,10 @@
   set in Settings or `MEMFORGE_LLM_*` still lowers what LiteLLM gives; a value
   that is not such an object stops MemForge at startup with an error naming
   the variable.
-  MemForge itself maps no route. Cloud: set `MEMFORGE_LLM_METADATA_MODELS` for
-  each generation route that relied on MemForge mapping it before pinning this
-  change.
+  MemForge itself maps no route.
 
 - `Database.insert_memory_and_upsert_agent_claim`, which nothing called, is
-  removed. Cloud: remove the HANA store's `insert_memory_and_upsert_agent_claim`
-  and its protocol entry.
+  removed.
 
 - Admin: a related Memory shows when its source recorded it as a readable
   date and time, such as "Mar 3, 2026, 12:30 PM", or as a date alone for a
@@ -240,9 +223,7 @@
   Stored tables, contract versions, audit events, error codes, the LLM call
   operation names in runtime events and metrics (`cross_document_relation`,
   `memory_relation`) and HTTP and MCP field names are unchanged, so no
-  migration runs. Cloud: the HANA adapter, the
-  core-integration `WorkspaceDatabase` and the runtime provider take the new
-  names with the pin.
+  migration runs.
 
 - Relation discovery now orders two statements recorded on the same day by
   the exact time their sources recorded them, for example two comments of one
@@ -260,9 +241,7 @@
   relation discovery work admin action
   (`POST /api/v1/relation-discovery/work/rerun` with state `completed` and no
   classifier version, or once for each version before
-  `cross-document-relation-v6`). Cloud: arrives with the pin; HANA reads the
-  Evidence time through the same shared function, and its relation time
-  columns already hold a full time, so it needs no change.
+  `cross-document-relation-v6`).
 
 - The Evaluation page no longer reports an Evidence selection failure when
   extraction recovers from it. When the model cites a passage it may not use
