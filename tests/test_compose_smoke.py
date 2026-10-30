@@ -1,9 +1,11 @@
-"""The compose smoke helper's offline checks: port bindings, waiting, and the MCP tool set it expects."""
+"""The compose smoke helper's offline checks: port bindings, waiting, the model plan and the MCP tools it expects."""
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -208,11 +210,12 @@ def test_model_usage_totals_the_tokens_of_each_logged_generation_call() -> None:
 
     lines = [call("derive", 1200, 300), "api-1  | unrelated", call("derive", 800, 200), call("support", None, None)]
 
-    assert smoke.model_usage(lines) == (
-        "3 generation calls, 2000 input and 500 output tokens; 1 without reported usage (derive 2, support 1)"
+    assert smoke.model_usage(lines, "openai_compatible: gpt-6-luna") == (
+        "3 generation calls to openai_compatible: gpt-6-luna, 2000 input and 500 output tokens; "
+        "1 without reported usage (derive 2, support 1)"
     )
     with pytest.raises(smoke.CheckFailed, match="no generation model call"):
-        smoke.model_usage(["api-1  | unrelated"])
+        smoke.model_usage(["api-1  | unrelated"], "openrouter: anthropic/claude-haiku-5.5")
 
 
 def test_quality_outputs_reads_the_case_outputs_of_the_run(monkeypatch) -> None:
@@ -221,3 +224,240 @@ def test_quality_outputs_reads_the_case_outputs_of_the_run(monkeypatch) -> None:
 
     assert json.loads(smoke.quality_outputs("http://api", "aer-1")) == {"cases": []}
     assert requests == [("GET", "/api/v1/agent-evaluations/runs/aer-1/case-outputs")]
+
+
+# -- Model plan --------------------------------------------------------------------------------
+
+SPLIT_OPTIONS = [
+    "--generation-provider", "openai_compatible",
+    "--generation-endpoint", "https://llm.example.com/v1",
+    "--generation-model", "gpt-6-luna",
+    "--generation-key-env", "TEAM_LLM_KEY",
+    "--embedding-provider", "openrouter",
+]
+
+
+def _plan(*options: str, **environ: str):
+    return smoke.plan_models(smoke.parse_args(["model-plan", *options]), environ)
+
+
+def test_without_model_options_the_plan_is_openrouter_with_its_key_or_none() -> None:
+    assert _plan() is None
+    assert _plan(OPENROUTER_API_KEY="  ") is None
+
+    plan = _plan(OPENROUTER_API_KEY="sk-or")
+
+    assert plan.kinds == {
+        "generation": smoke.KindPlan("openrouter", "anthropic/claude-haiku-5.5", None, "OPENROUTER_API_KEY"),
+        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None, "OPENROUTER_API_KEY"),
+    }
+    assert _plan("--generation-model", "openai/gpt-5-mini", OPENROUTER_API_KEY="sk-or").kinds[
+        "generation"
+    ] == smoke.KindPlan("openrouter", "openai/gpt-5-mini", None, "OPENROUTER_API_KEY")
+
+
+def test_ollama_serves_both_kinds_at_the_ollama_url_even_with_an_openrouter_key() -> None:
+    plan = _plan("--ollama", OPENROUTER_API_KEY="sk-or")
+
+    assert {kind: (item.provider, item.model, item.endpoint) for kind, item in plan.kinds.items()} == {
+        "generation": ("ollama", "qwen3:0.6b", smoke.DEFAULT_OLLAMA_URL),
+        "embedding": ("ollama", "nomic-embed-text", smoke.DEFAULT_OLLAMA_URL),
+    }
+    moved = _plan("--ollama", "--ollama-url", "http://gpu-box:11434")
+    assert {item.endpoint for item in moved.kinds.values()} == {"http://gpu-box:11434"}
+
+
+def test_each_kind_takes_its_own_provider() -> None:
+    plan = _plan(*SPLIT_OPTIONS, TEAM_LLM_KEY="sk-team", OPENROUTER_API_KEY="sk-or")
+
+    assert plan.kinds == {
+        "generation": smoke.KindPlan("openai_compatible", "gpt-6-luna", "https://llm.example.com/v1", "TEAM_LLM_KEY"),
+        "embedding": smoke.KindPlan("openrouter", "openai/text-embedding-3-small", None, "OPENROUTER_API_KEY"),
+    }
+    assert plan.label == (
+        "generation openai_compatible: gpt-6-luna; embedding openrouter: openai/text-embedding-3-small"
+    )
+    # A kind left unnamed takes the default provider, here OpenRouter.
+    unnamed = _plan(*SPLIT_OPTIONS[:8], TEAM_LLM_KEY="sk-team", OPENROUTER_API_KEY="sk-or")
+    assert unnamed.kinds["embedding"].provider == "openrouter"
+
+
+def test_a_direct_anthropic_key_reaches_the_reference_model() -> None:
+    plan = _plan("--generation-provider", "anthropic", "--embedding-provider", "openai")
+
+    assert plan.kinds == {
+        "generation": smoke.KindPlan("anthropic", "claude-haiku-5-5", None, "ANTHROPIC_API_KEY"),
+        "embedding": smoke.KindPlan("openai", "text-embedding-3-small", None, "OPENAI_API_KEY"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("options", "environ", "message"),
+    [
+        (["--generation-provider", "anthropic"], {}, "no embedding provider"),
+        (
+            ["--generation-provider", "openai_compatible"],
+            {"OPENROUTER_API_KEY": "sk-or"},
+            "--generation-model is required",
+        ),
+        (SPLIT_OPTIONS, {}, "TEAM_LLM_KEY, named by --generation-key-env, is not set"),
+    ],
+)
+def test_an_incomplete_plan_is_refused(options: list[str], environ: dict[str, str], message: str) -> None:
+    with pytest.raises(smoke.PlanError, match=re.escape(message)):
+        _plan(*options, **environ)
+
+
+def test_the_shell_reads_the_plan_without_any_key(tmp_path: Path) -> None:
+    environ = {"TEAM_LLM_KEY": "sk-team-secret", "OPENROUTER_API_KEY": "sk-or-secret", "PATH": "/usr/bin:/bin"}
+    printed = subprocess.run(
+        [sys.executable, str(SCRIPT), "model-plan", *SPLIT_OPTIONS, "--generation-model", "it's-a-model"],
+        env=environ, capture_output=True, text=True, check=True,
+    ).stdout
+    shell = subprocess.run(
+        ["bash", "-c", 'eval "$1"; printf "%s|%s|%s" "$models_label" "$generation_label" "$ollama_endpoints"']
+        + ["_", printed],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    assert "secret" not in printed and "llm.example.com" not in printed
+    assert shell == (
+        "generation openai_compatible: it's-a-model; embedding openrouter: openai/text-embedding-3-small"
+        "|openai_compatible: it's-a-model|"
+    )
+
+
+def test_the_shell_script_passes_every_model_option_the_helper_takes() -> None:
+    script = (ROOT / "scripts" / "compose_smoke.sh").read_text()
+    options = script.split("case $1 in", 1)[1].split("esac", 1)[0]
+    passed = set(re.findall(r"(--(?:generation|embedding)-[a-z-]+|--ollama(?:-url)?)[ )]", options))
+    helper_help = subprocess.run(
+        [sys.executable, str(SCRIPT), "model-plan", "--help"], capture_output=True, text=True, check=True
+    ).stdout
+
+    assert passed == set(re.findall(r"--[a-z-]+", helper_help)) - {"--help"}
+
+
+def _provider_descriptors() -> list[dict]:
+    """The descriptors ``GET /api/v1/model-settings/providers`` lists."""
+    from memforge.llm.providers import PROVIDER_DESCRIPTORS
+    from memforge.server.model_settings_api import _descriptor_response
+
+    return [_descriptor_response(descriptor).model_dump(mode="json") for descriptor in PROVIDER_DESCRIPTORS]
+
+
+class FakeSettingsApi:
+    """The Settings API calls ``configure_models`` makes, answering as a validated model does."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.candidates: dict[str, dict] = {}
+
+    def __call__(self, api: str, method: str, path: str, payload=None, *, expect=(200,)):
+        self.calls.append((method, path, payload))
+        kind = path.split("/")[4] if path.count("/") > 4 else None
+        if path == "/api/v1/model-settings/providers":
+            return {"providers": _provider_descriptors()}
+        if path.endswith("/discover-models"):
+            models = [{"id": "gpt-6-luna"}, {"id": "openai/text-embedding-3-small"}]
+            return {"ok": True, "models": models}
+        if method == "PUT":
+            self.candidates[kind] = payload
+            return {}
+        if path.endswith("/candidate/validate"):
+            return {"passed": True, "promoted": True, "validation": {"facts": {"latency_ms": 42}}}
+        if path == "/api/v1/model-settings":
+            return {
+                kind: {"active": {"provider": body["provider"], "model_id": body["model_id"], "state": "ready"}}
+                for kind, body in self.candidates.items()
+            }
+        raise AssertionError(f"unexpected {method} {path}")
+
+
+def test_each_kind_is_saved_through_its_own_provider(tmp_path: Path, monkeypatch) -> None:
+    environ = {"TEAM_LLM_KEY": "sk-team-secret", "OPENROUTER_API_KEY": "sk-or-secret"}
+    fake = FakeSettingsApi()
+    monkeypatch.setattr(smoke, "api_json", fake)
+    state = smoke.State(tmp_path / "state.json")
+
+    detail = smoke.configure_models("http://api", _plan(*SPLIT_OPTIONS, **environ), environ, state, timeout=5)
+
+    assert fake.candidates["generation"] == {
+        "provider": "openai_compatible",
+        "model_id": "gpt-6-luna",
+        "endpoint": "https://llm.example.com/v1",
+        "auth_strategy": "api_key",
+        "api_key": "sk-team-secret",
+        "token_limits": {
+            "context_window_tokens": smoke.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "max_output_tokens": smoke.DEFAULT_MAX_OUTPUT_TOKENS,
+        },
+    }
+    assert fake.candidates["embedding"] == {
+        "provider": "openrouter",
+        "model_id": "openai/text-embedding-3-small",
+        "endpoint": None,
+        "auth_strategy": "api_key",
+        "api_key": "sk-or-secret",
+    }
+    discovered = [payload for method, path, payload in fake.calls if path.endswith("/discover-models")]
+    assert [body["api_key"] for body in discovered] == ["sk-team-secret", "sk-or-secret"]
+    assert detail == (
+        "generation openai_compatible: gpt-6-luna validated in 42 ms; "
+        "embedding openrouter: openai/text-embedding-3-small validated in 42 ms"
+    )
+    assert "secret" not in detail and "secret" not in state.path.read_text()
+    assert state.get("models") == {
+        "generation": {"provider": "openai_compatible", "model": "gpt-6-luna"},
+        "embedding": {"provider": "openrouter", "model": "openai/text-embedding-3-small"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "plan", "message"),
+    [
+        ("generation", smoke.KindPlan("openai_compatible", "m", None, "KEY"), "pass --generation-endpoint"),
+        ("embedding", smoke.KindPlan("anthropic", "m", None, "KEY"), "Anthropic serves no embedding models"),
+        ("generation", smoke.KindPlan("openrouter", "m", None, "OPENROUTER_API_KEY"), "set OPENROUTER_API_KEY"),
+        ("generation", smoke.KindPlan("bedrock", "m", None, "KEY"), "bedrock is not a provider Settings offers"),
+    ],
+)
+def test_a_model_settings_would_refuse_is_refused_before_it_is_saved(kind: str, plan, message: str) -> None:
+    descriptors = {descriptor["id"]: descriptor for descriptor in _provider_descriptors()}
+
+    with pytest.raises(smoke.CheckFailed, match=re.escape(message)):
+        smoke._binding(kind, plan, descriptors, {})
+
+
+def test_a_keyless_provider_is_bound_without_a_key() -> None:
+    descriptors = {descriptor["id"]: descriptor for descriptor in _provider_descriptors()}
+    plan = smoke.KindPlan("ollama", "qwen3:0.6b", smoke.DEFAULT_OLLAMA_URL, "OLLAMA_API_KEY")
+
+    binding = smoke._binding("generation", plan, descriptors, {})
+
+    assert (binding.auth_strategy, binding.api_key) == ("none", None)
+    assert "api_key" not in smoke._candidate(binding, {})
+
+
+def test_the_restart_check_compares_each_kind_with_its_own_provider(tmp_path: Path, monkeypatch) -> None:
+    active = {
+        "generation": {"provider": "openai_compatible", "model_id": "gpt-6-luna", "state": "ready"},
+        "embedding": {"provider": "openrouter", "model_id": "openai/text-embedding-3-small", "state": "ready"},
+    }
+    answers = {
+        "/api/v1/health": {"status": "ok", "database": {"status": "ok"}, "vector_store": {"status": "ok"}},
+        "/api/v1/model-settings": {kind: {"active": binding} for kind, binding in active.items()},
+    }
+    monkeypatch.setattr(smoke, "api_json", lambda api, method, path: answers[path])
+    state = smoke.State(tmp_path / "state.json")
+    state.set(models={
+        "generation": {"provider": "openai_compatible", "model": "gpt-6-luna"},
+        "embedding": {"provider": "openrouter", "model": "openai/text-embedding-3-small"},
+    })
+
+    assert smoke.check_persisted("http://api", state) == (
+        "models kept (openai_compatible: gpt-6-luna, openrouter: openai/text-embedding-3-small); vector store ok"
+    )
+    active["embedding"]["provider"] = "openai"
+    with pytest.raises(smoke.CheckFailed, match="embedding model in use changed to openai"):
+        smoke.check_persisted("http://api", state)

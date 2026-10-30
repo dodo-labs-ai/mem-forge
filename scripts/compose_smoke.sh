@@ -23,13 +23,20 @@
 #   scripts/compose_smoke.sh [options]
 #
 # Options:
-#   --ollama                Configure models served by Ollama on this machine.
+#   --ollama                A kind without --KIND-provider uses Ollama on this
+#                           machine.
 #   --ollama-url URL        Ollama as the API container reaches it
 #                           (default http://host.docker.internal:11434).
-#   --generation-model ID   Generation model (default qwen3:0.6b with Ollama,
-#                           anthropic/claude-haiku-5.5 with OpenRouter).
-#   --embedding-model ID    Embedding model (default nomic-embed-text with
-#                           Ollama, openai/text-embedding-3-small with OpenRouter).
+#   --KIND-provider ID      The provider of the generation or the embedding
+#                           model, as Settings names it: openrouter, openai,
+#                           anthropic (generation only), ollama,
+#                           openai_compatible or litellm.
+#   --KIND-model ID         The model (defaults below).
+#   --KIND-endpoint URL     The provider's base URL; openai_compatible needs one,
+#                           ollama defaults to --ollama-url.
+#   --KIND-key-env NAME     The environment variable holding the provider's API
+#                           key (default <PROVIDER>_API_KEY, e.g.
+#                           OPENAI_COMPATIBLE_API_KEY).
 #   --no-models             Skip the model steps even when a provider is available.
 #   --sync-timeout SECONDS  How long the source sync may take (default 900).
 #   --report FILE           Also write the Markdown report to FILE.
@@ -46,12 +53,24 @@
 #                           of every case) as DIR/<kind>.json.
 #   -h, --help              Show this help.
 #
-# Models: with --ollama the smoke uses a local Ollama that has both models
-# pulled; otherwise, when OPENROUTER_API_KEY is exported or set in .env.test
-# at the repository root (see scripts/smoke_env.py), it uses OpenRouter. The
-# key is sent to the API in a request body and never printed. Without a provider the model, sync and retrieval
-# steps are reported as skipped, and the restart check looks for the source
-# added through the API, directly and through the MCP proxy.
+# Models: KIND is generation or embedding, and each kind is configured
+# through Settings with its own provider. A kind without --KIND-provider uses
+# a local Ollama that has the model pulled with --ollama, and otherwise
+# OpenRouter when OPENROUTER_API_KEY is set. Without --KIND-model a kind
+# takes its provider's default: Claude Haiku 5.5 for generation on openrouter
+# and anthropic, text-embedding-3-small for embedding on openrouter and
+# openai, qwen3:0.6b and nomic-embed-text on ollama; any other provider needs
+# --KIND-model. Keys are read from the environment or from .env.test at the
+# repository root (see scripts/smoke_env.py), sent to the API in request
+# bodies and never printed. With no provider for either kind the model, sync
+# and retrieval steps are reported as skipped, and the restart check looks for
+# the source added through the API, directly and through the MCP proxy.
+#
+# For example, generation through an OpenAI-compatible endpoint and embedding
+# through OpenRouter:
+#   scripts/compose_smoke.sh --generation-provider openai_compatible \
+#     --generation-endpoint https://llm.example.com/v1 --generation-model my-model \
+#     --embedding-provider openrouter
 #
 # Restricted networks: exported HTTPS_PROXY / HTTP_PROXY are passed to the
 # image build and to the API container, with NO_PROXY covering the stack and
@@ -75,14 +94,11 @@ SNAPSHOTS_DIR="$REPO_ROOT/evals/quality/quick/snapshots"
 SNAPSHOTS_IN_CONTAINER=/evaluation-snapshots
 SKIPPED=3
 
-use_ollama=0
 no_models=0
 run_quality=0
 quality_summary=
 model_usage=
-ollama_url=http://host.docker.internal:11434
-generation_model=
-embedding_model=
+model_args=()
 sync_timeout=900
 report_file=
 outputs_dir=
@@ -93,10 +109,10 @@ usage() {
 
 while [ $# -gt 0 ]; do
   case $1 in
-    --ollama) use_ollama=1 ;;
-    --ollama-url) ollama_url=${2:?--ollama-url needs a URL}; shift ;;
-    --generation-model) generation_model=${2:?--generation-model needs a model}; shift ;;
-    --embedding-model) embedding_model=${2:?--embedding-model needs a model}; shift ;;
+    --ollama) model_args+=("$1") ;;
+    --ollama-url | --generation-provider | --generation-model | --generation-endpoint | --generation-key-env | \
+    --embedding-provider | --embedding-model | --embedding-endpoint | --embedding-key-env)
+      model_args+=("$1" "${2:?$1 needs a value}"); shift ;;
     --no-models) no_models=1 ;;
     --quality) run_quality=1 ;;
     --sync-timeout) sync_timeout=${2:?--sync-timeout needs seconds}; shift ;;
@@ -112,18 +128,13 @@ done
 smoke_env=$("$PYTHON" "$REPO_ROOT/scripts/smoke_env.py") || exit 2
 eval "$smoke_env"
 
-if (( no_models )); then
-  model_provider=none
-elif (( use_ollama )); then
-  model_provider=ollama
-  generation_model=${generation_model:-qwen3:0.6b}
-  embedding_model=${embedding_model:-nomic-embed-text}
-elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
-  model_provider=openrouter
-  generation_model=${generation_model:-anthropic/claude-haiku-5.5}
-  embedding_model=${embedding_model:-openai/text-embedding-3-small}
-else
-  model_provider=none
+# Each kind's provider and model: models_label names both for the report,
+# generation_label the generation model, and ollama_endpoints the Ollama
+# servers the API container has to reach. An empty models_label means no model.
+models_label= generation_label= ollama_endpoints=
+if (( ! no_models )); then
+  model_plan=$("$PYTHON" "$HELPER" model-plan ${model_args[@]+"${model_args[@]}"}) || exit 2
+  eval "$model_plan"
 fi
 
 for tool in docker "$PYTHON"; do
@@ -316,27 +327,22 @@ mcp_tools() {
 }
 
 configure_models() {
-  case $model_provider in
-    none)
-      say "no model provider: pass --ollama or export OPENROUTER_API_KEY"
-      return "$SKIPPED"
-      ;;
-    ollama)
-      if ! compose exec -T api python -c '
+  local endpoint
+  if [ -z "$models_label" ]; then
+    say "no model provider: pass --ollama, export OPENROUTER_API_KEY, or name each kind's --KIND-provider"
+    return "$SKIPPED"
+  fi
+  for endpoint in $ollama_endpoints; do
+    if ! compose exec -T api python -c '
 import sys, urllib.request
 urllib.request.urlopen(sys.argv[1] + "/api/version", timeout=10).read()
-' "$ollama_url" >&2; then
-        say "the API container cannot reach Ollama at $ollama_url; start Ollama and let it accept connections from containers"
-        return 1
-      fi
-      helper models --provider ollama --endpoint "$ollama_url" \
-        --generation-model "$generation_model" --embedding-model "$embedding_model" >"$detail_file"
-      ;;
-    openrouter)
-      helper models --provider openrouter \
-        --generation-model "$generation_model" --embedding-model "$embedding_model" >"$detail_file"
-      ;;
-  esac
+' "$endpoint" >&2; then
+      say "the API container cannot reach Ollama at $endpoint;" \
+        "start Ollama and let it accept connections from containers"
+      return 1
+    fi
+  done
+  helper models ${model_args[@]+"${model_args[@]}"} >"$detail_file"
 }
 
 add_source() {
@@ -345,7 +351,7 @@ add_source() {
 
 sync_source() {
   local requested
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a generation model"
     return "$SKIPPED"
   fi
@@ -365,7 +371,7 @@ sync_source() {
 # second version and sync again, so each is an applied update with recorded
 # Support work for the Support cases to pin.
 revise_source() {
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a synced source"
     return "$SKIPPED"
   fi
@@ -381,7 +387,7 @@ revise_source() {
 # server; a conversation Source is collected by the device executor, which one
 # daemon pass runs with the snapshot provider.
 add_snapshot_sources() {
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a generation model"
     return "$SKIPPED"
   fi
@@ -390,7 +396,7 @@ add_snapshot_sources() {
 
 sync_snapshot_sources() {
   local revision=$1 requested
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a generation model"
     return "$SKIPPED"
   fi
@@ -407,7 +413,7 @@ sync_snapshot_sources() {
 
 retrieve_memories() {
   local searched
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a synced source"
     return "$SKIPPED"
   fi
@@ -422,11 +428,11 @@ retrieve_memories() {
 quality_checks() {
   local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" kind command seeded run_spec summary status
   local verdicts=() failed=0
-  if [ "$model_provider" = none ]; then
+  if [ -z "$models_label" ]; then
     say "needs a synced source"
     return "$SKIPPED"
   fi
-  quality_summary=
+  quality_summary="- Models: $models_label"$'\n\n'
   for kind in derivation support reconciliation; do
     command=seed-$kind-cases
     run_spec="$work_dir/quality-run-$kind.json"
@@ -469,8 +475,9 @@ save_quality_outputs() {
 # report: read from the API's log before the restart replaces its container,
 # whether or not an earlier step failed.
 read_model_usage() {
-  [ "$model_provider" = none ] && return
-  model_usage=$(compose logs --no-color api 2>/dev/null | "$PYTHON" "$HELPER" model-usage) ||
+  [ -z "$models_label" ] && return
+  model_usage=$(compose logs --no-color api 2>/dev/null |
+    "$PYTHON" "$HELPER" model-usage --model "$generation_label") ||
     model_usage="not read: $model_usage"
 }
 
@@ -545,11 +552,7 @@ print_report() {
   if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
     commit="$commit with local changes"
   fi
-  if [ "$model_provider" = none ]; then
-    models="none (model, sync and retrieval steps skipped)"
-  else
-    models="$model_provider: $generation_model, $embedding_model"
-  fi
+  models=${models_label:-none (model, sync and retrieval steps skipped)}
   echo "### Compose fresh-install smoke"
   echo
   echo "- Commit: $commit"

@@ -185,12 +185,16 @@ in every other deployment: a Source that names a snapshot is refused unless
 `MEMFORGE_EVALUATION_SNAPSHOT_ROOT` names the folder its set lies below, which
 only `--quality` sets.
 
-The rubrics are written against one reference model, Claude Haiku 5.5, which
-is the default generation model of `compose_smoke.sh` with OpenRouter. The
-verdict your pull request needs is the one on that model, so today it needs an
-OpenRouter key. A run with `--ollama` or another `--generation-model` is still
-worth reporting, but it is advisory: a `fail` there may come from the model
-rather than your change. Name the provider and model of every run you paste.
+The rubrics are written against one reference model, Claude Haiku 5.5. The
+verdict your pull request needs is the one on that model, through whichever
+provider serves it: `anthropic/claude-haiku-5.5` on OpenRouter, the default
+generation model of `compose_smoke.sh`, or `claude-haiku-5-5` with an
+Anthropic key (`--generation-provider anthropic`). The embedding model is not
+part of the reference. A run on another generation model, for example with
+`--ollama` or another `--generation-model`, is still worth reporting, but it
+is advisory: a `fail` there may come from the model rather than your change.
+The report and each summary name the provider and model of both kinds; paste
+them with the run.
 
 ### Provider keys for the smoke scripts
 
@@ -198,10 +202,32 @@ rather than your change. Name the provider and model of every run you paste.
 keys, and a local Ollama when it answers, and reports the rest as skipped. Add
 any other LiteLLM route with `--litellm-route`, with `--endpoint` when it needs
 one and `--kind embedding` for an embedding model.
-`compose_smoke.sh` configures its models through OpenRouter, or through a
-local Ollama with `--ollama`; with neither, it skips the model, sync and search
-steps, and your pull request should say so. Keep your keys in one file instead
-of exporting them in every terminal:
+`compose_smoke.sh` configures the generation and the embedding model each
+through its own provider, as Settings does. By default both use OpenRouter
+when `OPENROUTER_API_KEY` is set, or a local Ollama with `--ollama`. Name a
+kind's provider with `--generation-provider` or `--embedding-provider`, and
+its model, base URL and key variable with `--KIND-model`, `--KIND-endpoint`
+and `--KIND-key-env`; a key is read from `<PROVIDER>_API_KEY` unless you name
+another variable. A kind you leave unnamed keeps the default, so a generation
+key alone needs an embedding provider beside it. For example, a generation
+model behind an OpenAI-compatible endpoint, with OpenRouter for embedding:
+
+```bash
+scripts/compose_smoke.sh --generation-provider openai_compatible \
+  --generation-endpoint https://llm.example.com/v1 --generation-model my-model \
+  --generation-key-env MY_LLM_API_KEY --embedding-provider openrouter
+```
+
+Or Claude Haiku 5.5 with an Anthropic key, and OpenAI for embedding:
+
+```bash
+scripts/compose_smoke.sh --quality --generation-provider anthropic --embedding-provider openai
+```
+
+Without a provider for either kind, the smoke skips the model, sync and search
+steps, and your pull request should say so. `scripts/compose_smoke.sh --help`
+lists each provider's default model. Keep your keys in one file instead of
+exporting them in every terminal:
 
 ```bash
 cp .env.test.example .env.test
