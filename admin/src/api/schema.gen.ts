@@ -2108,6 +2108,10 @@ export interface paths {
         /**
          * Conversation Collection Request
          * @description The request one device collection attempt answers; asking again returns the same request.
+         *
+         *     ``record_schema`` names the schema the server reads the attempt's
+         *     messages in, so an executor that collects another refuses before it
+         *     polls.
          */
         post: operations["conversation_collection_request_api_v1_sources__source_id__conversation_collection_request_post"];
         delete?: never;

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- A local daemon whose release collects conversation messages in an earlier
+  record schema than the server reads, such as `teams-message:2` against
+  `teams-message:3`, is told to upgrade: the server answers its manifest
+  `409 local_agent_upgrade_required` with the reason, and the Sources page asks
+  to upgrade MemForge on the device that runs the daemon rather than showing a
+  failed sync to retry. A server older than the daemon's schema is refused with
+  `server_upgrade_required` instead, and the page asks to upgrade the server.
+  The collection request also names the record schema the server reads
+  (`record_schema`), so from this release a daemon refuses before it polls and
+  does not retry the attempt; a daemon of an earlier release still polls
+  before its manifest is refused. Upgrade `memforge-ai` on that device, then
+  run `memforge daemon restart`.
+
 ## 0.2.0b3 - 2026-10-30
 
 - A new Jira source authenticates with a personal access token by default, so

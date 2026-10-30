@@ -55,8 +55,8 @@ from memforge.evals.agent_evaluation import (
     SourceEvaluationStatus,
 )
 from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
-from memforge.conversations.intake import CollectionIntake, CollectionRejected
-from memforge.conversations.manifest import ManifestFormatError, request_to_payload
+from memforge.conversations.intake import AgentUpgradeRequired, CollectionIntake, CollectionRejected
+from memforge.conversations.manifest import LOCAL_AGENT_UPGRADE_REQUIRED, ManifestFormatError, request_to_payload
 from memforge.conversations.reader import SourceProjectionUnitReader
 from memforge.conversations.records import MessageIdentity, canonical_record_json
 from memforge.conversations.report import plan_report
@@ -9332,7 +9332,12 @@ def create_admin_app(
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        """The request one device collection attempt answers; asking again returns the same request."""
+        """The request one device collection attempt answers; asking again returns the same request.
+
+        ``record_schema`` names the schema the server reads the attempt's
+        messages in, so an executor that collects another refuses before it
+        polls.
+        """
 
         upload = await _conversation_upload(request, db, source_id=source_id, workspace_id=workspace_id, attempt=req)
         collection_request = await upload.gene.issue_collection_request(
@@ -9341,6 +9346,7 @@ def create_admin_app(
         return {
             "collection_attempt_id": upload.collection_attempt_id,
             "request": request_to_payload(collection_request),
+            "record_schema": upload.gene.record_schema,
         }
 
     @source_router.post("/{source_id}/conversation-collection/plan")
@@ -9396,6 +9402,8 @@ def create_admin_app(
             )
         except ManifestFormatError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except AgentUpgradeRequired as exc:
+            raise HTTPException(status_code=409, detail=f"{LOCAL_AGENT_UPGRADE_REQUIRED}: {exc}") from exc
         except CollectionRejected as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -9452,7 +9460,7 @@ def create_admin_app(
     async def retired_projection_inventory(source_id: str):
         """Tell an agent that reads the projection inventory to upgrade: the server owns every conversation decision."""
 
-        raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
+        raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
 
     @source_router.post("/{source_id}/adapter/manifest")
     async def prepare_local_source_manifest(
@@ -9469,7 +9477,7 @@ def create_admin_app(
         if _conversation_gene(source) is not None:
             # A conversation Source uploads a Collection Manifest; an agent
             # that sends it document snapshots is told to upgrade.
-            raise HTTPException(status_code=409, detail="local_agent_upgrade_required")
+            raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         lease_payload = await _require_current_local_agent_lease(

@@ -3969,7 +3969,7 @@ def _run_cloud_teams_sync_job(
     its processing, or for a dry run asks for its plan.
     """
 
-    from memforge.local_agent.conversation_executor import ConversationUploadError
+    from memforge.local_agent.conversation_executor import ConversationUploadError, RecordSchemaMismatch
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -4003,6 +4003,9 @@ def _run_cloud_teams_sync_job(
     except ConversationUploadError as exc:
         _raise_if_local_agent_lease_not_current(exc.response)
         return {"operation": operation, "source_id": source_id, "error": str(exc), "retryable": True}
+    except RecordSchemaMismatch as exc:
+        # No attempt succeeds until the daemon or the server is upgraded; the next scheduled sync asks again.
+        return {"operation": operation, "source_id": source_id, "error": str(exc), "retryable": False}
     except Exception as exc:
         return {
             "operation": operation,

@@ -65,6 +65,25 @@ it("does not expose arbitrary raw errors or offer unavailable configuration", ()
   expect(screen.queryByRole("button", { name: "Configure file scope" })).toBeNull();
 });
 
+it("asks to upgrade the local daemon when the server needs a newer release", () => {
+  const activity = sourceSyncActivityFromLocalJob({
+    job_id: "laj-1", status: "failed", last_error: null, next_attempt_at: null,
+    result: { error: "manifest upload failed: local_agent_upgrade_required: the manifest records messages as "
+      + "teams-message:2, an earlier version of the teams-message:3 this server reads" },
+  });
+  render(<SourceSyncStatusCard activity={activity} sourceName="Teams" itemLabel="messages" />);
+  expect(screen.getByText("Upgrade MemForge on the device that runs the local daemon, then retry sync.")).toBeTruthy();
+  expect(screen.queryByText(/teams-message/)).toBeNull();
+});
+
+it("asks to upgrade the server when the local daemon collects a later record schema", () => {
+  render(<SourceSyncStatusCard activity={{ state: "failed", error: {
+    message: "server_upgrade_required: this local daemon collects messages as teams-message:4 and the server "
+      + "reads the earlier teams-message:3",
+  } }} sourceName="Teams" itemLabel="messages" />);
+  expect(screen.getByText("Upgrade the MemForge server to the local daemon's release, then retry sync.")).toBeTruthy();
+});
+
 it("does not read 429 digits inside a failed document's identifiers as a rate limit", () => {
   render(<SourceSyncStatusCard activity={{ state: "failed", error: {
     message: "1 document could not be synced. Review the failed document details.",

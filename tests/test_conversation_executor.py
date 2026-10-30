@@ -14,18 +14,23 @@ from memforge.local_agent import conversation_executor
 from memforge.local_agent.conversation_executor import (
     ConversationUploadError,
     DeviceCollectionResult,
+    RecordSchemaMismatch,
     run_device_collection,
 )
 from memforge.local_agent.runner import CloudJobLeaseLost
+from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from tests.test_conversation_source_sync import CHAT, NOW, FakeTeams
 
 
 class Server:
     """The server side of the upload: it asks for a body only when it does not hold the message."""
 
-    def __init__(self, *, held: set[str] = frozenset(), refuse: str | None = None) -> None:
+    def __init__(
+        self, *, held: set[str] = frozenset(), refuse: str | None = None, reads: str | None = MESSAGE_SCHEMA.qualified_name
+    ) -> None:
         self.held = held
         self.refuse = refuse
+        self.reads = reads
         self.calls: list[tuple[str, dict]] = []
         self.manifest: dict | None = None
         self.bodies: list[dict] = []
@@ -34,8 +39,10 @@ class Server:
         self.calls.append(("request", attempt))
         selection = ConversationSelection(conversation_ids=(CHAT,), initial_history_days=30)
         request = ConversationLayer.collection_request(selection=selection, now=NOW)
-        return {"collection_attempt_id": "job-1:attempt:1",
-                "request": request_to_payload(request)}
+        answer = {"collection_attempt_id": "job-1:attempt:1", "request": request_to_payload(request)}
+        if self.reads is not None:
+            answer["record_schema"] = self.reads
+        return answer
 
     def submit_conversation_manifest(self, *, source_id, manifest, **attempt):
         self.calls.append(("manifest", attempt))
@@ -150,9 +157,59 @@ async def test_bodies_upload_in_batches(monkeypatch):
     assert [details["count"] for step, details in server.calls if step == "bodies"] == [2, 2, 1]
 
 
+@pytest.mark.parametrize(
+    ("reads", "reason"),
+    [
+        (f"teams-message:{MESSAGE_SCHEMA.version + 1}", "^local_agent_upgrade_required: .*`memforge daemon restart`$"),
+        (f"teams-message:{MESSAGE_SCHEMA.version - 1}", "^server_upgrade_required: .*the server reads the earlier teams-message:"),
+        ("conversation-message:1", f"collects messages as {MESSAGE_SCHEMA.qualified_name} and the server reads "
+                                   "conversation-message:1$"),
+    ],
+    ids=["server newer", "server older", "other schema"],
+)
+async def test_a_request_in_another_record_schema_fails_before_polling(reads, reason):
+    teams = _teams(2)
+    server = Server(reads=reads)
+
+    async def never_polled(*args, **kwargs):
+        raise AssertionError("polled a conversation the server cannot read")
+
+    teams.poll = never_polled
+
+    with pytest.raises(RecordSchemaMismatch, match=reason):
+        await _run(teams, server)
+    assert [step for step, _ in server.calls] == ["request"]
+
+
+async def test_a_server_that_names_no_record_schema_leaves_the_check_to_manifest_intake():
+    server = Server(reads=None)
+
+    await _run(_teams(1), server)
+
+    assert [step for step, _ in server.calls] == ["request", "manifest", "bodies", "process"]
+
+
 async def test_a_refused_upload_stops_the_attempt():
     with pytest.raises(ConversationUploadError, match="manifest upload failed"):
         await _run(_teams(1), Server(refuse="manifest"))
+
+
+def test_a_record_schema_mismatch_fails_the_job_without_a_retry(monkeypatch):
+    async def mismatched(job, payload, source_id, client, report_progress):
+        raise RecordSchemaMismatch("local_agent_upgrade_required: this local daemon collects messages as teams-message:3")
+
+    monkeypatch.setattr(main, "_collect_conversation_on_device", mismatched)
+
+    class Client:
+        target = main.build_target(origin="http://localhost:8000", edition="oss")
+
+    result = main._run_cloud_teams_sync_job(
+        {"job_id": "job-1", "attempt_count": 1, "operation": "teams_sync", "source_id": "src-teams", "payload": {}},
+        Client(),
+    )
+
+    assert result["retryable"] is False
+    assert result["error"].startswith("local_agent_upgrade_required: ")
 
 
 def test_a_lease_the_server_no_longer_honours_ends_the_job(monkeypatch):

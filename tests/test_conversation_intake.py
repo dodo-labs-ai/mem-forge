@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memforge.conversations.collections import CollectedBody, StoredCollections
-from memforge.conversations.intake import CollectionIntake, CollectionRejected
+from memforge.conversations.intake import AgentUpgradeRequired, CollectionIntake, CollectionRejected
 from memforge.conversations.layer import ConversationLayer, ConversationSelection
 from memforge.conversations.manifest import (
     CollectionManifest,
@@ -18,6 +18,7 @@ from memforge.conversations.manifest import (
     PollEvidence,
     RequestedConversation,
     manifest_to_payload,
+    predates_record_schema,
 )
 from memforge.conversations.port import (
     ConversationAccess,
@@ -391,18 +392,44 @@ async def test_a_conversation_the_source_cannot_read_keeps_the_label_its_request
     )
 
 
-async def test_a_manifest_in_another_record_schema_is_refused(database):
+@pytest.mark.parametrize(
+    ("schema", "other", "earlier"),
+    [
+        ("teams-message:2", "teams-message:3", True),
+        ("teams-message:3", "teams-message:10", True),
+        ("teams-message:10", "teams-message:3", False),
+        ("teams-message:3", "teams-message:3", False),
+        ("teams-message:2", "jira-comment:3", False),
+        ("teams-message:x", "teams-message:3", False),
+        ("teams-message:\u00b2", "teams-message:3", False),
+    ],
+)
+def test_a_record_schema_predates_only_a_later_version_of_itself(schema, other, earlier):
+    assert predates_record_schema(schema, other) is earlier
+
+
+@pytest.mark.parametrize(
+    ("server_reads", "refusal", "reason"),
+    [
+        ("teams-message:3", AgentUpgradeRequired, "teams-message:2, an earlier version of the teams-message:3"),
+        ("teams-message:1", CollectionRejected, "^server_upgrade_required: .*teams-message:2, a later version of the teams-message:1 this server reads$"),
+        ("jira-comment:6", CollectionRejected, "teams-message:2, not jira-comment:6"),
+    ],
+    ids=["agent older", "server older", "other schema"],
+)
+async def test_a_manifest_in_another_record_schema_is_refused(database, server_reads, refusal, reason):
     request = await _issue(database)
 
-    with pytest.raises(CollectionRejected, match="not teams-message:3"):
+    with pytest.raises(refusal, match=reason) as refused:
         await _intake(database).receive_manifest(
             _answer(request),
             source_id=SOURCE,
             collection_attempt_id=ATTEMPT,
             config_revision="cfg-1",
-            record_schema="teams-message:3",
+            record_schema=server_reads,
             received_at=NOW,
         )
+    assert isinstance(refused.value, AgentUpgradeRequired) is (refusal is AgentUpgradeRequired)
 
 
 async def test_a_manifest_another_upload_recorded_first_is_refused(database, monkeypatch):

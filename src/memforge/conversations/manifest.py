@@ -35,8 +35,28 @@ from memforge.source_time import parse_source_time
 MANIFEST_VERSION = 1
 
 
+LOCAL_AGENT_UPGRADE_REQUIRED = "local_agent_upgrade_required"
+"""How the server tells a device executor that its release predates what the server reads."""
+
+SERVER_UPGRADE_REQUIRED = "server_upgrade_required"
+"""How a refusal says the server's release predates what a device executor collects."""
+
+
 class ManifestFormatError(ValueError):
     """A manifest or request payload that does not have the shape its version defines."""
+
+
+def predates_record_schema(schema: str, other: str) -> bool:
+    """Whether ``schema`` is an earlier version of the record schema ``other``, each named ``name:version``."""
+
+    name, _, version = schema.rpartition(":")
+    other_name, _, other_version = other.rpartition(":")
+    return (
+        name == other_name
+        and version.isdecimal()
+        and other_version.isdecimal()
+        and int(version) < int(other_version)
+    )
 
 
 @dataclass(frozen=True, slots=True)
