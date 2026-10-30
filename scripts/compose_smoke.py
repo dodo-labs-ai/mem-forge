@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import select
 import socket
@@ -31,6 +32,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
@@ -581,6 +583,179 @@ def search_source(api: str, state: State) -> str:
     return f"{len(results)} memories for {SOURCE_QUERY!r}; first: {_excerpt(str(results[0].get('summary') or results[0].get('content') or '').encode(), 90)}"
 
 
+# -- Quality snapshots --------------------------------------------------------------------------
+
+# The Source configuration field that names the snapshot set a Source replays.
+SNAPSHOT_CONFIG_FIELD = "evaluation_snapshot"
+SNAPSHOT_SOURCE_FILE = "source.json"
+SNAPSHOT_MESSAGES_FILE = "messages.json"
+# A replayed conversation's newest message lands at least this long before replay began.
+REPLAY_LEAD = timedelta(hours=1)
+_REVISION_NAME = re.compile(r"[1-9][0-9]*")
+_TITLE_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})$")
+
+
+def _snapshot_sets(snapshots: Path) -> list[Path]:
+    """Each snapshot set, one per source type: a directory holding the Source configuration to create."""
+    return sorted(path for path in snapshots.iterdir() if (path / SNAPSHOT_SOURCE_FILE).is_file())
+
+
+def _snapshot_config(set_dir: Path, revision: int, replayed_at: str) -> dict[str, Any]:
+    spec = json.loads((set_dir / SNAPSHOT_SOURCE_FILE).read_text(encoding="utf-8"))
+    return {
+        **spec["config"],
+        SNAPSHOT_CONFIG_FIELD: {"set": set_dir.name, "revision": revision, "replayed_at": replayed_at},
+    }
+
+
+def create_snapshot_sources(api: str, snapshots: Path, state: State) -> str:
+    """Add one Source per snapshot set, replaying its revision 1; all of them begin their replay now."""
+    replayed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    sources = {}
+    for set_dir in _snapshot_sets(snapshots):
+        spec = json.loads((set_dir / SNAPSHOT_SOURCE_FILE).read_text(encoding="utf-8"))
+        created = api_json(
+            api,
+            "POST",
+            "/api/v1/sources",
+            {
+                "type": set_dir.name,
+                "name": spec["name"],
+                "access_policy": "private",
+                "config": _snapshot_config(set_dir, 1, replayed_at),
+            },
+        )
+        sources[set_dir.name] = {"id": created["id"], "replayed_at": replayed_at}
+    if not sources:
+        raise CheckFailed(f"{snapshots} holds no snapshot set")
+    state.set(snapshot_sources=sources)
+    return f"{len(sources)} snapshot sources: {', '.join(sorted(sources))}"
+
+
+def request_snapshot_syncs(api: str, snapshots: Path, state: State, revision: int) -> str:
+    """Move every snapshot Source to ``revision`` and ask for its sync; the run that finished last is waited past."""
+    sources = state.get("snapshot_sources") or {}
+    if not sources:
+        raise CheckFailed("no snapshot source was added")
+    for source_type, recorded in sources.items():
+        if revision > 1:
+            config = _snapshot_config(snapshots / source_type, revision, recorded["replayed_at"])
+            api_json(api, "PUT", f"/api/v1/sources/{recorded['id']}", {"config": config})
+        recorded["waits_past"] = (_source(api, recorded["id"]).get("sync") or {}).get("run_id")
+        api_json(api, "POST", f"/api/v1/sources/{recorded['id']}/sync", expect=(202,))
+    state.set(snapshot_sources=sources)
+    return f"revision {revision} requested for {len(sources)} snapshot sources"
+
+
+def wait_for_snapshot_syncs(api: str, state: State, *, timeout: float) -> str:
+    """Wait until every snapshot Source has finished a sync after the one it last finished, with memories."""
+    sources = state.get("snapshot_sources") or {}
+    deadline = time.monotonic() + timeout
+    outcomes = []
+    for source_type, recorded in sorted(sources.items()):
+
+        def synced() -> str | None:
+            source = _source(api, recorded["id"])
+            sync = source.get("sync") or {}
+            if sync.get("run_id") in (None, recorded.get("waits_past")):
+                return None
+            if sync.get("status") == "failed":
+                raise CheckFailed(f"the {source_type} snapshot sync failed: {sync.get('error_message')}")
+            if sync.get("status") not in FINISHED_SYNC_STATES:
+                return None
+            if source.get("memory_count", 0) < 1:
+                raise CheckFailed(f"the {source_type} snapshot synced {source['doc_count']} documents into no memory")
+            return f"{source_type} {sync['status']} ({source['doc_count']} documents, {source['memory_count']} memories)"
+
+        remaining = max(deadline - time.monotonic(), 1.0)
+        outcomes.append(wait_until(synced, timeout=remaining, interval=5, what=f"the {source_type} snapshot sync"))
+    return "; ".join(outcomes)
+
+
+def _parse_time(value: str) -> datetime:
+    """An ISO 8601 time, with ``Z`` read as UTC on every Python this helper runs on."""
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+
+
+def _snapshot_message_files(set_dir: Path) -> list[Path]:
+    """Each conversation revision's messages, in the item and revision directories the server reads."""
+    return [
+        path
+        for path in set_dir.glob(f"*/*/{SNAPSHOT_MESSAGES_FILE}")
+        if not path.parent.parent.name.startswith(".") and _REVISION_NAME.fullmatch(path.parent.name)
+    ]
+
+
+def _replayed_title(title: str, set_dir: Path, replayed_at: str) -> str:
+    """A conversation Unit's title as replay names it: the time it ends with moves by the set's replay offset.
+
+    A conversation snapshot's times move forward by whole days, so that its
+    newest message across every revision lands in the day before
+    ``REPLAY_LEAD`` ahead of the replay's start. A title names the time of
+    the Unit's first message, so only its date changes.
+    """
+    if not _snapshot_message_files(set_dir):
+        return title
+    match = _TITLE_TIME.search(title)
+    if match is None:
+        raise CheckFailed(f"the conversation case {title!r} does not end with its first message's time")
+    newest = max(
+        _parse_time(message["created_at"])
+        for messages in _snapshot_message_files(set_dir)
+        for message in json.loads(messages.read_text(encoding="utf-8"))
+    )
+    offset = timedelta(days=(_parse_time(replayed_at) - REPLAY_LEAD - newest) // timedelta(days=1))
+    moved = datetime.fromisoformat(match.group(1)) + offset
+    return title[: match.start()] + moved.isoformat()[:16]
+
+
+def quality_outputs(api: str, run_id: str) -> str:
+    """The case outputs of one quality run: each case's pinned input, its rubric and the model's output."""
+    return json.dumps(
+        api_json(api, "GET", f"/api/v1/agent-evaluations/runs/{run_id}/case-outputs"), indent=2, ensure_ascii=False
+    )
+
+
+# -- Model usage --------------------------------------------------------------------------------
+
+# Every structured model call logs one line with its operation and token usage.
+_MODEL_CALL = re.compile(r"structured_llm_call (\{.*\})\s*$")
+
+
+def model_usage(log_lines: Iterable[str]) -> str:
+    """The generation model calls the API logged, and their input and output token totals.
+
+    Embedding requests are not structured calls and are not counted. A call
+    whose provider reported no usage is counted apart.
+    """
+    calls = unreported = prompt_tokens = completion_tokens = 0
+    operations: dict[str, int] = {}
+    for line in log_lines:
+        match = _MODEL_CALL.search(line)
+        if match is None:
+            continue
+        try:
+            call = json.loads(match.group(1))
+        except ValueError:
+            continue
+        calls += 1
+        operation = str(call.get("operation") or "unnamed")
+        operations[operation] = operations.get(operation, 0) + 1
+        if call.get("prompt_tokens") is None or call.get("completion_tokens") is None:
+            unreported += 1
+            continue
+        prompt_tokens += int(call["prompt_tokens"])
+        completion_tokens += int(call["completion_tokens"])
+    if not calls:
+        raise CheckFailed("the API logged no generation model call")
+    by_operation = ", ".join(f"{name} {count}" for name, count in sorted(operations.items()))
+    unreported_note = f"; {unreported} without reported usage" if unreported else ""
+    return (
+        f"{calls} generation calls, {prompt_tokens} input and {completion_tokens} output tokens"
+        f"{unreported_note} ({by_operation})"
+    )
+
+
 # -- After the restart -------------------------------------------------------------------------
 
 
@@ -666,20 +841,31 @@ QUALITY_CASE_KINDS = {
 def quality_seed_spec(cohort_file: Path, state: State, kind: str) -> str:
     """The seed request of one case kind of the cohort file.
 
-    Each case names its Document by its current title within the smoke source;
-    a reconciliation case reads its hand-written situation from the file it
+    Each case names its Document by its current title within the smoke
+    source, or, with ``snapshot``, within the Source replaying that snapshot
+    set, where a conversation Unit's title names its replayed time. A
+    reconciliation case reads its hand-written situation from the file it
     names, next to the cohort file.
     """
     cohort = json.loads(cohort_file.read_text(encoding="utf-8"))
     source_id = state.get("source_id")
     if not source_id:
         raise CheckFailed("no source was added before the quality checks")
+    snapshot_sources = state.get("snapshot_sources") or {}
     cases = []
     for case in cohort[QUALITY_CASE_KINDS[kind][0]]:
         if kind == "reconciliation":
             situation = json.loads((cohort_file.parent / case["file"]).read_text(encoding="utf-8"))
             case = {"title": case["title"], "input": situation["input"], "rubric": situation["rubric"]}
-        cases.append({**case, "source_id": source_id})
+        snapshot = case.pop("snapshot", None)
+        if snapshot is None:
+            cases.append({**case, "source_id": source_id})
+            continue
+        if snapshot not in snapshot_sources:
+            raise CheckFailed(f"the case {case['title']!r} names the snapshot set {snapshot!r}, which no source replays")
+        replayed = snapshot_sources[snapshot]
+        title = _replayed_title(case["title"], cohort_file.parent / "snapshots" / snapshot, replayed["replayed_at"])
+        cases.append({**case, "title": title, "source_id": replayed["id"]})
     return json.dumps(
         {
             "selection_policy_version": f"{cohort['selection_policy_version']}-{kind}",
@@ -715,6 +901,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     bindings = commands.add_parser("bindings", help="check `docker inspect` output read from stdin")
     bindings.add_argument("--expect", action="append", default=[], metavar="SERVICE=PORT")
 
+    commands.add_parser("model-usage", help="total the generation model calls in API logs read from stdin")
+
     def api_command(name: str, help_text: str) -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--api", required=True, help="the smoke API, e.g. http://127.0.0.1:18765")
@@ -745,12 +933,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     sync.add_argument("--timeout", type=float, default=900)
     sync.add_argument("--new-run", action="store_true", help="wait for a run other than the one that last finished")
 
+    snapshot_sources = api_command("snapshot-sources", "add one source per quality snapshot set")
+    snapshot_sources.add_argument("--snapshots", type=Path, required=True)
+    snapshot_sync = api_command("snapshot-sync", "move the snapshot sources to a revision and ask for their sync")
+    snapshot_sync.add_argument("--snapshots", type=Path, required=True)
+    snapshot_sync.add_argument("--revision", type=int, required=True)
+    snapshot_wait = api_command("snapshot-wait", "wait for every snapshot source's sync")
+    snapshot_wait.add_argument("--timeout", type=float, default=900)
+
     api_command("search", "search the source's memories")
     seed_spec = api_command("quality-seed-spec", "print the quality cohort's seed request")
     seed_spec.add_argument("--cohort", type=Path, required=True)
     seed_spec.add_argument("--kind", choices=tuple(QUALITY_CASE_KINDS), required=True)
     run_spec = api_command("quality-run-spec", "print the quality run spec for a seed answer read from stdin")
     run_spec.add_argument("--cohort", type=Path, required=True)
+    outputs = api_command("quality-outputs", "print each case's pinned input, rubric and model output of a run")
+    outputs.add_argument("--run", required=True)
     api_command("persisted", "check what was recorded before the restart")
     return parser.parse_args(argv)
 
@@ -764,6 +962,8 @@ def run(args: argparse.Namespace) -> str:
             service, _, port = item.partition("=")
             expected[service] = int(port)
         return check_bindings(json.load(sys.stdin), expected)
+    if args.command == "model-usage":
+        return model_usage(sys.stdin)
     state = State(args.state)
     if args.command == "probe":
         return probe(args.api, args.ui)
@@ -777,12 +977,20 @@ def run(args: argparse.Namespace) -> str:
         return request_sync(args.api, state)
     if args.command == "wait-sync":
         return wait_for_sync(args.api, state, timeout=args.timeout, new_run=args.new_run)
+    if args.command == "snapshot-sources":
+        return create_snapshot_sources(args.api, args.snapshots, state)
+    if args.command == "snapshot-sync":
+        return request_snapshot_syncs(args.api, args.snapshots, state, args.revision)
+    if args.command == "snapshot-wait":
+        return wait_for_snapshot_syncs(args.api, state, timeout=args.timeout)
     if args.command == "search":
         return search_source(args.api, state)
     if args.command == "quality-seed-spec":
         return quality_seed_spec(args.cohort, state, args.kind)
     if args.command == "quality-run-spec":
         return quality_run_spec(args.cohort, json.load(sys.stdin))
+    if args.command == "quality-outputs":
+        return quality_outputs(args.api, args.run)
     return check_persisted(args.api, state)
 
 

@@ -1,0 +1,53 @@
+[
+  {
+    "message_id": "1761040800000",
+    "created_at": "2026-10-21T10:00:00+00:00",
+    "thread_root_id": null,
+    "record": {
+      "content": "Proposal: Kestrel 4.2 ships on Wednesday 2026-10-28 behind the kestrel-canary flag.",
+      "attachments": [],
+      "deleted": null,
+      "from": "Priya Nair",
+      "time": "2026-10-21T10:00:00+00:00",
+      "edited_time": null,
+      "reply_to_id": null,
+      "conversation_id": "19:kestrel-release-crew@thread.v2",
+      "conversation_name": "Kestrel release crew",
+      "representation": "teams-message:3"
+    }
+  },
+  {
+    "message_id": "1761041100000",
+    "created_at": "2026-10-21T10:05:00+00:00",
+    "thread_root_id": "1761040800000",
+    "record": {
+      "content": "Agreed. The canary covers 5% of tenants for the first 24 hours.",
+      "attachments": [],
+      "deleted": null,
+      "from": "Marco Bianchi",
+      "time": "2026-10-21T10:05:00+00:00",
+      "edited_time": null,
+      "reply_to_id": "1761040800000",
+      "conversation_id": "19:kestrel-release-crew@thread.v2",
+      "conversation_name": "Kestrel release crew",
+      "representation": "teams-message:3"
+    }
+  },
+  {
+    "message_id": "1761042000000",
+    "created_at": "2026-10-21T10:20:00+00:00",
+    "thread_root_id": null,
+    "record": {
+      "content": "I will write the rollback runbook before the release and link it in the release ticket.",
+      "attachments": [],
+      "deleted": null,
+      "from": "Lena Ortiz",
+      "time": "2026-10-21T10:20:00+00:00",
+      "edited_time": null,
+      "reply_to_id": null,
+      "conversation_id": "19:kestrel-release-crew@thread.v2",
+      "conversation_name": "Kestrel release crew",
+      "representation": "teams-message:3"
+    }
+  }
+]

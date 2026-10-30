@@ -1,0 +1,33 @@
+{
+  "notion_raw": 1,
+  "markdown": "## Plan\n\n1. Rebuild the panels of the Grafana board `kestrel-overview` on the built-in status page.\n2. Keep both running for one week.\n3. Retire the Grafana board after the comparison.\n",
+  "properties": [
+    {
+      "name": "Decision",
+      "type": "rich_text",
+      "value": "Replace the Grafana board kestrel-overview with the built-in status page."
+    },
+    {
+      "name": "Name",
+      "type": "title",
+      "value": "Kestrel dashboard migration"
+    },
+    {
+      "name": "Owner",
+      "type": "people",
+      "value": "Lena Ortiz"
+    },
+    {
+      "name": "Status",
+      "type": "status",
+      "value": "In progress"
+    },
+    {
+      "name": "Tags",
+      "type": "multi_select",
+      "value": "observability, migration"
+    }
+  ],
+  "truncated": false,
+  "unknown_not_found": 0
+}

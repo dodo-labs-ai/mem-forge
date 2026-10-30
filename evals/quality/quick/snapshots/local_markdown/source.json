@@ -1,0 +1,7 @@
+{
+  "name": "Quality snapshot: local_markdown",
+  "config": {
+    "root": "/evaluation-snapshots/local_markdown",
+    "vault_id": "kestrel-notes"
+  }
+}

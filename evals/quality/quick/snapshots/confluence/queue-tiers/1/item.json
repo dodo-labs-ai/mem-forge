@@ -1,0 +1,25 @@
+{
+  "item": {
+    "item_id": "confluence-77001",
+    "title": "Kestrel queue tiers",
+    "source_url": "https://confluence.example.test/display/KES/Kestrel+queue+tiers",
+    "last_modified": "2026-10-21T08:00:00+00:00",
+    "content_type": "text/html",
+    "space_or_project": "KES",
+    "version": "3",
+    "author": "Priya Nair",
+    "labels": [
+      "operations"
+    ],
+    "extra": {
+      "page_id": "77001",
+      "space_key": "KES",
+      "parent_page_id": "77000"
+    }
+  },
+  "raw": {
+    "file": "raw.html",
+    "content_type": "text/html"
+  },
+  "pdf": "export.pdf"
+}

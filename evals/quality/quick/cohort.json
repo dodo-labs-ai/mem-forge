@@ -77,6 +77,90 @@
           "kestrel-oncall"
         ]
       }
+    },
+    {
+      "snapshot": "local_markdown",
+      "title": "Kestrel backup policy",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "kestrel-archive"
+        ]
+      }
+    },
+    {
+      "snapshot": "github_repo",
+      "title": "queue-limits",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "payload"
+        ]
+      }
+    },
+    {
+      "snapshot": "github_pages",
+      "title": "on call",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "kestrel-primary"
+        ]
+      }
+    },
+    {
+      "snapshot": "jira",
+      "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "timeout"
+        ]
+      }
+    },
+    {
+      "snapshot": "confluence",
+      "title": "Kestrel queue tiers",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "payments"
+        ]
+      }
+    },
+    {
+      "snapshot": "notion",
+      "title": "Kestrel dashboard migration",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "Grafana"
+        ]
+      }
+    },
+    {
+      "snapshot": "teams",
+      "title": "Kestrel release crew thread from 2026-10-21T10:00",
+      "rubric": {
+        "expected_memory_count": {
+          "min": 1
+        },
+        "required_terms": [
+          "canary"
+        ]
+      }
     }
   ],
   "support_cases": [
@@ -113,6 +197,73 @@
         "expected_support_terms": {
           "Slack": "supported",
           "15": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "local_markdown",
+      "title": "Kestrel backup policy",
+      "rubric": {
+        "expected_support_terms": {
+          "kestrel-archive": "supported",
+          "6 hours": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "github_repo",
+      "title": "queue-limits",
+      "rubric": {
+        "expected_support_terms": {
+          "500": "supported",
+          "256": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "github_pages",
+      "title": "on call",
+      "rubric": {
+        "expected_support_terms": {
+          "secondary": "supported",
+          "5 minutes": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "jira",
+      "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
+      "rubric": {
+        "expected_support_terms": {
+          "20 seconds": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "confluence",
+      "title": "Kestrel queue tiers",
+      "rubric": {
+        "expected_support_terms": {
+          "invoices": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "notion",
+      "title": "Kestrel dashboard migration",
+      "rubric": {
+        "expected_support_terms": {
+          "two weeks": "unsupported"
+        }
+      }
+    },
+    {
+      "snapshot": "teams",
+      "title": "Kestrel release crew thread from 2026-10-21T10:00",
+      "rubric": {
+        "expected_support_terms": {
+          "canary": "supported",
+          "5%": "unsupported"
         }
       }
     }

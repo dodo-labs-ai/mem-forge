@@ -1,0 +1,11 @@
+{
+  "name": "Quality snapshot: confluence",
+  "config": {
+    "base_url": "https://confluence.example.test",
+    "pat": "evaluation-snapshot",
+    "sync_mode": "space",
+    "spaces": [
+      "KES"
+    ]
+  }
+}

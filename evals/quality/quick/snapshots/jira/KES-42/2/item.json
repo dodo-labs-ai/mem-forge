@@ -1,0 +1,37 @@
+{
+  "item": {
+    "item_id": "jira-KES-42",
+    "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
+    "source_url": "https://jira.example.test/browse/KES-42",
+    "last_modified": "2026-10-22T14:05:00+00:00",
+    "content_type": "application/json",
+    "space_or_project": "KES",
+    "version": "2026-10-22T14:05:00.000+0000",
+    "author": "Lena Ortiz",
+    "labels": [
+      "webhooks"
+    ],
+    "extra": {
+      "issue_id": "10042",
+      "issue_key": "KES-42",
+      "status": "Done",
+      "priority": "High",
+      "issue_type": "Task"
+    }
+  },
+  "raw": {
+    "file": "raw.json",
+    "content_type": "application/json"
+  },
+  "artifacts": [
+    {
+      "file": "artifacts/webhook-latency.png",
+      "provider_key": "20077",
+      "parent_observation_type": "comment",
+      "parent_provider_key": "30102",
+      "provider_revision": "2026-10-20T11:30:00.000+0000",
+      "filename": "webhook-latency.png",
+      "media_type": "image/png"
+    }
+  ]
+}

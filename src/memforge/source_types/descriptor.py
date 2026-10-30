@@ -83,6 +83,13 @@ class ConversationProviderReference:
         return load_reference(self.factory) if isinstance(self.factory, str) else self.factory
 
     def open(self, job_config: Mapping[str, Any]) -> AbstractAsyncContextManager[ConversationProvider]:
+        """Open the provider for one device collection; a job that replays an evaluation snapshot set opens its snapshot provider."""
+
+        from memforge.evals.source_snapshots import open_snapshot_provider, snapshot_reference
+
+        reference = snapshot_reference(job_config)
+        if reference is not None:
+            return open_snapshot_provider(self.provider_class(), reference)
         return self.factory_function()(job_config)
 
 

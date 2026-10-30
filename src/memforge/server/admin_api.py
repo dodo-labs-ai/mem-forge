@@ -54,6 +54,12 @@ from memforge.evals.agent_evaluation import (
     OnlineEvaluationCoveragePolicy,
     SourceEvaluationStatus,
 )
+from memforge.evals.source_snapshots import (
+    SNAPSHOT_CONFIG_FIELD,
+    complete_snapshot_config,
+    snapshot_reference,
+    snapshot_set_dir,
+)
 from memforge.conversations.collections import ArtifactLink, CollectedBody, StoredCollections
 from memforge.conversations.intake import AgentUpgradeRequired, CollectionIntake, CollectionRejected
 from memforge.conversations.manifest import LOCAL_AGENT_UPGRADE_REQUIRED, ManifestFormatError, request_to_payload
@@ -3311,12 +3317,50 @@ def _viewed_scope_transition(source: Mapping[str, Any], transition: dict[str, An
     }
 
 
-def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
-    """The conversation Gene of a Source, or ``None`` for a Source of another family."""
+def _complete_snapshot_config(config: Mapping[str, Any], existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Check the evaluation snapshot set a configuration names (:func:`complete_snapshot_config`).
+
+    A refusal raises ``SourceConfigInvalid`` on the snapshot field.
+    """
+
+    try:
+        return complete_snapshot_config(dict(config), existing_config)
+    except ValueError as exc:
+        raise SourceConfigInvalid([FieldIssue(SNAPSHOT_CONFIG_FIELD, str(exc))]) from exc
+
+
+def _require_snapshot_replay(config: Mapping[str, Any]) -> None:
+    """Refuse, with its reason, to run a Source that replays an evaluation snapshot set this deployment cannot read.
+
+    A set is readable only while the deployment replays snapshots; the
+    refusal answers 409.
+    """
+
+    try:
+        reference = snapshot_reference(config)
+        if reference is not None:
+            snapshot_set_dir(reference)
+    except SourceConfigurationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _is_conversation_source(source: Mapping[str, Any]) -> bool:
+    """Whether a Source's type is of the conversation family."""
 
     descriptor = source_type_descriptor(str(source.get("type") or ""))
-    if descriptor is None or descriptor.family is not CollectionFamilyKind.CONVERSATION:
+    return descriptor is not None and descriptor.family is CollectionFamilyKind.CONVERSATION
+
+
+def _conversation_gene(source: Mapping[str, Any]) -> ConversationGene | None:
+    """The conversation Gene of a Source, or ``None`` for a Source of another family.
+
+    A conversation Source that replays a snapshot set this deployment cannot
+    read is refused (:func:`_require_snapshot_replay`).
+    """
+
+    if not _is_conversation_source(source):
         return None
+    _require_snapshot_replay(source.get("config") or {})
     return cast(
         ConversationGene,
         create_gene(str(source["type"]), dict(source.get("config") or {}), str(source["id"])),
@@ -3736,9 +3780,13 @@ def _complete_source_config(
 ) -> dict[str, Any]:
     """Fill the values a source type derives from the Source or its stored configuration.
 
-    A refusal raises ``SourceConfigInvalid``, which the routes answer as 400 ``config_invalid``.
+    An evaluation snapshot set the configuration names is checked first
+    (:func:`~memforge.evals.source_snapshots.complete_snapshot_config`): it is
+    refused while the deployment does not replay snapshots. A refusal raises
+    ``SourceConfigInvalid``, which the routes answer as 400 ``config_invalid``.
     """
 
+    config = _complete_snapshot_config(config, existing_config)
     policy = _config_policy(source_type)
     if policy.complete is None:
         return config
@@ -6935,6 +6983,10 @@ def create_admin_app(
                 secret_fields=_source_secret_fields(name),
             )
             preview_config = {**stored_config, **preview_config}
+        try:
+            preview_config = _complete_snapshot_config(preview_config, existing["config"] if req.source_id else None)
+        except SourceConfigInvalid as exc:
+            raise _config_invalid_response(exc) from exc
 
         gene = None
         try:
@@ -8702,10 +8754,11 @@ def create_admin_app(
             raise HTTPException(status_code=404, detail="Source not found")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
+        _require_snapshot_replay(source.get("config") or {})
 
         retry_run_id = req.retry_target.execution_id if req and req.retry_target else None
         dry_run = bool(req and req.dry_run)
-        if dry_run and (retry_run_id is not None or _conversation_gene(source) is None):
+        if dry_run and (retry_run_id is not None or not _is_conversation_source(source)):
             # A dry run plans one new device collection of a conversation Source.
             raise HTTPException(status_code=400, detail="dry_run_requires_a_new_conversation_collection")
         if retry_run_id is None:
@@ -8813,7 +8866,7 @@ def create_admin_app(
         if lease_payload.get("dry_run"):
             # A dry run reports its plan; nothing it collected is processed.
             raise HTTPException(status_code=409, detail="dry_run_job_is_not_processed")
-        if _conversation_gene(current_source) is not None:
+        if _is_conversation_source(current_source):
             await _require_complete_collection(
                 _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
                 source_id,
@@ -9056,7 +9109,7 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         collection = _local_agent_collection(source.get("type"))
-        if not (collection is not None and collection.accepts_artifact_inputs) and _conversation_gene(source) is None:
+        if not (collection is not None and collection.accepts_artifact_inputs) and not _is_conversation_source(source):
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
@@ -9301,11 +9354,11 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        gene = _conversation_gene(source)
-        if gene is None:
+        if not _is_conversation_source(source):
             raise HTTPException(status_code=400, detail="source_is_not_a_conversation_source")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
+        gene = cast(ConversationGene, _conversation_gene(source))
         lease_payload = await _require_current_local_agent_lease(
             request,
             db,
@@ -9474,7 +9527,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        if _conversation_gene(source) is not None:
+        if _is_conversation_source(source):
             # A conversation Source uploads a Collection Manifest; an agent
             # that sends it document snapshots is told to upgrade.
             raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)

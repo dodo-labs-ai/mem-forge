@@ -35,9 +35,15 @@
 #   --report FILE           Also write the Markdown report to FILE.
 #   --quality               Also sync the synthetic documents of
 #                           evals/quality/quick, replace the ones it revises with
-#                           their second version and sync again, then run the
-#                           quick offline quality evaluation of each case kind;
-#                           the summaries follow the table.
+#                           their second version and sync again, replay the
+#                           source-type snapshots of evals/quality/quick/snapshots
+#                           through one Source per type, revision 1 then
+#                           revision 2, then run the quick offline quality
+#                           evaluation of each case kind; the summaries follow
+#                           the table.
+#   --quality-outputs DIR   With --quality, also save each case kind's case
+#                           outputs (the pinned input, rubric and model output
+#                           of every case) as DIR/<kind>.json.
 #   -h, --help              Show this help.
 #
 # Models: with --ollama the smoke uses a local Ollama that has both models
@@ -65,17 +71,21 @@ HELPER="$REPO_ROOT/scripts/compose_smoke.py"
 PLUGIN_DIR="$REPO_ROOT/integrations/claude-code/memforge-memory"
 PYTHON=${PYTHON:-python3}
 DOCS_IN_CONTAINER=/smoke-docs
+SNAPSHOTS_DIR="$REPO_ROOT/evals/quality/quick/snapshots"
+SNAPSHOTS_IN_CONTAINER=/evaluation-snapshots
 SKIPPED=3
 
 use_ollama=0
 no_models=0
 run_quality=0
 quality_summary=
+model_usage=
 ollama_url=http://host.docker.internal:11434
 generation_model=
 embedding_model=
 sync_timeout=900
 report_file=
+outputs_dir=
 
 usage() {
   sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'
@@ -91,6 +101,7 @@ while [ $# -gt 0 ]; do
     --quality) run_quality=1 ;;
     --sync-timeout) sync_timeout=${2:?--sync-timeout needs seconds}; shift ;;
     --report) report_file=${2:?--report needs a file}; shift ;;
+    --quality-outputs) outputs_dir=${2:?--quality-outputs needs a directory}; shift ;;
     -h | --help) usage; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -226,22 +237,32 @@ EOF
   chmod 755 "$docs_dir"
   chmod 644 "$docs_dir"/*.md
 
+  # With --quality the API replays the source-type snapshots, mounted read-only;
+  # only this Compose project turns evaluation snapshots on.
   {
     echo "services:"
     echo "  api:"
     echo "    env_file: !override"
     echo "      - path: \"$env_file\""
-    if [ -n "$https_proxy_value$http_proxy_value" ]; then
+    if [ -n "$https_proxy_value$http_proxy_value" ] || (( run_quality )); then
       echo "    environment:"
       [ -n "$https_proxy_value" ] && echo "      HTTPS_PROXY: \${MEMFORGE_SMOKE_HTTPS_PROXY}"
       [ -n "$http_proxy_value" ] && echo "      HTTP_PROXY: \${MEMFORGE_SMOKE_HTTP_PROXY}"
-      echo "      NO_PROXY: localhost,127.0.0.1,api,admin-ui,host.docker.internal"
+      [ -n "$https_proxy_value$http_proxy_value" ] &&
+        echo "      NO_PROXY: localhost,127.0.0.1,api,admin-ui,host.docker.internal"
+      (( run_quality )) && echo "      MEMFORGE_EVALUATION_SNAPSHOT_ROOT: $SNAPSHOTS_IN_CONTAINER"
     fi
     echo "    volumes:"
     echo "      - type: bind"
     echo "        source: \"$docs_dir\""
     echo "        target: $DOCS_IN_CONTAINER"
     echo "        read_only: true"
+    if (( run_quality )); then
+      echo "      - type: bind"
+      echo "        source: \"$SNAPSHOTS_DIR\""
+      echo "        target: $SNAPSHOTS_IN_CONTAINER"
+      echo "        read_only: true"
+    fi
   } >"$override_file"
   export MEMFORGE_SMOKE_HTTPS_PROXY=$https_proxy_value MEMFORGE_SMOKE_HTTP_PROXY=$http_proxy_value
 }
@@ -354,6 +375,36 @@ revise_source() {
   say "$(ls "$REPO_ROOT"/evals/quality/quick/revisions/*.md | wc -l | tr -d ' ') documents revised; $(cat "$detail_file")"
 }
 
+# The source-type snapshots: one Source per snapshot set, each replaying its
+# revision 1 and then its revision 2, so every type's update has recorded
+# Support work for the Support cases to pin. A document Source syncs on the
+# server; a conversation Source is collected by the device executor, which one
+# daemon pass runs with the snapshot provider.
+add_snapshot_sources() {
+  if [ "$model_provider" = none ]; then
+    say "needs a generation model"
+    return "$SKIPPED"
+  fi
+  helper snapshot-sources --snapshots "$SNAPSHOTS_DIR" >"$detail_file"
+}
+
+sync_snapshot_sources() {
+  local revision=$1 requested
+  if [ "$model_provider" = none ]; then
+    say "needs a generation model"
+    return "$SKIPPED"
+  fi
+  requested=$(helper snapshot-sync --snapshots "$SNAPSHOTS_DIR" --revision "$revision") ||
+    { say "$requested"; return 1; }
+  if ! compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
+      memforge adapter daemon once >&2; then
+    say "the local daemon pass failed; its report is above"
+    return 1
+  fi
+  helper snapshot-wait --timeout "$sync_timeout" >"$detail_file" || return 1
+  say "$requested; $(tail -n 1 "$detail_file")"
+}
+
 retrieve_memories() {
   local searched
   if [ "$model_provider" = none ]; then
@@ -393,6 +444,7 @@ quality_checks() {
       memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
     status=$?
     quality_summary+="### $kind cases"$'\n\n'"$summary"$'\n\n'
+    [ -n "$outputs_dir" ] && save_quality_outputs "$kind" "$summary"
     case $status in
       0) verdicts+=("$kind pass") ;;
       2) verdicts+=("$kind timed out"); failed=1 ;;
@@ -401,6 +453,25 @@ quality_checks() {
   done
   say "verdicts: $(IFS=,; echo "${verdicts[*]}" | sed 's/,/, /g'); summaries below the table"
   return "$failed"
+}
+
+# The case outputs of one case kind's run, named by the run its summary reports.
+save_quality_outputs() {
+  local kind=$1 summary=$2 run_id
+  run_id=$(echo "$summary" | sed -n 's/^- Run: `\(aer-[^`]*\)`.*/\1/p' | head -n 1)
+  [ -n "$run_id" ] || return 0
+  mkdir -p "$outputs_dir" &&
+    helper quality-outputs --run "$run_id" >"$outputs_dir/$kind.json" ||
+    echo "the $kind case outputs were not saved: $(tail -n 1 "$outputs_dir/$kind.json" 2>/dev/null)" >&2
+}
+
+# The generation model calls of the run so far and their tokens, for the
+# report: read from the API's log before the restart replaces its container,
+# whether or not an earlier step failed.
+read_model_usage() {
+  [ "$model_provider" = none ] && return
+  model_usage=$(compose logs --no-color api 2>/dev/null | "$PYTHON" "$HELPER" model-usage) ||
+    model_usage="not read: $model_usage"
 }
 
 restart_stack() {
@@ -485,6 +556,7 @@ print_report() {
   echo "- Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null), Compose $(docker compose version --short 2>/dev/null)"
   echo "- Models: $models"
+  [ -n "$model_usage" ] && echo "- Model usage: $model_usage"
   echo "- Wall time: $(format_seconds $(( $(date +%s) - run_started )))"
   echo
   echo "| Step | Result | Time | Detail |"
@@ -544,7 +616,11 @@ run_step "Local source sync" sync_source
 run_step "Memory retrieval" retrieve_memories
 if (( run_quality )); then
   run_step "Revised source sync" revise_source
+  run_step "Add snapshot sources" add_snapshot_sources
+  run_step "Snapshot sync, revision 1" sync_snapshot_sources 1
+  run_step "Snapshot sync, revision 2" sync_snapshot_sources 2
   run_step "Quick quality evaluation" quality_checks
 fi
+read_model_usage
 run_step "Restart on the same volume" restart_stack
 run_step "State survives restart" check_persisted

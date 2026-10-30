@@ -1,0 +1,22 @@
+{
+  "item": {
+    "item_id": "github-pages-833f400c97727366421927e0da65a9e9aae49b63",
+    "title": "on call",
+    "source_url": "https://acme.github.io/kestrel/handbook/on-call/",
+    "last_modified": "2026-10-22T10:00:00+00:00",
+    "content_type": "text/html; charset=utf-8",
+    "space_or_project": "acme.github.io/kestrel",
+    "version": "669d3e16b0046b944c5917f55344791ea6b75570a5a09023d55ba267e338b659",
+    "author": null,
+    "labels": [],
+    "extra": {
+      "canonical_url": "https://acme.github.io/kestrel/handbook/on-call/",
+      "content_updated_at": "2026-10-22T10:00:00+00:00",
+      "http_content_sha256": "669d3e16b0046b944c5917f55344791ea6b75570a5a09023d55ba267e338b659"
+    }
+  },
+  "raw": {
+    "file": "raw.html",
+    "content_type": "text/html; charset=utf-8"
+  }
+}

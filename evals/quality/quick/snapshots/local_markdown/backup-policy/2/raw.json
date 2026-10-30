@@ -1,0 +1,18 @@
+{
+  "package_kind": "local_markdown_document",
+  "content_role": "user_markdown_note",
+  "doc_id": "local-md-quality-snapshot-ops-backup-policy-txt",
+  "title": "Kestrel backup policy",
+  "source_url": "local-adapter://quality-snapshot/kestrel-notes/ops/backup-policy.txt",
+  "last_modified": "2026-10-22T08:00:00+00:00",
+  "space_or_project": "kestrel-notes",
+  "version": "726b997b5e91c4079fc842783a7128871cabc3c463f828dbbbd2c2b83e7e4509",
+  "vault_id": "kestrel-notes",
+  "relative_path": "ops/backup-policy.txt",
+  "content_type": "text/plain",
+  "raw_hash": "726b997b5e91c4079fc842783a7128871cabc3c463f828dbbbd2c2b83e7e4509",
+  "submitted_at": "2026-10-22T08:00:00+00:00",
+  "submitted_by": null,
+  "markdown": "Kestrel backup policy\n\nThe backup job kestrel-snapshot copies the queue database every 4 hours, since\nthe 2026-10 capacity review.\nEach copy is kept for 30 days in the cold-storage bucket kestrel-archive.\nA restore drill runs on the first Monday of every month; the on-call engineer\nrecords how long the restore took in the drill log.\n",
+  "source_updated_at": "2026-10-22T08:00:00+00:00"
+}

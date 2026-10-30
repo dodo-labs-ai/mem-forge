@@ -247,10 +247,12 @@ class GitHubPagesGene(DocumentGene):
             if base_url:
                 config["base_url"] = base_url
 
+    def _site_root(self) -> str:
+        """The site's root URL, read from the configuration, so a stored page normalizes without a connection."""
+        return _site_root_from_pages_url(str(self.config.get("base_url") or _scope_url_for_config(self.config)))
+
     async def authenticate(self) -> None:
-        base_url = _site_root_from_pages_url(
-            str(self.config.get("base_url") or _scope_url_for_config(self.config))
-        )
+        base_url = self._site_root()
         if not base_url:
             raise ValueError("GitHub Pages base_url is required")
         require_https_base_url(base_url, "GitHub Pages")
@@ -466,7 +468,7 @@ class GitHubPagesGene(DocumentGene):
         if raw.authoritative_empty:
             source_semantics = {
                 "source_type": "github_pages",
-                "site_url": self._base_url,
+                "site_url": self._site_root(),
                 "page_url": page_url,
                 "canonical_url": page_url,
                 "title": raw.item.title.strip() or "GitHub Pages Document",
@@ -488,7 +490,7 @@ class GitHubPagesGene(DocumentGene):
         metadata_lines = [
             "## Source Metadata",
             "- Source Type: GitHub Pages",
-            f"- Site URL: {self._base_url}",
+            f"- Site URL: {self._site_root()}",
             f"- Page URL: {page_url}",
         ]
         if raw.item.version:
@@ -505,7 +507,7 @@ class GitHubPagesGene(DocumentGene):
         ]).strip()
         source_semantics = {
             "source_type": "github_pages",
-            "site_url": self._base_url,
+            "site_url": self._site_root(),
             "page_url": page_url,
             "canonical_url": page_url,
             "title": title,
