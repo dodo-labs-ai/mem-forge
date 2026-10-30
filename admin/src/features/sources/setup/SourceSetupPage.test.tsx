@@ -264,14 +264,33 @@ test("an untouched mode field is sent absent", async () => {
 
   await userEvent.type(await screen.findByLabelText("Source name"), "Payroll Jira");
   await next();
-  expect(screen.getByRole("radio", { name: "Browser session" })).toBeChecked();
+  expect(screen.getByRole("radio", { name: "Personal access token" })).toBeChecked();
+  await userEvent.type(screen.getByLabelText("Jira Base URL"), "https://jira.example.com");
+  await userEvent.type(screen.getByLabelText("Personal Access Token"), "jira-pat");
+  await next();
+  await userEvent.type(await screen.findByLabelText("Projects to Sync"), "PAY{Enter}");
+  await userEvent.click(screen.getByRole("button", { name: "Create source" }));
+
+  const body = (await bodyOf(calls, "POST", "/api/v1/sources")) as { config: Record<string, unknown> };
+  expect(body.config).toEqual({ base_url: "https://jira.example.com", pat: "jira-pat", projects: ["PAY"] });
+});
+
+test("a new Jira source can choose a browser session instead of a token", async () => {
+  const { calls } = renderSetup("/sources/new/jira", {
+    routes: { "POST /api/v1/sources": () => ({ ...CREATED, type: "jira" }) },
+  });
+
+  await userEvent.type(await screen.findByLabelText("Source name"), "Payroll Jira");
+  await next();
+  await userEvent.click(screen.getByRole("radio", { name: "Browser session" }));
+  expect(screen.queryByLabelText("Personal Access Token")).not.toBeInTheDocument();
   await userEvent.type(screen.getByLabelText("Jira Base URL"), "https://jira.example.com");
   await next();
   await userEvent.type(await screen.findByLabelText("Projects to Sync"), "PAY{Enter}");
   await userEvent.click(screen.getByRole("button", { name: "Create source" }));
 
   const body = (await bodyOf(calls, "POST", "/api/v1/sources")) as { config: Record<string, unknown> };
-  expect(body.config).toEqual({ base_url: "https://jira.example.com", projects: ["PAY"] });
+  expect(body.config).toEqual({ base_url: "https://jira.example.com", auth_mode: "browser_cookie", projects: ["PAY"] });
 });
 
 test("a stored Confluence source with a root and a blank sync scope opens on the page tree step", async () => {

@@ -44,7 +44,6 @@ from memforge.auth.jira_auth import (
     JIRA_PRINCIPAL_CHANGED_CODE,
     JiraPrincipalChangedError,
     canonical_jira_origin,
-    effective_jira_auth_mode,
 )
 from memforge.evals.agent_evaluation import (
     AgentAssessmentAnnotatorKind,
@@ -76,6 +75,7 @@ from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.atlassian_auth import release_atlassian_request_limiter
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_repo_gene import GitHubRepoGene
+from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 from memforge.genes.toolkit.config import (
     FieldIssue,
     SourceConfigInvalid,
@@ -250,7 +250,6 @@ from memforge.source_types import (
     source_type_descriptor,
 )
 from memforge.source_types.form import check_config, effective_value
-from memforge.source_types.jira import jira_auth_mode
 from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
@@ -3905,7 +3904,7 @@ async def _cancel_running_jira_browser_sources_for_origin(
         if source.get("type") != "jira":
             continue
         config = source.get("config", {})
-        if effective_jira_auth_mode(config) != "browser_cookie":
+        if jira_auth_mode(config) != JIRA_AUTH_MODE_COOKIE:
             continue
         try:
             if canonical_jira_origin(str(config.get("base_url") or "")) != origin:
@@ -7084,7 +7083,7 @@ def create_admin_app(
                 s["scope_transition"] = _viewed_scope_transition(s, s["scope_transition"])
             if (
                 s["type"] == "jira"
-                and auth_mode == "browser_cookie"
+                and auth_mode == JIRA_AUTH_MODE_COOKIE
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:

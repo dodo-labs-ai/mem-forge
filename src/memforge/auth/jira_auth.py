@@ -25,6 +25,7 @@ from memforge.auth.browser_session import (
     BrowserSessionStore,
     register_provider,
 )
+from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 from memforge.genes.toolkit.config import require_https_base_url, tls_verify
 from memforge.source_secrets import decrypt_secret, encrypt_secret
 
@@ -95,14 +96,6 @@ def canonical_jira_origin(base_url: str) -> str:
     if port and not (scheme == "https" and port == 443):
         return f"{scheme}://{host}:{port}"
     return f"{scheme}://{host}"
-
-
-def effective_jira_auth_mode(config: dict[str, Any]) -> str:
-    """Return Jira auth mode with legacy PAT configs inferred consistently."""
-    configured = config.get("auth_mode")
-    if configured is None and (config.get("pat") or config.get("pat_encrypted")):
-        return "pat"
-    return str(configured or "browser_cookie").strip().lower()
 
 
 def _now_iso() -> str:
@@ -310,7 +303,7 @@ class JiraAuthSessionService:
             if source.get("type") != "jira":
                 continue
             source_config = source.get("config", {})
-            if effective_jira_auth_mode(source_config) != "browser_cookie":
+            if jira_auth_mode(source_config) != JIRA_AUTH_MODE_COOKIE:
                 continue
             try:
                 if canonical_jira_origin(source_config.get("base_url", "")) != origin:
@@ -417,6 +410,6 @@ register_provider(
         cookie_config_key="jira_cookie",
         canonical_origin=canonical_jira_origin,
         service_factory=lambda db: JiraAuthSessionService(db),
-        uses_browser_session=lambda config: effective_jira_auth_mode(config) == "browser_cookie",
+        uses_browser_session=lambda config: jira_auth_mode(config) == JIRA_AUTH_MODE_COOKIE,
     )
 )

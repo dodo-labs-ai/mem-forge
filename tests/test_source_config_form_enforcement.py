@@ -77,8 +77,8 @@ def _keys(response) -> list[str | None]:
 
 
 def test_required_applies_only_while_visible(client):
-    simple = _create(client, "jira", {"base_url": JIRA, "query_mode": "simple", "jql": "project = PAY"})
-    advanced = _create(client, "jira", {"base_url": JIRA, "query_mode": "advanced", "jql": "project = PAY"})
+    simple = _create(client, "jira", {"base_url": JIRA, "pat": "jira-pat", "query_mode": "simple", "jql": "project = PAY"})
+    advanced = _create(client, "jira", {"base_url": JIRA, "pat": "jira-pat", "query_mode": "advanced", "jql": "project = PAY"})
 
     assert _keys(simple) == ["projects"]
     assert advanced.status_code == 200, advanced.text
@@ -112,7 +112,7 @@ def test_condition_reads_declared_default_when_blank(client):
 
 def test_condition_reads_scope_default_when_blank(client):
     # No query_mode reads the descriptor's scope default simple, which requires projects.
-    response = _create(client, "jira", {"base_url": JIRA})
+    response = _create(client, "jira", {"base_url": JIRA, "pat": "jira-pat"})
 
     assert _keys(response) == ["projects"]
 
@@ -144,24 +144,47 @@ def test_confluence_blank_sync_mode_without_root_is_stored_as_space(client, data
     assert _stored_config(database, response.json()["id"])["sync_mode"] == "space"
 
 
-def test_jira_blank_auth_mode_with_stored_token_is_stored_as_pat(client, database):
-    _store(database, "src-jira-token", "jira", {"base_url": JIRA, "projects": ["PAY"], "pat": "jira-pat"})
+def test_a_new_jira_source_without_auth_mode_uses_a_personal_access_token(client, database):
+    without_token = _create(client, "jira", {"base_url": JIRA, "projects": ["PAY"]})
+    created = _create(client, "jira", {"base_url": JIRA, "projects": ["PAY"], "pat": "jira-pat"})
 
-    updated = client.put("/api/v1/sources/src-jira-token", json={"config": {"base_url": JIRA, "projects": ["PAY"]}})
+    assert _issues(without_token) == [("pat", "Jira Personal Access Token is required")]
+    assert created.status_code == 200, created.text
+    assert _stored_config(database, created.json()["id"])["auth_mode"] == "pat"
+
+
+def test_a_new_local_jira_source_without_auth_mode_uses_a_browser_session(client, database):
+    created = _create(client, "jira", {"base_url": JIRA, "sync_mode": "local_agent", "projects": ["PAY"]})
+
+    assert created.status_code == 200, created.text
+    assert _stored_config(database, created.json()["id"])["auth_mode"] == "browser_cookie"
+
+
+def test_a_new_jira_source_can_choose_a_browser_session(client, database):
+    created = _create(client, "jira", {"base_url": JIRA, "auth_mode": "browser_cookie", "projects": ["PAY"]})
+
+    assert created.status_code == 200, created.text
+    stored = _stored_config(database, created.json()["id"])
+    assert stored["auth_mode"] == "browser_cookie"
+    assert "pat_encrypted" not in stored
+
+
+@pytest.mark.parametrize(
+    ("stored", "auth_mode"),
+    [
+        ({"auth_mode": "browser_cookie"}, "browser_cookie"),
+        ({"auth_mode": "pat", "pat": "jira-pat"}, "pat"),
+    ],
+)
+def test_a_jira_save_without_auth_mode_keeps_the_stored_method(client, database, stored, auth_mode):
+    _store(database, "src-jira", "jira", {"base_url": JIRA, "projects": ["PAY"], **stored})
+
+    updated = client.put("/api/v1/sources/src-jira", json={"config": {"base_url": JIRA, "projects": ["OPS"]}})
+    listed = {source["id"]: source for source in client.get("/api/v1/sources").json()["data"]}
 
     assert updated.status_code == 200, updated.text
-    assert _stored_config(database, "src-jira-token")["auth_mode"] == "pat"
-
-
-def test_jira_source_list_returns_the_effective_auth_mode(client, database):
-    _store(database, "src-jira-token", "jira", {"base_url": JIRA, "projects": ["PAY"], "pat": "jira-pat"})
-    _store(database, "src-jira-session", "jira", {"base_url": JIRA, "projects": ["OPS"]})
-
-    sources = {source["id"]: source for source in client.get("/api/v1/sources").json()["data"]}
-
-    assert sources["src-jira-token"]["config"]["auth_mode"] == "pat"
-    assert sources["src-jira-session"]["config"]["auth_mode"] == "browser_cookie"
-    assert "auth_mode" not in _stored_config(database, "src-jira-token")
+    assert _stored_config(database, "src-jira")["auth_mode"] == auth_mode
+    assert listed["src-jira"]["config"]["auth_mode"] == auth_mode
 
 
 def test_update_is_checked_against_the_config_it_stores(client):
@@ -264,7 +287,11 @@ def test_teams_retention_preset_and_forever_pass_the_choice_check(client, retent
 
 
 def test_a_plain_value_error_from_a_hook_answers_config_invalid_with_a_null_key(client):
-    response = _create(client, "jira", {"base_url": JIRA, "projects": ["PAY"], "jira_cookie": "session=abc"})
+    response = _create(
+        client,
+        "jira",
+        {"base_url": JIRA, "auth_mode": "browser_cookie", "projects": ["PAY"], "jira_cookie": "session=abc"},
+    )
 
     assert _issues(response) == [(None, "Jira browser sessions are managed by shared auth sessions, not source config")]
 
@@ -334,7 +361,7 @@ def test_browse_tree_answers_config_invalid(client):
         ),
         (
             "jira",
-            {"base_url": JIRA, "query_mode": "advanced", "jql": "  "},
+            {"base_url": JIRA, "pat": "jira-pat", "query_mode": "advanced", "jql": "  "},
             ("jql", "Jira JQL is required"),
         ),
         (
@@ -346,3 +373,22 @@ def test_browse_tree_answers_config_invalid(client):
 )
 def test_each_former_per_type_requirement_is_refused_by_the_shared_check(client, source_type, config, expected):
     assert _issues(_create(client, source_type, config)) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("stored", "submitted", "changed"),
+    [
+        ({"auth_mode": "browser_cookie"}, {}, False),
+        ({"auth_mode": "pat", "pat_encrypted": "ciphertext"}, {}, False),
+        ({"auth_mode": "pat", "pat_encrypted": "ciphertext"}, {"pat": "new-jira-pat"}, True),
+        ({"auth_mode": "browser_cookie"}, {"auth_mode": "pat", "pat": "jira-pat"}, True),
+        ({"auth_mode": "pat", "pat_encrypted": "ciphertext"}, {"auth_mode": "browser_cookie"}, True),
+    ],
+)
+def test_a_jira_save_changes_credentials_only_when_the_method_or_token_changes(stored, submitted, changed):
+    from memforge.source_types import source_type_descriptor
+
+    credentials_changed = source_type_descriptor("jira").config.credentials_changed
+    existing = {"base_url": JIRA, "projects": ["PAY"], **stored}
+
+    assert credentials_changed({"base_url": JIRA, "projects": ["PAY"], **submitted}, existing) is changed

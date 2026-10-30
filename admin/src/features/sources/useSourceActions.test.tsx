@@ -83,8 +83,8 @@ test("Teams sign-in renews in place", async () => {
   expect(router.state.location.pathname).toBe("/sources");
 });
 
-test("a stored PAT Jira source without auth_mode opens the connection step", async () => {
-  const jira = makeSource({ id: "src-jira", type: "jira", config: { base_url: "https://jira.example.com", pat_configured: true } });
+test("a Jira token sign-in opens the connection step, where a token is entered", async () => {
+  const jira = makeSource({ id: "src-jira", type: "jira", config: { base_url: "https://jira.example.com", auth_mode: "pat", pat_configured: true } });
   const { calls } = renderAction(jira, "sign_in");
 
   await userEvent.click(screen.getByRole("button", { name: "Act" }));

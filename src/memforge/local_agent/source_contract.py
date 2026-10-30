@@ -70,6 +70,8 @@ def teams_config_within_history_bound(config: Mapping[str, Any]) -> dict[str, An
     if days <= MAX_INITIAL_HISTORY_DAYS:
         return None
     return {**config, "initial_history_days": MAX_INITIAL_HISTORY_DAYS}
+
+
 TEAMS_CONVERSATION_SELECTOR_FIELDS = (
     "conversation_ids",
     "channels",
@@ -77,6 +79,25 @@ TEAMS_CONVERSATION_SELECTOR_FIELDS = (
     "individual_chats",
 )
 _TEAMS_CONVERSATION_ID_RE = re.compile(r"^19:[^\s@]+@[^\s@]+$")
+
+
+def jira_config_with_auth_mode(config: Mapping[str, Any]) -> dict[str, Any] | None:
+    """A stored Jira configuration that names its authentication method, or ``None`` when it already does.
+
+    The named method is the one a configuration without it authenticates
+    with: local sync uses the shared browser session; otherwise a configuration
+    with no ``auth_mode`` key uses its token when it holds one (``pat`` or
+    ``pat_encrypted``), and a blank ``auth_mode`` or no token means the
+    browser session.
+    """
+
+    configured = config.get("auth_mode")
+    if str(configured or "").strip():
+        return None
+    local_sync = str(config.get("sync_mode") or "").strip().lower() == "local_agent"
+    holds_token = bool(config.get("pat") or config.get("pat_encrypted"))
+    auth_mode = "pat" if configured is None and holds_token and not local_sync else "browser_cookie"
+    return {**config, "auth_mode": auth_mode}
 
 
 class SourceSyncRunReceiptError(ValueError):

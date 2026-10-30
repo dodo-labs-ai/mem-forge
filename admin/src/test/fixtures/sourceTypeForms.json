@@ -35,7 +35,7 @@
       "name": "github_repo"
     },
     {
-      "auth_method": "browser_cookie",
+      "auth_method": "pat",
       "data_shape": "ticket",
       "default_sync_interval_minutes": 360,
       "description": "Tickets, decisions, and work items",
@@ -809,12 +809,6 @@
           "choices": [
             {
               "help_text": "",
-              "label": "Browser session",
-              "value": "browser_cookie",
-              "visible_when": []
-            },
-            {
-              "help_text": "",
               "label": "Personal access token",
               "value": "pat",
               "visible_when": [
@@ -825,18 +819,24 @@
                   ]
                 }
               ]
+            },
+            {
+              "help_text": "",
+              "label": "Browser session",
+              "value": "browser_cookie",
+              "visible_when": []
             }
           ],
-          "default": "browser_cookie",
+          "default": "pat",
           "field_type": "select",
           "fixed_after_create": false,
           "group": "connection",
-          "help_text": "Browser session uses the local CLI adapter (`memforge adapter auth jira refresh --base-url ...`) to capture cookies from your signed-in browser. Use this for Enterprise Jira where REST API quota is not available. PAT mode is only for Jira deployments that grant the user REST API quota.",
+          "help_text": "A personal access token, from Jira Data Center or Server, is sent as a bearer token and needs no local daemon. Browser session is for deployments where a personal access token is not available: the local CLI adapter (`memforge adapter auth jira refresh --base-url ...`) captures cookies from your signed-in browser. Local sync always uses a browser session.",
           "key": "auth_mode",
           "label": "Authentication Method",
           "options": [
-            "browser_cookie",
-            "pat"
+            "pat",
+            "browser_cookie"
           ],
           "order": 2,
           "placeholder": "",
