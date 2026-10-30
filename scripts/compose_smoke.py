@@ -591,8 +591,9 @@ def _candidate(binding: Binding, listed: dict[str, Any]) -> dict[str, Any]:
         "auth_strategy": binding.auth_strategy,
     }
     if binding.kind == "generation":
-        # Validation needs the model's token limits; a model listed without
-        # them takes the ones the quickstart suggests for a local model.
+        # Validation needs the model's token limits; a model whose listing
+        # gives none, or that is not listed, takes the ones the quickstart
+        # suggests for a local model.
         body["token_limits"] = {
             "context_window_tokens": listed.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS,
             "max_output_tokens": listed.get("max_output_tokens") or DEFAULT_MAX_OUTPUT_TOKENS,
