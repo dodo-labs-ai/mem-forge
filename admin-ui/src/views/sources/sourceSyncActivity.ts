@@ -364,6 +364,12 @@ function safeFailureDetail(error: SourceSyncActivity["error"]): string {
   const messages = [error?.message, ...(error?.items ?? []).map((item) => item.error)]
     .filter((value): value is string => Boolean(value?.trim()));
   const normalized = messages.join(" ").toLowerCase();
+  if (normalized.includes("local_agent_upgrade_required")) {
+    return "Upgrade MemForge on the device that runs the local daemon, then retry sync.";
+  }
+  if (normalized.includes("server_upgrade_required")) {
+    return "Upgrade the MemForge server to the local daemon's release, then retry sync.";
+  }
   if (normalized.includes("teams") && (
     normalized.includes("session expired")
     || normalized.includes("no teams session")

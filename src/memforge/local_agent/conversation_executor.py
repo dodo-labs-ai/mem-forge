@@ -2,14 +2,15 @@
 
 A local agent collects a conversation Source the server cannot read itself,
 such as Teams through the user's browser session. For one job attempt it asks
-the server what to collect, runs the provider for that request, and uploads
-the result: the Collection Manifest first, then only what the server reports
-it lacks, the bytes of message artifacts such as inline images followed by
-message bodies naming those uploads. It then hands the attempt over: the
-server processes it, or for a dry run reports the plan it would apply. It
-holds no window, coverage, absence or retention logic and reads nothing else
-from the server; the conversation layer decides from the manifest once
-processing starts.
+the server what to collect, refuses before polling when the server reads the
+messages in another record schema than its provider collects, runs the
+provider for that request, and uploads the result: the Collection Manifest
+first, then only what the server reports it lacks, the bytes of message
+artifacts such as inline images followed by message bodies naming those
+uploads. It then hands the attempt over: the server processes it, or for a
+dry run reports the plan it would apply. It holds no window, coverage,
+absence or retention logic and reads nothing else from the server; the
+conversation layer decides from the manifest once processing starts.
 """
 
 from __future__ import annotations
@@ -21,7 +22,13 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from memforge.conversations.collect import CollectedAttempt, collect
-from memforge.conversations.manifest import manifest_to_payload, request_from_payload
+from memforge.conversations.manifest import (
+    LOCAL_AGENT_UPGRADE_REQUIRED,
+    SERVER_UPGRADE_REQUIRED,
+    manifest_to_payload,
+    predates_record_schema,
+    request_from_payload,
+)
 from memforge.conversations.port import ConversationProvider, MessageArtifact
 from memforge.conversations.records import MESSAGE_OBSERVATION_TYPE, MessageIdentity
 from memforge.sync_progress import SyncProgressPhase
@@ -84,6 +91,10 @@ class ConversationUploadError(RuntimeError):
         self.response = response
 
 
+class RecordSchemaMismatch(RuntimeError):
+    """The server reads the Source's messages in another record schema than this agent's provider collects."""
+
+
 @dataclass(frozen=True, slots=True)
 class DeviceCollectionResult:
     """What one job attempt collected and uploaded, and the server's answer when it was handed over.
@@ -129,6 +140,7 @@ async def run_device_collection(
 
     attempt = {"local_agent_job_id": local_agent_job_id, "local_agent_attempt_count": local_agent_attempt_count}
     answer = _checked("collection request", client.conversation_collection_request(source_id=source_id, **attempt))
+    _require_record_schema(provider, answer.get("record_schema"))
     collection_attempt_id = str(answer["collection_attempt_id"])
     request = request_from_payload(answer["request"])
     report("fetching", 0, len(request.conversations))
@@ -250,6 +262,29 @@ def _upload_payload(collection: CollectedAttempt) -> dict[str, Any]:
     payload = manifest_to_payload(collection.manifest(received_at=datetime.now(timezone.utc)))
     del payload["received_at"]
     return payload
+
+
+def _require_record_schema(provider: ConversationProvider, read: object) -> None:
+    """Refuse, before polling, a request whose messages the server reads in another record schema.
+
+    A server that names no record schema leaves the check to manifest intake.
+    """
+
+    collected = provider.record_schema.qualified_name
+    if read is None or read == collected:
+        return
+    read = str(read)
+    if predates_record_schema(collected, read):
+        raise RecordSchemaMismatch(
+            f"{LOCAL_AGENT_UPGRADE_REQUIRED}: this local daemon collects messages as {collected} and the server "
+            f"reads {read}; upgrade memforge-ai on this device, then run `memforge daemon restart`"
+        )
+    if predates_record_schema(read, collected):
+        raise RecordSchemaMismatch(
+            f"{SERVER_UPGRADE_REQUIRED}: this local daemon collects messages as {collected} and the server reads "
+            f"the earlier {read}"
+        )
+    raise RecordSchemaMismatch(f"this local daemon collects messages as {collected} and the server reads {read}")
 
 
 def _checked(step: str, response: dict[str, Any]) -> dict[str, Any]:

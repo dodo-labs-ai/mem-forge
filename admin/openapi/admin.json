@@ -17202,7 +17202,7 @@
     },
     "/api/v1/sources/{source_id}/conversation-collection/request": {
       "post": {
-        "description": "The request one device collection attempt answers; asking again returns the same request.",
+        "description": "The request one device collection attempt answers; asking again returns the same request.\n\n``record_schema`` names the schema the server reads the attempt's\nmessages in, so an executor that collects another refuses before it\npolls.",
         "operationId": "conversation_collection_request_api_v1_sources__source_id__conversation_collection_request_post",
         "parameters": [
           {

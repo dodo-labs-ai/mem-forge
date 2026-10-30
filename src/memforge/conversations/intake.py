@@ -25,7 +25,9 @@ from memforge.conversations.manifest import (
     CollectionRequest,
     ManifestMessage,
     PollEvidence,
+    SERVER_UPGRADE_REQUIRED,
     manifest_from_payload,
+    predates_record_schema,
 )
 from memforge.conversations.port import ConversationAccess, MessageArtifact, PollOutcome
 from memforge.conversations.reader import ConversationUnitReader
@@ -34,6 +36,10 @@ from memforge.conversations.records import MessageIdentity, record_created_at, r
 
 class CollectionRejected(ValueError):
     """An upload that does not belong to the attempt it names, or contradicts its manifest."""
+
+
+class AgentUpgradeRequired(CollectionRejected):
+    """A manifest its device executor's release collected in a form this server no longer reads."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +71,8 @@ class CollectionIntake:
         """Keep one attempt's manifest and name what the server lacks of its messages.
 
         ``record_schema`` is the schema the Source's connector reads its
-        messages in; a manifest collected in another is refused.
+        messages in; a manifest collected in another is refused, and one
+        collected in an earlier version of it asks for the executor's upgrade.
         """
 
         manifest = manifest_from_payload(payload, received_at=received_at)
@@ -73,6 +80,16 @@ class CollectionIntake:
             raise CollectionRejected("the manifest names another Source or collection attempt")
         if manifest.config_revision != config_revision:
             raise CollectionRejected("the manifest was collected under another configuration")
+        if predates_record_schema(manifest.record_schema, record_schema):
+            raise AgentUpgradeRequired(
+                f"the manifest records messages as {manifest.record_schema}, an earlier version of the "
+                f"{record_schema} this server reads"
+            )
+        if predates_record_schema(record_schema, manifest.record_schema):
+            raise CollectionRejected(
+                f"{SERVER_UPGRADE_REQUIRED}: the manifest records messages as {manifest.record_schema}, a later "
+                f"version of the {record_schema} this server reads"
+            )
         if manifest.record_schema != record_schema:
             raise CollectionRejected(f"the manifest records messages as {manifest.record_schema}, not {record_schema}")
         request = await self._collections.request(source_id, collection_attempt_id)

@@ -1181,6 +1181,12 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 json={**context, "manifest": {**manifest, "conversations": [], "messages": []}},
             )
             retired_inventory = client.get(f"/api/v1/sources/{source_id}/projection-inventory", headers=headers)
+            earlier_schema = f"{MESSAGE_SCHEMA.name}:{MESSAGE_SCHEMA.version - 1}"
+            earlier_schema_manifest = client.post(
+                f"/api/v1/sources/{source_id}/conversation-collection/manifest",
+                headers=headers,
+                json={**context, "manifest": {**manifest, "record_schema": earlier_schema}},
+            )
             uploaded_manifest = client.post(
                 f"/api/v1/sources/{source_id}/conversation-collection/manifest",
                 headers=headers,
@@ -1239,6 +1245,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         assert requested.status_code == 200, requested.text
         assert requested_again.json() == requested.json()
         assert requested.json()["collection_attempt_id"] == attempt_id
+        assert requested.json()["record_schema"] == MESSAGE_SCHEMA.qualified_name
         assert [item["conversation_id"] for item in requested.json()["request"]["conversations"]] == [
             "19:conversation-a@example.test"
         ]
@@ -1251,6 +1258,11 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         assert "exactly the requested conversations" in unanswered_manifest.json()["detail"]
         assert retired_inventory.status_code == 409, retired_inventory.text
         assert retired_inventory.json()["detail"] == "local_agent_upgrade_required"
+        assert earlier_schema_manifest.status_code == 409, earlier_schema_manifest.text
+        assert earlier_schema_manifest.json()["detail"] == (
+            f"local_agent_upgrade_required: the manifest records messages as {earlier_schema}, an earlier version "
+            f"of the {MESSAGE_SCHEMA.qualified_name} this server reads"
+        )
         assert uploaded_manifest.status_code == 200, uploaded_manifest.text
         assert uploaded_manifest.json()["missing"] == [
             {"conversation_id": "19:conversation-a@example.test", "message_id": "m1", "body": True, "artifacts": []}
