@@ -4,9 +4,7 @@ from copy import deepcopy
 
 from memforge.llm.structured import (
     ChangeImpactWireResponse,
-    ContinueReadingWireResult,
     SupportAssessmentWireResponse,
-    SupportedWireResult,
     SupportWitnessDelta,
 )
 from memforge.pipeline.projection_fragments import FragmentSelectionError, FragmentSelectionErrorCode
@@ -119,13 +117,15 @@ class SupportWireAliases:
 
     def _decode_row(self, row, at: str):
         work_id = self._work(row.work_id, f"{at}.work_id")
-        if isinstance(row, ContinueReadingWireResult):
+        if (error := row.row_error()) is not None:
+            raise FragmentSelectionError(FragmentSelectionErrorCode.INVALID_SELECTION, error, location=at)
+        if row.status == "continue":
             delta = row.witness_delta
             return row.model_copy(update={"work_id": work_id, "witness_delta": SupportWitnessDelta(
                 support_witness_refs=self._refs(delta.support_witness_refs, f"{at}.support_witness_refs"),
                 opposing_witness_refs=self._refs(delta.opposing_witness_refs, f"{at}.opposing_witness_refs"),
             )})
-        if isinstance(row, SupportedWireResult):
+        if row.status == "supported":
             return row.model_copy(update={
                 "work_id": work_id,
                 "primary_ref": self._ref(row.primary_ref, f"{at}.primary_ref", allowed=self._primary_ids),
