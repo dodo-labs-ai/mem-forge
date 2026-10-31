@@ -416,7 +416,7 @@ def mcp_check(plugin_dir: Path, api: str, state: State, home: Path, *, phase: st
 
 MODEL_KINDS = ("generation", "embedding")
 DEFAULT_OLLAMA_URL = "http://host.docker.internal:11434"
-# The model a kind uses when only its provider is named: the reference
+# The model a kind uses when only its provider is named: the default
 # generation model, Claude Haiku 5.5, wherever the provider serves it; the same
 # small embedding model on the hosted providers that serve it; and for Ollama
 # the small local pair the quickstart suggests. ``scripts/provider_smoke.py``
@@ -554,11 +554,10 @@ def judge_env(plan: KindPlan | None, environ: dict[str, str]) -> str:
 
 def shell_plan(plan: ModelPlan | None, judge: KindPlan | None = None) -> str:
     """The plan as shell assignments: the labels the report prints and the Ollama servers to reach."""
-    values = {"models_label": "", "generation_label": "", "judge_label": "", "ollama_endpoints": ""}
+    values = {"models_label": "", "judge_label": "", "ollama_endpoints": ""}
     if plan is not None:
         values = {
             "models_label": plan.label,
-            "generation_label": plan.kinds["generation"].label,
             "judge_label": judge.label if judge is not None else "",
             "ollama_endpoints": " ".join(
                 sorted({
@@ -999,18 +998,38 @@ def quality_outputs(api: str, run_id: str) -> str:
 
 # -- Model usage --------------------------------------------------------------------------------
 
-# Every structured model call logs one line with its operation and token usage.
+# Every structured model call logs one line with its operation, model and token usage.
 _MODEL_CALL = re.compile(r"structured_llm_call (\{.*\})\s*$")
 
 
-def model_usage(log_lines: Iterable[str], model: str) -> str:
-    """The calls to the generation model ``model`` the API logged, and their input and output token totals.
+@dataclass
+class _ModelUsage:
+    calls: int = 0
+    unreported: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    operations: dict[str, int] = field(default_factory=dict)
 
-    Embedding requests are not structured calls and are not counted. A call
-    whose provider reported no usage is counted apart.
+    def describe(self, model: str) -> str:
+        unreported = f", {self.unreported} without reported usage" if self.unreported else ""
+        operations = ", ".join(f"{name} {count}" for name, count in sorted(self.operations.items()))
+        noun = "call" if self.calls == 1 else "calls"
+        return (
+            f"{self.calls} {noun} to {model}, {self.prompt_tokens} input and {self.completion_tokens} output tokens"
+            f"{unreported} ({operations})"
+        )
+
+
+def model_usage(log_lines: Iterable[str]) -> str:
+    """The structured model calls the API logged, per model, and their input and output token totals.
+
+    Each model the calls name gets its own entry, by the route the API logs,
+    such as ``openai/gpt-6-luna``, most calls first; a judge on another model
+    than generation is counted apart, and each entry's operations say which
+    calls were the judge's. Embedding requests are not structured calls and are
+    not counted. A call whose provider reported no usage is counted apart.
     """
-    calls = unreported = prompt_tokens = completion_tokens = 0
-    operations: dict[str, int] = {}
+    usage: dict[str, _ModelUsage] = {}
     for line in log_lines:
         match = _MODEL_CALL.search(line)
         if match is None:
@@ -1019,21 +1038,19 @@ def model_usage(log_lines: Iterable[str], model: str) -> str:
             call = json.loads(match.group(1))
         except ValueError:
             continue
-        calls += 1
+        entry = usage.setdefault(str(call.get("model") or "an unnamed model"), _ModelUsage())
+        entry.calls += 1
         operation = str(call.get("operation") or "unnamed")
-        operations[operation] = operations.get(operation, 0) + 1
+        entry.operations[operation] = entry.operations.get(operation, 0) + 1
         if call.get("prompt_tokens") is None or call.get("completion_tokens") is None:
-            unreported += 1
+            entry.unreported += 1
             continue
-        prompt_tokens += int(call["prompt_tokens"])
-        completion_tokens += int(call["completion_tokens"])
-    if not calls:
-        raise CheckFailed("the API logged no generation model call")
-    by_operation = ", ".join(f"{name} {count}" for name, count in sorted(operations.items()))
-    unreported_note = f"; {unreported} without reported usage" if unreported else ""
-    return (
-        f"{calls} generation calls to {model}, {prompt_tokens} input and {completion_tokens} output tokens"
-        f"{unreported_note} ({by_operation})"
+        entry.prompt_tokens += int(call["prompt_tokens"])
+        entry.completion_tokens += int(call["completion_tokens"])
+    if not usage:
+        raise CheckFailed("the API logged no model call")
+    return "; ".join(
+        entry.describe(model) for model, entry in sorted(usage.items(), key=lambda item: -item[1].calls)
     )
 
 
@@ -1166,8 +1183,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     bindings = commands.add_parser("bindings", help="check `docker inspect` output read from stdin")
     bindings.add_argument("--expect", action="append", default=[], metavar="SERVICE=PORT")
 
-    usage = commands.add_parser("model-usage", help="total the generation model calls in API logs read from stdin")
-    usage.add_argument("--model", required=True, help="the generation model's provider and model, as reported")
+    commands.add_parser("model-usage", help="total the model calls per model in API logs read from stdin")
 
     def model_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("--ollama", action="store_true", help="a kind without a provider uses Ollama")
@@ -1240,7 +1256,7 @@ def run(args: argparse.Namespace) -> str:
             expected[service] = int(port)
         return check_bindings(json.load(sys.stdin), expected)
     if args.command == "model-usage":
-        return model_usage(sys.stdin, args.model)
+        return model_usage(sys.stdin)
     if args.command == "model-plan":
         return shell_plan(plan_models(args, dict(os.environ)), plan_judge(args, dict(os.environ)))
     if args.command == "judge-env":

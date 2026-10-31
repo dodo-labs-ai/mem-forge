@@ -202,21 +202,25 @@ def test_the_run_spec_needs_every_case_pinned() -> None:
         smoke.quality_run_spec(COHORT, {"cohort_id": "aeo-1", "skipped": {"document_not_found": ["src:Missing"]}})
 
 
-def test_model_usage_totals_the_tokens_of_each_logged_generation_call() -> None:
-    def call(operation: str, prompt: int | None, completion: int | None) -> str:
-        payload = {"event": "structured_llm_call", "operation": operation}
+def test_model_usage_totals_the_tokens_of_each_logged_call_per_model() -> None:
+    def call(operation: str, model: str, prompt: int | None, completion: int | None) -> str:
+        payload = {"event": "structured_llm_call", "operation": operation, "model": model}
         if prompt is not None:
             payload |= {"prompt_tokens": prompt, "completion_tokens": completion}
         return f"api-1  | 2026-10-30 INFO memforge.llm.structured structured_llm_call {json.dumps(payload)}"
 
-    lines = [call("derive", 1200, 300), "api-1  | unrelated", call("derive", 800, 200), call("support", None, None)]
+    haiku, luna = "openrouter/anthropic/claude-haiku-5.5", "openai/gpt-6-luna"
+    lines = [
+        call("derive", haiku, 1200, 300), "api-1  | unrelated", call("derive", haiku, 800, 200),
+        call("support", haiku, None, None), call("expectation_judgment", luna, 500, 50),
+    ]
 
-    assert smoke.model_usage(lines, "openai_compatible: gpt-6-luna") == (
-        "3 generation calls to openai_compatible: gpt-6-luna, 2000 input and 500 output tokens; "
-        "1 without reported usage (derive 2, support 1)"
+    assert smoke.model_usage(lines) == (
+        f"3 calls to {haiku}, 2000 input and 500 output tokens, 1 without reported usage (derive 2, support 1); "
+        f"1 call to {luna}, 500 input and 50 output tokens (expectation_judgment 1)"
     )
-    with pytest.raises(smoke.CheckFailed, match="no generation model call"):
-        smoke.model_usage(["api-1  | unrelated"], "openrouter: anthropic/claude-haiku-5.5")
+    with pytest.raises(smoke.CheckFailed, match="no model call"):
+        smoke.model_usage(["api-1  | unrelated"])
 
 
 def test_quality_outputs_reads_the_case_outputs_of_the_run(monkeypatch) -> None:
@@ -345,7 +349,7 @@ def test_the_shell_reads_the_plan_without_any_key(tmp_path: Path) -> None:
         env=environ, capture_output=True, text=True, check=True,
     ).stdout
     shell = subprocess.run(
-        ["bash", "-c", 'eval "$1"; printf "%s|%s|%s" "$models_label" "$generation_label" "$ollama_endpoints"']
+        ["bash", "-c", 'eval "$1"; printf "%s|%s" "$models_label" "$ollama_endpoints"']
         + ["_", printed],
         capture_output=True, text=True, check=True,
     ).stdout
@@ -353,7 +357,7 @@ def test_the_shell_reads_the_plan_without_any_key(tmp_path: Path) -> None:
     assert "secret" not in printed and "llm.example.com" not in printed
     assert shell == (
         "generation openai_compatible: it's-a-model; embedding openrouter: openai/text-embedding-3-small"
-        "|openai_compatible: it's-a-model|"
+        "|"
     )
 
 

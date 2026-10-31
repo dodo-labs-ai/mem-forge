@@ -2647,6 +2647,7 @@ class LiteLlmStructuredClient:
         payload = {
             "event": "structured_llm_call",
             "operation": telemetry.operation,
+            "model": model,
             "attempt_count": telemetry.attempt_count,
             "retry_count": telemetry.retry_count,
             "fallback_count": telemetry.fallback_count,

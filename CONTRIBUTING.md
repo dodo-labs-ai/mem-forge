@@ -248,12 +248,11 @@ type's own normalization and projection without a model:
 uv run pytest tests/test_quality_snapshots.py -q
 ```
 
-Then run `scripts/compose_smoke.sh --quality --quality-outputs DIR` with the
-reference model, which saves every case's pinned input, rubric and model output
-in `DIR`, and read your type's cases to set their rubrics. Write each
-expectation as one fact a reader would keep, a stated decision, a limit or a
-constraint, not an aside, and name its values, so it is either met or not.
-Use the forms of
+Then run `scripts/compose_smoke.sh --quality --quality-outputs DIR`, which
+saves every case's pinned input, rubric and model output in `DIR`, and read
+your type's cases to set their rubrics. Write each expectation as one fact a
+reader would keep, a stated decision, a limit or a constraint, not an aside,
+and name its values, so it is either met or not. Use the forms of
 [Expectations and the judge](#expectations-and-the-judge):
 
 - extraction: "A memory states that …", for each fact the source must give.
@@ -274,16 +273,14 @@ in every other deployment: a Source that names a snapshot is refused unless
 `MEMFORGE_EVALUATION_SNAPSHOT_ROOT` names the folder its set lies below, which
 only `--quality` sets.
 
-The rubrics are written against one reference model, Claude Haiku 5.5. The
-summary your pull request needs is the one on that model, through whichever
-provider serves it: `anthropic/claude-haiku-5.5` on OpenRouter, the default
-generation model of `compose_smoke.sh`, or `claude-haiku-5-5` with an
-Anthropic key (`--generation-provider anthropic`). The embedding model is not
-part of the reference. A run on another generation model, for example with
-`--ollama` or another `--generation-model`, is still worth reporting, but an
-expectation not met there may come from the model rather than your change.
-The report and each summary name the provider and model of both kinds and of
-the judge; paste them with the run.
+Run the evaluation with any generation model you have. An expectation states
+what the source says, not how a model words it, so the same rubric holds for
+every model. A smaller model, for example one run with `--ollama`, may leave an
+expectation unmet, or give an output that is not well formed, because of the
+model rather than your change; a maintainer weighs that when reading the
+summary, and runs a `fail` that comes from the model again on a stronger one.
+The report and each summary name the generation, embedding and judge model
+with their providers; paste them with the run.
 
 ### Provider keys for the smoke scripts
 

@@ -142,10 +142,10 @@ smoke_env=$("$PYTHON" "$REPO_ROOT/scripts/smoke_env.py") || exit 2
 eval "$smoke_env"
 
 # Each kind's provider and model: models_label names both for the report,
-# generation_label the generation model, judge_label the model that judges the
-# quality cases, and ollama_endpoints the Ollama servers the API container has
-# to reach. An empty models_label means no model.
-models_label= generation_label= judge_label= ollama_endpoints=
+# judge_label the model that judges the quality cases, and ollama_endpoints the
+# Ollama servers the API container has to reach. An empty models_label means no
+# model.
+models_label= judge_label= ollama_endpoints=
 if (( ! no_models )); then
   model_plan=$("$PYTHON" "$HELPER" model-plan ${model_args[@]+"${model_args[@]}"}) || exit 2
   eval "$model_plan"
@@ -507,13 +507,13 @@ save_quality_outputs() {
     echo "the $kind case outputs were not saved: $(tail -n 1 "$outputs_dir/$kind.json" 2>/dev/null)" >&2
 }
 
-# The generation model calls of the run so far and their tokens, for the
+# The model calls of the run so far, per model, and their tokens, for the
 # report: read from the API's log before the restart replaces its container,
 # whether or not an earlier step failed.
 read_model_usage() {
   [ -z "$models_label" ] && return
   model_usage=$(compose logs --no-color api 2>/dev/null |
-    "$PYTHON" "$HELPER" model-usage --model "$generation_label") ||
+    "$PYTHON" "$HELPER" model-usage) ||
     model_usage="not read: $model_usage"
 }
 

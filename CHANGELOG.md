@@ -22,6 +22,12 @@
   each expectation not met with the Memories it rests on, and lists replay
   problems only when a code check did not pass.
 
+- Contributors: the `quick` cohort runs on any generation model. Its
+  expectations state what the source says, and each run reports its
+  generation, embedding and judge model. The smoke report's model usage line
+  totals the calls per model, so a judge on another model than generation is
+  counted apart.
+
 - Offline evaluation: each case kind allows a closed set of expectation forms,
   such as "A memory states that …" or "The outcome of the old memory `id` is
   kept.", and pinning a case refuses an expectation in another form or about an
