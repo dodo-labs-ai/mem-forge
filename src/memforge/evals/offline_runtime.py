@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 from memforge.config import AppConfig
+from memforge.evals.expectation_judge import ExpectationJudgeSpec, StructuredExpectationJudge
 from memforge.evals.offline_evaluation import (
     AgentEvaluationCaseKind,
     AgentEvaluationRun,
@@ -17,8 +19,52 @@ from memforge.evals.offline_evaluation import (
     SourceUnitSupportReplayExecutor,
     StructuredOfflineSemanticJudge,
 )
-from memforge.runtime import RuntimeProvider, resolve_models
+from memforge.llm.bindings import ModelBinding, build_binding, compile_binding
+from memforge.llm.providers import ModelConfigError
+from memforge.runtime import ResolvedModels, RuntimeProvider, generation_token_limits, resolve_models
+from memforge.server.model_settings_api import listed_model
 from memforge.storage.document_store import DocumentStore
+
+
+def configured_expectation_judge(config: AppConfig) -> tuple[ExpectationJudgeSpec, ModelBinding] | None:
+    """The expectation judge this deployment configures: the identity a run pins and its binding.
+
+    It is built as a generation binding of a registered provider, the way
+    Settings builds one, and compiled with its key, so a provider, model or key
+    the registry does not accept raises ``ModelConfigError`` naming the judge.
+    ``None`` when no judge model is configured.
+    """
+
+    settings = config.agent_evaluation
+    if not settings.judge_model:
+        return None
+    try:
+        binding = _judge_binding(config)
+        compile_binding(binding, settings.judge_api_key or None)
+    except ModelConfigError as exc:
+        raise ModelConfigError(exc.code, f"The expectation judge is not usable: {exc}") from exc
+    return ExpectationJudgeSpec(provider=binding.provider, model=binding.route), binding
+
+
+def _judge_binding(config: AppConfig, listed: Any | None = None) -> ModelBinding:
+    """The judge's binding, with the token limits and schema support its listing gives, as Settings records them."""
+
+    settings = config.agent_evaluation
+    limits = {
+        name: getattr(listed, name)
+        for name in ("context_window_tokens", "max_output_tokens")
+        if listed is not None and getattr(listed, name, None) is not None
+    }
+    return build_binding(
+        kind="generation",
+        provider=settings.judge_provider,
+        model_id=settings.judge_model,
+        config_source="environment",
+        endpoint=settings.judge_endpoint or None,
+        auth_strategy="api_key" if settings.judge_api_key else None,
+        token_limits=limits,
+        native_schema=getattr(listed, "native_schema", None),
+    )
 
 
 async def build_offline_evaluation_for_run(
@@ -77,4 +123,55 @@ async def build_offline_evaluation_for_run(
             if run.semantic_judge_manifest is not None
             else None
         ),
+        expectation_judge=await _expectation_judge(config, runtime_provider, run),
     )
+
+
+async def build_expectation_judge(
+    config: AppConfig, runtime_provider: RuntimeProvider,
+) -> tuple[ExpectationJudgeSpec, StructuredExpectationJudge] | None:
+    """The judge this deployment configures, on its own client; ``None`` without one.
+
+    Its requests are sized as a Settings binding's are: by the token limits its
+    provider's model listing gives, and the ``MEMFORGE_LLM_*`` limits for what
+    the listing leaves open or when it gives nothing the binding accepts.
+    """
+
+    configured = configured_expectation_judge(config)
+    if configured is None:
+        return None
+    spec, binding = configured
+    api_key = config.agent_evaluation.judge_api_key or None
+    try:
+        binding = _judge_binding(config, await listed_model(binding, api_key))
+    except ModelConfigError:
+        pass
+    client = runtime_provider.build_structured_llm_client(
+        ResolvedModels(
+            generation=compile_binding(binding, api_key),
+            embedding=None,
+            request_timeout_s=config.llm.request_timeout_s,
+            **generation_token_limits(config.llm, binding.token_limits),
+            input_budget_fraction=config.llm.input_budget_fraction,
+        ),
+        max_concurrent=config.llm.enrichment_max_concurrent,
+    )
+    return (spec, StructuredExpectationJudge(client)) if client is not None else None
+
+
+async def _expectation_judge(
+    config: AppConfig, runtime_provider: RuntimeProvider, run: AgentEvaluationRun,
+) -> StructuredExpectationJudge | None:
+    """The judge the run pins; ``None`` when this deployment does not configure that judge.
+
+    Without a judge the run still replays and scores its code checks, and
+    records each expectation as not judged.
+    """
+
+    if run.expectation_judge_manifest is None:
+        return None
+    configured = configured_expectation_judge(config)
+    if configured is None or configured[0] != ExpectationJudgeSpec.from_manifest(run.expectation_judge_manifest):
+        return None
+    built = await build_expectation_judge(config, runtime_provider)
+    return built[1] if built is not None else None

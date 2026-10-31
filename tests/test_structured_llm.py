@@ -780,6 +780,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             '{"verdict":"criterion_satisfied",'
             '"confidence":"high"}'
         ),
+        "ExpectationJudgmentResponse": '{"results":[]}',
         "CapabilityCheckResponse": '{"probe":{"label":"memforge","confirmed":true,"items":[]}}',
     }
 
@@ -813,6 +814,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             "prompt",
             model="gateway/judge-model",
         ),
+        "judge_offline_expectations": lambda: client.judge_offline_expectations("prompt"),
         "answer_schema": lambda: client.answer_schema(
             "prompt", response_format=CapabilityCheckResponse,
         ),
@@ -1568,6 +1570,30 @@ async def test_litellm_structured_client_bounds_schema_repair_diagnostics(
     assert "memories.8.memory_type" not in repair_prompt
     assert "secret-invalid-type" not in repair_prompt
     assert "Sensitive candidate" not in repair_prompt
+
+
+@pytest.mark.asyncio
+async def test_litellm_structured_client_logs_each_call_with_its_model(monkeypatch, caplog):
+    async def fake_acompletion(**kwargs):
+        return CompletionResponse('{"memories":[]}')
+
+    monkeypatch.setattr("memforge.llm.structured.litellm.acompletion", fake_acompletion)
+    set_native_schema_support(monkeypatch, False)
+    client = LiteLlmStructuredClient(
+        StructuredLlmConfig(
+            model="openai/gpt-6-luna",
+            base_url="https://llm.example.com/v1",
+            api_key="sk-secret",
+            timeout_s=1.0,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="memforge.llm.structured"):
+        await client.extract_projection_fragment_memories("prompt")
+
+    [line] = [record.getMessage() for record in caplog.records if record.getMessage().startswith("structured_llm_call ")]
+    assert json.loads(line.removeprefix("structured_llm_call "))["model"] == "openai/gpt-6-luna"
+    assert "llm.example.com" not in line and "sk-secret" not in line
 
 
 @pytest.mark.asyncio

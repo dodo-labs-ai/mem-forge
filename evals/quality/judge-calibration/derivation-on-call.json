@@ -1,0 +1,54 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "on-call",
+  "split": "dev",
+  "expectations": [
+    "A memory states that Kestrel pages the on-call engineer through the PagerDuty service kestrel-primary."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel pages the on-call engineer through the PagerDuty service `kestrel-primary`."
+        },
+        {
+          "id": "M2",
+          "memory": "Acknowledge a page within 5 minutes."
+        },
+        {
+          "id": "M3",
+          "memory": "If the primary does not acknowledge within 15 minutes, the page escalates to the secondary on-call engineer."
+        },
+        {
+          "id": "M4",
+          "memory": "Write the incident summary in the `#kestrel-incidents` channel before the shift ends."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the PagerDuty memory removed",
+      "items": [
+        {
+          "id": "M2",
+          "memory": "Acknowledge a page within 5 minutes."
+        },
+        {
+          "id": "M3",
+          "memory": "If the primary does not acknowledge within 15 minutes, the page escalates to the secondary on-call engineer."
+        },
+        {
+          "id": "M4",
+          "memory": "Write the incident summary in the `#kestrel-incidents` channel before the shift ends."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

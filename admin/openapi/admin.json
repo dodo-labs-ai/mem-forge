@@ -8193,7 +8193,7 @@
       },
       "ReconciliationCaseRequest": {
         "additionalProperties": false,
-        "description": "One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by\n``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the\n``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels\nincumbents ``kept``, ``revised`` or ``retired``.",
+        "description": "One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by\n``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the\n``incumbents`` and each incumbent's ``support`` result; the rubric's ``expectations`` are sentences about\nthe incumbents' outcomes (``kept``, ``revised`` or ``retired``).",
         "properties": {
           "doc_id": {
             "anyOf": [
@@ -11141,7 +11141,7 @@
       },
       "SupportCaseRequest": {
         "additionalProperties": false,
-        "description": "One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``\nwithin ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied\nupdate whose Support the model judged is pinned. The rubric labels Memories ``supported`` or\n``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold.",
+        "description": "One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``\nwithin ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied\nupdate whose Support the model judged is pinned. The rubric's ``expectations`` are sentences about the\nSupport verdicts, for the expectation judge.",
         "properties": {
           "derivation_id": {
             "anyOf": [
@@ -12743,7 +12743,7 @@
     },
     "/api/v1/agent-evaluations/runs": {
       "post": {
-        "description": "Admit one idempotent run; execution remains worker-owned.\n\nA candidate manifest without ``code_revision`` is pinned to the release\nthis server runs, the code its worker replays the cohort with, so a run\nadmitted after a deployment is a new run rather than the earlier one.\nOne without ``model`` is pinned to the route of the generation model in\nuse.",
+        "description": "Admit one idempotent run; execution remains worker-owned.\n\nA candidate manifest without ``code_revision`` is pinned to the release\nthis server runs, the code its worker replays the cohort with, so a run\nadmitted after a deployment is a new run rather than the earlier one.\nOne without ``model`` is pinned to the route of the generation model in\nuse. The run pins the expectation judge this deployment configures, if\nany; its decisions are advisory.",
         "operationId": "admit_agent_evaluation_run_api_v1_agent_evaluations_runs_post",
         "requestBody": {
           "content": {

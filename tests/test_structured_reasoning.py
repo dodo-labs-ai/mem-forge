@@ -116,6 +116,7 @@ async def _call(client: LiteLlmStructuredClient, operation: str) -> None:
         "validate_entity_batch": lambda: client.validate_entity_batch("prompt"),
         "rerank_memories": lambda: client.rerank_memories("prompt"),
         "judge_offline_semantics": lambda: client.judge_offline_semantics("prompt"),
+        "judge_offline_expectations": lambda: client.judge_offline_expectations("prompt"),
         "generation_check": lambda: client.answer_schema("prompt", response_format=CapabilityCheckResponse),
         "extract_projection_fragment_memories": lambda: client.extract_projection_fragment_memories("prompt"),
         "assess_claim_revisions": lambda: client.assess_claim_revisions("prompt"),
@@ -136,6 +137,7 @@ DIRECT_ANSWER_OPERATIONS = (
     "validate_entity_batch",
     "rerank_memories",
     "judge_offline_semantics",
+    "judge_offline_expectations",
     "generation_check",
 )
 REASONED_OPERATIONS = (

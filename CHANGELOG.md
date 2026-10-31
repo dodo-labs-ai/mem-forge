@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Offline evaluation: the rubric of a derivation, Support or reconciliation
+  case is a list of `expectations`, sentences an LLM judge checks against the
+  replayed output. It answers each one met, not met or unclear, three times,
+  and the majority counts. Its decisions are advisory: a run's verdict counts
+  only the replay's code checks, which now ask whether the output is valid
+  (every Support resolved, every incumbent has an outcome), not whether it
+  matches terms or labels. The seed endpoints and `memforge eval seed-*-cases`
+  refuse the earlier `expected_memory_count`, `required_terms`,
+  `expected_support`, `expected_support_terms` and `expected_incumbents`;
+  pin a workspace cohort again with expectations. A judged run of a cohort
+  pinned before reports `no_expectations` for each of its cases. The judge is test
+  configuration apart from Settings:
+  `MEMFORGE_AGENT_EVALUATION_JUDGE_{PROVIDER,MODEL,ENDPOINT,API_KEY}` name a
+  provider and generation model of the registry, and each run pins the judge
+  it was admitted with. Contributors: `compose_smoke.sh --quality` judges with
+  Claude Haiku 5.5 on OpenRouter by default and takes `--judge-provider`,
+  `--judge-model`, `--judge-endpoint` and `--judge-key-env`; its summary lists
+  each expectation not met with the Memories it rests on, and lists replay
+  problems only when a code check did not pass.
+
+- Contributors: the `quick` cohort runs on any generation model. Its
+  expectations state what the source says, and each run reports its
+  generation, embedding and judge model. The smoke report's model usage line
+  totals the calls per model, so a judge on another model than generation is
+  counted apart.
+
+- Offline evaluation: each case kind allows a closed set of expectation forms,
+  such as "A memory states that …" or "The outcome of the old memory `id` is
+  kept.", and pinning a case refuses an expectation in another form or about an
+  old memory the case does not hold; CONTRIBUTING lists the forms. Maintainers:
+  `memforge eval judge-calibrate` measures the configured judge against the
+  labeled outputs in `evals/quality/judge-calibration`, per split, kind and
+  form, after a change to the judge, its forms or its model.
+
 - Contributors: `scripts/compose_smoke.sh` configures the generation and the
   embedding model each through its own provider, as Settings does:
   `--generation-provider` and `--embedding-provider` take any provider Settings

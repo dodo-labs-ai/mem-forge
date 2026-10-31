@@ -1,0 +1,38 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "failure-alerts-zh",
+  "split": "dev",
+  "expectations": [
+    "A memory states that Kestrel's failure alerts go only to the Slack channel #kestrel-oncall."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel 任务连续失败三次后，告警只发送到 Slack 的 #kestrel-oncall 频道，不再发邮件；放弃邮件告警的原因是邮件容易被其他通知淹没，也无法统计确认时间。"
+        },
+        {
+          "id": "M2",
+          "memory": "值班同学需要在 15 分钟内确认告警。"
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the Slack memory removed",
+      "items": [
+        {
+          "id": "M2",
+          "memory": "值班同学需要在 15 分钟内确认告警。"
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

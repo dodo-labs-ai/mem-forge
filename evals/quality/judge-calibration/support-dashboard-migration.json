@@ -1,0 +1,59 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "dashboard-migration",
+  "split": "test",
+  "expectations": [
+    "If a memory states that the status page keeps the 99.9% availability panel, it is judged unsupported.",
+    "Every memory judged unsupported states the 99.9% availability panel."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The built-in status page keeps the 99.9% availability panel.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "Replace the Grafana board `kestrel-overview` with the built-in status page.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M3",
+          "memory": "Migration plan: rebuild the panels of the Grafana board `kestrel-overview` on the built-in status page; keep both running for two weeks; then retire the Grafana board after the comparison.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The built-in status page keeps the 99.9% availability panel.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "Replace the Grafana board `kestrel-overview` with the built-in status page.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M3",
+          "memory": "Migration plan: rebuild the panels of the Grafana board `kestrel-overview` on the built-in status page; keep both running for two weeks; then retire the Grafana board after the comparison.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met"
+      ]
+    }
+  ]
+}

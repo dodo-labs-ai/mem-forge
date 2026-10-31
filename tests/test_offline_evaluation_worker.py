@@ -141,7 +141,10 @@ async def _admit_run(
     )
     truth = await evaluation.accept_ground_truth(
         case_id=case.case_id,
-        rubric={"required_deterministic_criteria": ["incumbent_coverage"]},
+        rubric={
+            "expectations": ["The outcome of the old memory `mem-1` is kept."],
+            "required_deterministic_criteria": ["incumbent_coverage"],
+        },
         accepted_by="owner-1",
     )
     cohort = await evaluation.freeze_cohort(

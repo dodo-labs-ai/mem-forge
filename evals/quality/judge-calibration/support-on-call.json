@@ -1,0 +1,72 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "on-call",
+  "split": "dev",
+  "expectations": [
+    "If a memory states that a page must be acknowledged within 5 minutes, it is judged unsupported.",
+    "If a memory states that a page the primary does not acknowledge escalates to the secondary on-call engineer, and states no 5-minute limit, it is judged supported.",
+    "Every memory judged unsupported states the 5-minute time to acknowledge a page."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Write the incident summary in the `#kestrel-incidents` channel before the shift ends.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "If the primary does not acknowledge within 15 minutes, the page escalates to the secondary on-call engineer.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel pages the on-call engineer through the PagerDuty service `kestrel-primary`.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M4",
+          "memory": "Acknowledge a page within 5 minutes.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Write the incident summary in the `#kestrel-incidents` channel before the shift ends.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "If the primary does not acknowledge within 15 minutes, the page escalates to the secondary on-call engineer.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel pages the on-call engineer through the PagerDuty service `kestrel-primary`.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M4",
+          "memory": "Acknowledge a page within 5 minutes.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met",
+        "not_met"
+      ]
+    }
+  ]
+}

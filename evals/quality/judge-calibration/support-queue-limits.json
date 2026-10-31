@@ -1,0 +1,67 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "queue-limits",
+  "split": "test",
+  "expectations": [
+    "If a memory states that a job payload may be at most 256 KiB, it is judged unsupported.",
+    "If a memory states that each tenant may have at most 500 jobs in flight, and states no payload limit, it is judged supported.",
+    "Every memory judged unsupported states the 256 KiB payload limit."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A job payload may be at most 256 KiB; a larger payload is rejected with the error `KES-PAYLOAD-TOO-LARGE`.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "Each tenant may have at most 500 jobs in flight; further jobs wait in the tenant's backlog.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A job payload may be at most 256 KiB; a larger payload is rejected with the error `KES-PAYLOAD-TOO-LARGE`.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "Each tenant may have at most 500 jobs in flight; further jobs wait in the tenant's backlog.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "a kept fact beside a changed one, judged supported",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A job payload may be at most 256 KiB, and each tenant may have at most 500 jobs in flight.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met",
+        "met"
+      ]
+    }
+  ]
+}

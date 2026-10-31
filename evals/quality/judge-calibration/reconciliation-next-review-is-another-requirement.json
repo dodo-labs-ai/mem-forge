@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "next-review-is-another-requirement",
+  "split": "test",
+  "expectations": [
+    "The outcome of the old memory `old` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "At the September review, each team must test the retry policy locally and report gaps in the framework to the platform team.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "At the October review, teams must adopt retry policy v2 before GA; v1 is outdated, and each team reports what it changed and how it was tested."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "At the September review, each team must test the retry policy locally and report gaps in the framework to the platform team.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "At the October review, teams must adopt retry policy v2 before GA; v1 is outdated, and each team reports what it changed and how it was tested."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

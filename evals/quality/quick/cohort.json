@@ -14,67 +14,48 @@
     {
       "title": "Decision: the Kestrel job queue is stored in SQLite",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "SQLite"
+        "expectations": [
+          "A memory states that the Kestrel job queue is stored in SQLite, not in Redis."
         ]
       }
     },
     {
       "title": "Convention: Kestrel release tags",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "calendar"
+        "expectations": [
+          "A memory states that Kestrel releases use calendar versions."
         ]
       }
     },
     {
       "title": "Decision: Kestrel retries a failed job five times",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "kestrel-dlq"
+        "expectations": [
+          "A memory states that a job whose last retry fails moves to the kestrel-dlq queue."
         ]
       }
     },
     {
       "title": "Runbook: rotating the Kestrel signing key",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "rotate-key"
+        "expectations": [
+          "A memory states that `kestrel-admin rotate-key` creates the new signing key and publishes it next to the current one."
         ]
       }
     },
     {
       "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "fsync"
+        "expectations": [
+          "A memory states that the stall was caused by a configuration change that turned fsync off on the queue database."
         ]
       }
     },
     {
       "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "告警",
-          "kestrel-oncall"
+        "expectations": [
+          "A memory states that Kestrel's failure alerts go only to the Slack channel #kestrel-oncall."
         ]
       }
     },
@@ -82,11 +63,8 @@
       "snapshot": "local_markdown",
       "title": "Kestrel backup policy",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "kestrel-archive"
+        "expectations": [
+          "A memory states that each backup copy is kept for 30 days in the cold-storage bucket kestrel-archive."
         ]
       }
     },
@@ -94,11 +72,8 @@
       "snapshot": "github_repo",
       "title": "queue-limits",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "payload"
+        "expectations": [
+          "A memory states that a Kestrel job payload may be at most 256 KiB."
         ]
       }
     },
@@ -106,11 +81,8 @@
       "snapshot": "github_pages",
       "title": "on call",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "kestrel-primary"
+        "expectations": [
+          "A memory states that Kestrel pages the on-call engineer through the PagerDuty service kestrel-primary."
         ]
       }
     },
@@ -118,12 +90,9 @@
       "snapshot": "jira",
       "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "timeout",
-          "kestrel-webhook-audit"
+        "expectations": [
+          "A memory states the decision to raise the webhook delivery timeout to 20 seconds.",
+          "A memory states that every timed-out delivery is logged to the kestrel-webhook-audit stream."
         ]
       }
     },
@@ -131,11 +100,8 @@
       "snapshot": "confluence",
       "title": "Kestrel queue tiers",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "payments"
+        "expectations": [
+          "A memory states that the payments queue is in the Gold tier and that its jobs wait at most 30 seconds."
         ]
       }
     },
@@ -143,12 +109,9 @@
       "snapshot": "notion",
       "title": "Kestrel dashboard migration",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "Grafana",
-          "99.9%"
+        "expectations": [
+          "A memory states that the built-in status page replaces the Grafana board kestrel-overview.",
+          "A memory states that the status page keeps the 99.9% availability panel."
         ]
       }
     },
@@ -156,11 +119,8 @@
       "snapshot": "teams",
       "title": "Kestrel release crew thread from 2026-10-21T10:00",
       "rubric": {
-        "expected_memory_count": {
-          "min": 1
-        },
-        "required_terms": [
-          "canary"
+        "expectations": [
+          "A memory states that Kestrel 4.2 ships behind the kestrel-canary flag."
         ]
       }
     }
@@ -169,105 +129,117 @@
     {
       "title": "Decision: Kestrel retries a failed job five times",
       "rubric": {
-        "expected_support_terms": {
-          "kestrel-dlq": "supported",
-          "300": "unsupported",
-          "backoff": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that Kestrel retries a failed job three times, it is judged unsupported.",
+          "If a memory states that Kestrel waits 10, 60 and 300 seconds between retries, it is judged unsupported.",
+          "If a memory states that a fixed retry schedule was chosen over exponential backoff, it is judged unsupported.",
+          "If a memory states that a job whose last retry fails moves to the kestrel-dlq queue, and states nothing about how many times or how long Kestrel retries, it is judged supported.",
+          "Every memory judged unsupported states the count of three retries, the waits of 10, 60 and 300 seconds, or the choice of a fixed schedule over exponential backoff."
+        ]
       }
     },
     {
       "title": "Incident review: the Kestrel queue stalled on 2026-09-12",
       "rubric": {
-        "expected_support_terms": {
-          "startup check": "supported",
-          "on-call": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the on-call engineer is paged when no job has started for five minutes, it is judged unsupported.",
+          "If a memory states that a startup check refuses to run the queue with fsync off, and states nothing about paging, it is judged supported.",
+          "Every memory judged unsupported states that the on-call engineer is paged when no job has started."
+        ]
       }
     },
     {
       "title": "Runbook: rotating the Kestrel signing key",
       "rubric": {
-        "expected_support_terms": {
-          "kestrel-admin status": "supported"
-        }
+        "expectations": [
+          "If a memory states that a rotation waits until every worker reports the new key id in `kestrel-admin status`, it is judged supported.",
+          "No memory is judged unsupported."
+        ]
       }
     },
     {
       "title": "决定：Kestrel 的失败告警只发到 #kestrel-oncall",
       "rubric": {
-        "expected_support_terms": {
-          "Slack": "supported",
-          "15": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the on-call engineer must acknowledge an alert within 15 minutes, it is judged unsupported.",
+          "If a memory states that Kestrel's failure alerts go only to the Slack channel #kestrel-oncall, and states no time to acknowledge them, it is judged supported.",
+          "Every memory judged unsupported states the 15-minute time to acknowledge an alert."
+        ]
       }
     },
     {
       "snapshot": "local_markdown",
       "title": "Kestrel backup policy",
       "rubric": {
-        "expected_support_terms": {
-          "kestrel-archive": "supported",
-          "6 hours": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the backup job copies the queue database every 6 hours, it is judged unsupported.",
+          "If a memory states that each copy is kept for 30 days in the bucket kestrel-archive, and states nothing about how often a copy is made, it is judged supported.",
+          "Every memory judged unsupported states that a copy is made every 6 hours."
+        ]
       }
     },
     {
       "snapshot": "github_repo",
       "title": "queue-limits",
       "rubric": {
-        "expected_support_terms": {
-          "500": "supported",
-          "256": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that a job payload may be at most 256 KiB, it is judged unsupported.",
+          "If a memory states that each tenant may have at most 500 jobs in flight, and states no payload limit, it is judged supported.",
+          "Every memory judged unsupported states the 256 KiB payload limit."
+        ]
       }
     },
     {
       "snapshot": "github_pages",
       "title": "on call",
       "rubric": {
-        "expected_support_terms": {
-          "secondary": "supported",
-          "5 minutes": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that a page must be acknowledged within 5 minutes, it is judged unsupported.",
+          "If a memory states that a page the primary does not acknowledge escalates to the secondary on-call engineer, and states no 5-minute limit, it is judged supported.",
+          "Every memory judged unsupported states the 5-minute time to acknowledge a page."
+        ]
       }
     },
     {
       "snapshot": "jira",
       "title": "KES-42: Webhook delivery timeout is too short for slow receivers",
       "rubric": {
-        "expected_support_terms": {
-          "kestrel-webhook-audit": "unsupported",
-          "20 seconds": "unsupported"
-        }
+        "expectations": [
+          "If a memory states the decision to raise the webhook delivery timeout to 20 seconds, it is judged unsupported.",
+          "If a memory states that timed-out deliveries are logged to the kestrel-webhook-audit stream, it is judged unsupported.",
+          "Every memory judged unsupported states the 20-second timeout, the kestrel-webhook-audit stream, or that deliveries time out after 5 seconds."
+        ]
       }
     },
     {
       "snapshot": "confluence",
       "title": "Kestrel queue tiers",
       "rubric": {
-        "expected_support_terms": {
-          "invoices": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the invoices queue waits at most 2 minutes, it is judged unsupported.",
+          "Every memory judged unsupported states the 2-minute maximum wait of the invoices queue."
+        ]
       }
     },
     {
       "snapshot": "notion",
       "title": "Kestrel dashboard migration",
       "rubric": {
-        "expected_support_terms": {
-          "99.9%": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the status page keeps the 99.9% availability panel, it is judged unsupported.",
+          "Every memory judged unsupported states the 99.9% availability panel."
+        ]
       }
     },
     {
       "snapshot": "teams",
       "title": "Kestrel release crew thread from 2026-10-21T10:00",
       "rubric": {
-        "expected_support_terms": {
-          "canary": "supported",
-          "5%": "unsupported"
-        }
+        "expectations": [
+          "If a memory states that the canary covers 5% of tenants, it is judged unsupported.",
+          "If a memory states that Kestrel 4.2 ships behind the kestrel-canary flag, and states no share of tenants, it is judged supported.",
+          "Every memory judged unsupported states that the canary covers 5% of tenants."
+        ]
       }
     }
   ],

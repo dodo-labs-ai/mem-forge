@@ -15,5 +15,5 @@
     ],
     "support": {"wait-for-workers": "supported"}
   },
-  "rubric": {"expected_incumbents": {"wait-for-workers": "kept"}}
+  "rubric": {"expectations": ["The outcome of the old memory `wait-for-workers` is kept."]}
 }

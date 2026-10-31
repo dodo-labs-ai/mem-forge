@@ -1,0 +1,49 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "signing-key-rotation",
+  "split": "test",
+  "expectations": [
+    "If a memory states that a rotation waits until every worker reports the new key id in `kestrel-admin status`, it is judged supported.",
+    "No memory is judged unsupported."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "To rotate the Kestrel signing key, run `kestrel-admin rotate-key` on any node; it creates the new key and publishes it next to the current one. Wait until every worker reports the new key id in `kestrel-admin status`, then run `kestrel-admin retire-key <old key id>`. Payloads signed with the old key are rejected from then on.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "Kestrel signs every job payload with an Ed25519 key. Rotate the key every 90 days, or at once when it may have leaked.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "To rotate the Kestrel signing key, run `kestrel-admin rotate-key` on any node; it creates the new key and publishes it next to the current one. Wait until every worker reports the new key id in `kestrel-admin status`, then run `kestrel-admin retire-key <old key id>`. Payloads signed with the old key are rejected from then on.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "Kestrel signs every job payload with an Ed25519 key. Rotate the key every 90 days, or at once when it may have leaked.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met"
+      ]
+    }
+  ]
+}

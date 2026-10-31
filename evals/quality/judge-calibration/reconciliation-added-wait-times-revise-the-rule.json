@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "added-wait-times-revise-the-rule",
+  "split": "test",
+  "expectations": [
+    "The outcome of the old memory `old` is revised."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "A failed Kestrel job is retried three times before it moves to the kestrel-dlq queue.",
+          "outcome": "revised"
+        },
+        {
+          "id": "N1",
+          "new_memory": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts, before it moves to the kestrel-dlq queue."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "A failed Kestrel job is retried three times before it moves to the kestrel-dlq queue.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts, before it moves to the kestrel-dlq queue."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

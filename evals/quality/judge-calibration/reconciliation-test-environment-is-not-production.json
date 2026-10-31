@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "test-environment-is-not-production",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `friday-release` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "friday-release",
+          "old_memory": "Kestrel production releases ship every Friday.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "The Kestrel test environment is redeployed every Thursday."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "friday-release",
+          "old_memory": "Kestrel production releases ship every Friday.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "The Kestrel test environment is redeployed every Thursday."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

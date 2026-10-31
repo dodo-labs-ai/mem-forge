@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "rule-outlives-a-broken-rotation",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `wait-for-workers` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "wait-for-workers",
+          "old_memory": "Before retiring the old Kestrel signing key, wait until every worker reports the new key id in kestrel-admin status.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "On 2026-10-01 the old Kestrel signing key was retired before two workers reported the new key id, and their jobs failed for ten minutes."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "wait-for-workers",
+          "old_memory": "Before retiring the old Kestrel signing key, wait until every worker reports the new key id in kestrel-admin status.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "On 2026-10-01 the old Kestrel signing key was retired before two workers reported the new key id, and their jobs failed for ten minutes."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

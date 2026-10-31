@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "example-drops-parent-task",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `old` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Alert routing for the retry dashboard is a sub-task of the observability epic; Kestrel needs to align with the SRE team on how alerts are routed.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel and the SRE team need to align on alert routing: alerts should be raised per queue, not per job."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Alert routing for the retry dashboard is a sub-task of the observability epic; Kestrel needs to align with the SRE team on how alerts are routed.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel and the SRE team need to align on alert routing: alerts should be raised per queue, not per job."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

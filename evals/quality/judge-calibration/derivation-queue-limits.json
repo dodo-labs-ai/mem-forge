@@ -1,0 +1,38 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "queue-limits",
+  "split": "test",
+  "expectations": [
+    "A memory states that a Kestrel job payload may be at most 256 KiB."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A job payload may be at most 256 KiB; a larger payload is rejected with the error `KES-PAYLOAD-TOO-LARGE`."
+        },
+        {
+          "id": "M2",
+          "memory": "Each tenant may have at most 500 jobs in flight; further jobs wait in the tenant's backlog."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the payload memory removed",
+      "items": [
+        {
+          "id": "M2",
+          "memory": "Each tenant may have at most 500 jobs in flight; further jobs wait in the tenant's backlog."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

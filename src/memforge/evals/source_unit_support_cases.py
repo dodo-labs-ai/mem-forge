@@ -90,9 +90,9 @@ class SupportCaseRequest:
     """One Document whose applied update to pin: ``doc_id``, or ``title`` within ``source_id``.
 
     ``derivation_id`` names the update; without it, the Document's latest
-    applied update whose Support the model judged is pinned. ``rubric`` labels
-    Memories ``supported`` or ``unsupported``, by id in ``expected_support`` or
-    by a term their claims hold in ``expected_support_terms``.
+    applied update whose Support the model judged is pinned. ``rubric`` holds
+    ``expectations``: sentences about the Support verdicts, for the expectation
+    judge.
     """
 
     rubric: Mapping[str, object]

@@ -1,0 +1,57 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "webhook-timeout",
+  "split": "dev",
+  "expectations": [
+    "A memory states the decision to raise the webhook delivery timeout to 20 seconds.",
+    "A memory states that every timed-out delivery is logged to the kestrel-webhook-audit stream."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel webhook deliveries time out after 5 seconds, while receivers behind the acme gateway need up to 15 seconds."
+        },
+        {
+          "id": "M2",
+          "memory": "The decision is to raise the webhook delivery timeout to 20 seconds."
+        },
+        {
+          "id": "M3",
+          "memory": "A timed-out delivery is retried at most 3 times (`webhook.max_redeliveries`)."
+        },
+        {
+          "id": "M4",
+          "memory": "Every timed-out delivery is logged to the `kestrel-webhook-audit` stream, so support can answer tenants without reading the worker logs."
+        }
+      ],
+      "labels": [
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "the decision memory removed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel webhook deliveries time out after 5 seconds, while receivers behind the acme gateway need up to 15 seconds."
+        },
+        {
+          "id": "M3",
+          "memory": "A timed-out delivery is retried at most 3 times (`webhook.max_redeliveries`)."
+        },
+        {
+          "id": "M4",
+          "memory": "Every timed-out delivery is logged to the `kestrel-webhook-audit` stream, so support can answer tenants without reading the worker logs."
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met"
+      ]
+    }
+  ]
+}

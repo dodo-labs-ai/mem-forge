@@ -27,8 +27,8 @@
     }
   },
   "rubric": {
-    "expected_incumbents": {
-      "old": "kept"
-    }
+    "expectations": [
+      "The outcome of the old memory `old` is kept."
+    ]
   }
 }

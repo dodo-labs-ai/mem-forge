@@ -27,8 +27,8 @@
     }
   },
   "rubric": {
-    "expected_incumbents": {
-      "stall": "kept"
-    }
+    "expectations": [
+      "The outcome of the old memory `stall` is kept."
+    ]
   }
 }

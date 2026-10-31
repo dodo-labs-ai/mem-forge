@@ -1,0 +1,52 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "backup-policy",
+  "split": "dev",
+  "expectations": [
+    "If a memory states that the backup job copies the queue database every 6 hours, it is judged unsupported.",
+    "If a memory states that each copy is kept for 30 days in the bucket kestrel-archive, and states nothing about how often a copy is made, it is judged supported.",
+    "Every memory judged unsupported states that a copy is made every 6 hours."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A restore drill runs on the first Monday of every month, and the on-call engineer records how long the restore took in the drill log.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "The backup job kestrel-snapshot copies the queue database every 6 hours, and each copy is kept for 30 days in the cold-storage bucket kestrel-archive.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A restore drill runs on the first Monday of every month, and the on-call engineer records how long the restore took in the drill log.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "The backup job kestrel-snapshot copies the queue database every 6 hours, and each copy is kept for 30 days in the cold-storage bucket kestrel-archive.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met",
+        "met"
+      ]
+    }
+  ]
+}

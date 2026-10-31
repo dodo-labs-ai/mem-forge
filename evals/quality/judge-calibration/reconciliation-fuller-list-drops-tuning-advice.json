@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "fuller-list-drops-tuning-advice",
+  "split": "test",
+  "expectations": [
+    "The outcome of the old memory `old` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "The number of concurrent Kestrel workers is set by `max_workers` (default 8). Lower it to reduce lock contention on the queue database; raise it for throughput when many short jobs are queued.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel's `WorkerConfig` takes `poll_interval` (default 5 seconds), `lease_timeout` (default 60 seconds) and `max_workers` (maximum concurrent workers, default 8)."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "The number of concurrent Kestrel workers is set by `max_workers` (default 8). Lower it to reduce lock contention on the queue database; raise it for throughput when many short jobs are queued.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel's `WorkerConfig` takes `poll_interval` (default 5 seconds), `lease_timeout` (default 60 seconds) and `max_workers` (maximum concurrent workers, default 8)."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

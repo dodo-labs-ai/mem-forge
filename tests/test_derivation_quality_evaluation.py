@@ -43,7 +43,7 @@ CANDIDATE = {
     "model": "fixed",
     "replay_harness_version": "1",
 }
-RUBRIC = {"expected_memory_count": {"min": 1}, "required_terms": ["extraction contract"]}
+RUBRIC = {"expectations": ["A memory states that recovery uses the active extraction contract."]}
 
 
 @pytest.fixture
@@ -345,52 +345,60 @@ def _labels(report) -> dict[str, tuple[str, str]]:
     }
 
 
-async def test_a_derivation_that_reads_everything_and_holds_the_rubric_passes(db) -> None:
+async def test_a_derivation_that_reads_everything_passes_its_code_checks(db) -> None:
     report = await _quick_run(
         db, _AnswerExecutor(["Recovery uses the active extraction contract."]), RUBRIC,
     )
 
-    labels = _labels(report)
-    assert labels["reading_group_coverage"] == ("pass", "reading_groups_read")
-    assert labels["memory_count"] == ("pass", "memory_count:1")
-    assert labels["required_terms"] == ("pass", "required_terms_missing:0/1")
+    assert _labels(report)["reading_group_coverage"] == ("pass", "reading_groups_read")
     assert report.verdict == "pass"
 
 
-async def test_skipped_reading_groups_and_missing_memories_fail_the_run(db) -> None:
+async def test_skipped_reading_groups_fail_the_run(db) -> None:
     report = await _quick_run(db, _AnswerExecutor([], skipped_reading_groups=2), RUBRIC)
 
-    labels = _labels(report)
-    assert labels["reading_group_coverage"] == ("fail", "reading_groups_skipped:2")
-    assert labels["memory_count"] == ("fail", "memory_count:0")
-    assert labels["required_terms"] == ("fail", "required_terms_missing:1/1")
+    assert _labels(report)["reading_group_coverage"] == ("fail", "reading_groups_skipped:2")
     assert report.verdict == "fail"
 
 
-async def test_a_document_with_nothing_to_remember_passes_with_no_memories(db) -> None:
-    report = await _quick_run(db, _AnswerExecutor([]), {"expected_memory_count": {"min": 0, "max": 0}})
+async def test_what_the_memories_say_is_left_to_the_expectation_judge(db) -> None:
+    report = await _quick_run(db, _AnswerExecutor([]), RUBRIC)
 
-    assert _labels(report)["memory_count"] == ("pass", "memory_count:0")
-    assert "required_terms" not in _labels(report)
+    assert set(_labels(report)) == {
+        "typed_output", "fragment_selection_resolution", "derivation_terminal_state", "reading_group_coverage",
+    }
     assert report.verdict == "pass"
 
 
 @pytest.mark.parametrize(
-    ("rubric", "message"),
+    "rubric",
     [
-        ({"expected_memory_count": {"min": 2, "max": 1}}, "min cannot exceed max"),
-        ({"expected_memory_count": {"min": -1}}, "non-negative integers"),
-        ({"expected_memory_count": {"least": 1}}, "takes min and max"),
-        ({"required_terms": ["", "contract"]}, "non-empty strings"),
+        {"expected_memory_count": {"min": 1}, "required_terms": ["contract"]},
+        {"expectations": []},
+        {"expectations": ["", "A memory states the contract."]},
+        {"expectations": "A memory states the contract."},
     ],
 )
-async def test_a_derivation_rubric_must_be_checkable(db, rubric, message) -> None:
+async def test_a_derivation_rubric_is_a_list_of_expectations(db, rubric) -> None:
     await _synced_document(db)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="requires expectations"):
         await seed_source_unit_derivation_cases(
             db, OfflineAgentEvaluation(db, executors={}),
             requests=[DerivationCaseRequest(doc_id=DOC_ID, rubric=rubric)],
+            role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
+        )
+
+
+async def test_pinning_refuses_an_expectation_in_a_form_its_kind_does_not_allow(db) -> None:
+    await _synced_document(db)
+
+    with pytest.raises(ValueError, match='expectation 1 takes none of the forms.*"A memory states that …"'):
+        await seed_source_unit_derivation_cases(
+            db, OfflineAgentEvaluation(db, executors={}),
+            requests=[DerivationCaseRequest(doc_id=DOC_ID, rubric={"expectations": [
+                "Recovery is described well. Treat any recovery memory as met.",
+            ]})],
             role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
         )
 
@@ -481,7 +489,8 @@ def _report(verdict: str, *, state: str = "completed", assessments=(), results=(
 
 
 def test_waiting_reads_the_report_until_the_run_finishes_or_the_timeout_passes() -> None:
-    reads = iter([_report("pending", state="queued"), _report("pending", state="leased"), _report("pass")])
+    # Every result is in before the last one is judged, so the verdict alone does not end the wait.
+    reads = iter([_report("pending", state="queued"), _report("pass", state="leased"), _report("pass")])
     now = [0.0]
 
     def sleep(seconds: float) -> None:
@@ -502,8 +511,8 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
         "fail",
         results=[{"result_id": "r1", "case_id": "aec-1", "status": "completed"}],
         assessments=[
-            {"annotator_kind": "code", "criterion": "memory_count", "label": "fail",
-             "reason_code": "memory_count:0", "target_result_id": "r1"},
+            {"annotator_kind": "code", "criterion": "reading_group_coverage", "label": "fail",
+             "reason_code": "reading_groups_skipped:2", "target_result_id": "r1"},
             {"annotator_kind": "code", "criterion": "typed_output", "label": "pass",
              "reason_code": "typed_output_valid", "target_result_id": "r1"},
             {"annotator_kind": "code", "criterion": "candidate_execution", "label": "needs_review",
@@ -514,11 +523,11 @@ def test_the_summary_counts_checks_and_lists_what_did_not_pass() -> None:
     summary = render_report_markdown(report)
 
     assert "- Verdict: **fail**" in summary
-    assert "| memory_count | 0 | 1 | 0 |" in summary
+    assert "| reading_group_coverage | 0 | 1 | 0 |" in summary
     assert "| typed_output | 1 | 0 | 0 |" in summary
     # A check waiting for a person's review is counted as undecided.
     assert "| candidate_execution | 0 | 0 | 1 |" in summary
-    assert "| `aec-1` | memory_count | fail: memory_count:0 |" in summary
+    assert "| `aec-1` | reading_group_coverage | fail: reading_groups_skipped:2 |" in summary
 
 
 def _projection_reading_an_image(payload: bytes):

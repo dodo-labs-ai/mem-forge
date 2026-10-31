@@ -27,8 +27,8 @@
     }
   },
   "rubric": {
-    "expected_incumbents": {
-      "old": "revised"
-    }
+    "expectations": [
+      "The outcome of the old memory `old` is revised."
+    ]
   }
 }
