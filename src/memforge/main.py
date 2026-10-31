@@ -1221,7 +1221,8 @@ def eval_seed_derivation_cases(ctx: click.Context, spec_path: Path, workspace_id
     """Pin synced Documents as derivation cases with their rubrics and freeze their cohort.
 
     The spec names ``selection_policy_version``, an optional ``role`` and the
-    ``cases``, each a ``doc_id`` with its ``rubric`` and, to pin a derivation
+    ``cases``, each a ``doc_id`` with its ``rubric`` (``expectations``:
+    sentences the extracted Memories should meet) and, to pin a derivation
     other than the Document's first, its ``derivation_id``. Requires a
     maintenance operator.
     """
@@ -1247,9 +1248,8 @@ def eval_seed_support_cases(ctx: click.Context, spec_path: Path, workspace_id: s
     """Pin applied updates of synced Documents as Support cases and freeze their cohort.
 
     The spec names ``selection_policy_version``, an optional ``role`` and the
-    ``cases``, each a ``doc_id`` with its ``rubric`` (``expected_support``:
-    Memory id to ``supported`` or ``unsupported``, or ``expected_support_terms``:
-    a term the claims hold to a label) and, to pin an update other
+    ``cases``, each a ``doc_id`` with its ``rubric`` (``expectations``:
+    sentences about the Support verdicts) and, to pin an update other
     than the latest one the model judged Support in, its ``derivation_id``.
     Requires a maintenance operator.
     """
@@ -1277,8 +1277,8 @@ def eval_seed_reconciliation_cases(ctx: click.Context, spec_path: Path, workspac
     The spec names ``selection_policy_version``, an optional ``role`` and the
     ``cases``, each a synced Document (``doc_id``, or ``source_id`` and
     ``title``) with its ``input`` (``candidates``, ``incumbents`` and their
-    ``support``) and ``rubric`` (``expected_incumbents``: incumbent id to
-    ``kept``, ``revised`` or ``retired``). Requires a maintenance operator.
+    ``support``) and ``rubric`` (``expectations``: sentences about the
+    incumbents' outcomes). Requires a maintenance operator.
     """
 
     _emit_tool_payload(

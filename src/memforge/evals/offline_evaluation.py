@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -17,6 +16,14 @@ from enum import Enum
 from time import perf_counter
 from typing import Protocol
 
+from memforge.evals.expectation_judge import (
+    EXPECTATION_CRITERION,
+    ExpectationJudge,
+    ExpectationJudgeSpec,
+    case_output_view,
+    rubric_expectations,
+    validate_expectations,
+)
 from memforge.evals.agent_evaluation import (
     AgentAssessment,
     AgentAssessmentConfidence,
@@ -114,26 +121,26 @@ RELATION_LABEL_CRITERION = "relation_label"
 # classifier related to the subject; its reason code is the recorded label and
 # it waits for a person's label.
 UNLABELLED_RELATION_CRITERION = "unlabelled_relation"
-# The criteria of a derivation case beyond its typed output: every ReadingGroup
-# was read (none skipped because the model's answer was rejected even alone or
-# the group did not fit the model), and the rubric's expected Memory count and
-# required terms. Their reason codes hold counts only, never content.
+# A derivation case read every ReadingGroup: none was skipped because the
+# model's answer was rejected even alone or the group did not fit the model. Its
+# reason code holds a count only, never content.
 READING_GROUP_COVERAGE_CRITERION = "reading_group_coverage"
-MEMORY_COUNT_CRITERION = "memory_count"
-REQUIRED_TERMS_CRITERION = "required_terms"
 # A check that scores one item of a case stores its reason code as
 # "reason/item_id", so each stored assessment names the item it scores, such as
 # "none:equivalent/mem-1" for one candidate of a relation group.
 CHECK_ITEM_SEPARATOR = "/"
 _RELATION_LABELS = frozenset(label.value for label in MemoryRelationLabel)
-# What a maintainer expects of one pinned Memory's Support in the new revision.
-SUPPORT_LABELS = frozenset({"supported", "unsupported"})
-SUPPORT_LABEL_CRITERION = "support_label"
-UNLABELLED_UNSUPPORTED_CRITERION = "unlabelled_unsupported"
+# Every pinned Support of a Support case reached a verdict. A case with an
+# unresolved one has no result for the expectation judge to read; its reason
+# code counts them.
+SUPPORT_RESOLUTION_CRITERION = "support_resolution"
 IMAGE_READING_CRITERION = "image_reading"
+# Every incumbent of a reconciliation case has one of INCUMBENT_OUTCOMES.
 INCUMBENT_OUTCOME_CRITERION = "incumbent_outcome"
-UNLABELLED_OUTCOME_CRITERION = "unlabelled_outcome"
 _SUPPORT_RESULTS = frozenset(result.value for result in SupportResult)
+_RESOLVED_SUPPORT_RESULTS = frozenset({
+    SupportResult.SUPPORTED.value, SupportResult.UNAFFECTED.value, SupportResult.UNSUPPORTED.value,
+})
 
 
 class AgentEvaluationCaseKind(str, Enum):
@@ -142,6 +149,14 @@ class AgentEvaluationCaseKind(str, Enum):
     SOURCE_UNIT_RECONCILIATION = "source_unit_reconciliation_v1"
     MEMORY_RELATION = "cross_document_relation_v1"
     MEMORY_RELATION_GROUP = "cross_document_relation_group_v1"
+
+
+# The case kinds whose rubric is a list of expectations for the expectation judge.
+EXPECTATION_CASE_KINDS = frozenset({
+    AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION,
+    AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT,
+    AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION,
+})
 
 
 class AgentEvaluationPopulation(str, Enum):
@@ -608,6 +623,7 @@ class AgentEvaluationRun:
     completed_at: str | None = None
     baseline_run_id: str | None = None
     semantic_judge_manifest: Mapping[str, object] | None = None
+    expectation_judge_manifest: Mapping[str, object] | None = None
     schema_version: str = OFFLINE_EVALUATION_SCHEMA_VERSION
 
 
@@ -688,7 +704,7 @@ class AgentEvaluationCaseOutput:
 
     It holds the case's pinned input, its accepted rubric, the candidate output
     (for a relation case, the recorded label and the classifier's label of each
-    judged pair) and the code checks.
+    judged pair), the code checks and the expectation judge's decisions.
     """
 
     case: AgentEvaluationCase
@@ -1512,10 +1528,12 @@ class OfflineAgentEvaluation:
         *,
         executors: Mapping[AgentEvaluationCaseKind, OfflineCaseExecutor],
         semantic_judge: OfflineSemanticJudge | None = None,
+        expectation_judge: ExpectationJudge | None = None,
     ) -> None:
         self._store = store
         self._executors = dict(executors)
         self._semantic_judge = semantic_judge
+        self._expectation_judge = expectation_judge
 
     async def curate_case(
         self,
@@ -2149,6 +2167,7 @@ class OfflineAgentEvaluation:
         evaluator_version: str,
         created_by: str,
         semantic_judge_spec: SemanticJudgeSpec | None = None,
+        expectation_judge_spec: ExpectationJudgeSpec | None = None,
         replicate_count: int = 1,
         baseline_run_id: str | None = None,
         created_at: str | None = None,
@@ -2161,6 +2180,7 @@ class OfflineAgentEvaluation:
             evaluator_version=evaluator_version,
             created_by=created_by,
             semantic_judge_spec=semantic_judge_spec,
+            expectation_judge_spec=expectation_judge_spec,
             replicate_count=replicate_count,
             baseline_run_id=baseline_run_id,
             created_at=created_at,
@@ -2201,14 +2221,20 @@ class OfflineAgentEvaluation:
                 cached = await self._store.get_agent_evaluation_result(result_id)
                 if cached is not None:
                     any_error = any_error or cached.status is not AgentEvaluationResultStatus.COMPLETED
-                    if semantic_judge_spec is not None:
+                    if semantic_judge_spec is not None or expectation_judge_spec is not None:
                         checks = deterministic_checks(case, ground_truth, cached.output or {})
+                    if semantic_judge_spec is not None:
                         await self._record_semantic_assessment(
                             result=cached,
                             case=case,
                             ground_truth=ground_truth,
                             checks=checks,
                             spec=semantic_judge_spec,
+                        )
+                    if expectation_judge_spec is not None:
+                        await self._record_expectation_assessments(
+                            result=cached, case=case, ground_truth=ground_truth, checks=checks,
+                            spec=expectation_judge_spec,
                         )
                     continue
                 reusable = await self._store.get_cached_agent_evaluation_output(
@@ -2297,6 +2323,11 @@ class OfflineAgentEvaluation:
                         checks=checks,
                         spec=semantic_judge_spec,
                     )
+                if expectation_judge_spec is not None:
+                    await self._record_expectation_assessments(
+                        result=result, case=case, ground_truth=ground_truth, checks=checks,
+                        spec=expectation_judge_spec,
+                    )
         completed = replace(
             run,
             status=(
@@ -2325,6 +2356,7 @@ class OfflineAgentEvaluation:
         evaluator_version: str,
         created_by: str,
         semantic_judge_spec: SemanticJudgeSpec | None = None,
+        expectation_judge_spec: ExpectationJudgeSpec | None = None,
         replicate_count: int = 1,
         baseline_run_id: str | None = None,
         created_at: str | None = None,
@@ -2336,6 +2368,7 @@ class OfflineAgentEvaluation:
             evaluator_version=evaluator_version,
             created_by=created_by,
             semantic_judge_spec=semantic_judge_spec,
+            expectation_judge_spec=expectation_judge_spec,
             replicate_count=replicate_count,
             baseline_run_id=baseline_run_id,
             created_at=created_at,
@@ -2379,6 +2412,11 @@ class OfflineAgentEvaluation:
             evaluator_version=run.evaluator_version,
             created_by=run.created_by,
             semantic_judge_spec=semantic_judge_spec,
+            expectation_judge_spec=(
+                ExpectationJudgeSpec.from_manifest(run.expectation_judge_manifest)
+                if run.expectation_judge_manifest is not None
+                else None
+            ),
             replicate_count=run.replicate_count,
             baseline_run_id=run.baseline_run_id,
             created_at=run.created_at,
@@ -2398,6 +2436,7 @@ class OfflineAgentEvaluation:
         baseline_run_id: str | None,
         created_at: str | None,
         require_semantic_adapter: bool,
+        expectation_judge_spec: ExpectationJudgeSpec | None = None,
     ) -> tuple[AgentEvaluationCohort, AgentEvaluationRun]:
         if replicate_count < 1:
             raise ValueError("replicate_count must be positive")
@@ -2417,6 +2456,9 @@ class OfflineAgentEvaluation:
                 actor_user_id=created_by,
             )
             semantic_judge_manifest = semantic_judge_spec.to_manifest()
+        expectation_judge_manifest = (
+            expectation_judge_spec.to_manifest() if expectation_judge_spec is not None else None
+        )
         candidate = _canonical_mapping(candidate_manifest)
         candidate_hash = _hash(candidate)
         run_id = _id(
@@ -2428,6 +2470,7 @@ class OfflineAgentEvaluation:
             _hash(semantic_judge_manifest) if semantic_judge_manifest is not None else "",
             replicate_count,
             baseline_run_id or "",
+            *([_hash(expectation_judge_manifest)] if expectation_judge_manifest is not None else []),
         )
         existing = await self._store.get_agent_evaluation_run(run_id)
         run = AgentEvaluationRun(
@@ -2443,6 +2486,7 @@ class OfflineAgentEvaluation:
             created_at=(existing.created_at if existing is not None else created_at or _now()),
             baseline_run_id=baseline_run_id,
             semantic_judge_manifest=semantic_judge_manifest,
+            expectation_judge_manifest=expectation_judge_manifest,
         )
         if existing is not None:
             run = replace(run, created_by=existing.created_by, status=existing.status)
@@ -2584,7 +2628,9 @@ class OfflineAgentEvaluation:
         items = {item.case_id: item for item in cohort.items}
         checks: dict[str, list[AgentAssessment]] = {}
         for assessment in await self._store.list_agent_assessments_for_run(run_id):
-            if assessment.annotator_kind == "code" and assessment.target_result_id:
+            if assessment.target_result_id and (
+                assessment.annotator_kind == "code" or assessment.criterion == EXPECTATION_CRITERION
+            ):
                 checks.setdefault(assessment.target_result_id, []).append(assessment)
         outputs: list[AgentEvaluationCaseOutput] = []
         for result in await self._store.list_agent_evaluation_results(run_id):
@@ -2855,6 +2901,116 @@ class OfflineAgentEvaluation:
         await self._store.record_agent_assessments((assessment,))
         return assessment
 
+    async def _record_expectation_assessments(
+        self,
+        *,
+        result: AgentEvaluationResult,
+        case: AgentEvaluationCase,
+        ground_truth: AcceptedGroundTruthRevision,
+        checks: tuple[DeterministicCheck, ...],
+        spec: ExpectationJudgeSpec,
+    ) -> tuple[AgentAssessment, ...]:
+        """Record the judge's advisory decision on each expectation of the case's rubric.
+
+        A result without a valid output (none, one a code check failed, or a
+        Support case with an unresolved Support) spends no model call: each
+        expectation is recorded as failed, and reports as not judged, as does an
+        expectation most of the judge's votes did not answer. A rubric with no
+        expectations is recorded as one failed ``E0:no_expectations``. A decision
+        is reused exactly: its key covers the output, the rubric and the judge's
+        whole identity. Each assessment's reason code is "E<n>:<label>" followed
+        by the stored IDs of the output items the decision rests on, each after
+        "/", never content.
+        """
+
+        if case.case_kind not in EXPECTATION_CASE_KINDS:
+            return ()
+        expectations = rubric_expectations(ground_truth.rubric)
+        manifest_hash = _hash(spec.to_manifest())
+        fingerprints = [
+            _hash({
+                "result_output_hash": result.output_hash,
+                "unavailable_result_id": result.result_id if result.output_hash is None else None,
+                "case_manifest_hash": _hash(case.manifest),
+                "rubric_hash": ground_truth.rubric_hash,
+                "expectation": index,
+                "expectation_judge_manifest_hash": manifest_hash,
+            })
+            for index in (range(1, len(expectations) + 1) if expectations else (0,))
+        ]
+        assessment_ids = [
+            _id("aas", result.result_id, EXPECTATION_CRITERION, index, fingerprint)
+            for index, fingerprint in enumerate(fingerprints, start=1)
+        ]
+        existing = [await self._store.get_agent_assessment(assessment_id) for assessment_id in assessment_ids]
+        if all(assessment is not None for assessment in existing):
+            return tuple(existing)
+        cached = (
+            [await self._store.get_cached_agent_assessment(fingerprint) for fingerprint in fingerprints]
+            if expectations and result.output_hash is not None and result.output is not None
+            else [None] * len(fingerprints)
+        )
+
+        def not_judged(reason: str) -> list[tuple[str, AgentAssessmentLabel | None, str, str | None]]:
+            return [("failed", None, f"E{index}:{reason}", None) for index in range(1, len(expectations) + 1)]
+
+        decisions: list[tuple[str, AgentAssessmentLabel | None, str, str | None]]
+        view = (
+            case_output_view(case.case_kind.value, case.manifest, result.output)
+            if result.output is not None
+            else None
+        )
+        if not expectations:
+            decisions = [("failed", None, "E0:no_expectations", None)]
+        elif all(item is not None for item in cached):
+            decisions = [
+                (item.status, item.label, item.reason_code, item.assessment_id) for item in cached
+            ]
+        elif result.output is None:
+            decisions = not_judged("candidate_output_unavailable")
+        elif view is None or any(
+            check.label is DeterministicCheckLabel.FAIL
+            or (check.criterion == SUPPORT_RESOLUTION_CRITERION and check.label is not DeterministicCheckLabel.PASS)
+            for check in checks
+        ):
+            decisions = not_judged("no_valid_result")
+        elif self._expectation_judge is None:
+            decisions = not_judged("judge_unavailable")
+        else:
+            try:
+                verdicts = await self._expectation_judge.judge(expectations, view)
+            except Exception:
+                decisions = not_judged("judge_failed")
+            else:
+                decisions = [
+                    ("completed", verdict.label, _expectation_reason(index, verdict.label, verdict.item_ids), None)
+                    if verdict.label is not None
+                    else ("failed", None, f"E{index}:judge_failed", None)
+                    for index, verdict in enumerate(verdicts, start=1)
+                ]
+        assessments = tuple(
+            AgentAssessment(
+                assessment_id=assessment_id,
+                target_event_id=None,
+                target_result_id=result.result_id,
+                criterion=EXPECTATION_CRITERION,
+                status=status,
+                label=label,
+                reason_code=reason_code,
+                annotator_kind="llm",
+                evaluator_name="expectation_judge",
+                evaluator_version=spec.version,
+                input_fingerprint=fingerprint,
+                reused_from_assessment_id=reused_from,
+                created_at=datetime.fromisoformat(result.created_at),
+            )
+            for assessment_id, fingerprint, (status, label, reason_code, reused_from) in zip(
+                assessment_ids, fingerprints, decisions,
+            )
+        )
+        await self._store.record_agent_assessments(assessments)
+        return assessments
+
     async def _human_annotation_context(
         self,
         *,
@@ -3059,7 +3215,6 @@ def deterministic_checks(
             )
         )
         checks.append(_reading_group_coverage_check(extraction))
-        checks.extend(_derivation_rubric_checks(ground_truth.rubric, memories))
     elif case.case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
         results = _support_results(output)
         if results is None:
@@ -3070,7 +3225,12 @@ def deterministic_checks(
                     reason_code="support_output_invalid",
                 ),
             )
-        checks.extend(_support_label_checks(ground_truth.rubric, results, _support_claims(case.manifest)))
+        unresolved = sum(result not in _RESOLVED_SUPPORT_RESULTS for _, _, result in results)
+        checks.append(DeterministicCheck(
+            criterion=SUPPORT_RESOLUTION_CRITERION,
+            label=DeterministicCheckLabel.UNKNOWN if unresolved else DeterministicCheckLabel.PASS,
+            reason_code=f"support_unresolved:{unresolved}" if unresolved else "support_resolved",
+        ))
         pinned_reading = case.manifest.get("reads_images")
         if isinstance(pinned_reading, bool) and output.get("reads_images") is not pinned_reading:
             # A model that reads images differently reads other content than the judged one.
@@ -3117,7 +3277,15 @@ def deterministic_checks(
             )
         )
         if output.get("failure") is None:
-            checks.extend(_incumbent_outcome_checks(ground_truth.rubric, output.get("outcomes"), output.get("rechecks")))
+            outcomes = output.get("outcomes")
+            valid = isinstance(outcomes, Mapping) and set(outcomes) == expected_ids and all(
+                outcome in INCUMBENT_OUTCOMES for outcome in outcomes.values()
+            )
+            checks.append(DeterministicCheck(
+                criterion=INCUMBENT_OUTCOME_CRITERION,
+                label=DeterministicCheckLabel.PASS if valid else DeterministicCheckLabel.FAIL,
+                reason_code="incumbent_outcomes_valid" if valid else "incumbent_outcomes_invalid",
+            ))
     required = ground_truth.rubric.get("required_deterministic_criteria", [])
     present = {check.criterion for check in checks}
     if isinstance(required, list):
@@ -3244,158 +3412,6 @@ def _support_results(output: Mapping[str, object]) -> list[tuple[str, str, str]]
     return results
 
 
-def _term_pattern(term: str) -> re.Pattern[str]:
-    """Match ``term`` as a whole word, ignoring case.
-
-    Only an ASCII letter, digit or underscore bounds a word, so a term in a
-    script written without spaces, such as Chinese, matches inside a sentence.
-    """
-
-    def bounded(char: str) -> bool:
-        return char.isascii() and (char.isalnum() or char == "_")
-
-    return re.compile(
-        ("(?<![A-Za-z0-9_])" if bounded(term[0]) else "")
-        + re.escape(term)
-        + ("(?![A-Za-z0-9_])" if bounded(term[-1]) else ""),
-        re.IGNORECASE,
-    )
-
-
-def rubric_memory_labels(
-    by_id: Mapping[str, object], by_term: Mapping[str, object], claims: Mapping[str, str],
-) -> tuple[dict[str, str], tuple[str, ...]]:
-    """Each labelled Memory's Support label and the terms no claim holds.
-
-    A rubric names a Memory by its id, or by a term its claim holds; a term
-    names every such Memory. Synthetic cohorts use terms because a fresh install
-    extracts new Memory ids on every run, and a model may write two labelled
-    facts into one claim. A claim is supported only when every fact it holds
-    is, so a Memory any of its terms labels ``unsupported`` is unsupported. An
-    id label is the maintainer's word for one Memory; a term label that
-    contradicts it is rejected.
-    """
-
-    labels = {str(memory_id): str(label) for memory_id, label in by_id.items()}
-    by_terms: dict[str, set[str]] = {}
-    unmatched = []
-    for term, label in by_term.items():
-        pattern = _term_pattern(str(term))
-        named = [memory_id for memory_id, claim in claims.items() if pattern.search(claim)]
-        if not named:
-            unmatched.append(str(term))
-        for memory_id in named:
-            by_terms.setdefault(memory_id, set()).add(str(label))
-    for memory_id, term_labels in by_terms.items():
-        label = "unsupported" if "unsupported" in term_labels else "supported"
-        if labels.setdefault(memory_id, label) != label:
-            raise ValueError(f"Memory {memory_id} is labelled {labels[memory_id]} by id and {label} by its terms")
-    return labels, tuple(unmatched)
-
-
-def _support_claims(manifest: Mapping[str, object]) -> dict[str, str]:
-    return {
-        str(_mapping(item, "memory").get("id")): str(_mapping(item, "memory").get("content") or "")
-        for item in _mapping_list(manifest, "work_items")
-    }
-
-
-def _support_label_checks(
-    rubric: Mapping[str, object], results: Sequence[tuple[str, str, str]], claims: Mapping[str, str],
-) -> list[DeterministicCheck]:
-    """Check each pinned Support of a labelled Memory; an unlabelled one found unsupported needs review.
-
-    A Memory's label applies to each of its pinned Supports. A Support that
-    holds is ``supported`` whether it was read or bound unchanged; one left
-    unresolved cannot be judged against its label. A label term that no pinned
-    claim holds cannot be judged either.
-    """
-
-    expected, unmatched = rubric_memory_labels(
-        rubric.get("expected_support") or {},
-        rubric.get("expected_support_terms") or {},
-        claims,
-    )
-    # A term is content, so a report names it by its position in the rubric.
-    positions = {term: index for index, term in enumerate(rubric.get("expected_support_terms") or {})}
-    checks = [
-        DeterministicCheck(
-            criterion=SUPPORT_LABEL_CRITERION,
-            label=DeterministicCheckLabel.UNKNOWN,
-            reason_code="term_unmatched",
-            item_id=f"term:{positions[term]}",
-        )
-        for term in unmatched
-    ]
-    for memory_id, evidence_unit_id, result in results:
-        item_id = f"{memory_id}:{evidence_unit_id}"
-        actual = (
-            "supported" if result in {SupportResult.SUPPORTED.value, SupportResult.UNAFFECTED.value}
-            else "unsupported" if result == SupportResult.UNSUPPORTED.value
-            else None
-        )
-        if memory_id in expected:
-            label = str(expected[memory_id])
-            checks.append(DeterministicCheck(
-                criterion=SUPPORT_LABEL_CRITERION,
-                label=(
-                    DeterministicCheckLabel.UNKNOWN if actual is None
-                    else DeterministicCheckLabel.PASS if actual == label
-                    else DeterministicCheckLabel.FAIL
-                ),
-                reason_code=f"{label}:{result}",
-                item_id=item_id,
-            ))
-        elif actual == "unsupported":
-            checks.append(DeterministicCheck(
-                criterion=UNLABELLED_UNSUPPORTED_CRITERION,
-                label=DeterministicCheckLabel.UNKNOWN,
-                reason_code=result,
-                item_id=item_id,
-            ))
-    return checks
-
-
-def _incumbent_outcome_checks(
-    rubric: Mapping[str, object], outcomes: object, rechecks: object,
-) -> list[DeterministicCheck]:
-    """Check each labelled incumbent's outcome; an unlabelled one the replay does not keep needs review.
-
-    An outcome whose incumbent production would re-check first says so in its
-    reason, because the re-check can change it.
-    """
-
-    if not isinstance(outcomes, Mapping) or any(outcome not in INCUMBENT_OUTCOMES for outcome in outcomes.values()):
-        return [DeterministicCheck(
-            criterion=INCUMBENT_OUTCOME_CRITERION, label=DeterministicCheckLabel.FAIL,
-            reason_code="incumbent_outcomes_invalid",
-        )]
-    rechecked = {
-        str(item.get("memory_id")) for item in rechecks if isinstance(item, Mapping)
-    } if isinstance(rechecks, list) else set()
-    expected = rubric.get("expected_incumbents") or {}
-    checks = []
-    for incumbent_id in sorted({*expected, *outcomes}):
-        outcome = outcomes.get(incumbent_id)
-        note = ":before_recheck" if incumbent_id in rechecked else ""
-        if incumbent_id in expected:
-            label = str(expected[incumbent_id])
-            checks.append(DeterministicCheck(
-                criterion=INCUMBENT_OUTCOME_CRITERION,
-                label=DeterministicCheckLabel.PASS if outcome == label else DeterministicCheckLabel.FAIL,
-                reason_code=f"{label}:{outcome or 'missing'}{note}",
-                item_id=str(incumbent_id),
-            ))
-        elif outcome != "kept":
-            checks.append(DeterministicCheck(
-                criterion=UNLABELLED_OUTCOME_CRITERION,
-                label=DeterministicCheckLabel.UNKNOWN,
-                reason_code=f"{outcome}{note}",
-                item_id=str(incumbent_id),
-            ))
-    return checks
-
-
 def _reading_group_coverage_check(extraction: Mapping[str, object]) -> DeterministicCheck:
     telemetry = extraction.get("evidence_telemetry")
     skipped = telemetry.get("skipped_reading_group_count", 0) if isinstance(telemetry, Mapping) else 0
@@ -3405,45 +3421,6 @@ def _reading_group_coverage_check(extraction: Mapping[str, object]) -> Determini
         label=DeterministicCheckLabel.FAIL if skipped else DeterministicCheckLabel.PASS,
         reason_code=f"reading_groups_skipped:{skipped}" if skipped else "reading_groups_read",
     )
-
-
-def _derivation_rubric_checks(
-    rubric: Mapping[str, object],
-    memories: Sequence[object],
-) -> list[DeterministicCheck]:
-    """Check the extracted Memories against the counts and terms the rubric expects."""
-
-    checks: list[DeterministicCheck] = []
-    expected_count = rubric.get("expected_memory_count")
-    if isinstance(expected_count, Mapping):
-        low = int(expected_count.get("min", 0))
-        high = expected_count.get("max")
-        within = len(memories) >= low and (high is None or len(memories) <= int(high))
-        checks.append(
-            DeterministicCheck(
-                criterion=MEMORY_COUNT_CRITERION,
-                label=DeterministicCheckLabel.PASS if within else DeterministicCheckLabel.FAIL,
-                reason_code=f"memory_count:{len(memories)}",
-            )
-        )
-    terms = rubric.get("required_terms")
-    if isinstance(terms, list) and terms:
-        contents = [
-            str(memory.get("content") or "").casefold()
-            for memory in memories
-            if isinstance(memory, Mapping)
-        ]
-        missing = sum(
-            not any(str(term).casefold() in content for content in contents) for term in terms
-        )
-        checks.append(
-            DeterministicCheck(
-                criterion=REQUIRED_TERMS_CRITERION,
-                label=DeterministicCheckLabel.FAIL if missing else DeterministicCheckLabel.PASS,
-                reason_code=f"required_terms_missing:{missing}/{len(terms)}",
-            )
-        )
-    return checks
 
 
 def _derivation_evidence_resolves(
@@ -3700,52 +3677,8 @@ def _validate_rubric(
             raise ValueError("relation group rubric requires expected_labels for pinned candidates")
         if any(label not in _RELATION_LABELS for label in expected_labels.values()):
             raise ValueError("relation group expected_labels must be one of " + ", ".join(sorted(_RELATION_LABELS)))
-    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_DERIVATION:
-        _validate_derivation_rubric(rubric)
-    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_SUPPORT:
-        expected = rubric.get("expected_support", {})
-        terms = rubric.get("expected_support_terms", {})
-        if not isinstance(expected, Mapping) or not isinstance(terms, Mapping) or not (
-            "expected_support" in rubric or "expected_support_terms" in rubric
-        ):
-            raise ValueError(
-                "Support rubric requires expected_support (Memory id to label) or expected_support_terms (term to label)"
-            )
-        claims = _support_claims(case.manifest)
-        if not set(expected) <= set(claims):
-            raise ValueError("expected_support names only pinned Memories")
-        if any(not isinstance(term, str) or not term.strip() for term in terms):
-            raise ValueError("expected_support_terms terms must be non-empty strings")
-        if any(label not in SUPPORT_LABELS for label in [*expected.values(), *terms.values()]):
-            raise ValueError("Support labels must be one of " + ", ".join(sorted(SUPPORT_LABELS)))
-        rubric_memory_labels(expected, terms, claims)
-    if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION:
-        expected = rubric.get("expected_incumbents", {})
-        if not isinstance(expected, Mapping):
-            raise ValueError("expected_incumbents must be a mapping of incumbent id to outcome")
-        if not set(expected) <= {str(item.get("id")) for item in _mapping_list(case.manifest, "incumbents")}:
-            raise ValueError("expected_incumbents names only pinned incumbents")
-        if any(label not in INCUMBENT_OUTCOMES for label in expected.values()):
-            raise ValueError("expected_incumbents outcomes must be one of " + ", ".join(INCUMBENT_OUTCOMES))
-
-
-def _validate_derivation_rubric(rubric: Mapping[str, object]) -> None:
-    """A derivation rubric may bound the Memory count and name terms the Memories must hold."""
-
-    expected_count = rubric.get("expected_memory_count")
-    if expected_count is not None:
-        if not isinstance(expected_count, Mapping) or not set(expected_count) <= {"min", "max"}:
-            raise ValueError("expected_memory_count takes min and max")
-        bounds = [expected_count.get(name) for name in ("min", "max") if expected_count.get(name) is not None]
-        if any(not isinstance(bound, int) or isinstance(bound, bool) or bound < 0 for bound in bounds):
-            raise ValueError("expected_memory_count bounds must be non-negative integers")
-        if len(bounds) == 2 and bounds[0] > bounds[1]:
-            raise ValueError("expected_memory_count min cannot exceed max")
-    terms = rubric.get("required_terms")
-    if terms is not None and (
-        not isinstance(terms, list) or any(not isinstance(term, str) or not term.strip() for term in terms)
-    ):
-        raise ValueError("required_terms must be a list of non-empty strings")
+    if case_kind in EXPECTATION_CASE_KINDS:
+        validate_expectations(rubric)
 
 
 def _memory_from_payload(payload: Mapping[str, object]) -> Memory:
@@ -4029,6 +3962,11 @@ def agent_evaluation_run_to_payload(run: AgentEvaluationRun) -> dict[str, object
             if run.semantic_judge_manifest is not None
             else None
         ),
+        "expectation_judge_manifest": (
+            dict(run.expectation_judge_manifest)
+            if run.expectation_judge_manifest is not None
+            else None
+        ),
         "schema_version": run.schema_version,
     }
 
@@ -4050,6 +3988,11 @@ def agent_evaluation_run_from_payload(payload: Mapping[str, object]) -> AgentEva
         semantic_judge_manifest=(
             _mapping(payload, "semantic_judge_manifest")
             if payload.get("semantic_judge_manifest") is not None
+            else None
+        ),
+        expectation_judge_manifest=(
+            _mapping(payload, "expectation_judge_manifest")
+            if payload.get("expectation_judge_manifest") is not None
             else None
         ),
         schema_version=str(payload.get("schema_version") or OFFLINE_EVALUATION_SCHEMA_VERSION),
@@ -4223,6 +4166,21 @@ def _optional_date(value: object) -> date | None:
 
 def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) else None
+
+
+# The longest reason code every assessment store holds.
+EXPECTATION_REASON_LIMIT = 128
+
+
+def _expectation_reason(index: int, label: str, item_ids: Sequence[str]) -> str:
+    """An expectation's reason code with as many of its cited item IDs as every store holds."""
+
+    reason = f"E{index}:{label}"
+    for item_id in item_ids:
+        if len(reason) + len(CHECK_ITEM_SEPARATOR) + len(item_id) > EXPECTATION_REASON_LIMIT:
+            break
+        reason += CHECK_ITEM_SEPARATOR + item_id
+    return reason
 
 
 def _bounded_reason(value: str | None) -> str | None:

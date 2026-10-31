@@ -621,6 +621,30 @@ class OfflineSemanticJudgeResponse(StructuredResponseModel):
     confidence: Literal["low", "medium", "high"]
 
 
+class ExpectationJudgmentRow(StructuredResponseModel):
+    """Whether one replayed case's output meets one expectation of its rubric."""
+
+    model_config = ConfigDict(extra="forbid")
+    expectation_id: str = Field(description="Copy one expectation ID unchanged.")
+    item_ids: list[str] = Field(description=(
+        "The IDs of the output items the expectation concerns; [] when no item bears on it."
+    ))
+    check: str = Field(description="One short sentence checking those items against the expectation.")
+    verdict: Literal["met", "not_met", "unclear"] = Field(description=(
+        "met when the output plainly meets the expectation, not_met when it plainly does not, "
+        "unclear when the output alone cannot decide it."
+    ))
+
+
+class ExpectationJudgmentResponse(StructuredResponseModel):
+    """The judge's closed choice on each expectation it was given, after a one-sentence written check."""
+
+    model_config = ConfigDict(extra="forbid")
+    direct_answer = True
+
+    results: list[ExpectationJudgmentRow]
+
+
 @dataclass(frozen=True)
 class StructuredLlmConfig:
     # The LiteLLM route of the main model, with the endpoint and credential
@@ -2076,6 +2100,18 @@ class LiteLlmStructuredClient:
         return await self._call_schema(
             prompt=prompt,
             response_format=OfflineSemanticJudgeResponse,
+            model=model,
+        )
+
+    async def judge_offline_expectations(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+    ) -> ExpectationJudgmentResponse:
+        return await self._call_schema(
+            prompt=prompt,
+            response_format=ExpectationJudgmentResponse,
             model=model,
         )
 

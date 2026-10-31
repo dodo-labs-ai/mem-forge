@@ -344,7 +344,8 @@ export interface paths {
          *     this server runs, the code its worker replays the cohort with, so a run
          *     admitted after a deployment is a new run rather than the earlier one.
          *     One without ``model`` is pinned to the route of the generation model in
-         *     use.
+         *     use. The run pins the expectation judge this deployment configures, if
+         *     any; its decisions are advisory.
          */
         post: operations["admit_agent_evaluation_run_api_v1_agent_evaluations_runs_post"];
         delete?: never;
@@ -5611,8 +5612,8 @@ export interface components {
          * ReconciliationCaseRequest
          * @description One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by
          *     ``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the
-         *     ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels
-         *     incumbents ``kept``, ``revised`` or ``retired``.
+         *     ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expectations`` are sentences about
+         *     the incumbents' outcomes (``kept``, ``revised`` or ``retired``).
          */
         ReconciliationCaseRequest: {
             /** Doc Id */
@@ -6758,8 +6759,8 @@ export interface components {
          * SupportCaseRequest
          * @description One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
          *     within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
-         *     update whose Support the model judged is pinned. The rubric labels Memories ``supported`` or
-         *     ``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold.
+         *     update whose Support the model judged is pinned. The rubric's ``expectations`` are sentences about the
+         *     Support verdicts, for the expectation judge.
          */
         SupportCaseRequest: {
             /** Derivation Id */

@@ -1,8 +1,8 @@
 """Pin synced Documents as Source Unit derivation cases and freeze their cohort.
 
 A maintainer names the Documents of a workspace that a derivation cohort should
-hold, by id or by their title within a Source, each with a rubric: the number of
-Memories its extraction should give and terms those Memories must hold. A case
+hold, by id or by their title within a Source, each with a rubric: the
+expectations its extracted Memories should meet, for the expectation judge. A case
 pins one derivation of the Document's Source Unit as it was staged, whether or
 not its lifecycle has been applied since: the projected revision, the Document
 context and the access and inference capability hashes its Evidence work was

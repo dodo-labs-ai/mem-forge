@@ -47,24 +47,38 @@ if it does. Releases run all of them.
 
 `--quality` adds the quick offline quality evaluation to the Compose smoke. It
 syncs the synthetic documents in `evals/quality/quick/docs`, then replaces the
-ones in `revisions/` with their second version and syncs again, and evaluates
-three kinds of cases with the rubrics in `cohort.json`:
+ones in `revisions/` with their second version and syncs again, and replays
+three kinds of cases with the configured model:
 
-- extraction: how many memories each document should give and terms they must
-  hold;
-- Support after an update: whether each old memory still has support in the
-  second version, naming memories by a term their claims hold;
+- extraction: the memories a document's first version gives;
+- Support after an update: whether each memory of the first version still has
+  support in the second;
 - reconciliation: the hand-written situations in `reconciliation/`, each an old
-  memory, a new candidate with its evidence and the expected outcome for the
-  old memory (`kept`, `review`, `revised` or `retired`).
+  memory, a new candidate with its evidence and the outcome for the old memory
+  (`kept`, `revised` or `retired`).
 
-Each kind replays with the configured model and prints a summary with a verdict
-below the smoke table. A `fail` names the case and the check; run it again
-before you conclude, since a model's answers vary. A model may write two
-labelled facts into one memory; the memory is then expected unsupported when any
-of its terms is, since a claim holds only when all of it does. To test a new
+Each case's rubric, in `cohort.json` or its reconciliation file, is a list of
+expectations: sentences a reader can check against the case's output, such as
+"A memory states that a job whose last retry fails moves to the kestrel-dlq
+queue." A judge model reads each output and answers every expectation met, not
+met or unclear; it answers three times and the majority counts. A case whose
+replay gave no valid result, such as an unresolved Support, is not judged.
+
+Each kind prints a summary below the smoke table. Its verdict comes from code
+checks of the replay alone: every result completed, its output is well formed
+and every Support resolved. The judge's counts follow it, with each
+expectation not met or unclear, its sentence and the memories it rests on. The
+judge's decisions are advisory: a maintainer reads them in your pull request,
+and they never fail the smoke. A model's answers vary, so when an expectation is
+not met, run the evaluation again before you conclude. To test a new
 situation, add a document pair or a reconciliation file and list it in
 `cohort.json`.
+
+The judge is Claude Haiku 5.5 on OpenRouter when `OPENROUTER_API_KEY` is set.
+Name another with `--judge-provider`, `--judge-model`, `--judge-endpoint` and
+`--judge-key-env`, which take the providers and values the `--KIND-*` options
+take for generation. The judge is configured apart from the model under test,
+so every candidate is judged by the same model.
 
 Maintainers also run the same evaluation over cases pinned from a real
 workspace, which stay in that workspace.
@@ -174,27 +188,38 @@ uv run pytest tests/test_quality_snapshots.py -q
 
 Then run `scripts/compose_smoke.sh --quality --quality-outputs DIR` with the
 reference model, which saves every case's pinned input, rubric and model output
-in `DIR`, and read your type's cases to set their rubrics. A Support rubric
-labels every fact the revision changes, so write each one as something a
-reader would keep: a stated decision, a limit or a constraint, not an aside.
-Reword or drop a term only when the rubric itself is wrong, for example when
-the term is not in the source or a paraphrase is just as right. Never drop
-one because the model left out a fact that matters: that is the regression
-the case exists to catch. Replay is off
+in `DIR`, and read your type's cases to set their rubrics. Write each
+expectation as one fact a reader would keep, a stated decision, a limit or a
+constraint, not an aside, and name its values, so it is either met or not:
+
+- extraction: "A memory states that …", for each fact the source must give.
+- Support: "If a memory states that …, it is judged unsupported." for each
+  fact the revision changes, so the expectation holds when no memory states
+  it; "If a memory states that …, and states nothing about …, it is judged
+  supported." for a fact the revision keeps; and "Every memory judged
+  unsupported states …", listing the changed facts, to catch a memory judged
+  unsupported for no change. A memory that holds a changed fact beside a kept
+  one is unsupported, since a claim holds only when all of it does.
+- reconciliation: "The outcome of the old memory `id` is …".
+
+Reword an expectation only when it is wrong, for example when the source does
+not state it or a paraphrase would not meet it. Never drop one because the
+model left out a fact that matters: that is the regression the case exists to
+catch. Replay is off
 in every other deployment: a Source that names a snapshot is refused unless
 `MEMFORGE_EVALUATION_SNAPSHOT_ROOT` names the folder its set lies below, which
 only `--quality` sets.
 
 The rubrics are written against one reference model, Claude Haiku 5.5. The
-verdict your pull request needs is the one on that model, through whichever
+summary your pull request needs is the one on that model, through whichever
 provider serves it: `anthropic/claude-haiku-5.5` on OpenRouter, the default
 generation model of `compose_smoke.sh`, or `claude-haiku-5-5` with an
 Anthropic key (`--generation-provider anthropic`). The embedding model is not
 part of the reference. A run on another generation model, for example with
-`--ollama` or another `--generation-model`, is still worth reporting, but it
-is advisory: a `fail` there may come from the model rather than your change.
-The report and each summary name the provider and model of both kinds; paste
-them with the run.
+`--ollama` or another `--generation-model`, is still worth reporting, but an
+expectation not met there may come from the model rather than your change.
+The report and each summary name the provider and model of both kinds and of
+the judge; paste them with the run.
 
 ### Provider keys for the smoke scripts
 

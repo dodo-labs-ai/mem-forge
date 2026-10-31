@@ -780,6 +780,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             '{"verdict":"criterion_satisfied",'
             '"confidence":"high"}'
         ),
+        "ExpectationJudgmentResponse": '{"results":[]}',
         "CapabilityCheckResponse": '{"probe":{"label":"memforge","confirmed":true,"items":[]}}',
     }
 
@@ -813,6 +814,7 @@ async def test_explicit_schema_transport_covers_every_public_structured_operatio
             "prompt",
             model="gateway/judge-model",
         ),
+        "judge_offline_expectations": lambda: client.judge_offline_expectations("prompt"),
         "answer_schema": lambda: client.answer_schema(
             "prompt", response_format=CapabilityCheckResponse,
         ),

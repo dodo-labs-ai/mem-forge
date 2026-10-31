@@ -15,5 +15,5 @@
     ],
     "support": {"three-retries": "unsupported"}
   },
-  "rubric": {"expected_incumbents": {"three-retries": "retired"}}
+  "rubric": {"expectations": ["The outcome of the old memory `three-retries` is retired."]}
 }

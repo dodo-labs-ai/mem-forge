@@ -52,6 +52,16 @@
 #   --quality-outputs DIR   With --quality, also save each case kind's case
 #                           outputs (the pinned input, rubric and model output
 #                           of every case) as DIR/<kind>.json.
+#   --judge-provider ID     With --quality, the provider of the model that judges
+#                           each case against its expectations, one Settings
+#                           offers for generation (default openrouter when
+#                           OPENROUTER_API_KEY is set; without one, no case is
+#                           judged).
+#   --judge-model ID        The judge model (default: the provider's generation
+#                           default, Claude Haiku 5.5 on openrouter).
+#   --judge-endpoint URL    The judge provider's base URL.
+#   --judge-key-env NAME    The environment variable holding the judge's API
+#                           key (default <PROVIDER>_API_KEY).
 #   -h, --help              Show this help.
 #
 # Models: KIND is generation or embedding, and each kind is configured
@@ -62,8 +72,9 @@
 # and anthropic, text-embedding-3-small for embedding on openrouter and
 # openai, qwen3:0.6b and nomic-embed-text on ollama; any other provider needs
 # --KIND-model. Keys are read from the environment or from .env.test at the
-# repository root (see scripts/smoke_env.py), sent to the API in request
-# bodies and never printed. With no provider for either kind the model, sync
+# repository root (see scripts/smoke_env.py) and never printed: a model's key
+# is sent to the API in request bodies, and the judge's is written to the API's
+# env file in the smoke's temporary folder. With no provider for either kind the model, sync
 # and retrieval steps are reported as skipped, and the restart check looks for
 # the source added through the API, directly and through the MCP proxy.
 #
@@ -112,7 +123,8 @@ while [ $# -gt 0 ]; do
   case $1 in
     --ollama) model_args+=("$1") ;;
     --ollama-url | --generation-provider | --generation-model | --generation-endpoint | --generation-key-env | \
-    --embedding-provider | --embedding-model | --embedding-endpoint | --embedding-key-env)
+    --embedding-provider | --embedding-model | --embedding-endpoint | --embedding-key-env | \
+    --judge-provider | --judge-model | --judge-endpoint | --judge-key-env)
       model_args+=("$1" "${2:?$1 needs a value}"); shift ;;
     --no-models) no_models=1 ;;
     --quality) run_quality=1 ;;
@@ -130,9 +142,10 @@ smoke_env=$("$PYTHON" "$REPO_ROOT/scripts/smoke_env.py") || exit 2
 eval "$smoke_env"
 
 # Each kind's provider and model: models_label names both for the report,
-# generation_label the generation model, and ollama_endpoints the Ollama
-# servers the API container has to reach. An empty models_label means no model.
-models_label= generation_label= ollama_endpoints=
+# generation_label the generation model, judge_label the model that judges the
+# quality cases, and ollama_endpoints the Ollama servers the API container has
+# to reach. An empty models_label means no model.
+models_label= generation_label= judge_label= ollama_endpoints=
 if (( ! no_models )); then
   model_plan=$("$PYTHON" "$HELPER" model-plan ${model_args[@]+"${model_args[@]}"}) || exit 2
   eval "$model_plan"
@@ -224,6 +237,10 @@ write_inputs() {
   sed -e "s/^MEMFORGE_API_HOST_PORT=.*/MEMFORGE_API_HOST_PORT=$api_port/" \
       -e "s/^MEMFORGE_ADMIN_UI_HOST_PORT=.*/MEMFORGE_ADMIN_UI_HOST_PORT=$ui_port/" \
       "$REPO_ROOT/.env.example" >"$env_file"
+  # The judge is configured through the API's environment, apart from Settings.
+  if (( run_quality )) && [ -n "$judge_label" ]; then
+    "$PYTHON" "$HELPER" judge-env ${model_args[@]+"${model_args[@]}"} >>"$env_file" || exit 2
+  fi
 
   mkdir -p "$docs_dir"
   cat >"$docs_dir/job-queue-storage.md" <<'EOF'
@@ -450,8 +467,10 @@ quality_checks() {
     summary=$(compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
       memforge eval offline-run --spec /dev/stdin --timeout "$sync_timeout" --poll 5 <"$run_spec")
     status=$?
-    [ -n "$quality_summary" ] || quality_summary="- Models: $models_label"$'\n\n'
+    [ -n "$quality_summary" ] ||
+      quality_summary="- Models: $models_label; judge ${judge_label:-none (expectations not judged)}"$'\n\n'
     quality_summary+="### $kind cases"$'\n\n'"$summary"$'\n\n'
+    [ -n "$judge_label" ] && quality_summary+="$(quality_expectations "$summary")"$'\n\n'
     [ -n "$outputs_dir" ] && save_quality_outputs "$kind" "$summary"
     case $status in
       0) verdicts+=("$kind pass") ;;
@@ -461,6 +480,15 @@ quality_checks() {
   done
   say "verdicts: $(IFS=,; echo "${verdicts[*]}" | sed 's/,/, /g'); summaries below the table"
   return "$failed"
+}
+
+# The expectations of one case kind's run the judge did not find met, with
+# their sentences and the output items they rest on.
+quality_expectations() {
+  local run_id
+  run_id=$(echo "$1" | sed -n 's/^- Run: `\(aer-[^`]*\)`.*/\1/p' | head -n 1)
+  [ -n "$run_id" ] || return 0
+  helper quality-expectations --run "$run_id" || true
 }
 
 # The case outputs of one case kind's run, named by the run its summary reports.

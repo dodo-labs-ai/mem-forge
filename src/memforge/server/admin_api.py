@@ -1176,8 +1176,8 @@ class DerivationCasesSeedRequest(BaseModel):
 class SupportCaseRequest(BaseModel):
     """One synced Document whose applied update to pin as a Support case, by ``doc_id`` or by ``title``
     within ``source_id``. ``derivation_id`` names the update; without it, the Document's latest applied
-    update whose Support the model judged is pinned. The rubric labels Memories ``supported`` or
-    ``unsupported``: ``expected_support`` by Memory id, ``expected_support_terms`` by a term their claims hold."""
+    update whose Support the model judged is pinned. The rubric's ``expectations`` are sentences about the
+    Support verdicts, for the expectation judge."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1202,8 +1202,8 @@ class SupportCasesSeedRequest(BaseModel):
 class ReconciliationCaseRequest(BaseModel):
     """One hand-written reconciliation situation imported against a synced Document, by ``doc_id`` or by
     ``title`` within ``source_id``. ``input`` names the ``candidates`` with their Evidence, the
-    ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expected_incumbents`` labels
-    incumbents ``kept``, ``revised`` or ``retired``."""
+    ``incumbents`` and each incumbent's ``support`` result; the rubric's ``expectations`` are sentences about
+    the incumbents' outcomes (``kept``, ``revised`` or ``retired``)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -7840,7 +7840,8 @@ def create_admin_app(
         this server runs, the code its worker replays the cohort with, so a run
         admitted after a deployment is a new run rather than the earlier one.
         One without ``model`` is pinned to the route of the generation model in
-        use.
+        use. The run pins the expectation judge this deployment configures, if
+        any; its decisions are advisory.
         """
 
         from memforge.evals.offline_evaluation import (
@@ -7849,6 +7850,7 @@ def create_admin_app(
             agent_evaluation_run_execution_to_payload,
             agent_evaluation_run_to_payload,
         )
+        from memforge.evals.offline_runtime import configured_expectation_judge
         from memforge.release import current_release
         from memforge.runtime import resolve_models
 
@@ -7863,6 +7865,7 @@ def create_admin_app(
                 if body.semantic_judge is not None
                 else None
             )
+            expectation_judge = configured_expectation_judge(config)
             run, execution = await OfflineAgentEvaluation(db, executors={}).admit_run(
                 cohort_id=body.cohort_id,
                 candidate_manifest={**pins, **body.candidate_manifest},
@@ -7870,6 +7873,7 @@ def create_admin_app(
                 evaluator_version=body.evaluator_version,
                 created_by=resolve_request_principal(request),
                 semantic_judge_spec=semantic_judge,
+                expectation_judge_spec=expectation_judge[0] if expectation_judge is not None else None,
                 replicate_count=body.replicate_count,
                 baseline_run_id=body.baseline_run_id,
             )

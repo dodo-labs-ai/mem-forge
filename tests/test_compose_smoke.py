@@ -360,7 +360,7 @@ def test_the_shell_reads_the_plan_without_any_key(tmp_path: Path) -> None:
 def test_the_shell_script_passes_every_model_option_the_helper_takes() -> None:
     script = (ROOT / "scripts" / "compose_smoke.sh").read_text()
     options = script.split("case $1 in", 1)[1].split("esac", 1)[0]
-    passed = set(re.findall(r"(--(?:generation|embedding)-[a-z-]+|--ollama(?:-url)?)[ )]", options))
+    passed = set(re.findall(r"(--(?:generation|embedding|judge)-[a-z-]+|--ollama(?:-url)?)[ )]", options))
     helper_help = subprocess.run(
         [sys.executable, str(SCRIPT), "model-plan", "--help"], capture_output=True, text=True, check=True
     ).stdout
@@ -517,3 +517,66 @@ def test_the_restart_check_compares_each_kind_with_its_own_provider(tmp_path: Pa
     active["embedding"]["provider"] = "openai"
     with pytest.raises(smoke.CheckFailed, match="embedding model in use changed to openai"):
         smoke.check_persisted("http://api", state)
+
+
+def _judge(*options: str, **environ: str):
+    return smoke.plan_judge(smoke.parse_args(["judge-env", *options]), environ)
+
+
+def test_the_judge_defaults_to_the_reference_model_on_openrouter_or_none() -> None:
+    assert _judge() is None
+    assert _judge(OPENROUTER_API_KEY="key") == smoke.KindPlan("openrouter", "anthropic/claude-haiku-5.5", None)
+    assert _judge("--judge-provider", "anthropic", OPENROUTER_API_KEY="key").model == "claude-haiku-5-5"
+    with pytest.raises(smoke.PlanError, match="--judge-model is required"):
+        _judge("--judge-provider", "openai_compatible")
+
+
+def test_the_judge_reaches_the_api_only_through_its_env_file(capsys, monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "judge-secret$1")
+
+    assert smoke.main(["model-plan"]) == 0
+    assert "judge-secret" not in capsys.readouterr().out
+    assert smoke.main(["judge-env"]) == 0
+    printed = capsys.readouterr().out.splitlines()
+
+    assert printed == [
+        "MEMFORGE_AGENT_EVALUATION_JUDGE_PROVIDER='openrouter'",
+        "MEMFORGE_AGENT_EVALUATION_JUDGE_MODEL='anthropic/claude-haiku-5.5'",
+        "MEMFORGE_AGENT_EVALUATION_JUDGE_ENDPOINT=''",
+        "MEMFORGE_AGENT_EVALUATION_JUDGE_API_KEY='judge-secret$1'",
+    ]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "it's")
+    assert smoke.main(["judge-env"]) == 2
+    assert "it's" not in capsys.readouterr().err
+
+
+def test_the_expectations_not_met_are_listed_with_their_sentences_and_memories(monkeypatch) -> None:
+    case = {
+        "case_kind": "source_unit_support_v1",
+        "manifest": {
+            "projection": {"unit_title": {
+                "kind": "GitHub file", "fields": [["Repository", "acme/kestrel"], ["Path", "docs/queue-limits.md"]],
+            }},
+            "work_items": [
+                {"memory": {"id": "mem-a", "content": "A payload may be at most 256 KiB."}},
+                {"memory": {"id": "mem-b", "content": "A tenant may have 500 jobs in flight."}},
+            ],
+        },
+        "rubric": {"expectations": ["If a memory states the 256 KiB limit, it is judged unsupported.", "Other."]},
+        "result": {"output": {"supports": [
+            {"memory_id": "mem-a", "result": "supported"}, {"memory_id": "mem-b", "result": "supported"},
+        ]}},
+        "checks": [
+            {"criterion": "expectation", "status": "completed", "label": "fail", "reason_code": "E1:fail/mem-a"},
+            {"criterion": "expectation", "status": "completed", "label": "pass", "reason_code": "E2:pass"},
+            {"criterion": "support_resolution", "status": "completed", "label": "pass", "reason_code": "x"},
+        ],
+    }
+    monkeypatch.setattr(smoke, "api_json", lambda api, method, path: {"cases": [case]})
+
+    listed = smoke.quality_expectations("http://api", "aer-1").splitlines()
+
+    assert listed[2:] == [
+        "| acme/kestrel / docs/queue-limits.md | E1: If a memory states the 256 KiB limit, it is judged unsupported. | not met "
+        "| mem-a: A payload may be at most 256 KiB. (supported) |",
+    ]

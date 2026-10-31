@@ -20,7 +20,6 @@ from memforge.evals.offline_evaluation import (
     PinnedSupportInput,
     SourceUnitSupportReplayExecutor,
     deterministic_checks,
-    rubric_memory_labels,
 )
 from memforge.evals.source_unit_support_cases import SupportCaseRequest, seed_source_unit_support_cases
 from memforge.derivation_work import DerivationWork
@@ -36,6 +35,7 @@ from tests.test_revision_work import CHANGED, RULE, Client, Store
 ACTOR = "dev"
 DOC_ID = "doc"
 CANDIDATE = {"model": "fixture"}
+RUBRIC = {"expectations": ["No memory is judged unsupported."]}
 
 
 @pytest.fixture
@@ -151,7 +151,7 @@ async def _seed(db, synced, *, rubric=None, derivation_id=None):
     return await seed_source_unit_support_cases(
         synced, OfflineAgentEvaluation(db, executors={}),
         requests=[SupportCaseRequest(doc_id=DOC_ID, derivation_id=derivation_id,
-                                     rubric=rubric or {"expected_support": {}})],
+                                     rubric=rubric or RUBRIC)],
         role=AgentEvaluationRole.SENTINEL, selection_policy_version="support-v1", actor=ACTOR,
     )
 
@@ -200,99 +200,40 @@ async def test_an_update_is_pinned_from_its_receipts_and_replayed_through_the_sa
     assert replay_client.impact_prompts == production_client.impact_prompts
 
 
-async def test_labels_gate_the_case_and_an_unlabelled_retirement_needs_review(db) -> None:
+async def test_the_code_checks_ask_only_that_every_support_resolved(db) -> None:
     synced = Synced()
     await synced.run(Client(limit=16000))
     [pinned] = (await _seed(db, synced)).cases
     case = await db.get_agent_evaluation_case(pinned.case_id)
-    output = {
+    ground_truth = _ground_truth(case, RUBRIC)
+
+    resolved = deterministic_checks(case, ground_truth, {
         "supports": [
             {"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "supported"},
             {"memory_id": "memory-1", "evidence_unit_id": "eu-memory-1", "result": "unsupported"},
         ],
-    }
+    })
+    unresolved = deterministic_checks(case, ground_truth, {
+        "supports": [{"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "unresolved_capacity"}],
+    })
 
-    labelled = deterministic_checks(
-        case, _ground_truth(case, {"expected_support": {"memory-0": "unsupported", "memory-1": "unsupported"}}),
-        output,
-    )
-    unlabelled = deterministic_checks(case, _ground_truth(case, {"expected_support": {}}), output)
-    unresolved = deterministic_checks(
-        case, _ground_truth(case, {"expected_support": {"memory-0": "supported"}}),
-        {"supports": [{"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "unresolved_capacity"}]},
-    )
-
-    assert [(check.criterion, check.label, check.reason_code, check.item_id) for check in labelled[1:]] == [
-        ("support_label", DeterministicCheckLabel.FAIL, "unsupported:supported", "memory-0:eu-memory-0"),
-        ("support_label", DeterministicCheckLabel.PASS, "unsupported:unsupported", "memory-1:eu-memory-1"),
+    # Whether a verdict is right is the expectation judge's question, not a code check's.
+    assert [(check.criterion, check.label, check.reason_code) for check in resolved[1:]] == [
+        ("support_resolution", DeterministicCheckLabel.PASS, "support_resolved"),
     ]
-    assert [(check.criterion, check.label, check.item_id) for check in unlabelled[1:]] == [
-        ("unlabelled_unsupported", DeterministicCheckLabel.UNKNOWN, "memory-1:eu-memory-1"),
+    assert [(check.criterion, check.label, check.reason_code) for check in unresolved[1:]] == [
+        ("support_resolution", DeterministicCheckLabel.UNKNOWN, "support_unresolved:1"),
     ]
-    assert unresolved[1].label is DeterministicCheckLabel.UNKNOWN
-    assert deterministic_checks(case, _ground_truth(case, {"expected_support": {}}), {})[0].label is (
-        DeterministicCheckLabel.FAIL
-    )
+    assert deterministic_checks(case, ground_truth, {})[0].label is DeterministicCheckLabel.FAIL
 
 
-async def test_a_rubric_names_only_pinned_memories_with_a_known_label(db) -> None:
+@pytest.mark.parametrize("rubric", [{"expected_support": {"memory-0": "supported"}}, {"expectations": []}])
+async def test_a_support_rubric_is_a_list_of_expectations(db, rubric) -> None:
     synced = Synced()
     await synced.run(Client(limit=16000))
 
-    with pytest.raises(ValueError, match="only pinned Memories"):
-        await _seed(db, synced, rubric={"expected_support": {"memory-9": "supported"}})
-    with pytest.raises(ValueError, match="labels must be one of"):
-        await _seed(db, synced, rubric={"expected_support": {"memory-0": "kept"}})
-
-
-async def test_a_term_labels_every_pinned_memory_whose_claim_holds_it(db) -> None:
-    synced = Synced()
-    await synced.run(Client(limit=16000))
-    [pinned] = (await _seed(db, synced, rubric={"expected_support_terms": {"Reviewers": "supported"}})).cases
-    case = await db.get_agent_evaluation_case(pinned.case_id)
-    output = {
-        "supports": [
-            {"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "supported"},
-            {"memory_id": "memory-1", "evidence_unit_id": "eu-memory-1", "result": "unsupported"},
-        ],
-    }
-
-    checks = deterministic_checks(
-        case, _ground_truth(case, {"expected_support_terms": {"reviewers": "supported", "EU": "unsupported"}}), output,
-    )
-
-    assert [(check.criterion, check.label, check.reason_code, check.item_id) for check in checks[1:]] == [
-        ("support_label", DeterministicCheckLabel.UNKNOWN, "term_unmatched", "term:1"),
-        ("support_label", DeterministicCheckLabel.PASS, "supported:supported", "memory-0:eu-memory-0"),
-        ("support_label", DeterministicCheckLabel.FAIL, "supported:unsupported", "memory-1:eu-memory-1"),
-    ]
-    with pytest.raises(ValueError, match="labelled unsupported by id and supported by its terms"):
-        await _seed(db, synced, rubric={
-            "expected_support": {"memory-0": "unsupported"}, "expected_support_terms": {"releases": "supported"},
-        })
-
-
-def test_a_term_matches_a_whole_word_and_inside_unspaced_script() -> None:
-    claims = {
-        "api": "The API rate limit is 100.",
-        "rapid": "Rapid releases ship weekly.",
-        "retry": "失败任务重试三次后进入 kestrel-dlq。",
-    }
-
-    labels, unmatched = rubric_memory_labels(
-        {}, {"api": "supported", "重试": "unsupported", "kestrel-dlq": "unsupported", "dlq-x": "supported"}, claims,
-    )
-
-    assert labels == {"api": "supported", "retry": "unsupported"}
-    assert unmatched == ("dlq-x",)
-
-
-def test_a_claim_holding_a_fact_that_no_longer_holds_is_unsupported() -> None:
-    claims = {"merged": "Alerts go only to Slack and must be acknowledged within 15 minutes."}
-
-    labels, _ = rubric_memory_labels({}, {"Slack": "supported", "15": "unsupported"}, claims)
-
-    assert labels == {"merged": "unsupported"}
+    with pytest.raises(ValueError, match="requires expectations"):
+        await _seed(db, synced, rubric=rubric)
 
 
 @pytest.mark.parametrize(
@@ -339,7 +280,7 @@ async def test_the_seed_route_is_for_a_maintenance_operator_and_reports_skips(db
 
     config = AppConfig(base_dir=tmp_path / "memforge")
     config.sync.worker_enabled = False
-    body = {"selection_policy_version": "support-v1", "cases": [{"doc_id": DOC_ID, "rubric": {"expected_support": {}}}]}
+    body = {"selection_policy_version": "support-v1", "cases": [{"doc_id": DOC_ID, "rubric": RUBRIC}]}
     responses = {}
     for operator in (False, True):
         app = create_admin_app(
@@ -400,14 +341,14 @@ async def test_a_replay_that_reads_images_differently_needs_review(db) -> None:
         "supports": [{"memory_id": "memory-0", "evidence_unit_id": "eu-memory-0", "result": "supported"}],
     }
 
-    unpinned = deterministic_checks(case, _ground_truth(case, {"expected_support": {}}), output)
+    unpinned = deterministic_checks(case, _ground_truth(case, RUBRIC), output)
     pinned_reading = deterministic_checks(
         replace(case, manifest={**case.manifest, "reads_images": True}),
-        _ground_truth(case, {"expected_support": {}}), output,
+        _ground_truth(case, RUBRIC), output,
     )
 
-    assert [check.criterion for check in unpinned] == ["typed_output"]
-    assert [(check.criterion, check.label) for check in pinned_reading[1:]] == [
+    assert [check.criterion for check in unpinned] == ["typed_output", "support_resolution"]
+    assert [(check.criterion, check.label) for check in pinned_reading[2:]] == [
         ("image_reading", DeterministicCheckLabel.UNKNOWN),
     ]
 

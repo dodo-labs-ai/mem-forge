@@ -57,6 +57,7 @@ __all__ = [
     "ModelKindHealthResponse",
     "build_model_settings_router",
     "list_endpoint_models",
+    "listed_model",
     "listed_native_schema",
     "model_health_response",
 ]
@@ -979,6 +980,16 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
     ``None`` when the provider has no listing of the binding's kind, the
     listing does not answer, it does not hold the model or it declares nothing.
     """
+    option = await listed_model(binding, api_key)
+    return None if option is None else option.native_schema
+
+
+async def listed_model(binding: ModelBinding, api_key: str | None) -> ModelOption | None:
+    """What the model listing of ``binding``'s provider gives for its model.
+
+    ``None`` when the provider has no listing of the binding's kind, the
+    listing does not answer or it does not hold the model.
+    """
     descriptor = provider_descriptor(binding.provider)
     listing = descriptor.listing
     if listing is None or binding.kind not in listing.paths:
@@ -990,8 +1001,7 @@ async def listed_native_schema(binding: ModelBinding, api_key: str | None) -> bo
         api_key=api_key,
         strategy=binding.auth_strategy,
     )
-    option = next((model for model in listed.models if model.id == binding.model_id), None)
-    return None if option is None else option.native_schema
+    return next((model for model in listed.models if model.id == binding.model_id), None)
 
 
 async def list_endpoint_models(

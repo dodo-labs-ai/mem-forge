@@ -15,5 +15,5 @@
     ],
     "support": {"friday-release": "supported"}
   },
-  "rubric": {"expected_incumbents": {"friday-release": "kept"}}
+  "rubric": {"expectations": ["The outcome of the old memory `friday-release` is kept."]}
 }

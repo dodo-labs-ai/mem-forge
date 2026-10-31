@@ -21,6 +21,7 @@ from memforge.evals.offline_evaluation import (
     SourceUnitReconciliationReplayExecutor,
     deterministic_checks,
 )
+from memforge.evals.expectation_judge import case_output_view
 from memforge.evals.reconciliation_cases import ReconciliationCaseRequest, seed_reconciliation_cases
 from memforge.models import DocumentRecord
 from memforge.storage.database import Database
@@ -79,6 +80,9 @@ async def _import(db, request: ReconciliationCaseRequest):
     )
 
 
+RUBRIC = {"expectations": ["The outcome of the old memory `friday` is kept."]}
+
+
 async def _replayed(db, case_input, client, rubric):
     report = await _import(db, ReconciliationCaseRequest(input=case_input, rubric=rubric, doc_id=DOCUMENT.doc_id))
     case = await db.get_agent_evaluation_case(report.cases[0].case_id)
@@ -94,7 +98,7 @@ async def test_import_scopes_the_case_to_the_document_and_renders_its_evidence_a
     client = Client("unrelated")
 
     case, output, _ = await _replayed(
-        db, situation("The test environment deploys every Thursday."), client, {"expected_incumbents": {}},
+        db, situation("The test environment deploys every Thursday."), client, RUBRIC,
     )
 
     assert (case.source_id, case.doc_id, case.source_unit_id) == ("source-1", "doc-release", "unit-release")
@@ -124,7 +128,7 @@ async def test_each_incumbent_reports_what_the_validated_operations_do_to_it(db,
 
     _, output, _ = await _replayed(
         db, situation("Production releases ship every Friday after two reviews.", support=support),
-        Client(relation, direction), {"expected_incumbents": {}},
+        Client(relation, direction), RUBRIC,
     )
 
     assert output["failure"] is None
@@ -138,7 +142,7 @@ async def test_a_removal_waits_for_a_complete_relation_line(db) -> None:
 
     _, output, _ = await _replayed(
         db, situation("Production releases ship every Thursday.", support="unsupported"), client,
-        {"expected_incumbents": {}},
+        RUBRIC,
     )
 
     # The Candidate stays unjudged, so DestructiveValidation keeps the unsupported Memory.
@@ -147,14 +151,18 @@ async def test_a_removal_waits_for_a_complete_relation_line(db) -> None:
 
 
 async def test_an_outcome_production_would_recheck_first_names_the_recheck(db) -> None:
-    _, output, checks = await _replayed(
+    case, output, _ = await _replayed(
         db, situation("Production releases ship every Friday.", support="unsupported"), Client("equivalent"),
-        {"expected_incumbents": {}},
+        RUBRIC,
     )
 
     # Production re-reads an unsupported claim with the equivalent Candidate's Evidence; the replay does not.
     assert output["outcomes"] == {"friday": "retired"}
-    assert [check.reason_code for check in checks[-1:]] == ["retired:before_recheck"]
+    view = case_output_view(case.case_kind.value, case.manifest, output)
+    assert [item for item in view.items if item["id"] == "friday"] == [{
+        "id": "friday", "old_memory": "Production releases ship every Friday.", "outcome": "retired",
+        "rechecked_first_in_production": True,
+    }]
 
 
 async def test_each_of_several_incumbents_gets_its_own_outcome(db) -> None:
@@ -162,14 +170,11 @@ async def test_each_of_several_incumbents_gets_its_own_outcome(db) -> None:
     case_input["incumbents"].append({"id": "tags", "claim": "Release tags use calendar versions.", "memory_type": "convention"})
     case_input["support"]["tags"] = "unaffected"
 
-    _, output, checks = await _replayed(
-        db, case_input, Client("contradicts"), {"expected_incumbents": {"friday": "retired", "tags": "kept"}},
-    )
+    _, output, checks = await _replayed(db, case_input, Client("contradicts"), RUBRIC)
 
-    assert output["outcomes"]["friday"] == "retired"
+    assert output["outcomes"]["friday"] == "retired" and set(output["outcomes"]) == {"friday", "tags"}
     assert [check.label for check in checks if check.criterion == "incumbent_outcome"] == [
-        DeterministicCheckLabel.PASS, DeterministicCheckLabel.PASS if output["outcomes"]["tags"] == "kept"
-        else DeterministicCheckLabel.FAIL,
+        DeterministicCheckLabel.PASS,
     ]
 
 
@@ -186,7 +191,7 @@ async def test_a_failed_join_applies_nothing(db, monkeypatch) -> None:
 
     _, output, checks = await _replayed(
         db, situation("Production releases ship every Friday.", support="unsupported"), Client("unrelated"),
-        {"expected_incumbents": {"friday": "kept"}},
+        RUBRIC,
     )
 
     assert output["failure"]["reason_code"] == "refiner_choice_failed" and output["outcomes"] == {}
@@ -196,27 +201,22 @@ async def test_a_failed_join_applies_nothing(db, monkeypatch) -> None:
     assert not [check for check in checks if check.criterion == "incumbent_outcome"]
 
 
-async def test_a_label_gates_the_case_and_an_unlabelled_change_needs_review(db) -> None:
-    _, _, labelled = await _replayed(
+async def test_the_code_checks_leave_whether_an_outcome_is_right_to_the_expectation_judge(db) -> None:
+    _, output, checks = await _replayed(
         db, situation("The test environment deploys every Thursday.", support="unsupported"),
-        Client("contradicts"), {"expected_incumbents": {"friday": "kept"}},
-    )
-    _, _, unlabelled = await _replayed(
-        db, situation("Production releases ship every Thursday.", support="unsupported"),
-        Client("contradicts"), {"expected_incumbents": {}},
+        Client("contradicts"), RUBRIC,
     )
 
-    assert [(check.criterion, check.label, check.reason_code) for check in labelled[-1:]] == [
-        ("incumbent_outcome", DeterministicCheckLabel.FAIL, "kept:retired"),
-    ]
-    assert [(check.criterion, check.label, check.reason_code) for check in unlabelled[-1:]] == [
-        ("unlabelled_outcome", DeterministicCheckLabel.UNKNOWN, "retired"),
+    # The rubric expects the old memory kept; only the judge reads that.
+    assert output["outcomes"] == {"friday": "retired"}
+    assert [(check.criterion, check.label, check.reason_code) for check in checks[-1:]] == [
+        ("incumbent_outcome", DeterministicCheckLabel.PASS, "incumbent_outcomes_valid"),
     ]
 
 
 async def test_an_unknown_document_or_an_invalid_situation_is_not_imported(db) -> None:
     unknown = await _import(db, ReconciliationCaseRequest(
-        input=situation("Anything."), rubric={"expected_incumbents": {}}, doc_id="missing",
+        input=situation("Anything."), rubric=RUBRIC, doc_id="missing",
     ))
 
     assert unknown.cases == () and unknown.skipped["document_not_found"] == ("missing",)
@@ -224,13 +224,9 @@ async def test_an_unknown_document_or_an_invalid_situation_is_not_imported(db) -
         broken = situation("Anything.")
         broken["candidates"][0]["evidence"][0]["role"] = "required"
         await _import(db, ReconciliationCaseRequest(input=broken, rubric={}, doc_id=DOCUMENT.doc_id))
-    with pytest.raises(ValueError, match="names only pinned incumbents"):
+    with pytest.raises(ValueError, match="requires expectations"):
         await _import(db, ReconciliationCaseRequest(
-            input=situation("Anything."), rubric={"expected_incumbents": {"monday": "kept"}}, doc_id=DOCUMENT.doc_id,
-        ))
-    with pytest.raises(ValueError, match="one of kept, revised, retired"):
-        await _import(db, ReconciliationCaseRequest(
-            input=situation("Anything."), rubric={"expected_incumbents": {"friday": "review"}}, doc_id=DOCUMENT.doc_id,
+            input=situation("Anything."), rubric={"expected_incumbents": {"friday": "kept"}}, doc_id=DOCUMENT.doc_id,
         ))
 
 
@@ -251,7 +247,7 @@ async def test_a_malformed_situation_is_rejected(db, change, message) -> None:
     change(case_input)
 
     with pytest.raises(ValueError, match=message):
-        await _import(db, ReconciliationCaseRequest(input=case_input, rubric={"expected_incumbents": {}},
+        await _import(db, ReconciliationCaseRequest(input=case_input, rubric=RUBRIC,
                                                     doc_id=DOCUMENT.doc_id))
 
 
@@ -265,7 +261,7 @@ async def test_the_seed_route_is_for_a_maintenance_operator_and_reports_skips(db
     config.sync.worker_enabled = False
     body = {
         "selection_policy_version": "reconciliation-v1",
-        "cases": [{"doc_id": "doc-unsynced", "input": situation("Anything."), "rubric": {"expected_incumbents": {}}}],
+        "cases": [{"doc_id": "doc-unsynced", "input": situation("Anything."), "rubric": RUBRIC}],
     }
     responses = {}
     for operator in (False, True):
@@ -308,7 +304,7 @@ async def test_the_seed_route_imports_a_case_and_rejects_a_malformed_one(db, tmp
         for case_input in (situation("Anything."), malformed):
             responses.append(await client.post("/api/v1/agent-evaluations/reconciliation-cases/seed", json={
                 "selection_policy_version": "reconciliation-v1",
-                "cases": [{"doc_id": DOCUMENT.doc_id, "input": case_input, "rubric": {"expected_incumbents": {}}}],
+                "cases": [{"doc_id": DOCUMENT.doc_id, "input": case_input, "rubric": RUBRIC}],
             }))
     imported, rejected = responses
 

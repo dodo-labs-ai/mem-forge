@@ -337,15 +337,16 @@ class AgentAssessment:
             raise ValueError("only human assessments carry reviewer provenance")
         if self.annotator_kind == "code" and self.content_policy_id is not None:
             raise ValueError("code assessments cannot carry human-review provenance")
+        # An offline model decision names the exact input it read. Whether it
+        # also names a content policy is its evaluator's rule: the semantic
+        # shadow judge reads under one, the expectation judge does not.
         if (
             self.annotator_kind == "llm"
             and self.target_result_id is not None
             and self.schema_version == AGENT_ASSESSMENT_SCHEMA_VERSION
-            and (self.content_policy_id is None or self.input_fingerprint is None)
+            and self.input_fingerprint is None
         ):
-            raise ValueError(
-                "offline LLM assessment requires content-policy and input provenance"
-            )
+            raise ValueError("offline LLM assessment requires input provenance")
         if self.confidence is not None and self.annotator_kind != "llm":
             raise ValueError("only LLM assessments carry model confidence")
         if self.input_fingerprint is not None and self.annotator_kind != "llm":

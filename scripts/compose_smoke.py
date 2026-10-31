@@ -503,15 +503,69 @@ def plan_models(options: argparse.Namespace, environ: dict[str, str]) -> ModelPl
     return ModelPlan(kinds)
 
 
-def shell_plan(plan: ModelPlan | None) -> str:
+def plan_judge(options: argparse.Namespace, environ: dict[str, str]) -> KindPlan | None:
+    """The model that judges the quality cases against their expectations, or ``None`` without one.
+
+    It is named apart from the generation model, so a run of any candidate is
+    judged by the same model: by default Claude Haiku 5.5 on OpenRouter when
+    ``OPENROUTER_API_KEY`` is set. Its provider is one Settings offers for
+    generation, and its key is read from ``--judge-key-env`` or the provider's
+    own variable.
+    """
+    provider = options.judge_provider or (
+        "openrouter" if environ.get("OPENROUTER_API_KEY", "").strip() else None
+    )
+    if provider is None:
+        return None
+    model = options.judge_model or DEFAULT_MODELS.get(provider, {}).get("generation")
+    if not model:
+        raise PlanError(f"--judge-model is required with the {provider} provider")
+    key_variable = options.judge_key_env
+    if key_variable is not None and not _VARIABLE_NAME.fullmatch(key_variable):
+        # The value may be the key itself, so it is not repeated.
+        raise PlanError("--judge-key-env takes the name of an environment variable, not a key")
+    if key_variable is not None and not environ.get(key_variable, "").strip():
+        raise PlanError(f"{key_variable}, named by --judge-key-env, is not set")
+    endpoint = options.judge_endpoint or (options.ollama_url if provider == "ollama" else None)
+    return KindPlan(provider, model, endpoint.rstrip("/") if endpoint else None, key_variable)
+
+
+def judge_env(plan: KindPlan | None, environ: dict[str, str]) -> str:
+    """The API's environment lines that configure the judge; none without a judge.
+
+    Each value is single-quoted, so Compose reads it as written and never
+    interpolates a ``$`` in a key.
+    """
+    if plan is None:
+        return ""
+    key_variable = plan.key_variable or provider_key_variable(plan.provider)
+    values = {
+        "PROVIDER": plan.provider,
+        "MODEL": plan.model,
+        "ENDPOINT": plan.endpoint or "",
+        "API_KEY": environ.get(key_variable, "").strip(),
+    }
+    for name, value in values.items():
+        if "'" in value or "\n" in value:
+            # The value may be the key itself, so it is not repeated.
+            raise PlanError(f"the judge's {name.lower()} holds a quote or a line break, which the env file cannot carry")
+    return "\n".join(f"MEMFORGE_AGENT_EVALUATION_JUDGE_{name}='{value}'" for name, value in values.items())
+
+
+def shell_plan(plan: ModelPlan | None, judge: KindPlan | None = None) -> str:
     """The plan as shell assignments: the labels the report prints and the Ollama servers to reach."""
-    values = {"models_label": "", "generation_label": "", "ollama_endpoints": ""}
+    values = {"models_label": "", "generation_label": "", "judge_label": "", "ollama_endpoints": ""}
     if plan is not None:
         values = {
             "models_label": plan.label,
             "generation_label": plan.kinds["generation"].label,
+            "judge_label": judge.label if judge is not None else "",
             "ollama_endpoints": " ".join(
-                sorted({kind.endpoint for kind in plan.kinds.values() if kind.provider == "ollama" and kind.endpoint})
+                sorted({
+                    kind.endpoint
+                    for kind in (*plan.kinds.values(), *([judge] if judge is not None else []))
+                    if kind.provider == "ollama" and kind.endpoint
+                })
             ),
         }
     return "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
@@ -856,6 +910,86 @@ def _replayed_title(title: str, set_dir: Path, replayed_at: str) -> str:
     return title[: match.start()] + moved.isoformat()[:16]
 
 
+def quality_expectations(api: str, run_id: str) -> str:
+    """Each expectation the judge did not find met, with its sentence and the output items it rests on.
+
+    The run report names an expectation by its case and number only; this
+    reads the case outputs, so it is for the synthetic cohort, whose content
+    may appear in a pull request.
+    """
+    payload = api_json(api, "GET", f"/api/v1/agent-evaluations/runs/{run_id}/case-outputs")
+    rows = []
+    for case in payload.get("cases") or []:
+        expectations = (case.get("rubric") or {}).get("expectations") or []
+        items = _case_items(case)
+        title = _case_title(case)
+        for assessment in case.get("checks") or []:
+            if assessment.get("criterion") != "expectation":
+                continue
+            code, _, cited = str(assessment.get("reason_code") or "").partition("/")
+            expectation, _, detail = code.partition(":")
+            if assessment.get("status") == "completed" and assessment.get("label") == "pass":
+                continue
+            index = int(expectation[1:]) if expectation[1:].isdigit() else 0
+            outcome = (
+                {"fail": "not met"}.get(str(assessment.get("label")), "unclear")
+                if assessment.get("status") == "completed"
+                else f"not judged: {detail}"
+            )
+            sentence = expectations[index - 1] if 0 < index <= len(expectations) else "?"
+            shown = "<br>".join(
+                f"{item}: {_cell(items.get(item, '?'))}" for item in cited.split("/") if item
+            )
+            rows.append((str(title), index, _cell(sentence), outcome, shown))
+    if not rows:
+        return "Every expectation the judge read was met."
+    lines = ["| Case | Expectation | Outcome | Items |", "| --- | --- | --- | --- |"]
+    lines += [f"| {_cell(title)} | E{index}: {sentence} | {outcome} | {shown} |" for title, index, sentence, outcome, shown in sorted(rows)]
+    return "\n".join(lines)
+
+
+def _case_title(case: dict[str, Any]) -> str:
+    """The case's Source Unit as its projection titles it, by the values of its title fields; else its id."""
+    title = ((case.get("manifest") or {}).get("projection") or {}).get("unit_title")
+    if isinstance(title, dict):
+        values = [str(field[1]) for field in title.get("fields") or [] if isinstance(field, list) and len(field) == 2]
+        return " / ".join(values) or str(case.get("case_id"))
+    return str(title or case.get("case_id"))
+
+
+def _case_items(case: dict[str, Any]) -> dict[str, str]:
+    """The text of each output item, by the ID an expectation decision cites."""
+    manifest = case.get("manifest") or {}
+    output = (case.get("result") or {}).get("output") or {}
+    if case.get("case_kind") == "source_unit_derivation_v1":
+        memories = (output.get("extraction") or {}).get("memories") or []
+        return {f"M{index}": str(memory.get("content") or "") for index, memory in enumerate(memories, start=1)}
+    if case.get("case_kind") == "source_unit_support_v1":
+        claims = {
+            str(work["memory"].get("id")): str(work["memory"].get("content") or "")
+            for work in manifest.get("work_items") or []
+        }
+        results = {str(row.get("memory_id")): str(row.get("result")) for row in output.get("supports") or []}
+        return {memory_id: f"{claim} ({results.get(memory_id, '?')})" for memory_id, claim in claims.items()}
+    outcomes = output.get("outcomes") or {}
+    rechecked = {str(item.get("memory_id")) for item in output.get("rechecks") or []}
+    items = {
+        str(item.get("id")): f"{item.get('content')} ({outcomes.get(str(item.get('id')), '?')}"
+        + (", re-checked first in production" if str(item.get("id")) in rechecked else "") + ")"
+        for item in manifest.get("incumbents") or []
+    }
+    items.update({
+        f"N{index}": str(item.get("content") or "")
+        for index, item in enumerate(manifest.get("new_extractions") or [], start=1)
+    })
+    return items
+
+
+def _cell(text: str, limit: int = 200) -> str:
+    text = " ".join(str(text).split()).replace("|", "\\|")
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def quality_outputs(api: str, run_id: str) -> str:
     """The case outputs of one quality run: each case's pinned input, its rubric and the model's output."""
     return json.dumps(
@@ -1038,13 +1172,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     def model_options(command: argparse.ArgumentParser) -> None:
         command.add_argument("--ollama", action="store_true", help="a kind without a provider uses Ollama")
         command.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama as the API container reaches it")
-        for kind in MODEL_KINDS:
+        for kind in (*MODEL_KINDS, "judge"):
             command.add_argument(f"--{kind}-provider", help=f"the provider Settings offers for the {kind} model")
             command.add_argument(f"--{kind}-model", help=f"the {kind} model id")
             command.add_argument(f"--{kind}-endpoint", help=f"the {kind} provider's base URL")
             command.add_argument(f"--{kind}-key-env", help=f"the environment variable holding the {kind} API key")
 
     model_options(commands.add_parser("model-plan", help="print each kind's planned model as shell assignments"))
+    model_options(commands.add_parser("judge-env", help="print the API environment lines that configure the judge"))
 
     def api_command(name: str, help_text: str) -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text)
@@ -1087,6 +1222,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     seed_spec.add_argument("--kind", choices=tuple(QUALITY_CASE_KINDS), required=True)
     run_spec = api_command("quality-run-spec", "print the quality run spec for a seed answer read from stdin")
     run_spec.add_argument("--cohort", type=Path, required=True)
+    expectations = api_command("quality-expectations", "list the expectations of a run the judge did not find met")
+    expectations.add_argument("--run", required=True)
     outputs = api_command("quality-outputs", "print each case's pinned input, rubric and model output of a run")
     outputs.add_argument("--run", required=True)
     api_command("persisted", "check what was recorded before the restart")
@@ -1105,7 +1242,9 @@ def run(args: argparse.Namespace) -> str:
     if args.command == "model-usage":
         return model_usage(sys.stdin, args.model)
     if args.command == "model-plan":
-        return shell_plan(plan_models(args, dict(os.environ)))
+        return shell_plan(plan_models(args, dict(os.environ)), plan_judge(args, dict(os.environ)))
+    if args.command == "judge-env":
+        return judge_env(plan_judge(args, dict(os.environ)), dict(os.environ))
     state = State(args.state)
     if args.command == "probe":
         return probe(args.api, args.ui)
@@ -1134,6 +1273,8 @@ def run(args: argparse.Namespace) -> str:
         return quality_seed_spec(args.cohort, state, args.kind)
     if args.command == "quality-run-spec":
         return quality_run_spec(args.cohort, json.load(sys.stdin))
+    if args.command == "quality-expectations":
+        return quality_expectations(args.api, args.run)
     if args.command == "quality-outputs":
         return quality_outputs(args.api, args.run)
     return check_persisted(args.api, state)
@@ -1142,7 +1283,7 @@ def run(args: argparse.Namespace) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     # The shell evaluates what model-plan prints, so its reasons go to stderr.
-    reasons = sys.stderr if args.command == "model-plan" else sys.stdout
+    reasons = sys.stderr if args.command in {"model-plan", "judge-env"} else sys.stdout
     try:
         print(run(args))
     except PlanError as exc:

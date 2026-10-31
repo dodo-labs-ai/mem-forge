@@ -1,9 +1,12 @@
 """Wait for an admitted offline evaluation run and summarize its report for a pull request.
 
-The report is the service's content-free view: result states and the code
-checks of every result. The summary counts each check by label, lists every
-case whose result errored or whose check did not pass, and states the run's
-verdict, which decides the exit status of ``memforge eval offline-run``.
+The report is the service's content-free view: result states, the code
+checks of every result and the expectation judge's decisions. The summary
+counts each check by label, lists every case whose result errored or whose
+check did not pass, and states the run's verdict, which decides the exit status
+of ``memforge eval offline-run``. It then counts the judge's decisions and lists
+each expectation not met, unclear or not judged, with the IDs of the output
+items it rests on; these are advisory and never change the verdict.
 """
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from memforge.evals.expectation_judge import EXPECTATION_CRITERION
 
 # The execution states after which a run's report no longer changes.
 _FINISHED_EXECUTION_STATES = frozenset({"completed", "failed"})
@@ -100,10 +105,67 @@ def render_report_markdown(report: Mapping[str, Any]) -> str:
     if attention:
         lines += ["", "| Case | Check | Outcome |", "| --- | --- | --- |"]
         lines += [f"| `{case}` | {check} | {outcome} |" for case, check, outcome in sorted(attention)]
+    lines += _expectation_lines(run, report.get("assessments") or [], case_by_result)
     return "\n".join(lines) + "\n"
 
 
+# How a report names the judge's decision on one expectation.
+_EXPECTATION_OUTCOMES = {"pass": "met", "fail": "not met", "needs_review": "unclear"}
+
+
+def _expectation_lines(
+    run: Mapping[str, Any], assessments: list[Mapping[str, Any]], case_by_result: Mapping[str, str],
+) -> list[str]:
+    """The advisory table of the judge's decisions; none when the run pins no judge."""
+
+    judge = run.get("expectation_judge_manifest")
+    if not judge:
+        return []
+    counts: Counter[str] = Counter()
+    listed: list[tuple[str, int, str, str]] = []
+    for assessment in assessments:
+        if assessment.get("criterion") != EXPECTATION_CRITERION:
+            continue
+        code, _, items = str(assessment.get("reason_code") or "").partition("/")
+        expectation, _, detail = code.partition(":")
+        outcome = (
+            _EXPECTATION_OUTCOMES.get(str(assessment.get("label")), "unclear")
+            if assessment.get("status") == "completed"
+            else "not judged"
+        )
+        counts[outcome] += 1
+        if outcome != "met":
+            listed.append((
+                case_by_result.get(str(assessment.get("target_result_id")), "?"),
+                int(expectation[1:]) if expectation[1:].isdigit() else 0,
+                outcome if outcome != "not judged" else f"not judged: {detail}",
+                ", ".join(f"`{item}`" for item in items.split("/") if item),
+            ))
+    lines = [
+        "",
+        f"#### Expectations (advisory, judged by `{judge.get('model')}`)",
+        "",
+        "| Met | Not met | Unclear | Not judged |",
+        "| --- | --- | --- | --- |",
+        f"| {counts['met']} | {counts['not met']} | {counts['unclear']} | {counts['not judged']} |",
+    ]
+    if listed:
+        lines += ["", "| Case | Expectation | Outcome | Items |", "| --- | --- | --- | --- |"]
+        lines += [
+            f"| `{case}` | E{index} | {outcome} | {items} |" for case, index, outcome, items in sorted(listed)
+        ]
+    return lines
+
+
 def _finished(report: Mapping[str, Any]) -> bool:
-    if (report.get("summary") or {}).get("verdict", "pending") != "pending":
-        return True
-    return (report.get("execution") or {}).get("state") in _FINISHED_EXECUTION_STATES
+    """Whether the run's execution has ended, so its report no longer changes.
+
+    The verdict is decided once every result is in, before the judges' decisions
+    on the last result are recorded, so the execution's state decides; a run
+    without one has ended once its verdict is decided.
+    """
+
+    execution = report.get("execution")
+    if execution:
+        return execution.get("state") in _FINISHED_EXECUTION_STATES
+    return (report.get("summary") or {}).get("verdict", "pending") != "pending"

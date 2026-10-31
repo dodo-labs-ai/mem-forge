@@ -67,7 +67,8 @@ class ReconciliationCaseRequest:
     """One hand-written situation imported against a synced Document: ``doc_id``, or ``title`` within ``source_id``.
 
     ``input`` holds the situation (see the module docstring); ``rubric`` holds
-    ``expected_incumbents``: incumbent id to ``kept``, ``revised`` or ``retired``.
+    ``expectations``: sentences about the incumbents' outcomes (``kept``,
+    ``revised`` or ``retired``), for the expectation judge.
     """
 
     input: Mapping[str, object]
