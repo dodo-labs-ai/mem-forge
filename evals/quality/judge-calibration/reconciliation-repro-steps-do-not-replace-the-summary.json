@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "repro-steps-do-not-replace-the-summary",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `old` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Bug KES-501: changing a job's queue between cut-off and the next run loses the job's owner.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-501 reproduces when a job is cut off on run 6, its queue is changed on Sep 10 and its retry profile on Sep 8, and run 7 then starts: the job is dispatched without an owner."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Bug KES-501: changing a job's queue between cut-off and the next run loses the job's owner.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-501 reproduces when a job is cut off on run 6, its queue is changed on Sep 10 and its retry profile on Sep 8, and run 7 then starts: the job is dispatched without an owner."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

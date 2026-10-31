@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "retry-count-replaced",
+  "split": "test",
+  "expectations": [
+    "The outcome of the old memory `three-retries` is retired."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "three-retries",
+          "old_memory": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "A failed Kestrel job is retried five times, waiting 10, 60, 300, 900 and 3600 seconds between attempts."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "three-retries",
+          "old_memory": "A failed Kestrel job is retried three times, waiting 10, 60 and 300 seconds between attempts.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "A failed Kestrel job is retried five times, waiting 10, 60, 300, 900 and 3600 seconds between attempts."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

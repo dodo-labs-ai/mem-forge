@@ -1,0 +1,46 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "job-retries",
+  "split": "dev",
+  "expectations": [
+    "A memory states that a job whose last retry fails moves to the kestrel-dlq queue."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A Kestrel job that raises an error is retried three times, waiting 10, 60 and 300 seconds between attempts."
+        },
+        {
+          "id": "M2",
+          "memory": "After its last retry fails, a Kestrel job moves to the kestrel-dlq queue and stays there until an operator requeues or deletes it."
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel uses a short, fixed retry schedule rather than exponential backoff so that an operator can tell from the clock alone when a job will run again."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the dead-letter memory removed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "A Kestrel job that raises an error is retried three times, waiting 10, 60 and 300 seconds between attempts."
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel uses a short, fixed retry schedule rather than exponential backoff so that an operator can tell from the clock alone when a job will run again."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

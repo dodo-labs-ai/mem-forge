@@ -1,0 +1,42 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "signing-key-rotation",
+  "split": "test",
+  "expectations": [
+    "A memory states that `kestrel-admin rotate-key` creates the new signing key and publishes it next to the current one."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel signs every job payload with an Ed25519 key. Rotate the key every 90 days, or at once when it may have leaked."
+        },
+        {
+          "id": "M2",
+          "memory": "To rotate the Kestrel signing key, run `kestrel-admin rotate-key` on any node; it creates a new key and publishes it next to the current one. Wait until every worker reports the new key id in `kestrel-admin status`, then run `kestrel-admin retire-key <old key id>`. Payloads signed with the old key are rejected from then on."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the new key replaces the old one",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel signs every job payload with an Ed25519 key. Rotate the key every 90 days, or at once when it may have leaked."
+        },
+        {
+          "id": "M2",
+          "memory": "To rotate the Kestrel signing key, run `kestrel-admin rotate-key` on any node; it creates a new key and replaces the current one at once."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

@@ -1208,6 +1208,62 @@ def eval_offline_run(
     ctx.exit(0 if report_verdict(report) == "pass" else 1)
 
 
+@eval_group.command("judge-calibrate")
+@click.option(
+    "--dir",
+    "directory",
+    default=Path("evals/quality/judge-calibration"),
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="The folder of calibration cases.",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["dev", "test", "all"]),
+    default="all",
+    show_default=True,
+    help="Which calibration cases to judge.",
+)
+@click.pass_context
+def eval_judge_calibrate(ctx: click.Context, directory: Path, split: str) -> None:
+    """Judge labeled calibration cases with the configured expectation judge and print its agreement.
+
+    The judge is the one MEMFORGE_AGENT_EVALUATION_JUDGE_* configures. Run it
+    after changing how the judge reads a case kind or which model judges, and
+    put the test split's summary in the pull request. Exits 0 once every case
+    is judged, and 2 when no judge is configured or a calibration file is
+    malformed.
+    """
+
+    from memforge.evals.judge_calibration import (
+        CALIBRATION_SPLITS,
+        calibrate,
+        load_calibration,
+        render_calibration_markdown,
+    )
+    from memforge.evals.offline_runtime import build_expectation_judge
+    from memforge.llm.providers import ModelConfigError
+    from memforge.runtime import DefaultRuntimeProvider
+
+    logging.getLogger().setLevel(logging.WARNING)
+
+    async def _run() -> str:
+        built = await build_expectation_judge(ctx.obj["config"], DefaultRuntimeProvider())
+        if built is None:
+            raise ValueError("No expectation judge is configured: set MEMFORGE_AGENT_EVALUATION_JUDGE_*.")
+        spec, judge = built
+        splits = CALIBRATION_SPLITS if split == "all" else (split,)
+        return render_calibration_markdown(spec, await calibrate(judge, cases, splits=splits))
+
+    try:
+        cases = load_calibration(directory)
+        summary = asyncio.run(_run())
+    except (ValueError, ModelConfigError) as exc:
+        click.echo(str(exc), err=True)
+        ctx.exit(2)
+    click.echo(summary)
+
+
 @eval_group.command("seed-derivation-cases")
 @click.option(
     "--spec",

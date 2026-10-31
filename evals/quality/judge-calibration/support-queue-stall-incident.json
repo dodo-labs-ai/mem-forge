@@ -1,0 +1,52 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "queue-stall-incident",
+  "split": "dev",
+  "expectations": [
+    "If a memory states that the on-call engineer is paged when no job has started for five minutes, it is judged unsupported.",
+    "If a memory states that a startup check refuses to run the queue with fsync off, and states nothing about paging, it is judged supported.",
+    "Every memory judged unsupported states that the on-call engineer is paged when no job has started."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The queue database must have fsync enabled: startup refuses to run with fsync off. The incident response also added paging the on-call engineer when no job has started for five minutes.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "A configuration change that turned fsync off on the queue database caused a crash to corrupt the WAL file, leaving every worker waiting on a lock that was never released.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The queue database must have fsync enabled: startup refuses to run with fsync off. The incident response also added paging the on-call engineer when no job has started for five minutes.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "A configuration change that turned fsync off on the queue database caused a crash to corrupt the WAL file, leaving every worker waiting on a lock that was never released.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met",
+        "met"
+      ]
+    }
+  ]
+}

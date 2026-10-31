@@ -1,0 +1,52 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "failure-alerts-zh",
+  "split": "dev",
+  "expectations": [
+    "If a memory states that the on-call engineer must acknowledge an alert within 15 minutes, it is judged unsupported.",
+    "If a memory states that Kestrel's failure alerts go only to the Slack channel #kestrel-oncall, and states no time to acknowledge them, it is judged supported.",
+    "Every memory judged unsupported states the 15-minute time to acknowledge an alert."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "值班同学需要在 15 分钟内确认告警。",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "Kestrel 任务连续失败三次后，告警只发送到 Slack 的 #kestrel-oncall 频道，不再发送邮件；放弃邮件告警是因为邮件容易被其他通知淹没，也无法统计确认时间。",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "值班同学需要在 15 分钟内确认告警。",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "Kestrel 任务连续失败三次后，告警只发送到 Slack 的 #kestrel-oncall 频道，不再发送邮件；放弃邮件告警是因为邮件容易被其他通知淹没，也无法统计确认时间。",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met",
+        "not_met"
+      ]
+    }
+  ]
+}

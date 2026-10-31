@@ -1,0 +1,42 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "release-crew",
+  "split": "test",
+  "expectations": [
+    "If a memory states that the canary covers 5% of tenants, it is judged unsupported.",
+    "If a memory states that Kestrel 4.2 ships behind the kestrel-canary flag, and states no share of tenants, it is judged supported.",
+    "Every memory judged unsupported states that the canary covers 5% of tenants."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The crew agreed that the Kestrel 4.2 canary would run behind the `kestrel-canary` flag and cover 5% of tenants for the first 24 hours.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The crew agreed that the Kestrel 4.2 canary would run behind the `kestrel-canary` flag and cover 5% of tenants for the first 24 hours.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "met",
+        "met"
+      ]
+    }
+  ]
+}

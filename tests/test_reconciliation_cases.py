@@ -228,6 +228,11 @@ async def test_an_unknown_document_or_an_invalid_situation_is_not_imported(db) -
         await _import(db, ReconciliationCaseRequest(
             input=situation("Anything."), rubric={"expected_incumbents": {"friday": "kept"}}, doc_id=DOCUMENT.doc_id,
         ))
+    with pytest.raises(ValueError, match="names `monday`, which is not an old memory of the case"):
+        await _import(db, ReconciliationCaseRequest(
+            input=situation("Anything."), rubric={"expectations": ["The outcome of the old memory `monday` is kept."]},
+            doc_id=DOCUMENT.doc_id,
+        ))
 
 
 

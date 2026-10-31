@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "status-update-drops-environment",
+  "split": "test",
+  "expectations": [
+    "The outcome of the old memory `old` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "In KES-412 (production EU1, tenant acme-prod), duplicate job ids make dispatch fail with a DuplicateKeyError.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-412 is Blocked: dispatch fails in JobRouter.assign() because two queued jobs share the id 7f3c and the router builds a map keyed by job id, raising DuplicateKeyError."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "In KES-412 (production EU1, tenant acme-prod), duplicate job ids make dispatch fail with a DuplicateKeyError.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-412 is Blocked: dispatch fails in JobRouter.assign() because two queued jobs share the id 7f3c and the router builds a map keyed by job id, raising DuplicateKeyError."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

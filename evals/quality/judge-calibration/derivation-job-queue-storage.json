@@ -1,0 +1,38 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "job-queue-storage",
+  "split": "test",
+  "expectations": [
+    "A memory states that the Kestrel job queue is stored in SQLite, not in Redis."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The Kestrel job queue is stored in SQLite in WAL mode, not in Redis. The team chose SQLite so that a self-hosted Kestrel install runs as a single container with no separate queue service."
+        },
+        {
+          "id": "M2",
+          "memory": "Every queue worker must open the database with a busy timeout of five seconds, because WAL mode allows only one writer at a time."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the storage memory removed",
+      "items": [
+        {
+          "id": "M2",
+          "memory": "Every queue worker must open the database with a busy timeout of five seconds, because WAL mode allows only one writer at a time."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

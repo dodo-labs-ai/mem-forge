@@ -19,7 +19,16 @@
   it was admitted with. Contributors: `compose_smoke.sh --quality` judges with
   Claude Haiku 5.5 on OpenRouter by default and takes `--judge-provider`,
   `--judge-model`, `--judge-endpoint` and `--judge-key-env`; its summary lists
-  each expectation not met with the Memories it rests on.
+  each expectation not met with the Memories it rests on, and lists replay
+  problems only when a code check did not pass.
+
+- Offline evaluation: each case kind allows a closed set of expectation forms,
+  such as "A memory states that …" or "The outcome of the old memory `id` is
+  kept.", and pinning a case refuses an expectation in another form or about an
+  old memory the case does not hold; CONTRIBUTING lists the forms. Maintainers:
+  `memforge eval judge-calibrate` measures the configured judge against the
+  labeled outputs in `evals/quality/judge-calibration`, per split, kind and
+  form, after a change to the judge, its forms or its model.
 
 - Contributors: `scripts/compose_smoke.sh` configures the generation and the
   embedding model each through its own provider, as Settings does:

@@ -69,10 +69,10 @@ counts, and each expectation not met or unclear, with its sentence and the
 memories it rests on. A maintainer reads them in your pull request; they never
 fail the smoke. What fails it is a replay that gave no valid result: a result
 that did not complete, an output that is not well formed or a Support left
-unresolved. The summary then adds these replay problems. A model's answers vary, so when an expectation is
-not met, run the evaluation again before you conclude. To test a new
-situation, add a document pair or a reconciliation file and list it in
-`cohort.json`.
+unresolved. The summary then adds these replay problems. A model's answers
+vary, so when an expectation is not met, run the evaluation again before you
+conclude. To test a new situation, add a document pair or a reconciliation
+file and list it in `cohort.json`.
 
 The judge is Claude Haiku 5.5 on OpenRouter when `OPENROUTER_API_KEY` is set.
 Name another with `--judge-provider`, `--judge-model`, `--judge-endpoint` and
@@ -82,6 +82,68 @@ so every candidate is judged by the same model.
 
 Maintainers also run the same evaluation over cases pinned from a real
 workspace, which stay in that workspace.
+
+### Expectations and the judge
+
+What a case tests is yours to add; how every case is judged is the same for
+all of them and belongs to maintainers.
+
+You add, in `evals/quality/`:
+
+- documents, revisions and source-type snapshots, and the cases that pin them
+  in `quick/cohort.json` or a `quick/reconciliation/` file;
+- each case's expectations, written in one of the forms its kind allows and
+  naming the facts, old memories and outcomes of that case. Every expectation
+  rests on what the source states, never on what a model happened to write;
+- optionally, calibration cases for the judge in `judge-calibration/`, which a
+  maintainer reviews like any test data.
+
+The forms are a closed set per case kind:
+
+| Kind | Forms |
+| --- | --- |
+| extraction | "A memory states that …" |
+| Support | "If a memory states that …, it is judged unsupported." (or supported, optionally with ", and states nothing about …"); "Every memory judged unsupported states …"; "No memory is judged unsupported." |
+| reconciliation | "The outcome of the old memory `id` is kept." (or revised, retired) |
+
+`uv run pytest tests/test_quality_rubrics.py -q` checks every rubric against
+them without a model, and pinning a case refuses an expectation in another
+form or about an old memory the case does not hold.
+
+Maintainers own the judge in `src/memforge/evals/expectation_judge.py`: what
+each form means to it, its guide to each kind's output, its prompt, its labels
+and votes, and its default model. An expectation never tells the judge how to
+judge: "treat X as Y" or "ignore Z" is not a form. A rule in the judge never
+names a fact, value, case or document, and would hold unchanged if every case
+were replaced by a new one of the same kind.
+
+When the judge decides an expectation wrongly, reword the expectation within
+its form; an expectation that comes back unclear or split from run to run is
+usually ambiguous. When the judge misreads a form across cases, a maintainer
+redefines the form for every case of its kind and runs the calibration below.
+No change adds a rule for one case.
+
+#### Calibrating the judge
+
+`evals/quality/judge-calibration/` holds cases a person labeled: each file
+names a case kind, the document it is about, a split (`dev` or `test`),
+expectations, and one or more outputs as the judge reads them, each with a
+label, `met` or `not_met`, for every expectation. Outputs include ones edited
+to be wrong, so both labels occur; the best are near misses, such as another
+value or a changed fact beside a kept one. Every case about one document sits
+in the same split. A change to the judge, its forms or its model is worked out
+against the `dev` cases and measured on the `test` cases:
+
+```bash
+memforge eval judge-calibrate --split test
+```
+
+It judges with the model `MEMFORGE_AGENT_EVALUATION_JUDGE_*` configures and
+reports, per kind and form, the share of `met` labels the judge also found met
+(TPR) and of `not_met` labels it found not met (TNR), with every disagreement.
+Put the test summary in the pull request. A new case with an existing form
+needs no calibration run. Add a few labeled outputs when you add a form or
+when the judge decided a case wrongly, so the mistake stays tested.
 
 ### Quality snapshots
 
@@ -190,7 +252,9 @@ Then run `scripts/compose_smoke.sh --quality --quality-outputs DIR` with the
 reference model, which saves every case's pinned input, rubric and model output
 in `DIR`, and read your type's cases to set their rubrics. Write each
 expectation as one fact a reader would keep, a stated decision, a limit or a
-constraint, not an aside, and name its values, so it is either met or not:
+constraint, not an aside, and name its values, so it is either met or not.
+Use the forms of
+[Expectations and the judge](#expectations-and-the-judge):
 
 - extraction: "A memory states that …", for each fact the source must give.
 - Support: "If a memory states that …, it is judged unsupported." for each

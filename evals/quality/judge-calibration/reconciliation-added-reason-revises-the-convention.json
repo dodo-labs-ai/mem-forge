@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "added-reason-revises-the-convention",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `old` is revised."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Kestrel release tags are always cut from the main branch.",
+          "outcome": "revised"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel release tags are always cut from the main branch, never from a feature branch, so that every release contains all reviewed changes."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "old",
+          "old_memory": "Kestrel release tags are always cut from the main branch.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "Kestrel release tags are always cut from the main branch, never from a feature branch, so that every release contains all reviewed changes."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

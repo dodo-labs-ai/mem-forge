@@ -1,0 +1,44 @@
+{
+  "case_kind": "source_unit_reconciliation_v1",
+  "document": "later-comment-reports-the-fix",
+  "split": "dev",
+  "expectations": [
+    "The outcome of the old memory `stall` is kept."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "stall",
+          "old_memory": "In KES-418, a Kestrel worker that crashes while holding the queue lock never releases it, and the queue stalls until someone clears the lock by hand.",
+          "outcome": "kept"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-418 is fixed in Kestrel 3.4.2: a worker that loses its lease now releases the queue lock, so the queue keeps moving after a worker crash."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the old memory's outcome changed",
+      "items": [
+        {
+          "id": "stall",
+          "old_memory": "In KES-418, a Kestrel worker that crashes while holding the queue lock never releases it, and the queue stalls until someone clears the lock by hand.",
+          "outcome": "retired"
+        },
+        {
+          "id": "N1",
+          "new_memory": "KES-418 is fixed in Kestrel 3.4.2: a worker that loses its lease now releases the queue lock, so the queue keeps moving after a worker crash."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

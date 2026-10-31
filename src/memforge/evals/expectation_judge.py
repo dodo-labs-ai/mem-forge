@@ -8,6 +8,13 @@ answers each expectation with a closed choice: met, not met, or unclear. It
 answers several times and the majority decides; code, not the model, counts
 the answers. Its decisions are advisory: they never decide a run's verdict.
 
+How the judge reads a case is fixed here, per case kind, and owned by
+maintainers: the guide to the kind's output and the closed set of sentence
+forms its rubrics may take, each with what it means. A rubric fills a form with
+the facts, IDs and outcomes of its case and adds nothing to how it is judged,
+so a new case never changes the judge; a form whose meaning the judge misreads
+is redefined here, for every case of its kind.
+
 The judge is test configuration, not a product setting: the deployment that
 runs the evaluation names its provider and model, and every run pins that
 identity with the prompt it was given.
@@ -18,8 +25,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -32,17 +40,77 @@ EXPECTATION_JUDGE_VERSION = "1"
 # Each case is judged this many times; an expectation takes the label most of them give.
 EXPECTATION_JUDGE_VOTES = 3
 
-_OUTPUT_GUIDES: Mapping[str, str] = {
-    "source_unit_derivation_v1": "The output is the list of memories a model extracted from one document.",
-    "source_unit_support_v1": (
-        "The output lists memories extracted from an earlier version of a document. After the document "
-        "changed, a model judged whether the new version still supports each one: supported, "
-        "unsupported, or unresolved when it reached no verdict."
+@dataclass(frozen=True, slots=True)
+class ExpectationForm:
+    """One sentence form a rubric may take: its shape, an example, and how the judge reads it.
+
+    ``meaning`` is ``None`` when the sentence says all the judge needs.
+    """
+
+    pattern: str
+    example: str
+    meaning: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CaseKindJudging:
+    """How the judge reads one case kind: the guide to its output and the forms of its expectations."""
+
+    guide: str
+    forms: tuple[ExpectationForm, ...]
+
+
+# One sentence: a period inside it is followed by no space, as in "4.2" or `webhook.max_redeliveries`.
+_TEXT = r"(?:[^.\n]|\.(?=\S))+"
+_STATES_MEANING = (
+    "A memory states a fact when it asserts that fact's content in any wording or language, alone or "
+    "within a longer sentence; different words, units or number formats for the same content count. A "
+    "memory that speaks of something in general does not state a specific detail of it, and a memory "
+    "that gives a different value, subject or scope does not state the fact."
+)
+_JUDGING: Mapping[str, CaseKindJudging] = {
+    "source_unit_derivation_v1": CaseKindJudging(
+        guide="The output is the list of memories a model extracted from one document.",
+        forms=(ExpectationForm(rf"A memory states (?:that|the) {_TEXT}\.", "A memory states that …", _STATES_MEANING),),
     ),
-    "source_unit_reconciliation_v1": (
-        "The output lists the old memories of a document, each with the outcome a model chose after the "
-        "document changed (kept, revised or retired), and the new memories extracted from the "
-        "changed document."
+    "source_unit_support_v1": CaseKindJudging(
+        guide=(
+            "The output lists memories extracted from an earlier version of a document. After the document "
+            "changed, a model judged whether the new version still supports each one: supported, "
+            "unsupported, or unresolved when it reached no verdict."
+        ),
+        forms=(
+            ExpectationForm(
+                rf"If a memory states (?:that|the) {_TEXT}, it is judged (?:supported|unsupported)\.",
+                "If a memory states that …, it is judged unsupported.",
+                f"{_STATES_MEANING}\n"
+                'An expectation "If a memory states X, it is judged Y" is about the memories that state X and '
+                "nothing else: it is met when every memory that states X is judged Y, including when no memory "
+                "states X. When X also says what the memory does not state, a memory that does state that is "
+                "not one of them.",
+            ),
+            ExpectationForm(
+                rf"Every memory judged unsupported states {_TEXT}\.",
+                "Every memory judged unsupported states …",
+                'An expectation "Every memory judged unsupported states X" is met when each memory judged '
+                "unsupported states X, or one of the facts X lists, including when no memory is judged "
+                "unsupported.",
+            ),
+            ExpectationForm(r"No memory is judged unsupported\.", "No memory is judged unsupported."),
+        ),
+    ),
+    "source_unit_reconciliation_v1": CaseKindJudging(
+        guide=(
+            "The output lists the old memories of a document, each with the outcome a model chose after the "
+            "document changed (kept, revised or retired), and the new memories extracted from the "
+            "changed document."
+        ),
+        forms=(
+            ExpectationForm(
+                r"The outcome of the old memory `(?P<incumbent>[^`]+)` is (?:kept|revised|retired)\.",
+                "The outcome of the old memory `id` is kept.",
+            ),
+        ),
     ),
 }
 
@@ -55,16 +123,7 @@ For each expectation, decide from the output alone:
 - met: the output plainly meets the expectation;
 - not_met: the output plainly does not meet it;
 - unclear: the output alone cannot decide it.
-
-A memory states a fact when it asserts that fact's content in any wording or language, alone or
-within a longer sentence; different words, units or number formats for the same content count. A
-memory that speaks of something in general does not state a specific detail of it, and a memory
-that gives a different value, subject or scope does not state the fact.
-An expectation of the form "If a memory states X, it is judged Y" is about the memories that
-state X and nothing else: it is met when every memory that states X is judged Y, including when
-no memory states X. When X also says what the memory does not state, a memory that does state
-that is not one of them.
-
+{meanings}
 Answer every expectation once, by its ID: first list the IDs of the output items it concerns, then
 check each of them against it in one short sentence, then give the verdict.
 
@@ -75,10 +134,13 @@ Output:
 {output}
 """
 # Everything that shapes the judge's answers apart from its model: the prompt,
-# the guide to each case kind's output, the answer schema and the vote count.
+# how it reads each case kind, the answer schema and the vote count.
 EXPECTATION_JUDGE_PROMPT_HASH = hashlib.sha256(json.dumps({
     "prompt": _PROMPT_TEMPLATE,
-    "guides": dict(_OUTPUT_GUIDES),
+    "judging": {
+        kind: {"guide": judging.guide, "forms": [[form.pattern, form.meaning] for form in judging.forms]}
+        for kind, judging in _JUDGING.items()
+    },
     "schema": ExpectationJudgmentResponse.model_json_schema(),
     "votes": EXPECTATION_JUDGE_VOTES,
 }, sort_keys=True).encode("utf-8")).hexdigest()
@@ -147,12 +209,52 @@ def rubric_expectations(rubric: Mapping[str, object]) -> tuple[str, ...]:
     return tuple(str(item) for item in expectations) if isinstance(expectations, list) else ()
 
 
-def validate_expectations(rubric: Mapping[str, object]) -> None:
+def validate_expectations(
+    case_kind: str, rubric: Mapping[str, object], *, incumbent_ids: Collection[str] = (),
+) -> None:
+    """Refuse a rubric whose expectations are missing or not each in a form its case kind allows.
+
+    An expectation about an old memory must name one of ``incumbent_ids``.
+    """
+
     expectations = rubric.get("expectations")
     if not isinstance(expectations, list) or not expectations or any(
         not isinstance(item, str) or not item.strip() for item in expectations
     ):
         raise ValueError("the rubric requires expectations: a non-empty list of non-empty sentences")
+    for index, expectation in enumerate(expectations, start=1):
+        matched = expectation_form(case_kind, expectation)
+        if matched is None:
+            allowed = "; ".join(f'"{form.example}"' for form in _JUDGING[case_kind].forms)
+            raise ValueError(f"expectation {index} takes none of the forms a {case_kind} rubric allows: {allowed}")
+        incumbent = matched[1].get("incumbent")
+        if incumbent is not None and incumbent not in incumbent_ids:
+            raise ValueError(f"expectation {index} names `{incumbent}`, which is not an old memory of the case")
+
+
+def expectation_form(case_kind: str, expectation: str) -> tuple[ExpectationForm, Mapping[str, str]] | None:
+    """The form ``expectation`` takes among those its case kind allows, with the names it fills; else ``None``."""
+
+    if case_kind not in _JUDGING:
+        raise ValueError(f"case kind {case_kind!r} has no expectations; it is one of {', '.join(sorted(_JUDGING))}")
+    for form in _JUDGING[case_kind].forms:
+        match = re.fullmatch(form.pattern, expectation.strip())
+        if match is not None:
+            return form, match.groupdict()
+    return None
+
+
+def expectation_prompt(expectations: Mapping[str, str], view: CaseOutputView) -> str:
+    """The judge's prompt for some expectations of one case, by their IDs."""
+
+    judging = _JUDGING[view.case_kind]
+    meanings = "".join(f"\n{form.meaning}\n" for form in judging.forms if form.meaning)
+    return _PROMPT_TEMPLATE.format(
+        guide=judging.guide,
+        meanings=meanings,
+        expectations="\n".join(f"{item_id}: {text}" for item_id, text in expectations.items()),
+        output=json.dumps(list(view.items), ensure_ascii=False, indent=1),
+    )
 
 
 def case_output_view(
@@ -238,15 +340,10 @@ class StructuredExpectationJudge:
     ) -> tuple[ExpectationVerdict, ...]:
         ids = tuple(f"E{index}" for index in range(1, len(expectations) + 1))
         text = dict(zip(ids, expectations))
-        output = json.dumps(list(view.items), ensure_ascii=False, indent=1)
 
         def render(item_ids: tuple[str, ...], _parts: tuple[object, ...]) -> LlmRequest:
             return LlmRequest(
-                prompt=_PROMPT_TEMPLATE.format(
-                    guide=_OUTPUT_GUIDES[view.case_kind],
-                    expectations="\n".join(f"{item_id}: {text[item_id]}" for item_id in item_ids),
-                    output=output,
-                ),
+                prompt=expectation_prompt({item_id: text[item_id] for item_id in item_ids}, view),
                 response_format=ExpectationJudgmentResponse,
             )
 

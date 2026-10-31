@@ -1,0 +1,58 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "job-retries",
+  "split": "dev",
+  "expectations": [
+    "If a memory states that Kestrel retries a failed job three times, it is judged unsupported.",
+    "If a memory states that Kestrel waits 10, 60 and 300 seconds between retries, it is judged unsupported.",
+    "If a memory states that a fixed retry schedule was chosen over exponential backoff, it is judged unsupported.",
+    "If a memory states that a job whose last retry fails moves to the kestrel-dlq queue, and states nothing about how many times or how long Kestrel retries, it is judged supported.",
+    "Every memory judged unsupported states the count of three retries, the waits of 10, 60 and 300 seconds, or the choice of a fixed schedule over exponential backoff."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel uses a short, fixed retry schedule rather than exponential backoff so that an operator can tell from the clock alone when a job will run again. The schedule waits 10, 60 and 300 seconds between attempts.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "After its last retry fails, a Kestrel job moves to the kestrel-dlq queue, where it stays until an operator requeues or deletes it.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met",
+        "not_met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped; M1 also states the retry count",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel retries a failed job three times on a short, fixed schedule rather than exponential backoff, waiting 10, 60 and 300 seconds between attempts.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "After its last retry fails, a Kestrel job moves to the kestrel-dlq queue, where it stays until an operator requeues or deletes it.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met",
+        "not_met",
+        "met",
+        "met"
+      ]
+    }
+  ]
+}

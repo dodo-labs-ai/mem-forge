@@ -1,0 +1,62 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "webhook-timeout",
+  "split": "dev",
+  "expectations": [
+    "If a memory states the decision to raise the webhook delivery timeout to 20 seconds, it is judged unsupported.",
+    "If a memory states that timed-out deliveries are logged to the kestrel-webhook-audit stream, it is judged unsupported.",
+    "Every memory judged unsupported states the 20-second timeout, the kestrel-webhook-audit stream, or that deliveries time out after 5 seconds."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every timed-out delivery is logged to the kestrel-webhook-audit stream, so support can answer tenants without reading the worker logs.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "Decision: raise the webhook delivery timeout to 20 seconds. A timed-out delivery is retried at most 3 times (webhook.max_redeliveries).",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel webhook deliveries time out after 5 seconds; receivers behind the acme gateway need up to 15 seconds.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every timed-out delivery is logged to the kestrel-webhook-audit stream, so support can answer tenants without reading the worker logs.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "Decision: raise the webhook delivery timeout to 20 seconds. A timed-out delivery is retried at most 3 times (webhook.max_redeliveries).",
+          "verdict": "supported"
+        },
+        {
+          "id": "M3",
+          "memory": "Kestrel webhook deliveries time out after 5 seconds; receivers behind the acme gateway need up to 15 seconds.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met",
+        "met"
+      ]
+    }
+  ]
+}

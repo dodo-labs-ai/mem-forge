@@ -3678,7 +3678,12 @@ def _validate_rubric(
         if any(label not in _RELATION_LABELS for label in expected_labels.values()):
             raise ValueError("relation group expected_labels must be one of " + ", ".join(sorted(_RELATION_LABELS)))
     if case_kind in EXPECTATION_CASE_KINDS:
-        validate_expectations(rubric)
+        incumbents = (
+            _mapping_list(case.manifest, "incumbents")
+            if case_kind is AgentEvaluationCaseKind.SOURCE_UNIT_RECONCILIATION
+            else []
+        )
+        validate_expectations(case_kind.value, rubric, incumbent_ids={str(item.get("id")) for item in incumbents})
 
 
 def _memory_from_payload(payload: Mapping[str, object]) -> Memory:

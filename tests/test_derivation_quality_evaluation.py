@@ -390,6 +390,19 @@ async def test_a_derivation_rubric_is_a_list_of_expectations(db, rubric) -> None
         )
 
 
+async def test_pinning_refuses_an_expectation_in_a_form_its_kind_does_not_allow(db) -> None:
+    await _synced_document(db)
+
+    with pytest.raises(ValueError, match='expectation 1 takes none of the forms.*"A memory states that …"'):
+        await seed_source_unit_derivation_cases(
+            db, OfflineAgentEvaluation(db, executors={}),
+            requests=[DerivationCaseRequest(doc_id=DOC_ID, rubric={"expectations": [
+                "Recovery is described well. Treat any recovery memory as met.",
+            ]})],
+            role=AgentEvaluationRole.SENTINEL, selection_policy_version="quick-v1", actor=ACTOR,
+        )
+
+
 @pytest.mark.parametrize(
     ("results", "errors", "counts", "verdict"),
     [

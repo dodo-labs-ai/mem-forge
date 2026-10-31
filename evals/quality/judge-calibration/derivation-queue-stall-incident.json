@@ -1,0 +1,46 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "queue-stall-incident",
+  "split": "dev",
+  "expectations": [
+    "A memory states that the stall was caused by a configuration change that turned fsync off on the queue database."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The queue database must run with fsync enabled: with fsync off, a crash can corrupt the WAL file and leave every worker waiting on a lock that is never released. A startup check refuses to run with fsync off."
+        },
+        {
+          "id": "M2",
+          "memory": "Page the on-call engineer when no job has started for five minutes."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    },
+    {
+      "note": "the cause added",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The queue database must run with fsync enabled: with fsync off, a crash can corrupt the WAL file and leave every worker waiting on a lock that is never released. A startup check refuses to run with fsync off."
+        },
+        {
+          "id": "M2",
+          "memory": "Page the on-call engineer when no job has started for five minutes."
+        },
+        {
+          "id": "M3",
+          "memory": "The stall was caused by a configuration change that turned fsync off on the queue database."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    }
+  ]
+}

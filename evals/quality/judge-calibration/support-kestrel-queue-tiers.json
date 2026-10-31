@@ -1,0 +1,98 @@
+{
+  "case_kind": "source_unit_support_v1",
+  "document": "kestrel-queue-tiers",
+  "split": "test",
+  "expectations": [
+    "If a memory states that the invoices queue waits at most 2 minutes, it is judged unsupported.",
+    "Every memory judged unsupported states the 2-minute maximum wait of the invoices queue."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every Kestrel queue belongs to one tier. The tier sets how long a job may wait before a worker picks it up.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "The Bronze tier's maximum wait is 1 hour for the reports queue.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M3",
+          "memory": "The Gold tier's maximum wait is 2 minutes for the invoices queue.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M4",
+          "memory": "The Gold tier's maximum wait is 30 seconds for the payments queue.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M5",
+          "memory": "A queue whose wait exceeds its tier's maximum pages the on-call engineer.",
+          "verdict": "supported"
+        }
+      ],
+      "labels": [
+        "met",
+        "met"
+      ]
+    },
+    {
+      "note": "supported and unsupported swapped",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every Kestrel queue belongs to one tier. The tier sets how long a job may wait before a worker picks it up.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M2",
+          "memory": "The Bronze tier's maximum wait is 1 hour for the reports queue.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M3",
+          "memory": "The Gold tier's maximum wait is 2 minutes for the invoices queue.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M4",
+          "memory": "The Gold tier's maximum wait is 30 seconds for the payments queue.",
+          "verdict": "unsupported"
+        },
+        {
+          "id": "M5",
+          "memory": "A queue whose wait exceeds its tier's maximum pages the on-call engineer.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "not_met",
+        "not_met"
+      ]
+    },
+    {
+      "note": "another value judged unsupported",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "The Gold tier's maximum wait is 30 seconds for the payments queue.",
+          "verdict": "supported"
+        },
+        {
+          "id": "M2",
+          "memory": "The invoices queue waits at most 5 minutes before a worker picks it up.",
+          "verdict": "unsupported"
+        }
+      ],
+      "labels": [
+        "met",
+        "not_met"
+      ]
+    }
+  ]
+}

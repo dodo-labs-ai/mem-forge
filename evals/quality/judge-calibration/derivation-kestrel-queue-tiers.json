@@ -1,0 +1,66 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "kestrel-queue-tiers",
+  "split": "test",
+  "expectations": [
+    "A memory states that the payments queue is in the Gold tier and that its jobs wait at most 30 seconds."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every Kestrel queue belongs to one tier, and the tier sets how long a job may wait before a worker picks it up."
+        },
+        {
+          "id": "M2",
+          "memory": "The Kestrel payments queue is in the Gold tier, with a maximum wait of 30 seconds before a worker picks it up."
+        },
+        {
+          "id": "M3",
+          "memory": "The Kestrel invoices queue is in the Gold tier, with a maximum wait of 2 minutes before a worker picks it up."
+        },
+        {
+          "id": "M4",
+          "memory": "The Kestrel reports queue is in the Bronze tier, with a maximum wait of 1 hour before a worker picks it up."
+        },
+        {
+          "id": "M5",
+          "memory": "A Kestrel queue whose wait exceeds its tier's maximum pages the on-call engineer."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "the payments wait changed to 2 minutes",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Every Kestrel queue belongs to one tier, and the tier sets how long a job may wait before a worker picks it up."
+        },
+        {
+          "id": "M2",
+          "memory": "The Kestrel payments queue is in the Gold tier, with a maximum wait of 2 minutes before a worker picks it up."
+        },
+        {
+          "id": "M3",
+          "memory": "The Kestrel invoices queue is in the Gold tier, with a maximum wait of 2 minutes before a worker picks it up."
+        },
+        {
+          "id": "M4",
+          "memory": "The Kestrel reports queue is in the Bronze tier, with a maximum wait of 1 hour before a worker picks it up."
+        },
+        {
+          "id": "M5",
+          "memory": "A Kestrel queue whose wait exceeds its tier's maximum pages the on-call engineer."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

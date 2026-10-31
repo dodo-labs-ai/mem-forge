@@ -1,0 +1,34 @@
+{
+  "case_kind": "source_unit_derivation_v1",
+  "document": "release-tags",
+  "split": "dev",
+  "expectations": [
+    "A memory states that Kestrel releases use calendar versions."
+  ],
+  "outputs": [
+    {
+      "note": "as replayed",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel releases use calendar versions such as 2026.10.1. Release tags are always cut from the main branch, never from a feature branch, so every release contains all reviewed changes."
+        }
+      ],
+      "labels": [
+        "met"
+      ]
+    },
+    {
+      "note": "semantic versions instead",
+      "items": [
+        {
+          "id": "M1",
+          "memory": "Kestrel releases use semantic versions such as 4.2.0. Release tags are always cut from the main branch."
+        }
+      ],
+      "labels": [
+        "not_met"
+      ]
+    }
+  ]
+}

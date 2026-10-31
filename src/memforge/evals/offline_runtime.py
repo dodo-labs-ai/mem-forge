@@ -127,25 +127,21 @@ async def build_offline_evaluation_for_run(
     )
 
 
-async def _expectation_judge(
-    config: AppConfig, runtime_provider: RuntimeProvider, run: AgentEvaluationRun,
-) -> StructuredExpectationJudge | None:
-    """The judge the run pins, on its own client; ``None`` when this deployment does not configure that judge.
+async def build_expectation_judge(
+    config: AppConfig, runtime_provider: RuntimeProvider,
+) -> tuple[ExpectationJudgeSpec, StructuredExpectationJudge] | None:
+    """The judge this deployment configures, on its own client; ``None`` without one.
 
     Its requests are sized as a Settings binding's are: by the token limits its
     provider's model listing gives, and the ``MEMFORGE_LLM_*`` limits for what
     the listing leaves open or when it gives nothing the binding accepts.
-    Without a judge the run still replays and scores its code checks, and
-    records each expectation as not judged.
     """
 
-    if run.expectation_judge_manifest is None:
-        return None
     configured = configured_expectation_judge(config)
-    if configured is None or configured[0] != ExpectationJudgeSpec.from_manifest(run.expectation_judge_manifest):
+    if configured is None:
         return None
+    spec, binding = configured
     api_key = config.agent_evaluation.judge_api_key or None
-    binding = configured[1]
     try:
         binding = _judge_binding(config, await listed_model(binding, api_key))
     except ModelConfigError:
@@ -160,4 +156,22 @@ async def _expectation_judge(
         ),
         max_concurrent=config.llm.enrichment_max_concurrent,
     )
-    return StructuredExpectationJudge(client) if client is not None else None
+    return (spec, StructuredExpectationJudge(client)) if client is not None else None
+
+
+async def _expectation_judge(
+    config: AppConfig, runtime_provider: RuntimeProvider, run: AgentEvaluationRun,
+) -> StructuredExpectationJudge | None:
+    """The judge the run pins; ``None`` when this deployment does not configure that judge.
+
+    Without a judge the run still replays and scores its code checks, and
+    records each expectation as not judged.
+    """
+
+    if run.expectation_judge_manifest is None:
+        return None
+    configured = configured_expectation_judge(config)
+    if configured is None or configured[0] != ExpectationJudgeSpec.from_manifest(run.expectation_judge_manifest):
+        return None
+    built = await build_expectation_judge(config, runtime_provider)
+    return built[1] if built is not None else None
