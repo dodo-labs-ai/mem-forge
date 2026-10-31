@@ -305,7 +305,7 @@ class EvidenceDisplay(StructuredResponseModel):
     ))
 
 
-def _validate_evidence_displays(primary_ref, required_refs, displays):
+def validate_evidence_displays(primary_ref, required_refs, displays):
     selected = [primary_ref, *required_refs]
     actual = [display.ref for display in displays]
     if len(actual) != len(set(selected)) or len(set(actual)) != len(actual) or set(actual) != set(selected):
@@ -351,7 +351,7 @@ class ProjectionFragmentMemoryCandidate(StructuredResponseModel):
 
     @model_validator(mode="after")
     def validate_displays(self):
-        _validate_evidence_displays(self.primary_ref, self.required_refs, self.evidence_displays)
+        validate_evidence_displays(self.primary_ref, self.required_refs, self.evidence_displays)
         return self
 
 class ProjectionFragmentMemoryExtractionResponse(StructuredResponseModel):
@@ -1021,41 +1021,51 @@ class SupportWitnessDelta(BaseModel):
     opposing_witness_refs: list[str]
 
 
-class ContinueReadingWireResult(BaseModel):
-    """The claim is not yet completely supported; keep reading."""
+class SupportAssessmentWireRow(BaseModel):
+    """One work's answer: its status and the fields that status uses, every other field null.
+
+    The row is one flat object, so every provider decodes the same shape. Which
+    fields a status carries is this row's meaning rule, which the Support decoder
+    checks: a row that breaks it is rejected and re-asked alone.
+    """
+
+    STATUS_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "continue": ("witness_delta",),
+        "supported": ("primary_ref", "required_refs", "evidence_displays"),
+        "unsupported": (),
+    }
 
     model_config = ConfigDict(extra="forbid")
     work_id: str
-    status: Literal["continue"]
-    witness_delta: SupportWitnessDelta
+    status: Literal["continue", "supported", "unsupported"]
+    witness_delta: SupportWitnessDelta | None = Field(default=None, description=(
+        "continue: the current refs of this request that support or oppose the claim. Null otherwise."
+    ))
+    primary_ref: str | None = Field(default=None, description="supported: the Primary ref. Null otherwise.")
+    required_refs: list[str] | None = Field(default=None, description=(
+        "supported: the Required refs, possibly none. Null otherwise."
+    ))
+    evidence_displays: list[EvidenceDisplay] | None = Field(default=None, description=(
+        "supported: one display for each selected ref. Null otherwise."
+    ))
 
+    def row_error(self) -> str | None:
+        """This row's meaning rule: its status carries exactly the fields it uses; None when it holds."""
 
-class SupportedWireResult(BaseModel):
-    """One complete current Evidence Unit supports the claim, with readable presentation."""
-
-    model_config = ConfigDict(extra="forbid")
-    work_id: str
-    status: Literal["supported"]
-    primary_ref: str
-    required_refs: list[str]
-    evidence_displays: list[EvidenceDisplay]
-
-    @model_validator(mode="after")
-    def validate_displays(self):
-        _validate_evidence_displays(self.primary_ref, self.required_refs, self.evidence_displays)
-        return self
-
-
-class UnsupportedWireResult(BaseModel):
-    """The complete revision was read and no complete current Evidence Unit supports the claim."""
-
-    model_config = ConfigDict(extra="forbid")
-    work_id: str
-    status: Literal["unsupported"]
+        used = self.STATUS_FIELDS[self.status]
+        for field in ("witness_delta", "primary_ref", "required_refs", "evidence_displays"):
+            if (getattr(self, field) is None) == (field in used):
+                return f"a {self.status} row {'needs' if field in used else 'leaves null'} {field}"
+        if self.status == "supported":
+            try:
+                validate_evidence_displays(self.primary_ref, self.required_refs, self.evidence_displays)
+            except ValueError as error:
+                return str(error)
+        return None
 
 
 class SupportAssessmentWireResponse(BaseModel):
-    results: list[ContinueReadingWireResult | SupportedWireResult | UnsupportedWireResult]
+    results: list[SupportAssessmentWireRow]
 
 
 class ChangeImpactWireResult(BaseModel):

@@ -27,46 +27,69 @@ def wire():
     ]), [], {'w000001': 'WRK-0001'})
 
 
-def row_schema(status):
+def row_schema():
     schema = SupportAssessmentWireResponse.model_json_schema()
-    return next(v for v in schema['$defs'].values() if v.get('properties', {}).get('status', {}).get('const') == status)
+    assert schema['properties']['results']['items'] == {'$ref': '#/$defs/SupportAssessmentWireRow'}
+    return schema['$defs']['SupportAssessmentWireRow']
 
 
-def test_supported_row_has_only_bound_presentation_and_decodes_to_canonical_refs():
-    result = SupportAssessmentWireResponse.model_validate({'results': [SUPPORTED]})
-    row = wire().decode(result).results[0]
-    assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
-    assert row.required_refs == ['r000003']
-    success = row_schema('supported')
-    assert set(success['properties']) == {'work_id', 'status', 'primary_ref', 'required_refs', 'evidence_displays'}
-    assert success['additionalProperties'] is False
+def test_every_status_answers_in_one_flat_row():
+    row = row_schema()
+    assert set(row['properties']) == {
+        'work_id', 'status', 'witness_delta', 'primary_ref', 'required_refs', 'evidence_displays',
+    }
+    assert row['properties']['status']['enum'] == ['continue', 'supported', 'unsupported']
+    assert row['additionalProperties'] is False
     with pytest.raises(ValidationError):
         SupportAssessmentWireResponse.model_validate({'results': [{**SUPPORTED, 'reason': 'A long explanation'}]})
 
 
-def test_unsupported_row_carries_no_refs_or_prose():
-    assert set(row_schema('unsupported')['properties']) == {'work_id', 'status'}
-    for extra in ({'primary_ref': 'PRM-0002'}, {'reason': 'Current text omits the required scope.'}):
-        with pytest.raises(ValidationError):
-            SupportAssessmentWireResponse.model_validate(
-                {'results': [{'work_id': 'WRK-0001', 'status': 'unsupported', **extra}]}
-            )
+def test_supported_row_decodes_to_canonical_refs():
+    row = wire().decode(SupportAssessmentWireResponse.model_validate({'results': [SUPPORTED]})).results[0]
+    assert row.work_id == 'w000001' and row.primary_ref == 'p000002'
+    assert row.required_refs == ['r000003']
 
 
-def test_continue_row_carries_only_its_witness_delta():
-    assert set(row_schema('continue')['properties']) == {'work_id', 'status', 'witness_delta'}
+def test_continue_row_decodes_its_witness_delta():
     row = wire().decode(SupportAssessmentWireResponse.model_validate({'results': [CONTINUE]})).results[0]
     assert row.witness_delta.support_witness_refs == ['p000002']
     assert row.witness_delta.opposing_witness_refs == ['r000003']
-    with pytest.raises(ValidationError):
-        SupportAssessmentWireResponse.model_validate({'results': [{**CONTINUE, 'primary_ref': 'PRM-0002'}]})
 
 
-def test_every_schema_property_is_required_for_strict_transport():
-    for status in ('continue', 'supported', 'unsupported'):
-        schema = row_schema(status)
-        assert set(schema['required']) == set(schema['properties'])
-    assert 'oneOf' not in json.dumps(SupportAssessmentWireResponse.model_json_schema())
+@pytest.mark.parametrize('row, field', [
+    ({**SUPPORTED, 'evidence_displays': None}, 'evidence_displays'),
+    ({**SUPPORTED, 'witness_delta': CONTINUE['witness_delta']}, 'witness_delta'),
+    ({**SUPPORTED, 'evidence_displays': evidence_displays('PRM-0002')}, 'evidence_displays'),
+    ({**CONTINUE, 'witness_delta': None}, 'witness_delta'),
+    ({**CONTINUE, 'primary_ref': 'PRM-0002'}, 'primary_ref'),
+    ({'work_id': 'WRK-0001', 'status': 'unsupported', 'required_refs': []}, 'required_refs'),
+])
+def test_status_rules_reject_only_the_row_that_breaks_them(row, field):
+    aliases = SupportWireAliases(SimpleNamespace(fragments=[
+        SimpleNamespace(reference='p000002', primary_eligible=True),
+        SimpleNamespace(reference='r000003', primary_eligible=False),
+    ]), [], {'w000001': 'WRK-0001', 'w000002': 'WRK-0002'})
+    response = SupportAssessmentWireResponse.model_validate({'results': [
+        row, {'work_id': 'WRK-0002', 'status': 'unsupported'},
+    ]})
+    (bad, error), (good, decoded) = aliases.decode_rows(response)
+    assert (bad, error.code.value, error.location) == ('w000001', 'invalid_selection', 'results[0]')
+    assert field in str(error)
+    assert good == 'w000002' and decoded.status == 'unsupported'
+
+
+def test_strict_transport_requires_every_row_field():
+    from litellm.utils import type_to_response_format_param
+    from memforge.llm.structured import _native_schema_request_kwargs
+    wire_format = type_to_response_format_param(SupportAssessmentWireResponse)['json_schema']
+    row = wire_format['schema']['$defs']['SupportAssessmentWireRow']
+    assert wire_format['strict'] is True and set(row['required']) == set(row['properties'])
+    assert 'oneOf' not in json.dumps(wire_format)
+    # An explicit wire contract sends the model's own schema: a closed row whose unused fields may be null.
+    explicit = _native_schema_request_kwargs(SupportAssessmentWireResponse, 'json_schema_response_format')
+    row = explicit['response_format']['json_schema']['schema']['$defs']['SupportAssessmentWireRow']
+    assert row['additionalProperties'] is False and set(row['required']) == {'work_id', 'status'}
+    assert {'type': 'null'} in row['properties']['primary_ref']['anyOf']
 
 
 @pytest.mark.asyncio
@@ -125,3 +148,41 @@ async def test_pipeline_reuses_the_compact_wire_result_and_decodes_it_again():
     assert len(client.impact_prompts) == 1 and len(client.prompts) == 1 and second.reused == 2
     work = next(w for w in store.works.values() if w.kind == 'support_assess')
     assert all('reason' not in r and r['work_id'].startswith('WRK-') for r in work.result['results'])
+
+
+def _object_unions(schema):
+    """Paths of every anyOf or oneOf that offers more than one object shape."""
+    defs = schema.get('$defs', {})
+
+    def is_object(branch):
+        branch = defs[branch['$ref'].rsplit('/', 1)[-1]] if '$ref' in branch else branch
+        return 'properties' in branch
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key in ('anyOf', 'oneOf'):
+                if sum(is_object(branch) for branch in node.get(key, [])) > 1:
+                    yield path
+            for key, value in node.items():
+                yield from walk(value, f'{path}/{key}')
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from walk(value, f'{path}[{index}]')
+
+    return list(walk(schema, ''))
+
+
+def test_no_response_schema_asks_a_provider_to_choose_between_object_shapes():
+    # Strict decoders on some OpenAI-compatible endpoints rarely reach every branch of
+    # an object union, so a response row is one flat object and its decoder checks meaning.
+    import inspect
+    from pydantic import BaseModel
+    from memforge.llm import capability, structured
+    responses = [
+        model for module in (structured, capability) for name, model in inspect.getmembers(module, inspect.isclass)
+        if issubclass(model, BaseModel) and model.__module__ == module.__name__ and name.endswith('Response')
+    ]
+    assert SupportAssessmentWireResponse in responses
+    assert {model.__name__: _object_unions(model.model_json_schema()) for model in responses} == {
+        model.__name__: [] for model in responses
+    }
