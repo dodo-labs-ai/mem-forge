@@ -442,10 +442,12 @@ retrieve_memories() {
 
 # The quick quality evaluation runs through the CLI in the API image: for each
 # case kind it pins the cohort's cases, then submits the run and waits for the
-# worker's verdict. The step passes only when every kind's verdict is pass.
+# worker's verdict, which asks only whether the replay gave a valid result. The
+# step passes only when every kind's verdict is pass; the judge's decisions on
+# quality are reported below the table and never fail it.
 quality_checks() {
   local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" kind command seeded run_spec summary status
-  local verdicts=() failed=0
+  local problems=() failed=0
   if [ -z "$models_label" ]; then
     say "needs a synced source"
     return "$SKIPPED"
@@ -473,12 +475,16 @@ quality_checks() {
     [ -n "$judge_label" ] && quality_summary+="$(quality_expectations "$summary")"$'\n\n'
     [ -n "$outputs_dir" ] && save_quality_outputs "$kind" "$summary"
     case $status in
-      0) verdicts+=("$kind pass") ;;
-      2) verdicts+=("$kind timed out"); failed=1 ;;
-      *) verdicts+=("$kind $(echo "$summary" | sed -n 's/^- Verdict: \*\*\(.*\)\*\*$/\1/p' | head -n 1)"); failed=1 ;;
+      0) ;;
+      2) problems+=("$kind timed out"); failed=1 ;;
+      *) problems+=("$kind $(echo "$summary" | sed -n 's/^- Verdict: \*\*\(.*\)\*\*$/\1/p' | head -n 1)"); failed=1 ;;
     esac
   done
-  say "verdicts: $(IFS=,; echo "${verdicts[*]}" | sed 's/,/, /g'); summaries below the table"
+  if [ "$failed" -eq 0 ]; then
+    say "derivation, support and reconciliation replayed; quality below the table"
+  else
+    say "replay problems: $(IFS=,; echo "${problems[*]}" | sed 's/,/, /g'); summaries below the table"
+  fi
   return "$failed"
 }
 

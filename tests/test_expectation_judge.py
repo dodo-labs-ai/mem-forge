@@ -332,7 +332,7 @@ async def test_a_run_pins_its_judge_apart_from_one_that_pins_none(db) -> None:
     assert _expectations(unjudged) == []
 
 
-def test_the_summary_counts_the_decisions_apart_from_the_verdict() -> None:
+def test_a_judged_summary_reports_quality_and_shows_replay_checks_only_when_one_did_not_pass() -> None:
     report = {
         "run": {"run_id": "aer-1", "expectation_judge_manifest": SPEC.to_manifest(), "candidate_manifest": {}},
         "summary": {"verdict": "pass"},
@@ -351,12 +351,22 @@ def test_the_summary_counts_the_decisions_apart_from_the_verdict() -> None:
 
     summary = render_report_markdown(report)
 
-    assert "- Verdict: **pass**" in summary
-    assert "| expectation |" not in summary
-    assert "#### Expectations (advisory, judged by `openrouter/anthropic/claude-haiku-5.5`)" in summary
+    assert "- Judge: `openrouter/anthropic/claude-haiku-5.5`" in summary
     assert "| 1 | 1 | 0 | 1 |" in summary
     assert "| `aec-1` | E2 | not met | `mem-1`, `mem-2` |" in summary
     assert "| `aec-1` | E3 | not judged: judge_failed |  |" in summary
+    assert "Verdict" not in summary
+    assert "| Check |" not in summary
+
+    report["summary"] = {"verdict": "fail"}
+    report["assessments"][0] |= {"label": "fail", "reason_code": "typed_output_invalid"}
+    summary = render_report_markdown(report)
+
+    assert summary.index("| 1 | 1 | 0 | 1 |") < summary.index("#### Replay problems")
+    assert "- Verdict: **fail**" in summary
+    assert "| typed_output | 0 | 1 | 0 |" in summary
+    assert "| `aec-1` | typed_output | fail: typed_output_invalid |" in summary
+    assert "| expectation |" not in summary
 
 
 def test_the_judge_is_test_configuration_compiled_through_the_provider_registry(monkeypatch) -> None:

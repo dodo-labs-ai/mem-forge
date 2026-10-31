@@ -64,12 +64,12 @@ queue." A judge model reads each output and answers every expectation met, not
 met or unclear; it answers three times and the majority counts. A case whose
 replay gave no valid result, such as an unresolved Support, is not judged.
 
-Each kind prints a summary below the smoke table. Its verdict comes from code
-checks of the replay alone: every result completed, its output is well formed
-and every Support resolved. The judge's counts follow it, with each
-expectation not met or unclear, its sentence and the memories it rests on. The
-judge's decisions are advisory: a maintainer reads them in your pull request,
-and they never fail the smoke. A model's answers vary, so when an expectation is
+Each kind prints a summary of quality below the smoke table: the judge's
+counts, and each expectation not met or unclear, with its sentence and the
+memories it rests on. A maintainer reads them in your pull request; they never
+fail the smoke. What fails it is a replay that gave no valid result: a result
+that did not complete, an output that is not well formed or a Support left
+unresolved. The summary then adds these replay problems. A model's answers vary, so when an expectation is
 not met, run the evaluation again before you conclude. To test a new
 situation, add a document pair or a reconciliation file and list it in
 `cohort.json`.
