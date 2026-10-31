@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import select
+import shlex
 import socket
 import subprocess
 import sys
@@ -31,7 +32,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Callable, Iterable, Sequence
@@ -413,55 +414,193 @@ def mcp_check(plugin_dir: Path, api: str, state: State, home: Path, *, phase: st
 
 # -- Models -----------------------------------------------------------------------------
 
+MODEL_KINDS = ("generation", "embedding")
+DEFAULT_OLLAMA_URL = "http://host.docker.internal:11434"
+# The model a kind uses when only its provider is named: the reference
+# generation model, Claude Haiku 5.5, wherever the provider serves it; the same
+# small embedding model on the hosted providers that serve it; and for Ollama
+# the small local pair the quickstart suggests. ``scripts/provider_smoke.py``
+# states its own defaults in ``PROVIDERS``; this helper runs without the
+# checkout environment and cannot import them.
+DEFAULT_MODELS: dict[str, dict[str, str]] = {
+    "openrouter": {"generation": "anthropic/claude-haiku-5.5", "embedding": "openai/text-embedding-3-small"},
+    "anthropic": {"generation": "claude-haiku-5-5"},
+    "openai": {"embedding": "text-embedding-3-small"},
+    "ollama": {"generation": "qwen3:0.6b", "embedding": "nomic-embed-text"},
+}
+
+
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class PlanError(Exception):
+    """The model options name no complete model for each kind."""
+
+
+@dataclass(frozen=True)
+class KindPlan:
+    """How one model kind is reached: a provider Settings offers, its model and its credential."""
+
+    provider: str
+    model: str
+    endpoint: str | None
+    # The environment variable named for the API key; ``None`` reads the
+    # provider's own ``<PROVIDER>_API_KEY`` when its descriptor asks for a key.
+    key_variable: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}: {self.model}"
+
 
 @dataclass(frozen=True)
 class ModelPlan:
-    provider: str
-    endpoint: str | None
+    kinds: dict[str, KindPlan]
+
+    @property
+    def label(self) -> str:
+        return "; ".join(f"{kind} {self.kinds[kind].label}" for kind in MODEL_KINDS)
+
+
+def provider_key_variable(provider: str) -> str:
+    """The variable a provider's API key is read from when no other is named."""
+    return re.sub(r"[^A-Z0-9]+", "_", provider.upper()) + "_API_KEY"
+
+
+def plan_models(options: argparse.Namespace, environ: dict[str, str]) -> ModelPlan | None:
+    """Each kind's provider, model, endpoint and key variable, or ``None`` when no kind has a provider.
+
+    A kind whose provider is not named takes Ollama with ``--ollama``, otherwise
+    OpenRouter when ``OPENROUTER_API_KEY`` is set. The plan holds no key: the
+    key is read from its variable when the model is configured.
+    """
+    default_provider = None
+    if options.ollama:
+        default_provider = "ollama"
+    elif environ.get("OPENROUTER_API_KEY", "").strip():
+        default_provider = "openrouter"
+    providers = {kind: getattr(options, f"{kind}_provider") or default_provider for kind in MODEL_KINDS}
+    if not any(providers.values()):
+        return None
+    kinds = {}
+    for kind, provider in providers.items():
+        if provider is None:
+            raise PlanError(
+                f"no {kind} provider: pass --{kind}-provider, or --ollama, or export OPENROUTER_API_KEY"
+            )
+        model = getattr(options, f"{kind}_model") or DEFAULT_MODELS.get(provider, {}).get(kind)
+        if not model:
+            raise PlanError(f"--{kind}-model is required with the {provider} provider")
+        key_variable = getattr(options, f"{kind}_key_env")
+        if key_variable is not None:
+            if not _VARIABLE_NAME.fullmatch(key_variable):
+                # The value may be the key itself, so it is not repeated.
+                raise PlanError(f"--{kind}-key-env takes the name of an environment variable, not a key")
+            if not environ.get(key_variable, "").strip():
+                raise PlanError(f"{key_variable}, named by --{kind}-key-env, is not set")
+        endpoint = getattr(options, f"{kind}_endpoint") or (options.ollama_url if provider == "ollama" else None)
+        kinds[kind] = KindPlan(provider, model, endpoint.rstrip("/") if endpoint else None, key_variable)
+    return ModelPlan(kinds)
+
+
+def shell_plan(plan: ModelPlan | None) -> str:
+    """The plan as shell assignments: the labels the report prints and the Ollama servers to reach."""
+    values = {"models_label": "", "generation_label": "", "ollama_endpoints": ""}
+    if plan is not None:
+        values = {
+            "models_label": plan.label,
+            "generation_label": plan.kinds["generation"].label,
+            "ollama_endpoints": " ".join(
+                sorted({kind.endpoint for kind in plan.kinds.values() if kind.provider == "ollama" and kind.endpoint})
+            ),
+        }
+    return "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+
+
+@dataclass(frozen=True)
+class Binding:
+    """What the Settings API is sent for one kind: the planned model with the descriptor's auth strategy."""
+
+    kind: str
+    plan: KindPlan
     auth_strategy: str
-    api_key: str | None
-    models: dict[str, str]
+    api_key: str | None = field(default=None, repr=False)
+
+    def with_key(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.api_key:
+            body["api_key"] = self.api_key
+        return body
 
 
-def _listed_model(api: str, kind: str, plan: ModelPlan) -> dict[str, Any]:
+def _binding(kind: str, plan: KindPlan, descriptors: dict[str, dict[str, Any]], environ: dict[str, str]) -> Binding:
+    """Check the planned model against the provider descriptor Settings offers, as Settings would."""
+    descriptor = descriptors.get(plan.provider)
+    if descriptor is None:
+        raise CheckFailed(f"{plan.provider} is not a provider Settings offers ({', '.join(sorted(descriptors))})")
+    if kind not in descriptor.get("kinds", []):
+        raise CheckFailed(f"{descriptor.get('label')} serves no {kind} models")
+    if descriptor.get("endpoint_required") and not plan.endpoint:
+        raise CheckFailed(f"{descriptor.get('label')} needs an endpoint: pass --{kind}-endpoint")
+    strategies = descriptor.get("auth_strategies", [])
+    # A provider that proposes no key, such as a local Ollama, is sent one only when it is named.
+    key_variable = plan.key_variable
+    if key_variable is None and strategies[:1] == ["api_key"]:
+        key_variable = provider_key_variable(plan.provider)
+    api_key = (environ.get(key_variable, "").strip() or None) if key_variable else None
+    auth_strategy = "api_key" if api_key else "none"
+    if auth_strategy not in strategies:
+        raise CheckFailed(
+            f"{descriptor.get('label')} needs an API key: set {key_variable} or name one with --{kind}-key-env"
+        )
+    return Binding(kind, plan, auth_strategy, api_key)
+
+
+def _listed_model(api: str, binding: Binding) -> dict[str, Any]:
+    """The listing's entry for the planned model; an endpoint that lists no models gives none.
+
+    Where nothing is listed, the model is entered by hand, as Settings then asks.
+    """
+    kind, plan = binding.kind, binding.plan
     discovery = api_json(
         api,
         "POST",
         f"/api/v1/model-settings/{kind}/discover-models",
-        _with_key({"provider": plan.provider, "endpoint": plan.endpoint, "auth_strategy": plan.auth_strategy}, plan),
+        binding.with_key(
+            {"provider": plan.provider, "endpoint": plan.endpoint, "auth_strategy": binding.auth_strategy}
+        ),
     )
     if not discovery.get("ok"):
-        raise CheckFailed(f"listing the {kind} models failed: {discovery.get('message')}")
+        raise CheckFailed(f"listing the {kind} models of {plan.provider} failed: {discovery.get('message')}")
+    if discovery.get("models_supported") is False:
+        return {}
     # Ollama lists a model pulled without a tag under its ``latest`` tag.
-    wanted = {plan.models[kind], f"{plan.models[kind]}:latest"}
+    wanted = {plan.model, f"{plan.model}:latest"}
     for option in discovery.get("models", []):
         if option.get("id") in wanted:
             return option
     listed = ", ".join(option.get("id", "?") for option in discovery.get("models", [])[:10])
-    raise CheckFailed(f"{plan.provider} does not list the {kind} model {plan.models[kind]} (it lists {listed})")
+    raise CheckFailed(f"{plan.provider} does not list the {kind} model {plan.model} (it lists {listed})")
 
 
-def _with_key(body: dict[str, Any], plan: ModelPlan) -> dict[str, Any]:
-    if plan.api_key:
-        body["api_key"] = plan.api_key
-    return body
-
-
-def _candidate(kind: str, plan: ModelPlan, listed: dict[str, Any]) -> dict[str, Any]:
+def _candidate(binding: Binding, listed: dict[str, Any]) -> dict[str, Any]:
+    plan = binding.plan
     body: dict[str, Any] = {
         "provider": plan.provider,
-        "model_id": plan.models[kind],
+        "model_id": plan.model,
         "endpoint": plan.endpoint,
-        "auth_strategy": plan.auth_strategy,
+        "auth_strategy": binding.auth_strategy,
     }
-    if kind == "generation":
+    if binding.kind == "generation":
+        # Validation needs the model's token limits; a model whose listing
+        # gives none, or that is not listed, takes the ones the quickstart
+        # suggests for a local model.
         body["token_limits"] = {
             "context_window_tokens": listed.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS,
             "max_output_tokens": listed.get("max_output_tokens") or DEFAULT_MAX_OUTPUT_TOKENS,
         }
         if listed.get("native_schema") is not None:
             body["native_schema"] = listed["native_schema"]
-    return _with_key(body, plan)
+    return binding.with_key(body)
 
 
 def _reindex(api: str, timeout: float) -> str:
@@ -479,29 +618,37 @@ def _reindex(api: str, timeout: float) -> str:
     return wait_until(finished, timeout=timeout, interval=2, what="the vector index rebuild")
 
 
-def configure_models(api: str, plan: ModelPlan, state: State, *, timeout: float) -> str:
-    """Save and validate both models through the Settings API, as Settings does."""
+def configure_models(api: str, plan: ModelPlan, environ: dict[str, str], state: State, *, timeout: float) -> str:
+    """Save and validate each kind's model through the Settings API, as Settings does."""
+    descriptors = {
+        descriptor["id"]: descriptor
+        for descriptor in api_json(api, "GET", "/api/v1/model-settings/providers").get("providers", [])
+    }
+    bindings = [_binding(kind, plan.kinds[kind], descriptors, environ) for kind in MODEL_KINDS]
     notes = []
-    for kind in ("generation", "embedding"):
-        listed = _listed_model(api, kind, plan)
-        api_json(api, "PUT", f"/api/v1/model-settings/{kind}/candidate", _candidate(kind, plan, listed))
+    for binding in bindings:
+        kind, label = binding.kind, binding.plan.label
+        listed = _listed_model(api, binding)
+        api_json(api, "PUT", f"/api/v1/model-settings/{kind}/candidate", _candidate(binding, listed))
         outcome = api_json(api, "POST", f"/api/v1/model-settings/{kind}/candidate/validate")
         if not outcome.get("passed"):
-            raise CheckFailed(f"{kind} model {plan.models[kind]} failed validation: {outcome.get('error_code')}")
+            raise CheckFailed(f"{kind} model {label} failed validation: {outcome.get('error_code')}")
         latency = (outcome.get("validation") or {}).get("facts", {}).get("latency_ms")
-        note = f"{kind} {plan.models[kind]} validated in {latency} ms"
+        note = f"{kind} {label} validated in {latency} ms"
         if outcome.get("reindex_required"):
             note += ", " + _reindex(api, timeout)
         elif not outcome.get("promoted"):
             raise CheckFailed(f"{kind} model passed validation but was not put to use")
         notes.append(note)
     settings = api_json(api, "GET", "/api/v1/model-settings")
-    for kind in ("generation", "embedding"):
+    for kind in MODEL_KINDS:
         active = settings[kind].get("active") or {}
-        if active.get("model_id") != plan.models[kind] or active.get("state") != "ready":
+        if active.get("model_id") != plan.kinds[kind].model or active.get("state") != "ready":
             raise CheckFailed(f"the {kind} model in use is {active.get('model_id')} ({active.get('state')})")
-    state.set(models={"provider": plan.provider, **plan.models})
-    return f"{plan.provider}: " + "; ".join(notes)
+    state.set(
+        models={kind: {"provider": plan.kinds[kind].provider, "model": plan.kinds[kind].model} for kind in MODEL_KINDS}
+    )
+    return "; ".join(notes)
 
 
 # -- Source sync --------------------------------------------------------------------------
@@ -722,8 +869,8 @@ def quality_outputs(api: str, run_id: str) -> str:
 _MODEL_CALL = re.compile(r"structured_llm_call (\{.*\})\s*$")
 
 
-def model_usage(log_lines: Iterable[str]) -> str:
-    """The generation model calls the API logged, and their input and output token totals.
+def model_usage(log_lines: Iterable[str], model: str) -> str:
+    """The calls to the generation model ``model`` the API logged, and their input and output token totals.
 
     Embedding requests are not structured calls and are not counted. A call
     whose provider reported no usage is counted apart.
@@ -751,7 +898,7 @@ def model_usage(log_lines: Iterable[str]) -> str:
     by_operation = ", ".join(f"{name} {count}" for name, count in sorted(operations.items()))
     unreported_note = f"; {unreported} without reported usage" if unreported else ""
     return (
-        f"{calls} generation calls, {prompt_tokens} input and {completion_tokens} output tokens"
+        f"{calls} generation calls to {model}, {prompt_tokens} input and {completion_tokens} output tokens"
         f"{unreported_note} ({by_operation})"
     )
 
@@ -768,16 +915,17 @@ def check_persisted(api: str, state: State) -> str:
     models = state.get("models")
     if models:
         settings = api_json(api, "GET", "/api/v1/model-settings")
-        for kind in ("generation", "embedding"):
+        for kind in MODEL_KINDS:
             active = settings[kind].get("active") or {}
-            if active.get("provider") != models["provider"] or active.get("model_id") != models[kind]:
+            if active.get("provider") != models[kind]["provider"] or active.get("model_id") != models[kind]["model"]:
                 raise CheckFailed(
-                    f"the {kind} model in use changed to {active.get('provider')}/{active.get('model_id')}"
+                    f"the {kind} model in use changed to {active.get('provider')}: {active.get('model_id')}"
                 )
             if active.get("state") == "needs_revalidation":
                 raise CheckFailed(f"the {kind} model needs revalidation after the restart")
         vector_store = (health.get("vector_store") or {}).get("status")
-        notes.append(f"models kept ({models['generation']}, {models['embedding']}); vector store {vector_store}")
+        kept = ", ".join(f"{models[kind]['provider']}: {models[kind]['model']}" for kind in MODEL_KINDS)
+        notes.append(f"models kept ({kept}); vector store {vector_store}")
     source_id = state.get("source_id")
     if source_id:
         source = _source(api, source_id)
@@ -791,26 +939,6 @@ def check_persisted(api: str, state: State) -> str:
         if memories_before:
             notes.append(search_source(api, state).split(";")[0])
     return "; ".join(notes) if notes else f"health {health.get('status')}"
-
-
-# -- Command line ------------------------------------------------------------------------------
-
-
-def _model_plan(args: argparse.Namespace) -> ModelPlan:
-    if args.provider == "ollama":
-        return ModelPlan(
-            "ollama",
-            args.endpoint,
-            "none",
-            None,
-            {"generation": args.generation_model, "embedding": args.embedding_model},
-        )
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise CheckFailed("OPENROUTER_API_KEY is not set")
-    return ModelPlan(
-        "openrouter", None, "api_key", api_key, {"generation": args.generation_model, "embedding": args.embedding_model}
-    )
 
 
 # -- Quality checks ----------------------------------------------------------------
@@ -891,6 +1019,9 @@ def quality_run_spec(cohort_file: Path, seeded: dict[str, Any]) -> str:
     )
 
 
+# -- Command line ------------------------------------------------------------------------------
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -901,7 +1032,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     bindings = commands.add_parser("bindings", help="check `docker inspect` output read from stdin")
     bindings.add_argument("--expect", action="append", default=[], metavar="SERVICE=PORT")
 
-    commands.add_parser("model-usage", help="total the generation model calls in API logs read from stdin")
+    usage = commands.add_parser("model-usage", help="total the generation model calls in API logs read from stdin")
+    usage.add_argument("--model", required=True, help="the generation model's provider and model, as reported")
+
+    def model_options(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--ollama", action="store_true", help="a kind without a provider uses Ollama")
+        command.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama as the API container reaches it")
+        for kind in MODEL_KINDS:
+            command.add_argument(f"--{kind}-provider", help=f"the provider Settings offers for the {kind} model")
+            command.add_argument(f"--{kind}-model", help=f"the {kind} model id")
+            command.add_argument(f"--{kind}-endpoint", help=f"the {kind} provider's base URL")
+            command.add_argument(f"--{kind}-key-env", help=f"the environment variable holding the {kind} API key")
+
+    model_options(commands.add_parser("model-plan", help="print each kind's planned model as shell assignments"))
 
     def api_command(name: str, help_text: str) -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text)
@@ -918,10 +1061,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mcp.add_argument("--phase", choices=("tools", "memories", "verify"), required=True)
 
     models = api_command("models", "configure and validate the generation and embedding models")
-    models.add_argument("--provider", choices=("ollama", "openrouter"), required=True)
-    models.add_argument("--endpoint", default=None)
-    models.add_argument("--generation-model", required=True)
-    models.add_argument("--embedding-model", required=True)
+    model_options(models)
     models.add_argument("--timeout", type=float, default=600)
 
     source = api_command("source", "add the local source")
@@ -963,14 +1103,19 @@ def run(args: argparse.Namespace) -> str:
             expected[service] = int(port)
         return check_bindings(json.load(sys.stdin), expected)
     if args.command == "model-usage":
-        return model_usage(sys.stdin)
+        return model_usage(sys.stdin, args.model)
+    if args.command == "model-plan":
+        return shell_plan(plan_models(args, dict(os.environ)))
     state = State(args.state)
     if args.command == "probe":
         return probe(args.api, args.ui)
     if args.command == "mcp":
         return mcp_check(args.plugin, args.api, state, args.home, phase=args.phase)
     if args.command == "models":
-        return configure_models(args.api, _model_plan(args), state, timeout=args.timeout)
+        plan = plan_models(args, dict(os.environ))
+        if plan is None:
+            raise CheckFailed("no model provider is named")
+        return configure_models(args.api, plan, dict(os.environ), state, timeout=args.timeout)
     if args.command == "source":
         return create_source(args.api, args.root, state)
     if args.command == "sync":
@@ -996,14 +1141,19 @@ def run(args: argparse.Namespace) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    # The shell evaluates what model-plan prints, so its reasons go to stderr.
+    reasons = sys.stderr if args.command == "model-plan" else sys.stdout
     try:
         print(run(args))
+    except PlanError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except CheckFailed as exc:
-        print(str(exc))
+        print(str(exc), file=reasons)
         return 1
     except Exception as exc:  # an unexpected answer still ends as one report line
         traceback.print_exc()
-        print(f"{args.command} stopped on {type(exc).__name__}: {exc}")
+        print(f"{args.command} stopped on {type(exc).__name__}: {exc}", file=reasons)
         return 1
     return 0
 
