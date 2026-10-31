@@ -172,8 +172,8 @@
         "key": "lena.ortiz",
         "displayName": "Lena Ortiz"
       },
-      "body": "The load test showed batch receivers need up to 25 seconds, so the timeout is now 30 seconds.",
-      "renderedBody": "<p>The load test showed batch receivers need up to 25 seconds, so the timeout is now 30 seconds.</p>",
+      "body": "The load test showed batch receivers need up to 25 seconds, so we raise the timeout to 30 seconds instead of 20.",
+      "renderedBody": "<p>The load test showed batch receivers need up to 25 seconds, so we raise the timeout to 30 seconds instead of 20.</p>",
       "created": "2026-10-22T14:00:00.000+0000",
       "updated": "2026-10-22T14:00:00.000+0000"
     }
