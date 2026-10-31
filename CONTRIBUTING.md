@@ -163,7 +163,10 @@ root it replies to, and its record in the type's message schema:
 The record above leaves out fields for brevity; copy a full one from
 `snapshots/teams/`. Each revision lists the whole conversation as the provider
 would return it then: an edited message carries its new text and
-`edited_time`, and a new reply is one more entry.
+`edited_time`, and a new reply is one more entry. Replay moves every message
+time by whole days but never its text, so message text states no calendar
+date: a date written into the text falls behind the message that states it.
+Say when relative to the message instead, such as "tomorrow".
 
 To check a snapshot locally, run the L1 test, which reads it through the
 type's own normalization and projection without a model:

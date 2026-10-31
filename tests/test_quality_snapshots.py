@@ -12,6 +12,7 @@ snapshot provider the cohort replays it with.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -176,6 +177,40 @@ async def _conversation_reads(source_type: str, revision: int) -> dict[str, tupl
             raw = unit_raw_content(item, unit_payload(unit, record_schema=schema), with_artifacts=False)
             read[ref.conversation_id] = (item, raw, await gene.normalize(raw))
     return read
+
+
+CONVERSATION_TYPES = [
+    descriptor for descriptor in DESCRIPTORS
+    if descriptor.family is not CollectionFamilyKind.DOCUMENT and (SNAPSHOTS / descriptor.source_type).is_dir()
+]
+
+
+@pytest.mark.parametrize("descriptor", CONVERSATION_TYPES, ids=lambda descriptor: descriptor.source_type)
+def test_conversation_text_states_no_iso_date(descriptor) -> None:
+    """Replay moves message times but not text, so a date written in the text would fall behind its message."""
+
+    def text(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from text(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from text(item)
+        elif isinstance(value, str):
+            try:
+                datetime.fromisoformat(value)
+            except ValueError:
+                yield value
+
+    dated = [
+        f"{path.relative_to(SNAPSHOTS)}: {message['message_id']}"
+        for item_dir in item_dirs(SNAPSHOTS / descriptor.source_type)
+        for _, revision_dir in revision_dirs(item_dir)
+        for path in [revision_dir / "messages.json"]
+        for message in json.loads(path.read_text(encoding="utf-8"))
+        if any(re.search(r"\b\d{4}-\d{2}-\d{2}\b", value) for value in text(message["record"]))
+    ]
+    assert not dated, f"message text states a calendar date: {dated}"
 
 
 @pytest.mark.parametrize("descriptor", DESCRIPTORS, ids=lambda descriptor: descriptor.source_type)
