@@ -37,7 +37,7 @@ their output into the PR:
 
 | Your change touches | Also run |
 | --- | --- |
-| The LiteLLM version or anything in `src/memforge/llm/`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
+| The LiteLLM version, `src/memforge/llm/transport.py`, `src/memforge/llm/providers.py`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
 | The Dockerfile, Compose files, database migrations, startup, or configuration defaults | `scripts/compose_smoke.sh` |
 | Prompts, extraction, judgement, decoding, decision contracts, answer schemas, or default models | `scripts/compose_smoke.sh --quality` |
 

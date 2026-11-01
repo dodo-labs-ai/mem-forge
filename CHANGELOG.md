@@ -30,9 +30,9 @@
 
 - Contributors: `make test` runs the suite in four processes, and CI runs
   `make lint` and `make test`, so local and CI checks are the same commands.
-  Any change under `src/memforge/llm/` calls for `provider_smoke.py`, and an
-  answer schema change for `compose_smoke.sh --quality`. A release runs both,
-  as the release guide now states.
+  An answer schema change calls for `compose_smoke.sh --quality`. A release
+  runs `provider_smoke.py` and `compose_smoke.sh --quality`, as the release
+  guide now states.
 
 - Offline evaluation: each case kind allows a closed set of expectation forms,
   such as "A memory states that …" or "The outcome of the old memory `id` is
