@@ -8,8 +8,7 @@ contributions are small, well-tested, and easy to review.
 ```bash
 git clone https://github.com/dodo-labs-ai/mem-forge.git
 cd mem-forge
-uv sync --extra dev
-cd admin-ui && npm ci && cd ..
+make install ui-install
 ```
 
 Copy `.env.example` to `.env` for local overrides. Never commit `.env`,
@@ -17,7 +16,8 @@ Copy `.env.example` to `.env` for local overrides. Never commit `.env`,
 
 ## Before You Open A PR
 
-Run the checks that match the files you changed:
+Run the checks that match the files you changed, or all of them with
+`make check`:
 
 ```bash
 make lint
@@ -27,23 +27,25 @@ make ui-test
 make ui-build
 ```
 
-These Makefile targets are maintainer shortcuts for the underlying `uv` and
-`npm` commands. The public quickstart uses Docker Compose instead.
+CI runs the same `make lint` and `make test` on every pull request; they
+include the provider request contract tests. CI also checks the lock file and
+the build, and runs the admin UI checks and end-to-end tests.
 
-CI runs the lint, unit tests and the provider request contract tests on every
-pull request. Some changes also need a check that reaches real providers or a
-real Docker install, which CI cannot run. Run the ones your change calls for
-and paste their output into the PR:
+Some changes also need a check that reaches real providers or a real Docker
+install, which CI cannot run. Run the ones your change calls for and paste
+their output into the PR:
 
 | Your change touches | Also run |
 | --- | --- |
-| The LiteLLM version, `src/memforge/llm/transport.py`, `src/memforge/llm/providers.py`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
+| The LiteLLM version or anything in `src/memforge/llm/`, or adds a provider or route | `uv run python scripts/provider_smoke.py` |
 | The Dockerfile, Compose files, database migrations, startup, or configuration defaults | `scripts/compose_smoke.sh` |
-| Prompts, extraction, judgement, decoding, decision contracts, or default models | `scripts/compose_smoke.sh --quality` |
+| Prompts, extraction, judgement, decoding, decision contracts, answer schemas, or default models | `scripts/compose_smoke.sh --quality` |
 
-A change that fits several rows needs every check they name. When you are not
-sure whether a change belongs to the prompts and extraction row, treat it as
-if it does. Releases run all of them.
+A change that fits several rows needs every check they name; `--quality`
+includes the plain Compose smoke. When you are not sure whether a change
+belongs to the prompts and extraction row, treat it as if it does. A release
+runs `provider_smoke.py` and `compose_smoke.sh --quality`, as
+[the release guide](docs/releasing-python-distribution.md) states.
 
 `--quality` adds the quick offline quality evaluation to the Compose smoke. It
 syncs the synthetic documents in `evals/quality/quick/docs`, then replaces the

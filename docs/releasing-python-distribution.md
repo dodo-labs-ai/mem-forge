@@ -28,13 +28,28 @@ release immediately after configuring it.
 ## Release sequence
 
 1. Update `project.version` in `pyproject.toml` and refresh `uv.lock`.
-2. Merge the version change after CI passes.
-3. Create a GitHub release whose tag is exactly `memforge-ai-v<version>`, for
+2. On the release commit, run the checks CI cannot run, with every provider
+   key you hold, and keep their output for the release notes:
+
+   ```bash
+   uv run python scripts/provider_smoke.py
+   scripts/compose_smoke.sh --quality
+   ```
+
+   The first checks that each provider still accepts MemForge's requests; the
+   release notes name the providers that ran, and say "only the request format
+   was verified for this release" for each one that did not. The second
+   builds the checkout into a fresh Compose stack, runs the quick quality
+   evaluation and checks that data survives a restart. Every step must pass,
+   the quality step included rather than skipped, and the notes carry the
+   table, the quality summary and the models it names.
+3. Merge the version change after CI passes.
+4. Create a GitHub release whose tag is exactly `memforge-ai-v<version>`, for
    example `memforge-ai-v0.1.55`.
-4. The release workflow builds one wheel and one source distribution, verifies
+5. The release workflow builds one wheel and one source distribution, verifies
    their metadata and `memforge` console entry point, and publishes them through
    the `pypi` environment.
-5. Verify the public installation from a clean tool environment:
+6. Verify the public installation from a clean tool environment:
 
    ```bash
    pipx install memforge-ai
