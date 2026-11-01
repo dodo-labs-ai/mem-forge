@@ -263,8 +263,10 @@ Inside the container, `localhost` points back to the container itself.
 
 MemForge sizes its requests to the token limits of the generation model: its
 context window and the most it can write in one answer. LiteLLM knows these
-limits for most hosted models. For a model it has no limits for, which is
-common for local models, validation stops with the code
+limits for most hosted models, from the model table packaged with the LiteLLM
+version MemForge installs; MemForge never downloads a newer table. For a model
+it has no limits for, which is common for local models and for a hosted model
+released after that LiteLLM version, validation stops with the code
 `token_limits_required` and Settings shows one more step: enter the
 **context window** and the **maximum output**, in tokens, with the generation
 model, and validate again. Take the numbers from the model card or from your

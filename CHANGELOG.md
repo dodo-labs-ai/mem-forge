@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Model providers: LiteLLM 1.106.6 replaces 1.86.0. MemForge reads the model
+  table packaged with that LiteLLM version and no longer lets LiteLLM download
+  the latest table at start, so a model's limits change only with a LiteLLM
+  upgrade; a hosted model newer than the table asks for its token limits in
+  Settings, as a local model does. Anthropic structured answers are requested
+  through Anthropic's `output_format` JSON schema instead of a forced tool
+  call, and embedding requests no longer send `encoding_format`, which
+  providers default to float. A call's own deadline now bounds a provider that
+  keeps a connection busy; the separate per-request bound is removed, as is
+  the Ollama model lookup override: LiteLLM now sends the Ollama key of the
+  environment only with a lookup that names no address, and the lookup it
+  makes after a request carries no key.
+
 - Offline evaluation: the rubric of a derivation, Support or reconciliation
   case is a list of `expectations`, sentences an LLM judge checks against the
   replayed output. It answers each one met, not met or unclear, three times,

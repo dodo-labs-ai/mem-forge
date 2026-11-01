@@ -7,8 +7,9 @@ import shutil
 
 import pytest
 
-# litellm loads its model cost map when it is first imported. The copy packaged
-# with litellm keeps the suite, and every process it starts, off the network.
+# litellm loads its model table when it is first imported. A test module may
+# import litellm before memforge.llm, which selects the packaged copy for the
+# product, so the suite selects it here as well.
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 

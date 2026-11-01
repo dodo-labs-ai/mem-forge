@@ -16,7 +16,7 @@ StallMode = Literal["silent", "headers", "trickle"]
 STALL_MODES: tuple[StallMode, ...] = ("silent", "headers", "trickle")
 
 # The endpoint gives up and closes the connection after this long, so a
-# request that is not ended at its timeout fails with another error instead of
+# call that is not ended at its deadline fails with another error instead of
 # keeping a test waiting.
 GIVES_UP_AFTER_S = 5.0
 _TRICKLE_INTERVAL_S = 0.05
