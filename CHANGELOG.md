@@ -29,7 +29,10 @@
   configuration apart from Settings:
   `MEMFORGE_AGENT_EVALUATION_JUDGE_{PROVIDER,MODEL,ENDPOINT,API_KEY}` name a
   provider and generation model of the registry, and each run pins the judge
-  it was admitted with. Contributors: `compose_smoke.sh --quality` judges with
+  it was admitted with. `MEMFORGE_AGENT_EVALUATION_JUDGE_AUTH_STRATEGY` takes
+  an auth strategy the provider accepts, such as `environment` for a provider
+  that reads its credentials from the environment and takes no key; unset, it
+  is `api_key` with a key and otherwise the provider's default, as in Settings. Contributors: `compose_smoke.sh --quality` judges with
   Claude Haiku 5.5 on OpenRouter by default and takes `--judge-provider`,
   `--judge-model`, `--judge-endpoint` and `--judge-key-env`; its summary lists
   each expectation not met with the Memories it rests on, and lists replay

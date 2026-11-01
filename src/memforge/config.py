@@ -151,13 +151,16 @@ class AgentEvaluationConfig:
     worker_lease_seconds: float = 120.0
     # The model that judges replayed cases against their rubric expectations: a
     # provider of the model registry and one of its generation models, with an
-    # endpoint and key when the provider takes them. It is test configuration,
-    # apart from the models Settings configures; without a model, runs record
-    # no expectation decisions.
+    # endpoint and key when the provider takes them. Its auth strategy is one
+    # its provider accepts; unset, it is ``api_key`` with a key and otherwise
+    # the provider's default, as in Settings. It is test configuration, apart
+    # from the models Settings configures; without a model, runs record no
+    # expectation decisions.
     judge_provider: str = ""
     judge_model: str = ""
     judge_endpoint: str = ""
     judge_api_key: str = ""
+    judge_auth_strategy: str = ""
 
 
 @dataclass
@@ -344,7 +347,7 @@ class AppConfig:
                 or self.agent_evaluation.worker_lease_seconds
             ),
         )
-        for name in ("judge_provider", "judge_model", "judge_endpoint", "judge_api_key"):
+        for name in ("judge_provider", "judge_model", "judge_endpoint", "judge_api_key", "judge_auth_strategy"):
             setattr(self.agent_evaluation, name, env_override(
                 f"MEMFORGE_AGENT_EVALUATION_{name.upper()}", getattr(self.agent_evaluation, name),
             ).strip())

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 from memforge.config import AppConfig
 from memforge.evals.expectation_judge import ExpectationJudgeSpec, StructuredExpectationJudge
@@ -20,7 +20,7 @@ from memforge.evals.offline_evaluation import (
     StructuredOfflineSemanticJudge,
 )
 from memforge.llm.bindings import ModelBinding, build_binding, compile_binding
-from memforge.llm.providers import ModelConfigError
+from memforge.llm.providers import AuthStrategy, ModelConfigError
 from memforge.runtime import ResolvedModels, RuntimeProvider, generation_token_limits, resolve_models
 from memforge.server.model_settings_api import listed_model
 from memforge.storage.document_store import DocumentStore
@@ -30,8 +30,10 @@ def configured_expectation_judge(config: AppConfig) -> tuple[ExpectationJudgeSpe
     """The expectation judge this deployment configures: the identity a run pins and its binding.
 
     It is built as a generation binding of a registered provider, the way
-    Settings builds one, and compiled with its key, so a provider, model or key
-    the registry does not accept raises ``ModelConfigError`` naming the judge.
+    Settings builds one, and compiled with its key, so a provider, model, auth
+    strategy or key the registry does not accept raises ``ModelConfigError``
+    naming the judge. A provider that reads its credentials from the
+    environment takes the ``environment`` strategy and no key.
     ``None`` when no judge model is configured.
     """
 
@@ -61,7 +63,8 @@ def _judge_binding(config: AppConfig, listed: Any | None = None) -> ModelBinding
         model_id=settings.judge_model,
         config_source="environment",
         endpoint=settings.judge_endpoint or None,
-        auth_strategy="api_key" if settings.judge_api_key else None,
+        auth_strategy=cast(AuthStrategy, settings.judge_auth_strategy)
+        or ("api_key" if settings.judge_api_key else None),
         token_limits=limits,
         native_schema=getattr(listed, "native_schema", None),
     )
