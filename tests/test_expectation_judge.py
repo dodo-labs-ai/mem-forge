@@ -38,6 +38,7 @@ from memforge.evals import offline_runtime
 from memforge.evals.offline_run import render_report_markdown
 from memforge.evals.offline_runtime import _expectation_judge, configured_expectation_judge
 from memforge.evals.source_unit_derivation_cases import DerivationCaseRequest, seed_source_unit_derivation_cases
+from memforge.llm.bindings import compile_binding
 from memforge.llm.providers import ModelConfigError
 from memforge.llm.structured import ExpectationJudgmentResponse, ExpectationJudgmentRow, StructuredLlmError
 from memforge.server.admin_api import create_admin_app
@@ -431,6 +432,51 @@ def test_the_judge_is_test_configuration_compiled_through_the_provider_registry(
         configured_expectation_judge(AppConfig())
     monkeypatch.delenv("MEMFORGE_AGENT_EVALUATION_JUDGE_MODEL")
     assert configured_expectation_judge(AppConfig()) is None
+
+
+def test_a_judge_whose_provider_reads_its_credentials_from_the_environment_takes_no_key(monkeypatch) -> None:
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_PROVIDER", "litellm")
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_MODEL", "bedrock/anthropic.claude-haiku-5-5")
+
+    with pytest.raises(ModelConfigError, match="expectation judge is not usable") as unkeyed:
+        configured_expectation_judge(AppConfig())
+    assert unkeyed.value.code == "credential_unavailable"
+
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_AUTH_STRATEGY", " environment ")
+    spec, binding = configured_expectation_judge(AppConfig())
+
+    assert spec == ExpectationJudgeSpec(provider="litellm", model="bedrock/anthropic.claude-haiku-5-5")
+    assert binding.auth_strategy == "environment"
+    assert compile_binding(binding, None).api_key is None
+
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_AUTH_STRATEGY", "none")
+    with pytest.raises(ModelConfigError) as refused:
+        configured_expectation_judge(AppConfig())
+    assert refused.value.code == "auth_strategy_not_supported"
+
+
+async def test_a_worker_judges_with_the_credentials_of_the_environment_when_the_judge_takes_them(monkeypatch) -> None:
+    built = []
+
+    class Provider:
+        def build_structured_llm_client(self, models, *, max_concurrent):
+            built.append(models)
+            return JudgeClient(respond=lambda _prompt: None)
+
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_PROVIDER", "litellm")
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_MODEL", "bedrock/anthropic.claude-haiku-5-5")
+    monkeypatch.setenv("MEMFORGE_AGENT_EVALUATION_JUDGE_AUTH_STRATEGY", "environment")
+    spec = ExpectationJudgeSpec(provider="litellm", model="bedrock/anthropic.claude-haiku-5-5")
+    run = agent_evaluation_run_from_payload({
+        "run_id": "aer-1", "cohort_id": "aec-1", "candidate_manifest": {}, "candidate_manifest_hash": "h",
+        "evaluator_suite": "quick", "evaluator_version": "1", "replicate_count": 1, "status": "running",
+        "created_by": ACTOR, "created_at": "2026-10-31T00:00:00+00:00",
+        "expectation_judge_manifest": spec.to_manifest(),
+    })
+
+    assert isinstance(await _expectation_judge(AppConfig(), Provider(), run), StructuredExpectationJudge)
+    [models] = built
+    assert (models.generation.route, models.generation.api_key) == ("bedrock/anthropic.claude-haiku-5-5", None)
 
 
 async def test_a_worker_judges_a_run_only_with_the_judge_it_pins_sized_by_its_listing(monkeypatch) -> None:
