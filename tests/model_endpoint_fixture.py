@@ -11,6 +11,25 @@ from memforge.llm.transport import NoRedirectAsyncClient
 Respond = Callable[[httpx.Request], httpx.Response]
 
 
+def send_every_new_client_to(monkeypatch, respond: Respond) -> None:
+    """Have every HTTP client built from now on send its requests to ``respond``.
+
+    LiteLLM and the provider SDKs it drives send every request through an
+    ``httpx.AsyncClient``, whichever transport they would give it. Each new
+    client gets ``respond`` as its transport instead, so no request leaves the
+    process, and the client itself still follows or refuses redirects. A client
+    built with an in-memory transport of its own keeps it.
+    """
+    build = httpx.AsyncClient.__init__
+
+    def __init__(self: httpx.AsyncClient, *args, **kwargs) -> None:
+        if not isinstance(kwargs.get("transport"), httpx.MockTransport):
+            kwargs.update(transport=httpx.MockTransport(respond), mounts=None, trust_env=False)
+        build(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", __init__)
+
+
 class InMemorySharedClient(NoRedirectAsyncClient):
     """The shared client with each connection pool replaced by an in-memory server."""
 

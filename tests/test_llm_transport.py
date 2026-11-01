@@ -15,16 +15,13 @@ from memforge.llm.bindings import build_binding, compile_binding
 from memforge.llm.embedding import EmbeddingRuntime, EmbeddingSettings
 from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.llm.transport import (
-    end_provider_client_exchanges_at_their_timeout,
     install_no_redirect_http_client,
     is_retryable_provider_error,
-    keep_ollama_model_lookups_off_request_endpoints,
     provider_retry_after_seconds,
     provider_status_code,
     refuse_redirects_in_provider_clients,
-    send_within_timeout,
 )
-from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups
+from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups, send_every_new_client_to
 
 # The time a call that is not about its deadline is given. The first request a
 # process sends through a provider's SDK also imports that SDK's modules, which
@@ -298,11 +295,7 @@ async def ollama_endpoint(monkeypatch):
         )
 
     lookups = OllamaLookups()
-    monkeypatch.setattr(
-        AsyncHTTPHandler,
-        "_create_async_transport",
-        staticmethod(lambda **_options: httpx.MockTransport(chat)),
-    )
+    send_every_new_client_to(monkeypatch, chat)
     monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
     monkeypatch.setattr(litellm, "module_level_client", lookups)
     yield requests, lookups
@@ -312,21 +305,15 @@ async def ollama_endpoint(monkeypatch):
 async def test_a_keyless_ollama_endpoint_is_never_sent_the_ollama_key_of_the_environment(
     monkeypatch, ollama_endpoint
 ) -> None:
-    """LiteLLM looks the model up once more after the request, at the address the request went to."""
+    """LiteLLM asks about the model after the request too, at the address the request went to.
+
+    The key ``OLLAMA_API_KEY`` holds goes only to the server ``OLLAMA_API_BASE``
+    names; a question at the request's address carries no key.
+    """
     requests, lookups = ollama_endpoint
     monkeypatch.setenv("OLLAMA_API_KEY", "environment-ollama-key")
     monkeypatch.setenv("OLLAMA_API_BASE", "https://ollama-environment.example.test")
     getattr(litellm.get_model_info, "cache_clear", lambda: None)()
-    loop = asyncio.get_running_loop()
-    looked_up_after_the_request = asyncio.Event()
-    look_up = litellm.OllamaConfig.get_model_info
-
-    def watched_look_up(self, model, api_base=None):
-        if api_base is not None:
-            loop.call_soon_threadsafe(looked_up_after_the_request.set)
-        return look_up(self, model, api_base)
-
-    monkeypatch.setattr(litellm.OllamaConfig, "get_model_info", watched_look_up)
     binding = build_binding(
         kind="generation",
         provider="ollama",
@@ -340,83 +327,14 @@ async def test_a_keyless_ollama_endpoint_is_never_sent_the_ollama_key_of_the_env
     )
 
     await client.rerank_memories("Rank the matching memories")
-    await asyncio.wait_for(looked_up_after_the_request.wait(), timeout=10)
+    async with asyncio.timeout(10):
+        while not any(httpx.URL(url).host == "ollama-keyless.example.test" for url, _headers in lookups.requests):
+            await asyncio.sleep(0.05)
 
     assert {request.url.host for request in requests} == {"ollama-keyless.example.test"}
     assert {request.headers.get("authorization") for request in requests} == {"Bearer no-api-key"}
-    assert lookups.requests
-    assert {httpx.URL(url).host for url, _headers in lookups.requests} == {"ollama-environment.example.test"}
-
-
-def test_an_ollama_lookup_at_a_request_endpoint_reports_a_model_with_no_known_limits(monkeypatch) -> None:
-    lookups = OllamaLookups()
-    monkeypatch.setattr(litellm, "module_level_client", lookups)
-    monkeypatch.setenv("OLLAMA_API_KEY", "environment-ollama-key")
-
-    info = litellm.OllamaConfig().get_model_info(
-        "ollama_chat/private-chat-model", api_base="https://ollama-keyless.example.test/api/chat"
-    )
-
-    assert lookups.requests == []
-    assert (info["key"], info["max_input_tokens"], info["input_cost_per_token"]) == (
-        "ollama_chat/private-chat-model",
-        None,
-        0.0,
-    )
-
-
-def test_keeping_ollama_lookups_off_request_endpoints_wraps_the_lookup_once() -> None:
-    lookup = litellm.OllamaConfig.get_model_info
-
-    keep_ollama_model_lookups_off_request_endpoints()
-
-    assert litellm.OllamaConfig.get_model_info is lookup
-
-
-# -- Request timeouts ---------------------------------------------------------------
-
-
-async def test_an_exchange_that_outlasts_its_timeout_fails_as_a_read_timeout() -> None:
-    request = httpx.Request("POST", "https://models.example.test/v1/chat/completions")
-    request.extensions["timeout"] = httpx.Timeout(0.05).as_dict()
-
-    async def never_answers(_request: httpx.Request, **_options) -> httpx.Response:
-        await asyncio.sleep(60)
-        raise AssertionError("unreachable")
-
-    with pytest.raises(httpx.ReadTimeout) as raised:
-        await send_within_timeout(never_answers, request)
-
-    assert raised.value.request is request
-
-
-async def test_a_request_without_a_timeout_is_sent_unbounded() -> None:
-    request = httpx.Request("GET", "https://models.example.test/v1/models")
-    request.extensions["timeout"] = httpx.Timeout(None).as_dict()
-
-    async def answers(_request: httpx.Request, **_options) -> httpx.Response:
-        return httpx.Response(200)
-
-    assert (await send_within_timeout(answers, request)).status_code == 200
-
-
-async def test_a_timeout_the_send_raises_itself_is_left_as_it_is() -> None:
-    request = httpx.Request("GET", "https://models.example.test/v1/models")
-    request.extensions["timeout"] = httpx.Timeout(5.0).as_dict()
-    own = TimeoutError("the transport's own")
-
-    async def raises(_request: httpx.Request, **_options) -> httpx.Response:
-        raise own
-
-    with pytest.raises(TimeoutError) as raised:
-        await send_within_timeout(raises, request)
-
-    assert raised.value is own
-
-
-def test_ending_provider_client_exchanges_at_their_timeout_wraps_the_builder_once() -> None:
-    builder = AsyncHTTPHandler.create_client
-
-    end_provider_client_exchanges_at_their_timeout()
-
-    assert AsyncHTTPHandler.create_client is builder
+    for url, headers in lookups.requests:
+        if httpx.URL(url).host == "ollama-keyless.example.test":
+            assert "authorization" not in {name.lower() for name in headers}
+        else:
+            assert httpx.URL(url).host == "ollama-environment.example.test"

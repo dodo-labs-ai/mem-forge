@@ -19,7 +19,6 @@ Adding a provider is adding its row.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import time
@@ -55,8 +54,8 @@ from memforge.llm.structured import (
     StructuredResponseModel,
     failure_retryable,
 )
-from memforge.llm.transport import NoRedirectAsyncClient, is_retryable_provider_error
-from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups
+from memforge.llm.transport import NoRedirectAsyncClient
+from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups, send_every_new_client_to
 from tests.stalling_endpoint_fixture import GIVES_UP_AFTER_S, STALL_MODES, stalling_endpoint
 
 Feature = Literal[
@@ -83,11 +82,11 @@ FEATURES: Mapping[ModelKind, tuple[Feature, ...]] = {
 }
 
 # How a structured request asks for its schema. ``json_schema``: an OpenAI
-# ``response_format`` of type ``json_schema``. ``json_tool_call``: one tool the
-# model is made to call, whose input is the answer. ``format``: the schema as
-# Ollama's ``format``. ``json_text``: the schema written into the prompt, for a
-# model nothing declares to take one.
-SchemaShape = Literal["json_schema", "json_tool_call", "format", "json_text"]
+# ``response_format`` of type ``json_schema``. ``output_format``: Anthropic's
+# ``output_format`` of type ``json_schema``. ``format``: the schema as Ollama's
+# ``format``. ``json_text``: the schema written into the prompt, for a model
+# nothing declares to take one.
+SchemaShape = Literal["json_schema", "output_format", "format", "json_text"]
 
 # The credential an API-key row is configured with.
 _KEY = "row-key"
@@ -97,9 +96,9 @@ _SECRET_REF = "secret:row"
 # process sends through a provider's SDK also imports that SDK's modules, which
 # on a busy machine takes seconds of the call's own time.
 _UNHURRIED_CALL_S = 60.0
-_REQUEST_TIMEOUT_S = 0.5
-# A request ended at its timeout ends well before the stalling endpoint gives up.
-_ENDED_AT_ITS_TIMEOUT_S = GIVES_UP_AFTER_S / 2
+_CALL_DEADLINE_S = 0.5
+# A call ended at its deadline ends well before the stalling endpoint gives up.
+_ENDED_AT_ITS_DEADLINE_S = GIVES_UP_AFTER_S / 2
 # The limits every structured client's route states. A quarter of the context
 # window is far above the output limit, so the output limit is the route's
 # output capacity.
@@ -163,20 +162,14 @@ def _openai_chat(body: dict[str, Any], answer: str) -> dict[str, Any]:
 
 
 def _anthropic_messages(body: dict[str, Any], answer: str) -> dict[str, Any]:
-    """A Messages reply: the call of the tool the request made the model call, or text."""
-    tool = (body.get("tool_choice") or {}).get("name")
-    content = (
-        [{"type": "tool_use", "id": "toolu_1", "name": tool, "input": json.loads(answer)}]
-        if tool
-        else [{"type": "text", "text": answer}]
-    )
+    """A Messages reply whose text is the answer."""
     return {
         "id": "msg_1",
         "type": "message",
         "role": "assistant",
         "model": body["model"],
-        "content": content,
-        "stop_reason": "tool_use" if tool else "end_turn",
+        "content": [{"type": "text", "text": answer}],
+        "stop_reason": "end_turn",
         "stop_sequence": None,
         "usage": {"input_tokens": 1, "output_tokens": 1},
     }
@@ -278,8 +271,6 @@ class GenerationContract:
     reply: Callable[[dict[str, Any], str], dict[str, Any]]
     error: Callable[[int], dict[str, Any]]
     reasoning_off: tuple[ReasoningOff, ...]
-    # How LiteLLM reports an exchange it ended at its timeout.
-    timeout_error: type[Exception]
     # Other fields the request body carries.
     fields: Mapping[str, Any] = field(default_factory=dict)
     # Whether the model listing declares that the model answers in a response
@@ -298,10 +289,6 @@ class EmbeddingContract:
     error: Callable[[int], dict[str, Any]]
     # The request field a set dimension is sent in.
     dimensions_field: str
-    # How LiteLLM reports an exchange it ended at its timeout; ``None`` when
-    # LiteLLM sends the request without its timeout, and only the runtime's
-    # own deadline ends it.
-    timeout_error: type[Exception] | None
     fields: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -361,7 +348,6 @@ MATRIX: tuple[Row, ...] = (
                 ReasoningOff("gpt-5-chat-latest", {}),
                 ReasoningOff("a-model-litellm-does-not-know", {}),
             ),
-            timeout_error=litellm.Timeout,
         ),
         embedding=EmbeddingContract(
             model_id="text-embedding-3-small",
@@ -371,8 +357,7 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
-            fields={"encoding_format": "float"},
+            fields={"encoding_format": None},
         ),
     ),
     Row(
@@ -386,12 +371,11 @@ MATRIX: tuple[Row, ...] = (
             url="https://api.anthropic.com/v1/messages",
             model="claude-haiku-4-5",
             headers={"x-api-key": _KEY, "anthropic-version": "2023-06-01", "authorization": None},
-            schema="json_tool_call",
+            schema="output_format",
             output_limit=("max_tokens",),
             reply=_anthropic_messages,
             error=_anthropic_error,
             reasoning_off=(ReasoningOff("claude-haiku-4-5", {}),),
-            timeout_error=litellm.Timeout,
         ),
     ),
     Row(
@@ -421,7 +405,6 @@ MATRIX: tuple[Row, ...] = (
                     wire={"reasoning": {"enabled": False}},
                 ),
             ),
-            timeout_error=litellm.Timeout,
             fields={"usage": {"include": True}},
             native_schema=True,
         ),
@@ -433,7 +416,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
         ),
     ),
     Row(
@@ -452,7 +434,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_chat,
             error=_openai_error,
             reasoning_off=(),
-            timeout_error=litellm.Timeout,
             fields={"usage": {"include": True}},
             native_schema=False,
         ),
@@ -483,7 +464,6 @@ MATRIX: tuple[Row, ...] = (
                 ReasoningOff("qwen3", {"think": False}),
                 ReasoningOff("gpt-oss:20b", {"think": "low"}),
             ),
-            timeout_error=litellm.APIConnectionError,
             fields={"stream": False},
         ),
         embedding=EmbeddingContract(
@@ -494,8 +474,7 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
-            fields={"encoding_format": "float"},
+            fields={"encoding_format": None},
         ),
     ),
     Row(
@@ -514,7 +493,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_ollama_chat,
             error=_ollama_error,
             reasoning_off=(),
-            timeout_error=litellm.APIConnectionError,
             fields={"stream": False},
         ),
         embedding=EmbeddingContract(
@@ -525,8 +503,7 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
-            fields={"encoding_format": "float"},
+            fields={"encoding_format": None},
         ),
         excluded={
             (kind, feature): _SAME_REQUESTS_AS_KEYLESS_OLLAMA
@@ -553,7 +530,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_chat,
             error=_openai_error,
             reasoning_off=(ReasoningOff("gpt-5-mini", {}), ReasoningOff("qwen3", {})),
-            timeout_error=litellm.Timeout,
         ),
         embedding=EmbeddingContract(
             model_id="BAAI/bge-m3",
@@ -563,8 +539,7 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
-            fields={"encoding_format": "float"},
+            fields={"encoding_format": None},
         ),
     ),
     Row(
@@ -583,7 +558,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_chat,
             error=_openai_error,
             reasoning_off=(ReasoningOff("openai/gpt-5-mini", {}),),
-            timeout_error=litellm.Timeout,
         ),
         embedding=EmbeddingContract(
             model_id="openai/text-embedding-3-small",
@@ -593,8 +567,7 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
-            fields={"encoding_format": "float"},
+            fields={"encoding_format": None},
         ),
     ),
     Row(
@@ -608,12 +581,11 @@ MATRIX: tuple[Row, ...] = (
             url="https://api.anthropic.com/v1/messages",
             model="claude-haiku-4-5",
             headers={"x-api-key": _KEY, "anthropic-version": "2023-06-01", "authorization": None},
-            schema="json_tool_call",
+            schema="output_format",
             output_limit=("max_tokens",),
             reply=_anthropic_messages,
             error=_anthropic_error,
             reasoning_off=(ReasoningOff("anthropic/claude-haiku-4-5", {}),),
-            timeout_error=litellm.Timeout,
         ),
         excluded={
             ("embedding", feature): "Anthropic serves no embedding models."
@@ -631,12 +603,11 @@ MATRIX: tuple[Row, ...] = (
             url="https://openrouter.ai/api/v1/chat/completions",
             model="anthropic/claude-haiku-5.5",
             headers={"authorization": f"Bearer {_KEY}"},
-            schema="json_text",
+            schema="json_schema",
             output_limit=("max_tokens",),
             reply=_openai_chat,
             error=_openai_error,
             reasoning_off=(ReasoningOff("openrouter/anthropic/claude-haiku-5.5", {}),),
-            timeout_error=litellm.Timeout,
             fields={"usage": {"include": True}},
         ),
         embedding=EmbeddingContract(
@@ -647,7 +618,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_openai_embeddings,
             error=_openai_error,
             dimensions_field="dimensions",
-            timeout_error=litellm.Timeout,
         ),
     ),
     Row(
@@ -666,7 +636,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_ollama_chat,
             error=_ollama_error,
             reasoning_off=(ReasoningOff("ollama_chat/qwen3", {}),),
-            timeout_error=litellm.APIConnectionError,
             fields={"stream": False},
         ),
         embedding=EmbeddingContract(
@@ -677,7 +646,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_ollama_embed,
             error=_ollama_error,
             dimensions_field="dimensions",
-            timeout_error=None,
         ),
         known_gaps={("embedding", "credential"): _OLLAMA_EMBEDDING_KEY_GAP},
     ),
@@ -695,7 +663,6 @@ MATRIX: tuple[Row, ...] = (
             reply=_voyage_embeddings,
             error=_openai_error,
             dimensions_field="output_dimension",
-            timeout_error=litellm.APIConnectionError,
         ),
         excluded={
             ("generation", feature): "Voyage serves embedding models only."
@@ -838,11 +805,7 @@ async def wire(monkeypatch):
     wire = _Wire()
     shared = InMemorySharedClient(wire.handle)
     monkeypatch.setattr(litellm, "aclient_session", shared)
-    monkeypatch.setattr(
-        AsyncHTTPHandler,
-        "_create_async_transport",
-        staticmethod(lambda **_options: httpx.MockTransport(wire.handle)),
-    )
+    send_every_new_client_to(monkeypatch, wire.handle)
     async with _fresh_provider_clients(monkeypatch):
         yield wire
     await shared.aclose()
@@ -995,11 +958,12 @@ async def test_a_structured_request_reaches_the_provider_as_its_api_takes_it_and
         assert response_format["type"] == "json_schema"
         assert set(response_format["json_schema"]["schema"]["properties"]) == {"ranking"}
         assert "tools" not in body
-    elif contract.schema == "json_tool_call":
-        assert body["tool_choice"] == {"type": "tool", "name": "json_tool_call"}
-        assert [tool["name"] for tool in body["tools"]] == ["json_tool_call"]
-        assert set(body["tools"][0]["input_schema"]["properties"]) == {"ranking"}
-        assert "response_format" not in body
+    elif contract.schema == "output_format":
+        assert request.headers["anthropic-beta"] == "structured-outputs-2025-11-13"
+        assert body["output_format"]["type"] == "json_schema"
+        assert set(body["output_format"]["schema"]["properties"]) == {"ranking"}
+        assert [name for name in ("response_format", "tools") if name in body] == []
+        assert _JSON_TEXT_INSTRUCTION not in _prompt_text(body)
     elif contract.schema == "format":
         assert set(body["format"]["properties"]) == {"ranking"}
         assert [name for name in ("response_format", "tools") if name in body] == []
@@ -1122,59 +1086,31 @@ async def _ended(call: Awaitable[Any]) -> tuple[BaseException | None, float]:
     return None, time.monotonic() - started
 
 
-def _sdk_request(kind: ModelKind, invocation: ResolvedInvocation) -> Awaitable[Any]:
-    """The request alone, as the SDK sends it with a timeout and no retries."""
-    if kind == "generation":
-        return litellm.acompletion(
-            model=invocation.route,
-            messages=_MESSAGES,
-            timeout=_REQUEST_TIMEOUT_S,
-            num_retries=0,
-            **invocation.request_kwargs(),
-        )
-    return litellm.aembedding(
-        model=invocation.route,
-        input=["alpha"],
-        timeout=_REQUEST_TIMEOUT_S,
-        max_retries=0,
-        **invocation.request_kwargs(),
-    )
-
-
 def _product_call(kind: ModelKind, invocation: ResolvedInvocation) -> Awaitable[Any]:
     """The call the product makes, bounded by its own deadline."""
     if kind == "generation":
-        client = _structured_client(invocation, timeout_s=_REQUEST_TIMEOUT_S)
+        client = _structured_client(invocation, timeout_s=_CALL_DEADLINE_S)
         return client.answer_schema(_PROMPT, response_format=_Ranking)
-    return _embedding_runtime(invocation, timeout_s=_REQUEST_TIMEOUT_S).embed_query("alpha")
+    return _embedding_runtime(invocation, timeout_s=_CALL_DEADLINE_S).embed_query("alpha")
 
 
 @pytest.mark.parametrize("mode", STALL_MODES)
 @pytest.mark.parametrize(("row", "kind"), _row_kinds("timeout"))
-async def test_a_request_ends_at_its_timeout_however_the_endpoint_stalls(
+async def test_a_call_ends_at_its_deadline_however_the_endpoint_stalls(
     provider_clients, row, kind, mode
 ) -> None:
-    """A provider that keeps the connection busy holds neither the request nor the call past its time."""
-    contract = row.contract(kind)
+    """A provider that keeps the connection busy holds the call no longer than its deadline."""
     with stalling_endpoint(mode) as address:
         invocation = _invocation(row, kind, endpoint=f"{address}{row.api_path}")
-        calls = [_product_call(kind, invocation)]
-        if contract.timeout_error is not None:
-            calls.append(_sdk_request(kind, invocation))
-        ended = await asyncio.gather(*(_ended(call) for call in calls))
+        product_error, product_s = await _ended(_product_call(kind, invocation))
 
-    (product_error, product_s), *sdk = ended
-    assert product_s < _ENDED_AT_ITS_TIMEOUT_S
+    assert product_s < _ENDED_AT_ITS_DEADLINE_S
     assert failure_retryable(product_error) is True
     if kind == "generation":
         assert isinstance(product_error, StructuredLlmError)
         assert product_error.terminal_category == "deadline_exceeded"
     else:
         assert isinstance(product_error, EmbeddingDeadlineExceeded)
-    for sdk_error, sdk_s in sdk:
-        assert sdk_s < _ENDED_AT_ITS_TIMEOUT_S
-        assert isinstance(sdk_error, contract.timeout_error)
-        assert is_retryable_provider_error(sdk_error) is True
 
 
 # -- Redirects ----------------------------------------------------------------------

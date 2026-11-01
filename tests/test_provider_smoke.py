@@ -27,7 +27,7 @@ from memforge.llm.capability import CapabilityCheck
 from memforge.llm.providers import ResolvedInvocation
 from memforge.server import model_settings_api
 from memforge.server.model_settings_api import ModelDiscoveryResponse, ModelOption
-from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups
+from tests.model_endpoint_fixture import InMemorySharedClient, OllamaLookups, send_every_new_client_to
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "provider_smoke.py"
 SECRET = "sk-or-smoke-0123456789abcdef"
@@ -245,11 +245,7 @@ async def provider(monkeypatch):
     provider = _Provider()
     shared = InMemorySharedClient(provider.handle)
     monkeypatch.setattr(litellm, "aclient_session", shared)
-    monkeypatch.setattr(
-        AsyncHTTPHandler,
-        "_create_async_transport",
-        staticmethod(lambda **_options: httpx.MockTransport(provider.handle)),
-    )
+    send_every_new_client_to(monkeypatch, provider.handle)
     monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
     monkeypatch.setattr(litellm, "module_level_client", OllamaLookups())
     module_client = AsyncHTTPHandler(timeout=litellm.request_timeout)
