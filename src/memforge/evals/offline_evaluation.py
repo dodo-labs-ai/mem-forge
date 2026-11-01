@@ -3359,7 +3359,7 @@ def relation_run_summary(
     *,
     unlabelled_relations: int,
 ) -> dict[str, float | int | None]:
-    """The relation outcomes a release gate reads, beside the per-label metrics.
+    """The relation outcomes a run reports, beside the per-label metrics.
 
     ``false_relations`` counts labelled ``none`` pairs the classifier related,
     the error a reader pays for; ``none_recall`` is the share of labelled
