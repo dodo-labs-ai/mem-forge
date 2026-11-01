@@ -28,6 +28,12 @@
   totals the calls per model, so a judge on another model than generation is
   counted apart.
 
+- Contributors: `make test` runs the suite in four processes, and CI runs
+  `make lint` and `make test`, so local and CI checks are the same commands.
+  An answer schema change calls for `compose_smoke.sh --quality`. A release
+  runs `provider_smoke.py` and `compose_smoke.sh --quality`, as the release
+  guide now states.
+
 - Offline evaluation: each case kind allows a closed set of expectation forms,
   such as "A memory states that …" or "The outcome of the old memory `id` is
   kept.", and pinning a case refuses an expectation in another form or about an
