@@ -105,9 +105,8 @@ is not, ask the person to read the error that Settings shows for the model.
 
 Tell the person:
 
-> Open http://localhost:5174/sources and choose **Add source**. Pick Notion,
-> Confluence, Jira or a GitHub repository, enter the credentials the form asks
-> for, and run a sync. Turn on **Sync automatically** to keep it current.
+> Open http://localhost:5174/sources and choose **Add source**. Pick a tool your
+> team uses, enter the credentials the form asks for, and run a sync. Turn on **Sync automatically** to keep it current.
 
 Link them to
 [Add a source](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md#4-add-a-source)

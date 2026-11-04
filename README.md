@@ -28,9 +28,10 @@ up to date. Built from your docs, tickets and chat.
 
 **Your agent only sees the local repo.** A new hire's agent reads the checkout
 and guesses, while the answer sits in a Notion page nobody linked. A `CLAUDE.md`
-or `AGENTS.md` file only fits so many rules. MemForge connects to Confluence,
-Jira, Notion, GitHub and Teams, so the agent can check what your team already
-decided before it acts.
+or `AGENTS.md` file only fits so many rules. MemForge connects to the wikis,
+tickets, repositories and chat your team already uses, so the agent can check
+what was decided before it acts. Every connector feeds the same pipeline, so
+each new source gets extraction, rechecks and evidence.
 
 **Docs change, and old answers linger.** When a doc changes, the next sync
 rechecks every memory built on it and keeps, replaces or retires each one, with
@@ -96,8 +97,8 @@ the agent.
    the memories, and optionally an embedding model for semantic search. After
    **Save and validate**, each one shows **Ready**.
 
-3. **Connect a source.** In **Sources**, add Notion pages, a Confluence
-   space, a Jira project or a GitHub repository, and run a sync. Turn on
+3. **Connect a source.** In **Sources**, add a source, such as a Confluence
+   space or a GitHub repository, and run a sync. Turn on
    **Sync automatically** to keep it current. The source shows the memories it
    made as the sync runs.
 
@@ -139,7 +140,7 @@ flowchart LR
     Recheck["Recheck when a source changes,<br/>link related memories"]
     Store[("Local storage")]
   end
-  Docs["Confluence, Jira, Notion,<br/>GitHub, Teams, local files"]
+  Docs["Your team's wikis, tickets,<br/>repositories and chat"]
 
   CC --> Plugin
   Docs -- "sync" --> API
