@@ -914,14 +914,14 @@ def quality_expectations(api: str, run_id: str) -> str:
 
     The run report names an expectation by its case and number only; this
     reads the case outputs, so it is for the synthetic cohort, whose content
-    may appear in a pull request.
+    may appear in a pull request. A row names its case by ID as the run report
+    does, for ``name_quality_cases`` to name.
     """
     payload = api_json(api, "GET", f"/api/v1/agent-evaluations/runs/{run_id}/case-outputs")
     rows = []
     for case in payload.get("cases") or []:
         expectations = (case.get("rubric") or {}).get("expectations") or []
         items = _case_items(case)
-        title = _case_title(case)
         for assessment in case.get("checks") or []:
             if assessment.get("criterion") != "expectation":
                 continue
@@ -939,21 +939,12 @@ def quality_expectations(api: str, run_id: str) -> str:
             shown = "<br>".join(
                 f"{item}: {_cell(items.get(item, '?'))}" for item in cited.split("/") if item
             )
-            rows.append((str(title), index, _cell(sentence), outcome, shown))
+            rows.append((str(case.get("case_id")), index, _cell(sentence), outcome, shown))
     if not rows:
         return "Every expectation the judge read was met."
     lines = ["| Case | Expectation | Outcome | Items |", "| --- | --- | --- | --- |"]
-    lines += [f"| {_cell(title)} | E{index}: {sentence} | {outcome} | {shown} |" for title, index, sentence, outcome, shown in sorted(rows)]
+    lines += [f"| `{case_id}` | E{index}: {sentence} | {outcome} | {shown} |" for case_id, index, sentence, outcome, shown in sorted(rows)]
     return "\n".join(lines)
-
-
-def _case_title(case: dict[str, Any]) -> str:
-    """The case's Source Unit as its projection titles it, by the values of its title fields; else its id."""
-    title = ((case.get("manifest") or {}).get("projection") or {}).get("unit_title")
-    if isinstance(title, dict):
-        values = [str(field[1]) for field in title.get("fields") or [] if isinstance(field, list) and len(field) == 2]
-        return " / ".join(values) or str(case.get("case_id"))
-    return str(title or case.get("case_id"))
 
 
 def _case_items(case: dict[str, Any]) -> dict[str, str]:
@@ -1170,6 +1161,29 @@ def quality_run_spec(cohort_file: Path, seeded: dict[str, Any]) -> str:
     )
 
 
+def quality_case_names(cohort_file: Path, kind: str, seeded: dict[str, Any]) -> dict[str, str]:
+    """Each case's name in the cohort file, by the ID its seed answer pinned it under.
+
+    A seed answer lists the cases in the order of the request, and only a
+    cohort pinned completely reaches a run.
+    """
+    specs = json.loads(cohort_file.read_text(encoding="utf-8"))[QUALITY_CASE_KINDS[kind][0]]
+    return {case["case_id"]: _quality_case_name(spec) for spec, case in zip(specs, seeded.get("cases") or [])}
+
+
+def _quality_case_name(spec: dict[str, Any]) -> str:
+    """The case's Document title and what tells it from other cases of that title: its snapshot set or file."""
+    qualifier = Path(spec["file"]).stem if "file" in spec else spec.get("snapshot")
+    return f"{spec['title']} ({qualifier})" if qualifier else spec["title"]
+
+
+def name_quality_cases(summary: str, names: dict[str, str]) -> str:
+    """The summary with each case ID a table row holds in backticks replaced by the case's name."""
+    for case_id, name in names.items():
+        summary = summary.replace(f"`{case_id}`", _cell(name))
+    return summary
+
+
 # -- Command line ------------------------------------------------------------------------------
 
 
@@ -1240,6 +1254,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run_spec.add_argument("--cohort", type=Path, required=True)
     expectations = api_command("quality-expectations", "list the expectations of a run the judge did not find met")
     expectations.add_argument("--run", required=True)
+    case_names = api_command("quality-name-cases", "name the cases of a run summary read from stdin")
+    case_names.add_argument("--cohort", type=Path, required=True)
+    case_names.add_argument("--kind", choices=tuple(QUALITY_CASE_KINDS), required=True)
+    case_names.add_argument("--seeded", type=Path, required=True, help="the seed answer that pinned the cases")
     outputs = api_command("quality-outputs", "print each case's pinned input, rubric and model output of a run")
     outputs.add_argument("--run", required=True)
     api_command("persisted", "check what was recorded before the restart")
@@ -1291,6 +1309,9 @@ def run(args: argparse.Namespace) -> str:
         return quality_run_spec(args.cohort, json.load(sys.stdin))
     if args.command == "quality-expectations":
         return quality_expectations(args.api, args.run)
+    if args.command == "quality-name-cases":
+        seeded = json.loads(args.seeded.read_text(encoding="utf-8"))
+        return name_quality_cases(sys.stdin.read(), quality_case_names(args.cohort, args.kind, seeded))
     if args.command == "quality-outputs":
         return quality_outputs(args.api, args.run)
     return check_persisted(args.api, state)

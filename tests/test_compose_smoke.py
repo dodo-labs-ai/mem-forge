@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import re
 import subprocess
@@ -556,11 +557,9 @@ def test_the_judge_reaches_the_api_only_through_its_env_file(capsys, monkeypatch
 
 def test_the_expectations_not_met_are_listed_with_their_sentences_and_memories(monkeypatch) -> None:
     case = {
+        "case_id": "aec-queue-limits",
         "case_kind": "source_unit_support_v1",
         "manifest": {
-            "projection": {"unit_title": {
-                "kind": "GitHub file", "fields": [["Repository", "acme/kestrel"], ["Path", "docs/queue-limits.md"]],
-            }},
             "work_items": [
                 {"memory": {"id": "mem-a", "content": "A payload may be at most 256 KiB."}},
                 {"memory": {"id": "mem-b", "content": "A tenant may have 500 jobs in flight."}},
@@ -581,6 +580,58 @@ def test_the_expectations_not_met_are_listed_with_their_sentences_and_memories(m
     listed = smoke.quality_expectations("http://api", "aer-1").splitlines()
 
     assert listed[2:] == [
-        "| acme/kestrel / docs/queue-limits.md | E1: If a memory states the 256 KiB limit, it is judged unsupported. | not met "
+        "| `aec-queue-limits` | E1: If a memory states the 256 KiB limit, it is judged unsupported. | not met "
         "| mem-a: A payload may be at most 256 KiB. (supported) |",
     ]
+
+
+@pytest.mark.parametrize("kind", smoke.QUALITY_CASE_KINDS)
+def test_every_case_of_a_kind_has_its_own_name(kind: str) -> None:
+    specs = json.loads(COHORT.read_text(encoding="utf-8"))[smoke.QUALITY_CASE_KINDS[kind][0]]
+    seeded = {"cases": [{"case_id": f"aec-{index}"} for index in range(len(specs))]}
+
+    names = smoke.quality_case_names(COHORT, kind, seeded)
+
+    assert list(names) == [case["case_id"] for case in seeded["cases"]]
+    assert len(set(names.values())) == len(specs)
+
+
+def test_a_reconciliation_case_is_named_by_its_title_and_situation_file() -> None:
+    spec = json.loads(COHORT.read_text(encoding="utf-8"))["reconciliation_cases"][0]
+
+    names = smoke.quality_case_names(COHORT, "reconciliation", {"cases": [{"case_id": "aec-1"}]})
+
+    assert names == {"aec-1": f"{spec['title']} ({Path(spec['file']).stem})"}
+
+
+def test_a_summary_names_its_cases_in_the_rows_that_hold_their_ids() -> None:
+    summary = "\n".join([
+        "- Run: `aer-1` on cohort `aeo-1`",
+        "| `aec-1` | reading_group_coverage | fail: reading_groups_skipped:1 |",
+        "| `aec-2` | E1: Other. | not met |  |",
+        "| `aec-unknown` | result | failed: timeout |",
+    ])
+
+    named = smoke.name_quality_cases(summary, {"aec-1": "Runbook | rotation", "aec-2": "Decision (retries)"})
+
+    assert named.splitlines() == [
+        "- Run: `aer-1` on cohort `aeo-1`",
+        "| Runbook \\| rotation | reading_group_coverage | fail: reading_groups_skipped:1 |",
+        "| Decision (retries) | E1: Other. | not met |  |",
+        "| `aec-unknown` | result | failed: timeout |",
+    ]
+
+
+def test_the_name_command_reads_the_summary_from_stdin(tmp_path, monkeypatch, capsys) -> None:
+    title = json.loads(COHORT.read_text(encoding="utf-8"))["cases"][0]["title"]
+    seeded = tmp_path / "seeded.json"
+    seeded.write_text(json.dumps({"cases": [{"case_id": "aec-1"}]}), encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", io.StringIO("| `aec-1` | result | failed: timeout |"))
+
+    status = smoke.main([
+        "quality-name-cases", "--api", "http://api", "--state", str(tmp_path / "state.json"),
+        "--cohort", str(COHORT), "--kind", "derivation", "--seeded", str(seeded),
+    ])
+
+    assert status == 0
+    assert capsys.readouterr().out.startswith(f"| {title}")
