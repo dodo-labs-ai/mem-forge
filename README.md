@@ -82,11 +82,15 @@ the agent.
 
    ```bash
    git clone https://github.com/dodo-labs-ai/mem-forge.git && cd mem-forge
+   git checkout -q "$(git describe --tags --abbrev=0 --match 'memforge-ai-v*')"
    cp .env.example .env
-   docker compose up --build
+   docker compose up
    ```
 
-   The admin UI is at http://localhost:5174.
+   The second line moves to the latest release. Compose pulls that release's
+   prebuilt images when it has them, and otherwise builds them from the
+   checkout, which takes several minutes. The admin UI is at
+   http://localhost:5174.
 
 2. **Choose models.** In **Settings**, choose a generation model, which writes
    the memories, and optionally an embedding model for semantic search. After

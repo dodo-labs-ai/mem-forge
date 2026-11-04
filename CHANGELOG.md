@@ -29,6 +29,21 @@
   work is re-run when a release starts, so the same applies to what that work
   recorded.
 
+- Docker Compose: a release publishes its API and admin UI images to
+  `ghcr.io/dodo-labs-ai` for `linux/amd64` and `linux/arm64`, and a clone of that
+  release runs them with a plain `docker compose up` instead of building them.
+  `compose.yaml` names the tag of its own checkout: a release commit names its
+  version, and any other commit names `dev`, which is never published, so `main`
+  builds the checkout. When a pull fails, Compose builds the checkout instead.
+  `docker compose up --build` still builds, with the build mirrors. `MEMFORGE_IMAGE_REGISTRY` points the images at a mirror of `ghcr.io`;
+  the tag cannot be overridden, so a `.env` kept across an upgrade cannot pin an
+  old release. The setup guides now check out the latest release, and upgrading
+  is `git checkout` of the new release and `docker compose up -d`. Recovery points
+  work as before. Contributors: `scripts/verify_image_tag.py` runs in CI and in
+  the release workflow, a release sets the tag and then sets it back to `dev`,
+  and `compose_smoke.sh` keeps testing the source tree under image names of its
+  own.
+
 - Compose smoke: the summaries of `scripts/compose_smoke.sh --quality` name each
   case by its cohort title, with its snapshot set or situation file, in every
   table, with or without a judge, instead of the case ID of that run.

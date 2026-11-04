@@ -14,17 +14,19 @@ Requirements:
 ```bash
 git clone https://github.com/dodo-labs-ai/mem-forge.git
 cd mem-forge
+git checkout -q "$(git describe --tags --abbrev=0 --match 'memforge-ai-v*')"
 cp .env.example .env
 ```
 
-Leave the model settings in `.env` empty: you choose the models and enter
-their keys in the admin UI (step 2). To name them in `.env` instead, see
+The `git checkout` line moves to the latest release. Leave the model settings
+in `.env` empty: you choose the models and enter their keys in the admin UI
+(step 2). To name them in `.env` instead, see
 [Configuring models in `.env`](#configuring-models-in-env).
 
 Then start the stack:
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
 Open `http://localhost:5174`. The UI is served by the `admin-ui` container and
@@ -36,6 +38,28 @@ page under `/v2/` redirects to the same page at `/`.
 Runtime data is stored in the `memforge-data` Docker volume. Remove that volume
 only when you intentionally want a clean local instance. To move to a new
 release, see [Upgrading](#upgrading).
+
+### Which images run
+
+`compose.yaml` names the images that belong to your checkout, so
+`docker compose up` runs that checkout and no other:
+
+| Checkout | What `docker compose up` does |
+| --- | --- |
+| A release | Pulls that release's `ghcr.io/dodo-labs-ai/memforge-api` and `memforge-admin-ui` images, built for `linux/amd64` and `linux/arm64`, unless you already have them. |
+| `main` or any other commit | Tries the tag `dev`, which is never published, so the pull fails and Compose builds the checkout. |
+
+When a pull fails, because the registry cannot be reached or the release has no
+images yet, Compose goes on to build the images from your checkout. At a
+terminal you see the pull give way to `[+] Building`; in a log or an agent's
+shell, Compose also prints the registry's error, such as `denied` or `not found`.
+The build takes several minutes, and it runs your checkout's code, so it is safe
+to let it finish. `docker compose pull` shows why the pull failed, and
+`docker compose up --no-build` stops at the failure instead of building.
+
+`docker compose up --build` always builds your checkout and does not try the
+registry. Compose reuses an image it already has, so use `--build` whenever you
+have changed the source or pulled `main`.
 
 ### Network scope
 
@@ -50,12 +74,21 @@ explicit host/container route instead of widening the published host binding.
 
 If either port is already in use, set `MEMFORGE_API_HOST_PORT` or
 `MEMFORGE_ADMIN_UI_HOST_PORT` in `.env` and restart with the same
-`docker compose up --build` command.
+`docker compose up` command.
 
 ### Restricted or slow registry networks
 
-If base images fail to pull from Docker Hub, set a mirror prefix in `.env`
-before rebuilding:
+If `ghcr.io` is slow or blocked, name a mirror of it in `.env`. The image tag
+stays the one your checkout names:
+
+```bash
+sed -i.bak 's#^MEMFORGE_IMAGE_REGISTRY=.*#MEMFORGE_IMAGE_REGISTRY=<mirror host>/dodo-labs-ai#' .env
+docker compose up
+```
+
+Without a mirror, Compose builds the images instead. If the base images of that
+build fail to pull from Docker Hub, set a mirror prefix in `.env` before
+rebuilding:
 
 ```bash
 sed -i.bak 's#^MEMFORGE_DOCKERHUB_PREFIX=.*#MEMFORGE_DOCKERHUB_PREFIX=docker.m.daocloud.io/library/#' .env
@@ -373,7 +406,7 @@ generation and `https://api.openai.com/v1` for embedding.
 Restart the stack after editing `.env`:
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
 `memforge config show` prints the model each kind is using, where its settings
@@ -654,13 +687,18 @@ memforge sync --source "Source name"
 
 ## Upgrading
 
-Get the new release and rebuild the stack. The `memforge-data` volume, with
-your memories, sources and settings, is kept:
+Check out the new release and start it. Compose pulls its images and replaces
+the containers. The `memforge-data` volume, with your memories, sources and
+settings, is kept:
 
 ```bash
-git pull            # or: git checkout <release tag>
-docker compose up -d --build
+git fetch origin --tags
+git checkout -q "$(git describe --tags --abbrev=0 --match 'memforge-ai-v*' origin/main)"
+docker compose up -d
 ```
+
+A checkout that follows `main` moves with `git pull` and
+`docker compose up -d --build` instead.
 
 When the new release has schema migrations that the data has not applied
 yet, it upgrades the data before it serves anything:
@@ -715,11 +753,12 @@ The restore asks for confirmation (`--yes` skips it) and keeps the data it
 replaces as a new recovery point, so it can be undone the same way. If a
 restore stops before it finishes, MemForge refuses to start until the same
 restore is run again. Then start the release you want to run. To go back to
-the release before the upgrade, check it out and rebuild:
+the release before the upgrade, check it out and start it, adding `--build` if
+its `compose.yaml` names no image:
 
 ```bash
 git checkout <previous release tag>
-docker compose up -d --build
+docker compose up -d
 ```
 
 Starting the newer release again instead upgrades the restored data again.

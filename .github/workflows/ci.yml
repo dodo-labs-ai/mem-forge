@@ -40,6 +40,16 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Runs on every change, documentation included, so that no commit after a
+  # release goes on running that release's images.
+  image-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/verify_image_tag.py
+
   python:
     needs: changes
     if: needs.changes.outputs.code == 'true'

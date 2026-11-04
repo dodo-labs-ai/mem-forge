@@ -14,10 +14,12 @@
 # The stack runs as a Compose project of its own (memforge-smoke-<random>) with
 # its own data volume, on free loopback ports, and starts from
 # .env.example as a newcomer's .env does; a .env in the checkout is not read.
-# Your own `memforge` project, its volume and its ports are never touched.
-# Everything the smoke creates (containers, volume, network, the images it
-# built and its temporary folder) is removed when it ends, also when a step
-# fails or it is interrupted. The shared build cache is kept.
+# It always runs images built from this checkout, named after the project, so
+# they replace neither an image you pulled nor one you built. Your own
+# `memforge` project, its volume and its ports are never touched. Everything
+# the smoke creates (containers, volume, network, the images it built and its
+# temporary folder) is removed when it ends, also when a step fails or it is
+# interrupted. The shared build cache is kept.
 #
 # Usage:
 #   scripts/compose_smoke.sh [options]
@@ -167,7 +169,7 @@ api_url="http://127.0.0.1:$api_port"
 ui_url="http://127.0.0.1:$ui_port"
 https_proxy_value=${HTTPS_PROXY:-${https_proxy:-}}
 http_proxy_value=${HTTP_PROXY:-${http_proxy:-}}
-export MEMFORGE_API_HOST_PORT=$api_port MEMFORGE_ADMIN_UI_HOST_PORT=$ui_port
+export MEMFORGE_API_HOST_PORT=$api_port MEMFORGE_ADMIN_UI_HOST_PORT=$ui_port MEMFORGE_IMAGE_REGISTRY=$project
 
 step_names=()
 step_results=()
@@ -567,7 +569,7 @@ leftovers() {
     docker ps -aq --filter "$label"
     docker volume ls -q --filter "$label"
     docker network ls -q --filter "$label"
-    docker image ls -q --filter "reference=$project-*"
+    docker image ls -q --filter "reference=$project/*"
   } 2>/dev/null
 }
 
@@ -575,7 +577,7 @@ clean_up() {
   local started remaining
   started=$(date +%s)
   log "Clean up"
-  compose down -v --remove-orphans --rmi local >&2
+  compose down -v --remove-orphans --rmi all >&2
   remaining=$(leftovers)
   if [ -z "$remaining" ]; then
     record "Clean up" pass $(( $(date +%s) - started )) \

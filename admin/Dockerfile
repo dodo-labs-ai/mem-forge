@@ -1,8 +1,11 @@
 ARG DOCKERHUB_PREFIX=
 
+# The bundles are the same on every platform, so the Node stages run on the
+# build machine's own platform and a multi-platform build never emulates them.
+
 # Deprecated (admin-ui-v1): builds the V1 admin UI served at /v1/. Delete this
 # stage and its COPY below when V1 is removed.
-FROM ${DOCKERHUB_PREFIX}node:20-alpine AS build-v1
+FROM --platform=$BUILDPLATFORM ${DOCKERHUB_PREFIX}node:20-alpine AS build-v1
 
 ARG NPM_REGISTRY=
 
@@ -20,7 +23,7 @@ RUN if [ -n "$NPM_REGISTRY" ]; then \
 COPY admin-ui/ ./
 RUN npm run build
 
-FROM ${DOCKERHUB_PREFIX}node:20-alpine AS build
+FROM --platform=$BUILDPLATFORM ${DOCKERHUB_PREFIX}node:20-alpine AS build
 
 ARG NPM_REGISTRY=
 

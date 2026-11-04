@@ -41,23 +41,27 @@ or the one the person names.
 ## 2. Start MemForge
 
 Ask the person where to keep MemForge, suggesting `~/mem-forge`. Do not clone
-it inside their own project. Then clone it there:
+it inside their own project. Then clone it there and move to the latest release:
 
 ```bash
 git clone https://github.com/dodo-labs-ai/mem-forge.git ~/mem-forge
 cd ~/mem-forge
+git checkout -q "$(git describe --tags --abbrev=0 --match 'memforge-ai-v*')"
 ```
 
 In the checkout, create `.env` unless one exists, and start the stack:
 
 ```bash
 [ -f .env ] || cp .env.example .env
-docker compose up -d --build --wait
+docker compose up -d --wait
 ```
 
-`--wait` returns once the API reports healthy. The first build can take
-several minutes, longer than a shell tool's default timeout, so allow up to
-15 minutes. If it fails, show the person `docker compose logs api` and stop.
+`--wait` returns once the API reports healthy. Compose pulls the release's
+prebuilt images. If a pull fails it prints the registry's error, such as
+`denied` or `not found`, and goes on to build the images from the checkout; let
+that finish, because it is not a failure. A build can take several minutes,
+longer than a shell tool's default timeout, so allow up to 15 minutes.
+If the command itself fails, show the person `docker compose logs api` and stop.
 
 The commands below use the default ports. If the person set other ports in
 `.env`, `docker compose port api 8765` shows the API's address.

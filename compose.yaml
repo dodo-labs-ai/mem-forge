@@ -1,7 +1,12 @@
 name: memforge
 
+# The image tag belongs to this checkout. A release commit names its own version,
+# so a clone of that release pulls its images. Every other commit names dev, which
+# is never published: the pull fails, and Compose builds the checkout instead.
+# `docker compose up --build` always builds the checkout.
 services:
   api:
+    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-api:dev
     build:
       context: .
       dockerfile: Dockerfile
@@ -40,6 +45,7 @@ services:
       start_period: 20s
 
   admin-ui:
+    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-admin-ui:dev
     build:
       context: .
       dockerfile: admin/Dockerfile
