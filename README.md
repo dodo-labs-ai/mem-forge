@@ -26,40 +26,34 @@ up to date. Built from your docs, tickets and chat.
 
 ## Why MemForge
 
-**Your agent only sees the local repo.** A new hire's agent reads the checkout
-and guesses, while the answer sits in a Notion page nobody linked. A `CLAUDE.md`
-or `AGENTS.md` file only fits so many rules. MemForge connects to the wikis,
-tickets, repositories and chat your team already uses, so the agent can check
-what was decided before it acts. Every connector feeds the same pipeline, so
-each new source gets extraction, rechecks and evidence.
-
-**Docs change, and old answers linger.** When a doc changes, the next sync
-rechecks every memory built on it and keeps, replaces or retires each one, with
-no manual cleanup. The old version stays as history. MemForge also looks for
-memories that repeat, update or contradict each other and links them. When it
-finds a conflict, it keeps both and tells the agent, so the disagreement is
-visible instead of blended into one answer.
-
-**Agents shouldn't read whole docs to find one rule.** A model extracts short
-memories from your docs, and MemForge searches those instead. The agent searches
-by keyword and, with an embedding model, by meaning, and gets back only the
-memories that match. It opens the evidence or source when it needs more.
-Extraction spends model tokens when a source syncs, so agents have less to read
-when they answer. Nobody has to keep an index or folder structure tidy for the
-agent to find things.
-
-**Team memory with evidence.** A memory from a source cites the text it rests on
-and links to the page, ticket or file, pinned to the revision where the source
-allows it. The cited text can be the model's wording, so the agent can open the
-original to confirm it.
-
-**Run it yourself, or share it across the team.** The open-source edition is
-Apache-2.0 and runs on your machine for one person, with local storage and your
-own model keys. Source text goes to the model providers you choose, and the
-plugins don't capture your sessions. The
-[Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13),
-on the way, will give the whole team one shared memory, so every agent starts
-from the same knowledge.
+- **Turns your team's wiki, tickets and chat into memory your coding agents can
+  search.** On its own, a coding agent sees only the local checkout. MemForge syncs
+  sources such as Confluence, Jira and Teams ahead of time and builds one memory
+  from them, so agents search that memory instead of querying each tool. New sources
+  plug into the same
+  [connector interface](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/architecture.md#adding-a-source),
+  so the list can keep growing.
+- **Continuously detects stale facts and conflicts as your docs change.** Each sync,
+  on demand or on a schedule, rechecks the facts taken from changed docs and keeps, replaces
+  or retires each one. New facts are also compared with what's already in memory.
+  When it finds two docs that disagree, the agent gets both, with a note saying they
+  conflict or which is newer.
+- **Gives agents precise facts, not documents that blow up their context.** At sync,
+  a model turns your sources into memories: precise facts and decisions that keep
+  their conditions and exceptions. Agents search them over MCP by keyword, and by
+  meaning if you add an embedding model. Search results carry no document text, so a
+  full document enters the context only when the agent asks for it.
+- **Always justifies each fact with its real source.** Every fact from a source cites
+  the passage behind it and, where one exists, links to the original page, ticket or
+  file. If no source supports a fact any more, it is retired. The citation can be a
+  paraphrase, so MemForge also keeps the source text it read, and you or the agent
+  can open it to confirm.
+- **Runs on your machine, with team sharing on the way.** The open-source edition
+  is Apache-2.0 and single-user, with local storage and your own model keys. Source
+  text goes to the model providers you choose, and the agent plugins don't record
+  your sessions. The hosted
+  [Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13)
+  will give the whole team one shared memory.
 
 ## Quick start
 
@@ -81,7 +75,8 @@ The agent starts MemForge and installs its plugin, then hands you the admin UI
 to enter your model key and connect a source, so your keys never pass through
 the agent.
 
-**Or set it up yourself:**
+<details>
+<summary><b>Or set it up yourself</b> with Docker Compose, in 5 steps</summary>
 
 1. **Start MemForge.**
 
@@ -124,6 +119,8 @@ the agent.
    ```
 
    The agent answers with the memories that apply and names the source of each.
+
+</details>
 
 The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers every model provider,
 local folders, the host CLI and network details.
