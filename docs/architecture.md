@@ -11,7 +11,7 @@ MemForge or contribute to it.
 | Component | What it does | Code |
 | --- | --- | --- |
 | API service | A FastAPI application that owns sources, sync, memories, reviews and settings | `src/memforge/server` |
-| Source connectors | One per source type: Confluence, Jira, Notion, GitHub Pages, GitHub repositories, Microsoft Teams and local folders. The code calls a connector a *gene*. Each fetches documents and hands them over in one common form | `src/memforge/genes` |
+| Source connectors | One per source type, registered through a descriptor that shared code reads. The code calls a connector a *gene*. Each fetches documents and hands them over in one common form | `src/memforge/genes`, `src/memforge/source_types` |
 | Pipeline | Extracts memories from each document with an LLM, keeps the Evidence each memory rests on, and rechecks memories when their source changes | `src/memforge/pipeline` |
 | Storage | SQLite for documents, memories and sync state, with FTS5 for keyword search, and Chroma for vectors | `src/memforge/storage` |
 | Retrieval | Vector, keyword and entity channels run in parallel and are fused into one ranking | `src/memforge/retrieval` |

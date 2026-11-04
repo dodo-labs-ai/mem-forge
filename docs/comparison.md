@@ -7,8 +7,8 @@ are the better choice.
 
 ## Which one fits
 
-- **MemForge:** your agents need what your team already wrote in Confluence,
-  Jira, Notion, GitHub or Teams, with a source behind each extracted memory. The
+- **MemForge:** your agents need what your team already wrote in its wikis,
+  tickets, repositories and chat, with a source behind each extracted memory. The
   open-source edition is for one person on one machine; a
   [shared Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13)
   is on the way.
@@ -24,7 +24,7 @@ are the better choice.
 
 | | MemForge | Mem0 | Zep / Graphiti | claude-mem | Unblocked |
 | --- | --- | --- | --- | --- | --- |
-| Built from | Confluence, Jira, Notion, GitHub, Teams, local files, and memories an agent saves when you ask | Content your application sends; its Claude Code plugin also captures coding sessions | Data sent through APIs, loaders or MCP | Coding-agent sessions | Code, tickets, docs, conversations and other tools |
+| Built from | Your team's wikis, tickets, repositories, chat and local files, and memories an agent saves when you ask | Content your application sends; its Claude Code plugin also captures coding sessions | Data sent through APIs, loaders or MCP | Coding-agent sessions | Code, tickets, docs, conversations and other tools |
 | When knowledge changes | Rechecks memories against the new revision, keeps history, links conflicts | Adds facts with temporal context; update and delete are separate APIs | Facts have validity periods; old facts can be invalidated | Records new session observations | Weighs recency, expertise and code across sources; shows both sides of a real conflict, with citations |
 | How you check a memory | Cited text and a source link, pinned to the revision where available | Change history for each memory | Source episodes behind each fact | Observation IDs, with the files each one read or changed | Citations to files, PRs, tickets and docs |
 | Open source | Apache-2.0 local service | Apache-2.0 library; hosted Platform is separate | Apache-2.0 Graphiti; hosted Zep is separate | Apache-2.0 local service | Not open source; cloud by default, on-premises on Enterprise |
