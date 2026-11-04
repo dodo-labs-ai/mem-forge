@@ -33,33 +33,34 @@ tickets, repositories and chat your team already uses, so the agent can check
 what was decided before it acts. Every connector feeds the same pipeline, so
 each new source gets extraction, rechecks and evidence.
 
-**Docs change, and old answers linger.** When a doc changes, the next sync
-rechecks every memory built on it and keeps, replaces or retires each one, with
-no manual cleanup. The old version stays as history. MemForge also looks for
-memories that repeat, update or contradict each other and links them. When it
-finds a conflict, it keeps both and tells the agent, so the disagreement is
-visible instead of blended into one answer.
+**Your agent can't tell which doc is current.** When a doc changes, MemForge
+rechecks every memory built on it at the next sync and keeps, replaces or
+retires each one, with no manual cleanup. The old version stays as history. It
+also looks for memories that repeat, update or contradict each other and links
+them. When it finds a conflict, it keeps both and tells the agent, so the
+disagreement is visible instead of blended into one answer.
 
-**Agents shouldn't read whole docs to find one rule.** A model extracts short
-memories from your docs, and MemForge searches those instead. The agent searches
-by keyword and, with an embedding model, by meaning, and gets back only the
-memories that match. It opens the evidence or source when it needs more.
-Extraction spends model tokens when a source syncs, so agents have less to read
-when they answer. Nobody has to keep an index or folder structure tidy for the
-agent to find things.
+**Your agent reads whole docs to find one rule.** MemForge indexes short
+memories that a model extracted from your docs, not the docs themselves. The
+agent searches by keyword and, with an embedding model, by meaning, and gets
+back only the memories that match. It opens the evidence or source when it needs
+more. Extraction spends model tokens when a source syncs, so agents have less to
+read when they answer. Nobody has to keep an index or folder structure tidy for
+the agent to find things.
 
-**Team memory with evidence.** A memory from a source cites the text it rests on
-and links to the page, ticket or file, pinned to the revision where the source
-allows it. The cited text can be the model's wording, so the agent can open the
-original to confirm it.
+**Your agent can't show where an answer came from.** MemForge is team memory
+with evidence: a memory from a source cites the text it rests on and links to
+the page, ticket or file, pinned to the revision where the source allows it. The
+cited text can be the model's wording, so the agent can open the original to
+confirm it.
 
-**Run it yourself, or share it across the team.** The open-source edition is
-Apache-2.0 and runs on your machine for one person, with local storage and your
-own model keys. Source text goes to the model providers you choose, and the
-plugins don't capture your sessions. The
+**Every agent on your team starts from zero.** The
 [Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13),
 on the way, will give the whole team one shared memory, so every agent starts
-from the same knowledge.
+from the same knowledge. Today, the open-source edition is Apache-2.0 and runs
+on your machine for one person, with local storage and your own model keys.
+Source text goes to the model providers you choose, and the plugins don't capture
+your sessions.
 
 ## Quick start
 
