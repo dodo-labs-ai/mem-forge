@@ -11,8 +11,8 @@ Start here if you are new to the repository:
 - [API overview](api.md): core Admin API endpoints.
 - [Local repository sync](local-repo-sync.md): syncing a local folder or
   repository through the local daemon.
-- [How MemForge compares](comparison.md): MemForge beside Mem0, Zep / Graphiti,
-  claude-mem and Unblocked, with sources.
+- [How MemForge compares](comparison.md): when to choose MemForge and when
+  another tool fits better.
 - [Python distribution release](releasing-python-distribution.md): package
   naming, Trusted Publisher configuration, release tags, and install smoke.
 

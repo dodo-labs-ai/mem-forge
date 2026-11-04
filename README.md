@@ -26,33 +26,39 @@ up to date. Built from your docs, tickets and chat.
 
 ## Why MemForge
 
-**On day one, your agent knows what your team knows.** A new hire picks up a
-ticket, and their agent reads the code and guesses. The answer the team
-settled months ago sits in a Notion page nobody linked. With MemForge, the
-agent checks team memory before it acts and finds the convention, decision or
-known issue that applies, from Confluence, Jira, Notion, GitHub and Teams in
-one `search` call.
+**Your agent only sees the local repo.** A new hire's agent reads the checkout
+and guesses, while the answer sits in a Notion page nobody linked. A `CLAUDE.md`
+or `AGENTS.md` file only fits so many rules. MemForge connects to Confluence,
+Jira, Notion, GitHub and Teams, so the agent can check what your team already
+decided before it acts.
 
-**When a doc changes, memory follows.** The team changed a rule last week, and
-agents still repeat the old one. With MemForge, the next sync rechecks every
-memory built on the changed page: each is kept, replaced or retired, and the
-earlier version stays as history. Memories that repeat, update or contradict
-each other are linked, so the agent sees which one replaced another and where
-two disagree.
+**Docs change, and old answers linger.** When a doc changes, the next sync
+rechecks every memory built on it and keeps, replaces or retires each one, with
+no manual cleanup. The old version stays as history. MemForge also looks for
+memories that repeat, update or contradict each other and links them. When it
+finds a conflict, it keeps both and tells the agent, so the disagreement is
+visible instead of blended into one answer.
 
-**Every answer shows where it came from.** A confident answer you cannot check
-is a liability. With MemForge, each memory comes with its supporting text and
-a link to the page, ticket or file. Where the source allows it, the citation
-is pinned to the revision and passage that was read, and the agent can open
-the original. The supporting text can be the model's focused wording, not
-always a verbatim quote.
+**Agents shouldn't read whole docs to find one rule.** A model extracts short
+memories from your docs, and MemForge searches those instead. The agent searches
+by keyword and, with an embedding model, by meaning, and gets back only the
+memories that match. It opens the evidence or source when it needs more.
+Extraction spends model tokens when a source syncs, so agents have less to read
+when they answer. Nobody has to keep an index or folder structure tidy for the
+agent to find things.
 
-**It runs on your machine.** Apache-2.0, with local storage (SQLite, FTS5 and
-Chroma). You bring your own model keys, and those providers receive only what
-is sent for inference. The plugins send no session transcripts.
+**Team memory with evidence.** A memory from a source cites the text it rests on
+and links to the page, ticket or file, pinned to the revision where the source
+allows it. The cited text can be the model's wording, so the agent can open the
+original to confirm it.
 
-See [how MemForge compares](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/comparison.md) with Mem0, Zep, claude-mem and
-Unblocked.
+**Run it yourself, or share it across the team.** The open-source edition is
+Apache-2.0 and runs on your machine for one person, with local storage and your
+own model keys. Source text goes to the model providers you choose, and the
+plugins don't capture your sessions. The
+[Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13),
+on the way, will give the whole team one shared memory, so every agent starts
+from the same knowledge.
 
 ## Quick start
 
@@ -213,6 +219,8 @@ how to scope it. Need one that is missing?
 - [Quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md): setup, models, plugins, sources, CLI,
   development from source
 - [Docs index](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/README.md): quickstart, architecture, API and release guides
+- [How MemForge compares](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/comparison.md): when to choose MemForge and when
+  another tool fits better
 - [Contributing](https://github.com/dodo-labs-ai/mem-forge/blob/main/CONTRIBUTING.md)
 
 ## License
