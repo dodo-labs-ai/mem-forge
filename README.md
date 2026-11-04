@@ -82,7 +82,8 @@ The agent starts MemForge and installs its plugin, then hands you the admin UI
 to enter your model key and connect a source, so your keys never pass through
 the agent.
 
-**Or set it up yourself:**
+<details>
+<summary><b>Or set it up yourself</b> with Docker Compose, in 5 steps</summary>
 
 1. **Start MemForge.**
 
@@ -125,6 +126,8 @@ the agent.
    ```
 
    The agent answers with the memories that apply and names the source of each.
+
+</details>
 
 The [quickstart](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/quickstart.md) covers every model provider,
 local folders, the host CLI and network details.
