@@ -26,29 +26,32 @@ up to date. Built from your docs, tickets and chat.
 
 ## Why MemForge
 
-- **Reaches beyond the repo.** A coding agent only sees the local checkout, and a
-  `CLAUDE.md` or `AGENTS.md` file only fits so many rules. MemForge connects to
-  the wikis, tickets, repositories and chat your team already uses. Every
-  connector feeds the same pipeline, so each new source gets extraction, rechecks
-  and evidence.
-- **Keeps up when docs change.** Old answers tend to linger after a doc changes.
-  The next sync rechecks every memory built on it and keeps, replaces or retires
-  each one, with no manual cleanup. MemForge also looks for memories that repeat,
-  update or contradict each other and links them, so the agent sees a conflict
-  instead of a blended answer.
-- **Searches memories, not whole docs.** Whole docs spend tokens on text the agent
-  doesn't need. A model extracts short memories at sync, and the agent searches
-  them by keyword and, with an embedding model, by meaning. It opens the evidence
-  or source only when it needs more, and nobody has to keep an index or folder
-  structure tidy.
-- **Shows its evidence.** A memory from a source cites the text behind it and
-  links to the page, ticket or file, pinned to the revision where the source
-  allows it. The cited text can be the model's wording, so the agent can open the
-  original to confirm it.
-- **Runs locally, with team sharing on the way.** The open-source edition is
-  Apache-2.0 and runs on your machine for one person, with local storage and your
-  own model keys. Source text goes to the model providers you choose, and the
-  plugins don't capture your sessions. The
+- **Turns your team's wiki, tickets and chat into memory your coding agents can
+  search.** On its own, a coding agent sees only the local checkout. MemForge syncs
+  sources such as Confluence, Jira and Teams ahead of time and builds one memory
+  from them, so agents search that memory instead of querying each tool. New sources
+  plug into the same
+  [connector interface](https://github.com/dodo-labs-ai/mem-forge/blob/main/docs/architecture.md#adding-a-source),
+  so the list can keep growing.
+- **Continuously detects stale facts and conflicts as your docs change.** Each sync,
+  on demand or on a schedule, rechecks the facts taken from changed docs and keeps, replaces
+  or retires each one. New facts are also compared with what's already in memory.
+  When it finds two docs that disagree, the agent gets both, with a note saying they
+  conflict or which is newer.
+- **Gives agents precise facts, not documents that blow up their context.** At sync,
+  a model turns your sources into memories: precise facts and decisions that keep
+  their conditions and exceptions. Agents search them over MCP by keyword, and by
+  meaning if you add an embedding model. Search results carry no document text, so a
+  full document enters the context only when the agent asks for it.
+- **Always justifies each fact with its real source.** Every fact from a source cites
+  the passage behind it and, where one exists, links to the original page, ticket or
+  file. If no source supports a fact any more, it is retired. The citation can be a
+  paraphrase, so MemForge also keeps the source text it read, and you or the agent
+  can open it to confirm.
+- **Runs on your machine, with team sharing on the way.** The open-source edition
+  is Apache-2.0 and single-user, with local storage and your own model keys. Source
+  text goes to the model providers you choose, and the agent plugins don't record
+  your sessions. The hosted
   [Team Cloud Edition](https://github.com/dodo-labs-ai/mem-forge/discussions/13)
   will give the whole team one shared memory.
 
