@@ -48,7 +48,7 @@
 #                           through one Source per type, revision 1 then
 #                           revision 2, then run the quick offline quality
 #                           evaluation of each case kind; the summaries follow
-#                           the table.
+#                           the table and name each case by its cohort title.
 #   --quality-outputs DIR   With --quality, also save each case kind's case
 #                           outputs (the pinned input, rubric and model output
 #                           of every case) as DIR/<kind>.json.
@@ -446,7 +446,7 @@ retrieve_memories() {
 # step passes only when every kind's verdict is pass; the judge's decisions on
 # quality are reported below the table and never fail it.
 quality_checks() {
-  local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" kind command seeded run_spec summary status
+  local cohort="$REPO_ROOT/evals/quality/quick/cohort.json" kind command seeded seeded_file run_spec summary status
   local problems=() failed=0
   if [ -z "$models_label" ]; then
     say "needs a synced source"
@@ -456,13 +456,15 @@ quality_checks() {
   for kind in derivation support reconciliation; do
     command=seed-$kind-cases
     run_spec="$work_dir/quality-run-$kind.json"
+    seeded_file="$work_dir/quality-seeded-$kind.json"
     if ! seeded=$(helper quality-seed-spec --cohort "$cohort" --kind "$kind" |
         compose exec -T -e MEMFORGE_API_URL=http://127.0.0.1:8765 api \
           memforge eval "$command" --spec /dev/stdin); then
       say "pinning the $kind cases failed: $(echo "$seeded" | tr '\n' ' ')"
       return 1
     fi
-    if ! printf '%s' "$seeded" | helper quality-run-spec --cohort "$cohort" >"$run_spec"; then
+    printf '%s' "$seeded" >"$seeded_file"
+    if ! helper quality-run-spec --cohort "$cohort" <"$seeded_file" >"$run_spec"; then
       say "$kind: $(cat "$run_spec")"
       return 1
     fi
@@ -471,8 +473,7 @@ quality_checks() {
     status=$?
     [ -n "$quality_summary" ] ||
       quality_summary="- Models: $models_label; judge ${judge_label:-none (expectations not judged)}"$'\n\n'
-    quality_summary+="### $kind cases"$'\n\n'"$summary"$'\n\n'
-    [ -n "$judge_label" ] && quality_summary+="$(quality_expectations "$summary")"$'\n\n'
+    quality_summary+="### $kind cases"$'\n\n'"$(quality_details "$cohort" "$kind" "$seeded_file" "$summary")"$'\n\n'
     [ -n "$outputs_dir" ] && save_quality_outputs "$kind" "$summary"
     case $status in
       0) ;;
@@ -486,6 +487,19 @@ quality_checks() {
     say "replay problems: $(IFS=,; echo "${problems[*]}" | sed 's/,/, /g'); summaries below the table"
   fi
   return "$failed"
+}
+
+# What one case kind's run reports: its summary and, with a judge, the expectations
+# not met, each case named by the cohort. A report whose cases cannot be named
+# still shows, by case ID.
+quality_details() {
+  local cohort=$1 kind=$2 seeded_file=$3 summary=$4 details named
+  details=$summary
+  [ -n "$judge_label" ] && details+=$'\n\n'"$(quality_expectations "$summary")"
+  if named=$(printf '%s' "$details" | helper quality-name-cases --cohort "$cohort" --kind "$kind" --seeded "$seeded_file"); then
+    details=$named
+  fi
+  printf '%s' "$details"
 }
 
 # The expectations of one case kind's run the judge did not find met, with

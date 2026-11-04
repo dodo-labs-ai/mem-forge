@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compose smoke: the summaries of `scripts/compose_smoke.sh --quality` name each
+  case by its cohort title, with its snapshot set or situation file, in every
+  table, with or without a judge, instead of the case ID of that run.
+
 - Model providers: LiteLLM 1.106.6 replaces 1.86.0. MemForge reads the model
   table packaged with that LiteLLM version and no longer lets LiteLLM download
   the latest table at start, so a model's limits change only with a LiteLLM
