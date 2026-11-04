@@ -11,6 +11,7 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_image_tag.py"
 VERSION = "1.2.3b4"
+RELEASE_TAG = f"memforge-ai-v{VERSION}"
 
 
 def _load_script():
@@ -23,6 +24,7 @@ def _load_script():
 
 
 verify_image_tag = _load_script()
+UNPUBLISHED_TAG = verify_image_tag.UNPUBLISHED_TAG
 
 
 def _write_checkout(root: Path, *, api_tag: str, admin_ui_tag: str | None = None) -> None:
@@ -71,14 +73,34 @@ def checkout(tmp_path: Path) -> Path:
 def test_this_repository_names_an_allowed_image_tag():
     tag = verify_image_tag.compose_image_tag(REPOSITORY_ROOT)
 
-    assert tag in {verify_image_tag.UNPUBLISHED_TAG, verify_image_tag.project_version(REPOSITORY_ROOT)}
+    assert tag in {UNPUBLISHED_TAG, verify_image_tag.project_version(REPOSITORY_ROOT)}
 
 
 def test_a_commit_between_releases_names_the_unpublished_tag(checkout: Path):
-    _write_checkout(checkout, api_tag="dev")
+    _write_checkout(checkout, api_tag=VERSION)
+    _commit(checkout, "release")
+    _git(checkout, "tag", RELEASE_TAG)
+    _write_checkout(checkout, api_tag=UNPUBLISHED_TAG)
     _commit(checkout, "between releases")
 
-    assert verify_image_tag.verify_checkout(checkout) == "dev"
+    assert verify_image_tag.verify_checkout(checkout) == UNPUBLISHED_TAG
+
+
+def test_a_raised_version_that_compose_does_not_name_is_refused(checkout: Path):
+    _write_checkout(checkout, api_tag=UNPUBLISHED_TAG)
+    _commit(checkout, "version raised, compose left behind")
+
+    with pytest.raises(SystemExit, match=f"no release tag {RELEASE_TAG}"):
+        verify_image_tag.verify_checkout(checkout)
+
+
+def test_the_same_commit_would_be_refused_again_once_it_is_released(checkout: Path):
+    _write_checkout(checkout, api_tag=UNPUBLISHED_TAG)
+    _commit(checkout, "version raised, compose left behind")
+    _git(checkout, "tag", RELEASE_TAG)
+
+    with pytest.raises(SystemExit, match="must name its own version"):
+        verify_image_tag.verify_release(checkout, RELEASE_TAG)
 
 
 def test_a_release_commit_passes_before_and_after_it_is_tagged(checkout: Path):
@@ -87,7 +109,7 @@ def test_a_release_commit_passes_before_and_after_it_is_tagged(checkout: Path):
 
     assert verify_image_tag.verify_checkout(checkout) == VERSION
 
-    _git(checkout, "tag", f"memforge-ai-v{VERSION}")
+    _git(checkout, "tag", RELEASE_TAG)
 
     assert verify_image_tag.verify_checkout(checkout) == VERSION
 
@@ -95,24 +117,25 @@ def test_a_release_commit_passes_before_and_after_it_is_tagged(checkout: Path):
 def test_a_later_commit_may_not_keep_a_released_tag(checkout: Path):
     _write_checkout(checkout, api_tag=VERSION)
     _commit(checkout, "release")
-    _git(checkout, "tag", f"memforge-ai-v{VERSION}")
+    _git(checkout, "tag", RELEASE_TAG)
     (checkout / "later.txt").write_text("later\n", encoding="utf-8")
     _commit(checkout, "later")
 
-    with pytest.raises(SystemExit, match="set it back to 'dev'"):
+    with pytest.raises(SystemExit, match="set it back to"):
         verify_image_tag.verify_checkout(checkout)
 
 
-def test_a_tag_other_than_the_version_or_dev_is_refused(checkout: Path):
-    _write_checkout(checkout, api_tag="latest")
+@pytest.mark.parametrize("tag", ["latest", "dev"])
+def test_a_tag_other_than_the_version_or_the_unpublished_tag_is_refused(checkout: Path, tag: str):
+    _write_checkout(checkout, api_tag=tag)
     _commit(checkout, "floating")
 
-    with pytest.raises(SystemExit, match="names image tag 'latest'"):
+    with pytest.raises(SystemExit, match=f"names image tag '{tag}'"):
         verify_image_tag.verify_checkout(checkout)
 
 
 def test_both_images_must_name_one_tag(tmp_path: Path):
-    _write_checkout(tmp_path, api_tag=VERSION, admin_ui_tag="dev")
+    _write_checkout(tmp_path, api_tag=VERSION, admin_ui_tag=UNPUBLISHED_TAG)
 
     with pytest.raises(SystemExit, match="different image tags"):
         verify_image_tag.compose_image_tag(tmp_path)
@@ -120,7 +143,7 @@ def test_both_images_must_name_one_tag(tmp_path: Path):
 
 def test_a_missing_image_is_refused(tmp_path: Path):
     (tmp_path / "compose.yaml").write_text(
-        "services:\n  api:\n    image: ghcr.io/acme/memforge-api:dev\n", encoding="utf-8"
+        "services:\n  api:\n    image: ghcr.io/acme/memforge-api:1.0\n", encoding="utf-8"
     )
 
     with pytest.raises(SystemExit, match="expected"):
@@ -130,7 +153,7 @@ def test_a_missing_image_is_refused(tmp_path: Path):
 def test_a_release_publishes_the_version_its_commit_names(tmp_path: Path):
     _write_checkout(tmp_path, api_tag=VERSION)
 
-    assert verify_image_tag.verify_release(tmp_path, f"memforge-ai-v{VERSION}") == VERSION
+    assert verify_image_tag.verify_release(tmp_path, RELEASE_TAG) == VERSION
 
 
 @pytest.mark.parametrize(
@@ -144,8 +167,8 @@ def test_a_tag_that_is_not_this_python_release_publishes_nothing(tmp_path: Path,
         verify_image_tag.verify_release(tmp_path, release_tag)
 
 
-def test_a_release_whose_commit_still_names_dev_publishes_nothing(tmp_path: Path):
-    _write_checkout(tmp_path, api_tag="dev")
+def test_a_release_whose_commit_still_names_the_unpublished_tag_publishes_nothing(tmp_path: Path):
+    _write_checkout(tmp_path, api_tag=UNPUBLISHED_TAG)
 
     with pytest.raises(SystemExit, match="must name its own version"):
-        verify_image_tag.verify_release(tmp_path, f"memforge-ai-v{VERSION}")
+        verify_image_tag.verify_release(tmp_path, RELEASE_TAG)

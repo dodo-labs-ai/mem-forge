@@ -2,12 +2,17 @@
 """Verify that compose.yaml names the images this checkout should run.
 
 A release commit names its own version, so a clone of that release pulls its
-images. Every other commit names ``dev``, which is never published, so Compose
-builds that checkout. A version that outlived its release would make later
-commits run that release's images, so only the release's own commit may name it.
+images. Every other commit names a dev tag of its Compose project, which is never
+published, so Compose builds that checkout under a name no other project shares.
+
+A version that outlived its release would make later commits run that release's
+images, so only the release's own commit may name it. A raised version that
+compose.yaml does not name would pass here and be refused only once it is
+released, so the commit that raises it must name it. This needs the checkout's
+release tags.
 
 With ``--release-tag`` the script checks a release instead, and prints the
-version the publish workflow tags the images with.
+version the publish workflows tag the images with.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import tomllib
 
 
 RELEASE_TAG_PREFIX = "memforge-ai-v"
-UNPUBLISHED_TAG = "dev"
+UNPUBLISHED_TAG = "dev-${COMPOSE_PROJECT_NAME}"
 IMAGES = ("memforge-api", "memforge-admin-ui")
 _IMAGE_LINE = re.compile(r"^\s*image:\s*\S*/(?P<image>memforge-[a-z-]+):(?P<tag>\S+)\s*$", re.MULTILINE)
 
@@ -56,15 +61,21 @@ def _release_commit(root: Path, version: str) -> str | None:
 
 def verify_checkout(root: Path) -> str:
     tag = compose_image_tag(root)
-    if tag == UNPUBLISHED_TAG:
-        return tag
     version = project_version(root)
+    released_at = _release_commit(root, version)
+    if tag == UNPUBLISHED_TAG:
+        if released_at is None:
+            raise SystemExit(
+                f"version {version} has no release tag {RELEASE_TAG_PREFIX}{version} and compose.yaml names"
+                f" {UNPUBLISHED_TAG!r}: the commit that raises the version names it as the image tag,"
+                " or its release publishes no images"
+            )
+        return tag
     if tag != version:
         raise SystemExit(
             f"compose.yaml names image tag {tag!r}: a release commit names its version {version!r},"
             f" and any other commit names {UNPUBLISHED_TAG!r}"
         )
-    released_at = _release_commit(root, version)
     if released_at is not None and _git(root, "rev-parse", "HEAD").stdout.strip() != released_at:
         raise SystemExit(
             f"compose.yaml still names image tag {tag!r}, released at {released_at}:"

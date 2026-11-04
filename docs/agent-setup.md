@@ -57,9 +57,10 @@ docker compose up -d --wait
 ```
 
 `--wait` returns once the API reports healthy. Compose pulls the release's
-prebuilt images. If a pull fails it prints the registry's error, such as
-`denied` or `not found`, and goes on to build the images from the checkout; let
-that finish, because it is not a failure. A build can take several minutes,
+prebuilt images, or builds them from the checkout when the release names none.
+If a pull fails it prints the registry's error, such as `denied` or `not found`,
+and goes on to build the images; let that finish, because it is not a failure.
+A build can take several minutes,
 longer than a shell tool's default timeout, so allow up to 15 minutes.
 If the command itself fails, show the person `docker compose logs api` and stop.
 

@@ -41,13 +41,13 @@ release, see [Upgrading](#upgrading).
 
 ### Which images run
 
-`compose.yaml` names the images that belong to your checkout, so
-`docker compose up` runs that checkout and no other:
+`compose.yaml` names the images that belong to your checkout:
 
 | Checkout | What `docker compose up` does |
 | --- | --- |
 | A release | Pulls that release's `ghcr.io/dodo-labs-ai/memforge-api` and `memforge-admin-ui` images, built for `linux/amd64` and `linux/arm64`, unless you already have them. |
-| `main` or any other commit | Tries the tag `dev`, which is never published, so the pull fails and Compose builds the checkout. |
+| A release whose `compose.yaml` names no image, as every release up to 0.2.0b3 does | Builds the checkout, unless images from an earlier build exist. Compose then runs those without a message, so add `--build` to run this checkout. |
+| `main` or any other commit | Tries a tag that is never published, `dev-` and the Compose project's name, so the pull fails and Compose builds the checkout. |
 
 When a pull fails, because the registry cannot be reached or the release has no
 images yet, Compose goes on to build the images from your checkout. At a
@@ -78,11 +78,12 @@ If either port is already in use, set `MEMFORGE_API_HOST_PORT` or
 
 ### Restricted or slow registry networks
 
-If `ghcr.io` is slow or blocked, name a mirror of it in `.env`. The image tag
-stays the one your checkout names:
+If `ghcr.io` is slow or blocked and your network offers a mirror of it, add the
+mirror to `.env`, where the last value of a setting counts. No public mirror has
+been verified for these images. The image tag stays the one your checkout names:
 
 ```bash
-sed -i.bak 's#^MEMFORGE_IMAGE_REGISTRY=.*#MEMFORGE_IMAGE_REGISTRY=<mirror host>/dodo-labs-ai#' .env
+printf '\nMEMFORGE_IMAGE_REGISTRY=<mirror host>/dodo-labs-ai\n' >> .env
 docker compose up
 ```
 
@@ -687,15 +688,21 @@ memforge sync --source "Source name"
 
 ## Upgrading
 
-Check out the new release and start it. Compose pulls its images and replaces
-the containers. The `memforge-data` volume, with your memories, sources and
-settings, is kept:
+Check out the new release and start it. The `memforge-data` volume, with your
+memories, sources and settings, is kept:
 
 ```bash
 git fetch origin --tags
 git checkout -q "$(git describe --tags --abbrev=0 --match 'memforge-ai-v*' origin/main)"
 docker compose up -d
 ```
+
+Compose pulls the release's images and replaces the containers. The images of the
+release you left stay on disk until you remove them with `docker image rm`.
+
+If `grep image: compose.yaml` prints nothing, as for every release up to 0.2.0b3,
+the release has no images to pull. Use `docker compose up -d --build` for it: a
+plain `up -d` goes on running the images you already have, without a message.
 
 A checkout that follows `main` moves with `git pull` and
 `docker compose up -d --build` instead.

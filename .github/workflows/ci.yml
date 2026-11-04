@@ -41,7 +41,8 @@ jobs:
           fi
 
   # Runs on every change, documentation included, so that no commit after a
-  # release goes on running that release's images.
+  # release goes on running that release's images, and a raised version names its
+  # images before it is released. The check needs the release tags.
   image-tag:
     runs-on: ubuntu-latest
     steps:

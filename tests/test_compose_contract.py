@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tomllib
 
 import pytest
 
@@ -16,6 +17,7 @@ NETWORK_BIND_VARIABLES = (
     "MEMFORGE_ADMIN_UI_BIND_ADDR",
 )
 IMAGE_VARIABLES = (
+    "COMPOSE_PROJECT_NAME",
     "MEMFORGE_IMAGE_REGISTRY",
     "MEMFORGE_IMAGE_TAG",
 )
@@ -123,6 +125,18 @@ def test_an_empty_registry_setting_keeps_the_default_registry():
 
     assert _image_name_and_tag(rendered, "api")[0] == "ghcr.io/dodo-labs-ai/memforge-api"
     assert _image_name_and_tag(rendered, "admin-ui")[0] == "ghcr.io/dodo-labs-ai/memforge-admin-ui"
+
+
+def test_two_projects_between_releases_build_under_different_image_tags():
+    version = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    default = _render_compose()
+    if _image_name_and_tag(default, "api")[1] == version:
+        pytest.skip("a release commit names its version, so every project runs the release's images")
+
+    feature = _render_compose({"COMPOSE_PROJECT_NAME": "feature-a"})
+    for service_name in ("api", "admin-ui"):
+        assert _image_name_and_tag(default, service_name)[1] == "dev-memforge"
+        assert _image_name_and_tag(feature, service_name)[1] == "dev-feature-a"
 
 
 def test_the_environment_cannot_detach_a_checkout_from_its_image_tag():
