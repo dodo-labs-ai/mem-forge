@@ -26,7 +26,7 @@ up to date. Built from your docs, tickets and chat.
 
 ## Why MemForge
 
-**Your team's knowledge isn't in the repo.** A new hire's agent reads the code
+**Your agent only sees the local repo.** A new hire's agent reads the checkout
 and guesses, while the answer sits in a Notion page nobody linked. A `CLAUDE.md`
 or `AGENTS.md` file only fits so many rules. MemForge connects to Confluence,
 Jira, Notion, GitHub and Teams, so the agent can check what your team already
