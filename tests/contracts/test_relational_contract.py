@@ -390,7 +390,8 @@ class RelationalStoreContract:
             ),
         }
         created = {memory.id: memory.created_at for memory in memories}
-        assert all(candidate.created_at == created[candidate.memory_id] is not None for candidate in candidates)
+        assert all(candidate.created_at is not None for candidate in candidates)
+        assert all(candidate.created_at == created[candidate.memory_id] for candidate in candidates)
 
     # -- Visibility filtering ----------------------------------------------
 

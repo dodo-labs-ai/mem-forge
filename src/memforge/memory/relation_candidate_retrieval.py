@@ -62,7 +62,7 @@ class RelationCandidateRetrievalPolicy:
 
     ``per_list_limit`` is the budget: a challenger is compared with at most three
     times that many Memories, whatever the workspace size. Each list is read to
-    ``rank_window_size`` so that dropping inaccessible and later Memories still
+    ``rank_window_size`` so that dropping inaccessible and later Memories usually
     leaves it ``per_list_limit`` deep.
     """
 
@@ -81,7 +81,10 @@ class RelationCandidateRetrievalPolicy:
 
 @dataclass(frozen=True, slots=True)
 class Nomination:
-    """A Memory that at least one ranked list placed within its first ``per_list_limit`` items."""
+    """A Memory that at least one ranked list placed within its first ``per_list_limit`` items.
+
+    The rule's result holds ids only; retrieval pairs it with the candidate's row.
+    """
 
     memory_id: str
     # The best 1-based rank the Memory has in any list that nominated it.
@@ -480,18 +483,16 @@ def _memory_access_compatible(candidate: Memory, challenger: Memory) -> bool:
     )
 
 
-_UNKNOWN_CREATION = datetime.min.replace(tzinfo=timezone.utc)
-
-
 def _creation_order(created_at: datetime | None, memory_id: str) -> tuple[datetime, str]:
     """When a Memory was created, as UTC, with its id breaking ties within one commit.
 
-    A time without an offset is UTC. An unknown time orders first, so such a
-    Memory is a candidate of later challengers and has no candidates itself.
+    A time without an offset is UTC. Every store records the time a Memory is
+    created, so a missing one means a store did not read it, and discovery fails
+    rather than judge the pair from both sides.
     """
 
     if created_at is None:
-        return _UNKNOWN_CREATION, memory_id
+        raise ValueError(f"relation discovery needs the creation time of Memory {memory_id}")
     if created_at.tzinfo is None:
         return created_at.replace(tzinfo=timezone.utc), memory_id
     return created_at.astimezone(timezone.utc), memory_id

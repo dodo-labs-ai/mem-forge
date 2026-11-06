@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -592,9 +592,63 @@ async def test_large_memory_corpus_stays_behind_bounded_channel_windows() -> Non
     assert selection.audit["candidate_count_kind"] == "windowed"
 
 
+class _EntityOnlyRelational:
+    """Returns every row from the entity list, in the order given, and no other list."""
+
+    def __init__(self, rows: list[CandidateMemory]) -> None:
+        self.rows = rows
+
+    async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
+        del entity_ids, scope, memory_types, limit, kwargs
+        return [(row.memory_id, 1.0) for row in self.rows]
+
+    async def list_active_candidate_memories(self, memory_ids):
+        del memory_ids
+        return self.rows
+
+    async def list_active_memories(self, memory_ids):
+        return [_challenger(memory_id) for memory_id in memory_ids]
+
+
+class _EmptyKeyword:
+    async def search(self, query, scope, memory_types, limit):
+        del query, scope, memory_types, limit
+        return []
+
+
+class _EmptyVector:
+    async def get_record(self, memory_id):
+        del memory_id
+        return None
+
+
+def _challenger(memory_id: str, created_at: datetime = CHALLENGER_CREATED) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=memory_id,
+        status="active",
+        content="Payroll runs weekly.",
+        memory_type="fact",
+        visibility="workspace",
+        owner_user_id=None,
+        repo_identifier="repo-a",
+        project_key="PAY",
+        created_at=created_at,
+    )
+
+
+def _entity_only_retriever(rows: list[CandidateMemory]) -> RelationCandidateRetriever:
+    return RelationCandidateRetriever(
+        relational=_EntityOnlyRelational(rows), keyword=_EmptyKeyword(), vector=_EmptyVector()
+    )
+
+
 def test_each_list_nominates_its_first_items_and_the_candidates_are_their_union() -> None:
     channels = {
-        "shared_entities": [RankedChannelItem("mem-x", 3.0), RankedChannelItem("mem-y", 2.0), RankedChannelItem("mem-z", 1.0)],
+        "shared_entities": [
+            RankedChannelItem("mem-x", 3.0),
+            RankedChannelItem("mem-y", 2.0),
+            RankedChannelItem("mem-z", 1.0),
+        ],
         "lexical_bm25": [RankedChannelItem("mem-y", 9.0), RankedChannelItem("mem-w", 8.0)],
     }
 
@@ -609,48 +663,51 @@ def test_each_list_nominates_its_first_items_and_the_candidates_are_their_union(
 
 @pytest.mark.asyncio
 async def test_only_memories_created_before_the_challenger_are_candidates() -> None:
-    rows = [
-        _candidate("mem-earlier"),
-        _candidate("mem-later", created_at=datetime(2026, 3, 1, tzinfo=timezone.utc)),
-        _candidate("mem-a-same-commit", created_at=CHALLENGER_CREATED),
-        _candidate("mem-z-same-commit", created_at=CHALLENGER_CREATED),
-        _candidate("mem-naive-earlier", created_at=datetime(2026, 1, 15)),
-    ]
-
-    class OrderedRelational:
-        async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
-            del entity_ids, scope, memory_types, limit, kwargs
-            return [(row.memory_id, 1.0) for row in rows]
-
-        async def list_active_candidate_memories(self, memory_ids):
-            del memory_ids
-            return rows
-
-    class EmptyKeyword:
-        async def search(self, query, scope, memory_types, limit):
-            del query, scope, memory_types, limit
-            return []
-
-    class EmptyVector:
-        async def get_record(self, memory_id):
-            del memory_id
-            return None
-
-    retriever = RelationCandidateRetriever(relational=OrderedRelational(), keyword=EmptyKeyword(), vector=EmptyVector())
-    challenger = SimpleNamespace(
-        id="mem-m-same-commit",
-        content="Payroll runs weekly.",
-        memory_type="fact",
-        visibility="workspace",
-        owner_user_id=None,
-        repo_identifier="repo-a",
-        project_key="PAY",
-        created_at=CHALLENGER_CREATED,
+    retriever = _entity_only_retriever(
+        [
+            _candidate("mem-earlier"),
+            _candidate("mem-later", created_at=datetime(2026, 3, 1, tzinfo=timezone.utc)),
+            _candidate("mem-a-same-commit", created_at=CHALLENGER_CREATED),
+            _candidate("mem-z-same-commit", created_at=CHALLENGER_CREATED),
+            _candidate("mem-naive-earlier", created_at=datetime(2026, 1, 15)),
+            # 07:00 at +08:00 is 23:00 UTC the day before the challenger.
+            _candidate("mem-offset-earlier", created_at=datetime(2026, 2, 1, 7, tzinfo=timezone(timedelta(hours=8)))),
+        ]
     )
 
-    selection = await retriever.retrieve(challenger=challenger, entity_ids=[7], actor_user_id="user-a", source_id="src-new")
+    selection = await retriever.retrieve(
+        challenger=_challenger("mem-m-same-commit"), entity_ids=[7], actor_user_id="user-a", source_id="src-new"
+    )
 
-    assert set(selection.candidate_ids) == {"mem-earlier", "mem-a-same-commit", "mem-naive-earlier"}
+    assert set(selection.candidate_ids) == {
+        "mem-earlier",
+        "mem-a-same-commit",
+        "mem-naive-earlier",
+        "mem-offset-earlier",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_memory_without_a_creation_time_fails_discovery() -> None:
+    retriever = _entity_only_retriever([_candidate("mem-unknown", created_at=None)])
+
+    with pytest.raises(ValueError, match="creation time of Memory mem-unknown"):
+        await retriever.retrieve(
+            challenger=_challenger("mem-new"), entity_ids=[7], actor_user_id="user-a", source_id="src-new"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_selected_candidate_that_turns_out_later_fails_the_selection() -> None:
+    later = _candidate("mem-later", created_at=datetime(2026, 3, 1, tzinfo=timezone.utc))
+    retriever = _entity_only_retriever([later])
+    selection = RelationCandidateSelection(
+        discovery=(RetrievedRelationCandidate(memory=later, best_rank=1, channels=("shared_entities",)),),
+        audit={},
+    )
+
+    with pytest.raises(StaleCandidateSelectionError):
+        await retriever.load_selected_memories(selection, challenger=_challenger("mem-new"), source_id="src-new")
 
 
 @pytest.mark.asyncio
@@ -661,43 +718,16 @@ async def test_every_pair_is_judged_from_exactly_one_side() -> None:
         "mem-3": CHALLENGER_CREATED,
         "mem-4": datetime(2026, 3, 1, tzinfo=timezone.utc),
     }
-    rows = [_candidate(memory_id, created_at=moment) for memory_id, moment in created.items()]
+    retriever = _entity_only_retriever(
+        [_candidate(memory_id, created_at=moment) for memory_id, moment in created.items()]
+    )
 
-    class AllRelational:
-        async def graph_search(self, entity_ids, scope, memory_types, limit, **kwargs):
-            del entity_ids, scope, memory_types, limit, kwargs
-            return [(memory_id, 1.0) for memory_id in created]
-
-        async def list_active_candidate_memories(self, memory_ids):
-            del memory_ids
-            return rows
-
-    class EmptyKeyword:
-        async def search(self, query, scope, memory_types, limit):
-            del query, scope, memory_types, limit
-            return []
-
-    class EmptyVector:
-        async def get_record(self, memory_id):
-            del memory_id
-            return None
-
-    retriever = RelationCandidateRetriever(relational=AllRelational(), keyword=EmptyKeyword(), vector=EmptyVector())
     judged: list[frozenset[str]] = []
     for memory_id, moment in created.items():
-        challenger = SimpleNamespace(
-            id=memory_id,
-            content="Payroll runs weekly.",
-            memory_type="fact",
-            visibility="workspace",
-            owner_user_id=None,
-            repo_identifier="repo-a",
-            project_key="PAY",
-            created_at=moment,
+        selection = await retriever.retrieve(
+            challenger=_challenger(memory_id, moment), entity_ids=[7], actor_user_id="user-a", source_id="src-new"
         )
-        selection = await retriever.retrieve(challenger=challenger, entity_ids=[7], actor_user_id="user-a", source_id="src-new")
         judged += [frozenset((memory_id, candidate)) for candidate in selection.candidate_ids]
 
-    assert sorted(judged, key=sorted) == sorted(
-        {frozenset((first, second)) for first in created for second in created if first != second}, key=sorted
-    )
+    every_pair = {frozenset((first, second)) for first in created for second in created if first != second}
+    assert sorted(judged, key=sorted) == sorted(every_pair, key=sorted)
