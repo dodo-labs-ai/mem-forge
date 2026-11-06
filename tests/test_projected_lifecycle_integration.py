@@ -8120,7 +8120,7 @@ class _DeterministicRelationCandidates:
             discovery=(
                 RetrievedRelationCandidate(
                     memory=self.candidate_row,
-                    score=1.0,
+                    best_rank=1,
                     channels=("lexical_bm25",),
                 ),
             ),

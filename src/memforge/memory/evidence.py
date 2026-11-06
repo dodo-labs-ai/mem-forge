@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import Any, Generic, Mapping, Protocol, TypeVar
@@ -594,6 +595,9 @@ class CandidateMemory:
     doc_revision_id: str | None = None
     source_anchor: str | None = None
     source_metadata: Mapping[str, object] = field(default_factory=dict)
+    # When the Memory was created. Relation discovery judges each pair from its
+    # later Memory, so it compares this time with the challenger's.
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

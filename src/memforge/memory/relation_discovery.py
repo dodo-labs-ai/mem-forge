@@ -1,7 +1,8 @@
 """Budgeted post-commit discovery of Memory relations.
 
-Discovery labels each (challenger, candidate) pair and writes relations only.
-It creates no Review and changes neither Memory.
+Discovery labels each pair of a Memory and an earlier candidate and writes
+relations only, so every pair is judged once, from its later Memory. It creates
+no Review and changes neither Memory.
 """
 
 from __future__ import annotations
