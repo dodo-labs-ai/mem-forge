@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Relation discovery asks the classifier about at most 15 candidates per
+  memory instead of 32 to 128. Each of the three ranked lists (shared
+  entities, vector neighbours and BM25) nominates its first five memories, and
+  the candidates are their union; the fused ranking and the adaptive budget
+  are removed. A memory now judges only memories created before it, so each
+  pair is judged once, from its later memory, and the stored relation no
+  longer depends on which of the two discovery jobs finished last. A source
+  revision that changes a claim creates a new memory, which judges the older
+  ones again. On a full GOV.UK sync of 2,145 memories this asked 11 candidates
+  per memory on average and spent about a tenth of the earlier relation tokens.
+  `relation_candidates.score` is now empty; the candidate order is each
+  memory's best rank in any list. The classifier, its prompt and its contract
+  version are unchanged, so no migration runs. Storage adapters return each
+  candidate's `created_at`, and discovery fails a memory whose creation time
+  is missing.
+
+  After upgrading, re-run all completed and exhausted discovery work once,
+  from the relation discovery work admin action
+  (`POST /api/v1/relation-discovery/work/rerun`, once with state `completed`
+  and once with state `exhausted`). A partial re-run can drop a relation: the
+  earlier memory's job no longer judges the pair and removes what it recorded,
+  while the later memory's job, which now owns the pair, has not run again.
+
 - Compose smoke: the summaries of `scripts/compose_smoke.sh --quality` name each
   case by its cohort title, with its snapshot set or situation file, in every
   table, with or without a judge, instead of the case ID of that run.
