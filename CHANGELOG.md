@@ -7,21 +7,23 @@
   entities, vector neighbours and BM25) nominates its first five memories, and
   the candidates are their union; the fused ranking and the adaptive budget
   are removed. A memory now judges only memories created before it, so each
-  pair is judged once, from its later memory, and the stored relation no
+  pair is judged at most once, from its later memory, and the stored relation no
   longer depends on which of the two discovery jobs finished last. A source
   revision that changes a claim creates a new memory, which judges the older
   ones again. On a full GOV.UK sync of 2,145 memories this asked 11 candidates
-  per memory on average and spent about a tenth of the earlier relation tokens.
+  per memory on average, where the earlier rule asked 96 or more for almost
+  every memory of a smaller sync.
   `relation_candidates.score` is now empty; the candidate order is each
   memory's best rank in any list. The classifier, its prompt and its contract
   version are unchanged, so no migration runs. Storage adapters return each
   candidate's `created_at`, and discovery fails a memory whose creation time
   is missing.
 
-  After upgrading, re-run all completed and exhausted discovery work once,
-  from the relation discovery work admin action
-  (`POST /api/v1/relation-discovery/work/rerun`, once with state `completed`
-  and once with state `exhausted`). A partial re-run can drop a relation: the
+  After upgrading, re-run all completed discovery work once, through the admin
+  API as a maintenance operator
+  (`POST /api/v1/relation-discovery/work/rerun` with `{"state": "completed"}`);
+  exhausted work is re-run when the new release starts. A partial re-run can
+  drop a relation: the
   earlier memory's job no longer judges the pair and removes what it recorded,
   while the later memory's job, which now owns the pair, has not run again.
 
