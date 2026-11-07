@@ -661,6 +661,36 @@ def test_each_list_nominates_its_first_items_and_the_candidates_are_their_union(
     )
 
 
+def test_a_memory_a_list_repeats_takes_one_place() -> None:
+    channels = {
+        "lexical_bm25": [
+            RankedChannelItem("mem-x", 9.0),
+            RankedChannelItem("mem-x", 8.0),
+            RankedChannelItem("mem-y", 7.0),
+        ],
+    }
+
+    assert nominate_candidates(channels, per_list_limit=2) == (
+        Nomination("mem-x", 1, ("lexical_bm25",)),
+        Nomination("mem-y", 2, ("lexical_bm25",)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_memories_at_the_head_of_a_list_take_no_place() -> None:
+    later = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    retriever = _entity_only_retriever(
+        [_candidate(f"mem-later-{index}", created_at=later) for index in range(5)]
+        + [_candidate(f"mem-earlier-{index}") for index in range(6)]
+    )
+
+    selection = await retriever.retrieve(
+        challenger=_challenger("mem-new"), entity_ids=[7], actor_user_id="user-a", source_id="src-new"
+    )
+
+    assert selection.candidate_ids == tuple(f"mem-earlier-{index}" for index in range(5))
+
+
 @pytest.mark.asyncio
 async def test_only_memories_created_before_the_challenger_are_candidates() -> None:
     retriever = _entity_only_retriever(

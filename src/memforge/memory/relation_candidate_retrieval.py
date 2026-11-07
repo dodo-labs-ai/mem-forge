@@ -98,18 +98,20 @@ def nominate_candidates(
     *,
     per_list_limit: int,
 ) -> tuple[Nomination, ...]:
-    """Each list nominates its first ``per_list_limit`` items, and the candidates are their union.
+    """Each list nominates its first ``per_list_limit`` Memories, and the candidates are their union.
 
-    Candidates are ordered by best rank, then Memory id, so the order does not
-    depend on which list is read first.
+    A Memory a list repeats takes one place, at its first rank. Candidates are
+    ordered by best rank, then Memory id, so the order does not depend on which
+    list is read first.
     """
 
     best_rank: dict[str, int] = {}
     nominated_by: dict[str, list[str]] = {}
     for channel, items in channels.items():
-        for rank, item in enumerate(items[:per_list_limit], start=1):
-            best_rank[item.item_id] = min(rank, best_rank.get(item.item_id, rank))
-            nominated_by.setdefault(item.item_id, []).append(channel)
+        memory_ids = list(dict.fromkeys(item.item_id for item in items))
+        for rank, memory_id in enumerate(memory_ids[:per_list_limit], start=1):
+            best_rank[memory_id] = min(rank, best_rank.get(memory_id, rank))
+            nominated_by.setdefault(memory_id, []).append(channel)
     return tuple(
         Nomination(memory_id, best_rank[memory_id], tuple(nominated_by[memory_id]))
         for memory_id in sorted(best_rank, key=lambda memory_id: (best_rank[memory_id], memory_id))
