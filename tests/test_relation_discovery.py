@@ -126,7 +126,7 @@ class _Candidates:
                         owner_user_id=candidate.owner_user_id,
                         repo_identifier=candidate.repo_identifier,
                     ),
-                    score=1.0 / (index + 1),
+                    best_rank=index + 1,
                     channels=("lexical_bm25",),
                 )
                 for index, candidate in enumerate(self._candidates)

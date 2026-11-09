@@ -1,4 +1,10 @@
-"""Provider-neutral candidate retrieval for relation discovery."""
+"""Provider-neutral candidate retrieval for relation discovery.
+
+Each of the three ranked lists (shared entities, vector neighbours and BM25)
+nominates its first ``per_list_limit`` eligible Memories, and the candidates are
+their union. A Memory is eligible only when it was created before the
+challenger, so every pair is judged once, from its later Memory.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Mapping, Sequence
 
@@ -16,11 +23,7 @@ from memforge.memory.evidence import (
 )
 from memforge.memory.relation_discovery_contract import resolve_relation_discovery_actor_user_id
 from memforge.models import Memory, MemoryStatus, Visibility
-from memforge.retrieval.rank_fusion import (
-    FusedRankedItem,
-    RankedChannelItem,
-    weighted_reciprocal_rank_fusion,
-)
+from memforge.retrieval.rank_fusion import RankedChannelItem
 from memforge.retrieval.search import sanitize_fts_query
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch, RelationalStore, VectorStore
@@ -55,39 +58,70 @@ _LEXICAL_DISCOVERY_STOP_WORDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class RelationCandidateRetrievalPolicy:
-    """Bounded discovery policy; mandatory candidates are outside this budget."""
+    """How many candidates each ranked list nominates, and how deep each list is read.
 
-    initial_budget: int = 32
-    expansion_step: int = 32
-    max_budget: int = 128
+    ``per_list_limit`` is the budget: a challenger is compared with at most three
+    times that many Memories, whatever the workspace size. Each list is read to
+    ``rank_window_size`` so that dropping inaccessible and later Memories usually
+    leaves it ``per_list_limit`` deep.
+    """
+
+    per_list_limit: int = 5
     rank_window_size: int = 128
     lexical_query_term_limit: int = 32
-    rrf_k: int = 60
-    channel_weights: Mapping[str, float] = field(
-        default_factory=lambda: {
-            CandidateBucket.SHARED_ENTITIES.value: 1.0,
-            CandidateBucket.SEMANTIC_VECTOR_NEIGHBORS.value: 1.0,
-            CandidateBucket.LEXICAL_BM25.value: 1.0,
-        }
-    )
 
     def __post_init__(self) -> None:
-        if self.initial_budget < 1:
-            raise ValueError("initial discovery budget must be positive")
-        if self.expansion_step < 1:
-            raise ValueError("discovery expansion step must be positive")
-        if self.max_budget < self.initial_budget:
-            raise ValueError("max discovery budget must cover the initial budget")
-        if self.rank_window_size < self.max_budget:
-            raise ValueError("rank window must cover the maximum discovery budget")
+        if self.per_list_limit < 1:
+            raise ValueError("each ranked list must nominate at least one candidate")
+        if self.rank_window_size < self.per_list_limit:
+            raise ValueError("rank window must cover the per-list limit")
         if self.lexical_query_term_limit < 1:
             raise ValueError("lexical discovery query must contain at least one term")
 
 
 @dataclass(frozen=True, slots=True)
+class Nomination:
+    """A Memory that at least one ranked list placed within its first ``per_list_limit`` items.
+
+    The rule's result holds ids only; retrieval pairs it with the candidate's row.
+    """
+
+    memory_id: str
+    # The best 1-based rank the Memory has in any list that nominated it.
+    best_rank: int
+    # The lists that nominated it, in the order the lists were given.
+    channels: tuple[str, ...]
+
+
+def nominate_candidates(
+    channels: Mapping[str, Sequence[RankedChannelItem]],
+    *,
+    per_list_limit: int,
+) -> tuple[Nomination, ...]:
+    """Each list nominates its first ``per_list_limit`` Memories, and the candidates are their union.
+
+    A Memory a list repeats takes one place, at its first rank. Candidates are
+    ordered by best rank, then Memory id, so the order does not depend on which
+    list is read first.
+    """
+
+    best_rank: dict[str, int] = {}
+    nominated_by: dict[str, list[str]] = {}
+    for channel, items in channels.items():
+        memory_ids = list(dict.fromkeys(item.item_id for item in items))
+        for rank, memory_id in enumerate(memory_ids[:per_list_limit], start=1):
+            best_rank[memory_id] = min(rank, best_rank.get(memory_id, rank))
+            nominated_by.setdefault(memory_id, []).append(channel)
+    return tuple(
+        Nomination(memory_id, best_rank[memory_id], tuple(nominated_by[memory_id]))
+        for memory_id in sorted(best_rank, key=lambda memory_id: (best_rank[memory_id], memory_id))
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RetrievedRelationCandidate:
     memory: CandidateMemory
-    score: float
+    best_rank: int
     channels: tuple[str, ...]
 
 
@@ -111,7 +145,7 @@ class RelationCandidateSelection:
             "candidates": [
                 {
                     "memory_id": candidate.memory.memory_id,
-                    "score": candidate.score,
+                    "best_rank": candidate.best_rank,
                     "channels": candidate.channels,
                 }
                 for candidate in self.discovery
@@ -128,7 +162,6 @@ class RelationCandidateSelection:
                     bucket_rank=10,
                     complete=True,
                     candidates=tuple(candidate.memory for candidate in self.discovery),
-                    scores={candidate.memory.memory_id: candidate.score for candidate in self.discovery},
                     candidate_reasons={
                         candidate.memory.memory_id: ("hybrid_discovery:" + ",".join(candidate.channels))
                         for candidate in self.discovery
@@ -182,20 +215,14 @@ class RelationCandidateRetriever:
         eligible_channels = {
             channel: tuple(item for item in items if item.item_id in eligible) for channel, items in channels.items()
         }
-        fused = weighted_reciprocal_rank_fusion(
-            channels=eligible_channels,
-            weights=self._policy.channel_weights,
-            k=self._policy.rrf_k,
-        )
-        discovery_budget = _adaptive_discovery_budget(fused, self._policy)
-        selected = fused[:discovery_budget]
+        nominations = nominate_candidates(eligible_channels, per_list_limit=self._policy.per_list_limit)
         discovery = tuple(
             RetrievedRelationCandidate(
-                memory=eligible[item.item_id],
-                score=item.score,
-                channels=tuple(part.channel for part in item.contributions),
+                memory=eligible[nomination.memory_id],
+                best_rank=nomination.best_rank,
+                channels=nomination.channels,
             )
-            for item in selected
+            for nomination in nominations
         )
         return RelationCandidateSelection(
             discovery=discovery,
@@ -208,8 +235,7 @@ class RelationCandidateRetriever:
             telemetry={
                 "channel_candidate_counts": {channel: len(items) for channel, items in channels.items()},
                 "eligible_candidate_count": len(eligible),
-                "fused_candidate_count": len(fused),
-                "discovery_budget": discovery_budget,
+                "per_list_limit": self._policy.per_list_limit,
                 "channel_errors": list(channel_errors),
                 "provenance_rows_loaded": len(provenance_rows),
                 "retrieval_latency_ms": round(
@@ -411,10 +437,12 @@ def _eligible_candidate_rows(
     source_id: str,
     excluded_source_ids: frozenset[str],
 ) -> dict[str, CandidateMemory]:
-    """Active Memories the challenger may be related to, its own Source Unit's included."""
+    """Active Memories created before the challenger that it may be related to, its own Source Unit's included."""
     eligible: dict[str, CandidateMemory] = {}
+    challenger_order = _creation_order(challenger.created_at, challenger.id)
     for candidate in rows:
-        if candidate.memory_id == challenger.id:
+        # The challenger itself orders equal, so it is left out with every later Memory.
+        if _creation_order(candidate.created_at, candidate.memory_id) >= challenger_order:
             continue
         if candidate.visibility != challenger.visibility:
             continue
@@ -457,20 +485,16 @@ def _memory_access_compatible(candidate: Memory, challenger: Memory) -> bool:
     )
 
 
-def _adaptive_discovery_budget(
-    fused: Sequence[FusedRankedItem],
-    policy: RelationCandidateRetrievalPolicy,
-) -> int:
-    if not fused:
-        return 0
-    upper_bound = min(len(fused), policy.max_budget)
-    budget = min(policy.initial_budget, upper_bound)
-    required = budget
-    for index, candidate in enumerate(fused[:upper_bound]):
-        if len(candidate.contributions) > 1:
-            required = max(required, index + 1)
-    while budget < required:
-        budget = min(upper_bound, budget + policy.expansion_step)
-    while budget < upper_bound and fused[budget].score == fused[budget - 1].score:
-        budget = min(upper_bound, budget + 1)
-    return budget
+def _creation_order(created_at: datetime | None, memory_id: str) -> tuple[datetime, str]:
+    """When a Memory was created, as UTC, with its id breaking ties within one commit.
+
+    A time without an offset is UTC. Every store records the time a Memory is
+    created, so a missing one means a store did not read it, and discovery fails
+    rather than judge the pair from both sides.
+    """
+
+    if created_at is None:
+        raise ValueError(f"relation discovery needs the creation time of Memory {memory_id}")
+    if created_at.tzinfo is None:
+        return created_at.replace(tzinfo=timezone.utc), memory_id
+    return created_at.astimezone(timezone.utc), memory_id

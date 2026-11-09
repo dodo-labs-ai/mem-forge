@@ -30,7 +30,7 @@ are part of the concrete implementation.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -389,6 +389,35 @@ class RelationalStoreContract:
                 "repo-a",
             ),
         }
+        created = {memory.id: memory.created_at for memory in memories}
+        assert all(candidate.created_at is not None for candidate in candidates)
+        assert all(candidate.created_at == created[candidate.memory_id] for candidate in candidates)
+
+    async def test_candidate_creation_times_keep_ties_and_microsecond_order(
+        self,
+        adapters: ContractAdapters,
+    ) -> None:
+        """Relation discovery orders a pair by creation time, so a store must not merge or reorder these times."""
+
+        store = adapters.relational
+        committed = datetime(2026, 7, 15, 9, 30, tzinfo=timezone.utc)
+        memories = (
+            make_memory("order-same-a", created_at=committed),
+            make_memory("order-same-b", created_at=committed),
+            make_memory("order-next", created_at=committed + timedelta(microseconds=1)),
+        )
+        await store.upsert_document(make_document("doc-order", source="src-order"))
+        for memory in memories:
+            await store.insert_memory(memory)
+            await store.add_memory_source(memory.id, "doc-order", "github", None, source_updated_at=None)
+
+        created = {
+            candidate.memory_id: candidate.created_at
+            for candidate in await store.list_active_candidate_memories(tuple(memory.id for memory in memories))
+        }
+
+        assert created["order-same-a"] == created["order-same-b"]
+        assert created["order-same-a"] < created["order-next"]
 
     # -- Visibility filtering ----------------------------------------------
 

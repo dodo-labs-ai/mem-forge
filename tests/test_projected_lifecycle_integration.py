@@ -8120,7 +8120,7 @@ class _DeterministicRelationCandidates:
             discovery=(
                 RetrievedRelationCandidate(
                     memory=self.candidate_row,
-                    score=1.0,
+                    best_rank=1,
                     channels=("lexical_bm25",),
                 ),
             ),
@@ -10336,3 +10336,91 @@ async def test_transient_support_failure_leaves_revision_uncommitted_and_retry_c
     assert contents == {claim, candidate_text}
     renewed = await active_support_evidence(db, incumbent.id, source_id="src-1")
     assert {part.validation_unit_revision_id for part in renewed} == {third.source_unit_revisions[0].id}
+
+
+async def _judged_labels(db: Database) -> dict[str, dict[str, str]]:
+    """The labels each challenger's latest relation run recorded, by challenger."""
+
+    rows = await db.db.execute_fetchall("SELECT result_memory_id, audit_json FROM relation_runs ORDER BY started_at, id")
+    return {row["result_memory_id"]: json.loads(row["audit_json"])["labels"] for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_a_revised_claim_judges_the_claim_it_revised_and_a_rerun_keeps_that_judge(db: Database) -> None:
+    first = _projection(run_id="projection-judge-1", body="Service uses PostgreSQL 15.")
+    adapters = build_sqlite_adapters(db, object())
+    engine = MemoryEngine(
+        relation_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=AdmittingClient(),
+    )
+    await engine.prepare_and_commit_projected_lifecycle(
+        projection=first,
+        doc_id="confluence-123",
+        raw_memories=_selected(first, [RawMemory(content="Service uses PostgreSQL 15.", memory_type="fact")]),
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="Service uses PostgreSQL 15.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    second = _projection(
+        run_id="projection-judge-2",
+        body="Service uses PostgreSQL 16.",
+        prior=first.source_unit_revisions[0],
+        prior_observations={revision.observation_id: revision for revision in first.observation_revisions},
+    )
+    await MemoryEngine(
+        relation_candidates=_candidate_retriever(adapters),
+        db=db,
+        memory_store=_OutboxDrainer(db),
+        structured_llm_client=_ConflictingReplacementClient(),
+    ).prepare_and_commit_projected_lifecycle(
+        projection=second,
+        doc_id="confluence-123",
+        raw_memories=_selected(second, [
+            RawMemory(
+                content="Service uses PostgreSQL 16.",
+                memory_type="fact",
+                source_observation_id=_body_observation(second).id,
+                evidence_quote="Service uses PostgreSQL 16.",
+            )
+        ]),
+        doc_type="design-doc",
+        project_key="ENG",
+        repo_identifier=None,
+        document_content="Service uses PostgreSQL 16.",
+        update_mode="full_document",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=datetime(2026, 7, 16, tzinfo=timezone.utc),
+    )
+    memories = {memory.content: memory for memory in await db.list_memories()}
+    original, revised = memories["Service uses PostgreSQL 15."], memories["Service uses PostgreSQL 16."]
+    discovery = RelationDiscovery(
+        store=db,
+        candidate_retriever=_candidate_retriever(adapters),
+        pair_classifier=_DeterministicRelationClassifier(MemoryRelationLabel.CONTRADICTS),
+    )
+
+    # The revision is a new Memory, created after the claim it revised.
+    assert revised.id != original.id and revised.created_at > original.created_at
+    await discovery.process_slice(worker_id="relation-worker")
+    assert await _judged_labels(db) == {original.id: {}, revised.id: {original.id: "contradicts"}}
+
+    rerun = await db.rerun_relation_discovery_work(
+        RelationDiscoveryWorkSelection(state=RelationDiscoveryWorkState.COMPLETED, max_attempts=5), actor="operator"
+    )
+    await discovery.process_slice(worker_id="relation-worker")
+
+    assert rerun == 2
+    assert await _judged_labels(db) == {original.id: {}, revised.id: {original.id: "contradicts"}}
+    [relation] = await db.db.execute_fetchall("SELECT label, discovery_work_id FROM cross_document_relations")
+    [judge] = await db.db.execute_fetchall(
+        "SELECT memory_id FROM relation_discovery_work WHERE id = ?", (relation["discovery_work_id"],)
+    )
+    assert (relation["label"], judge["memory_id"]) == ("contradicts", revised.id)

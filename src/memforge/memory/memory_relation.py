@@ -1,8 +1,9 @@
 """Memory relation contract: one closed label per Memory pair.
 
-Discovery compares a committed Memory with bounded candidates from any Source
-Unit, its own included, after commit. Each pair receives exactly one label. A relation annotates
-both Memories for readers; it never changes either Memory's lifecycle.
+Discovery compares a committed Memory with bounded candidates created before it,
+from any Source Unit, its own included, after commit. Each pair receives exactly
+one label, from its later Memory. A relation annotates both Memories for readers;
+it never changes either Memory's lifecycle.
 """
 
 from __future__ import annotations

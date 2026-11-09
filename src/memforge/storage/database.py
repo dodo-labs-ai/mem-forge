@@ -12187,9 +12187,9 @@ class Database:
         The run replaces every relation the classifier recorded for this work,
         so a pair the work no longer judges keeps no relation from it. The
         completion guard has checked that both contents of every judged pair
-        are current. The run's label replaces the stored relation, whichever
-        work recorded it, and a pair judged none loses it, unless a person
-        confirmed the stored relation for these same contents.
+        are current. A pair is judged only from its later Memory, so the run's
+        label replaces the stored relation, and a pair judged none loses it,
+        unless a person confirmed the stored relation for these same contents.
         """
 
         await self._delete_work_classifier_relations_unlocked(work_id)
@@ -14062,6 +14062,7 @@ class Database:
                        m.visibility,
                        m.owner_user_id,
                        m.repo_identifier,
+                       m.created_at,
                        ms.source_id,
                        ms.doc_id,
                        ms.doc_id AS source_lineage_id,
@@ -23135,6 +23136,7 @@ class Database:
             doc_revision_id=d.get("doc_revision_id"),
             source_anchor=d.get("source_anchor"),
             source_metadata=source_metadata,
+            created_at=_parse_dt(d.get("created_at")),
         )
 
     def _row_to_projection_scope_transition(self, row) -> ProjectionScopeTransition:
