@@ -19,13 +19,15 @@
   candidate's `created_at`, and discovery fails a memory whose creation time
   is missing.
 
-  After upgrading, re-run all completed discovery work once, through the admin
-  API as a maintenance operator
-  (`POST /api/v1/relation-discovery/work/rerun` with `{"state": "completed"}`);
-  exhausted work is re-run when the new release starts. A partial re-run can
-  drop a relation: the
-  earlier memory's job no longer judges the pair and removes what it recorded,
-  while the later memory's job, which now owns the pair, has not run again.
+  Upgrading needs no re-run: existing relations stay current and the rule
+  applies to discovery that runs from then on. If you do re-run, the first
+  re-run must cover all completed work, through the admin API as a maintenance
+  operator (`POST /api/v1/relation-discovery/work/rerun` with
+  `{"state": "completed"}`). A partial re-run can drop a relation: the earlier
+  memory's job no longer judges the pair and removes what it recorded, while
+  the later memory's job, which now owns the pair, has not run again. Exhausted
+  work is re-run when a release starts, so the same applies to what that work
+  recorded.
 
 - Compose smoke: the summaries of `scripts/compose_smoke.sh --quality` name each
   case by its cohort title, with its snapshot set or situation file, in every
