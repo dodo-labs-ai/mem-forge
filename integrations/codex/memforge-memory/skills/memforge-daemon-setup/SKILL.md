@@ -68,18 +68,20 @@ command to run locally.
 
 ## Install or upgrade the CLI
 
-Use an isolated tool environment, not system Python:
+Use an isolated tool environment, not system Python. MemForge is in beta and
+installers skip beta releases unless asked, so keep the pre-release options, or
+the install stops at the older stable release:
 
 ```bash
-uv tool install memforge-ai
-uv tool upgrade memforge-ai
+uv tool install --python 3.12 --prerelease allow memforge-ai
+uv tool upgrade --prerelease allow memforge-ai
 ```
 
 or, when the user already uses pipx:
 
 ```bash
-pipx install memforge-ai
-pipx upgrade memforge-ai
+pipx install --python python3.12 --pip-args=--pre memforge-ai
+pipx upgrade --pip-args=--pre memforge-ai
 ```
 
 Afterward require both commands to exist:

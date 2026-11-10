@@ -7,7 +7,9 @@ lifecycle reconciliation.
 
 ## Setup
 
-1. Install the host-side CLI with `pipx install memforge-ai`.
+1. Install the host-side CLI with
+   `pipx install --python python3.12 --pip-args=--pre memforge-ai`; the
+   [quickstart](quickstart.md#6-install-the-host-cli) explains the options.
 2. Run `memforge setup` to configure the active API target and install the local
    daemon as a login user service.
 3. In the Sources UI, add a Local Markdown or GitHub Repository source.
