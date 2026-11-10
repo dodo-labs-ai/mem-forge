@@ -578,9 +578,15 @@ Install the host-side CLI in an isolated environment when you want to query the
 service from a terminal or run local-source adapters from this machine:
 
 ```bash
-pipx install memforge-ai
+pipx install --python python3.12 --pip-args=--pre memforge-ai
 memforge --help
 ```
+
+MemForge is in beta, and installers skip beta releases unless asked:
+`--pip-args=--pre` selects the newest release, beta included, rather than the
+older stable one. `--python` chooses a Python version that all of MemForge's
+dependencies publish builds for. Move an earlier install to the newest release
+with `pipx upgrade --pip-args=--pre memforge-ai`.
 
 `memforge-ai` is the Python distribution name; the installed command and import
 package remain `memforge`.

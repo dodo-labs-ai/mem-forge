@@ -49,12 +49,13 @@ release immediately after configuring it.
 5. The release workflow builds one wheel and one source distribution, verifies
    their metadata and `memforge` console entry point, and publishes them through
    the `pypi` environment.
-6. Verify the public installation from a clean tool environment:
+6. Verify the public installation from a clean tool environment. The last
+   command must print the version just released:
 
    ```bash
-   pipx install memforge-ai
+   pipx install --python python3.12 --pip-args=--pre memforge-ai
    memforge --help
-   python -c 'from importlib.metadata import version; print(version("memforge-ai"))'
+   pipx list --short | grep memforge-ai
    ```
 
 Plugin tags such as `memforge-memory-v0.1.55` do not match the Python release
