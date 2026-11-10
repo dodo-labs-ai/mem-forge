@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0b4 - 2026-11-10
 
 - Relation discovery asks the classifier about at most 15 candidates per
   memory instead of 32 to 128. Each of the three ranked lists (shared
