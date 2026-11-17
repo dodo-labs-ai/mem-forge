@@ -91,7 +91,7 @@ class TransientErrorClassifier(Protocol):
 
 
 def failure_retryable(error: BaseException, *, store: TransientErrorClassifier | None = None) -> bool:
-    """Whether a Source Unit derivation or lifecycle failure may succeed when the run is retried.
+    """Whether a failed Source Unit derivation, lifecycle or sync run may succeed when it runs again.
 
     A failure is retryable only when its cause proves it transient:
 
@@ -106,6 +106,12 @@ def failure_retryable(error: BaseException, *, store: TransientErrorClassifier |
     - a storage error that ``store`` classifies as transient (a store that
       names no transient errors classifies none).
 
+    An exception that says none of this, raised ``from`` a cause, is as
+    retryable as that cause: a Gene that words a provider error as its own
+    ``RuntimeError`` keeps the error's answer. Only the explicit cause counts;
+    an exception raised while another was being handled is not caused by it.
+    An exception that declares ``retryable`` answers for its whole chain.
+
     Every other failure fails the same way again: a provider that refused the
     request, its credential or its model (400, 401, 403, 404, 422), a request
     error, an invalid model response, and any exception that declares nothing. Such a failure is
@@ -116,12 +122,25 @@ def failure_retryable(error: BaseException, *, store: TransientErrorClassifier |
     it.
     """
 
-    declared = getattr(error, "retryable", None)
-    if declared is not None:
-        return bool(declared)
-    category = getattr(error, "terminal_category", None)
-    if category is not None:
-        return terminal_failure_retryable(category, provider_status_code(error))
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        declared = getattr(current, "retryable", None)
+        if declared is not None:
+            return bool(declared)
+        category = getattr(current, "terminal_category", None)
+        if category is not None:
+            return terminal_failure_retryable(category, provider_status_code(current))
+        if _proves_transient(current, store):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _proves_transient(error: BaseException, store: TransientErrorClassifier | None) -> bool:
+    """Whether ``error`` itself is a transient embedding, provider or storage failure."""
+
     if isinstance(error, EmbeddingDeadlineExceeded):
         return True
     if isinstance(error, EmbeddingProviderError) and error.unreachable:

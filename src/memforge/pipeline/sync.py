@@ -37,7 +37,6 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.genes import gene_exports_pdf, source_rediscovers_documents
 from memforge.genes.conversation_gene import CollectionAttempt
-from memforge.genes.base import SourceConfigurationError
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
@@ -1837,10 +1836,7 @@ class GeneSyncOrchestrator:
                 )
             except Exception:
                 logger.exception("Failed to record the failed Documents of %s", source_id)
-            failure_retryable = (
-                not isinstance(e, SourceConfigurationError)
-                and bool(getattr(e, "retryable", True))
-            )
+            failure_retryable = retries_failure(e, store=self.db)
             if (runtime_bundle := getattr(e, "runtime_bundle", None)) is not None:
                 runtime_bundles.append(runtime_bundle)
             if scope_transition is not None and transition_started:

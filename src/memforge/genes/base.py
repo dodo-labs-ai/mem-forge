@@ -54,7 +54,13 @@ logger = logging.getLogger(__name__)
 
 
 class SourceConfigurationError(RuntimeError):
-    """A source cannot sync successfully until its configuration changes."""
+    """A source cannot sync successfully until its configuration changes.
+
+    Running it again fails the same way, whatever error it was raised from, so
+    the failure is not retryable.
+    """
+
+    retryable = False
 
 
 class Gene(ABC):

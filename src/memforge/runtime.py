@@ -29,7 +29,7 @@ from memforge.llm.embedding import (
 )
 from memforge.llm.embedding_profile import EmbeddingIdentity, EmbeddingProfile
 from memforge.llm.providers import ModelConfigError, ResolvedInvocation, provider_descriptor
-from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
+from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig, failure_retryable
 from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_operation,
@@ -123,7 +123,13 @@ class SourceSyncStopRequested(RuntimeError):
 
 
 class SourceSyncBoundaryError(RuntimeError):
-    """Raised when a durable run no longer matches its captured input boundary."""
+    """Raised when a durable run no longer matches its captured input boundary.
+
+    The run is not retried, whatever another base of a subclass declares: a
+    new run captures the Source's current boundary.
+    """
+
+    retryable = False
 
 
 class SourceSyncUnsupportedError(SourceSyncBoundaryError):
@@ -1618,6 +1624,7 @@ class SourceSyncWorker:
                     last_sync_at=datetime.now(timezone.utc),
                     last_sync_status="failed",
                     error_message="sync completed without final state",
+                    failure_retryable=False,
                 )
             if final_state.last_sync_status in {"failed", "partial"}:
                 error_message = final_state.error_message or "source sync failed"
@@ -1685,10 +1692,7 @@ class SourceSyncWorker:
             failed_at = datetime.now(timezone.utc)
             next_attempt_at = self._next_retry_at(run, failed_at)
             retryable = (
-                not isinstance(
-                    exc,
-                    (SourcePausedError, SourceNotActiveError, SourceSyncBoundaryError, SourceConfigurationError),
-                )
+                failure_retryable(exc, store=self.db)
                 and next_attempt_at is not None
                 and not run.reprocess_document_ids
             )

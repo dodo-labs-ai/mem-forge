@@ -189,8 +189,11 @@ class ConnectorUnreachableError(httpx.TransportError):
     """A request kept failing to reach the provider until its attempts ran out.
 
     The message names the product, the URL, the number of attempts and the
-    last transport error, and asks the user to check the VPN or network.
+    last transport error, and asks the user to check the VPN or network. The
+    provider may be reachable again later, so the failure is retryable.
     """
+
+    retryable = True
 
 
 class ConnectorHttpClient:
