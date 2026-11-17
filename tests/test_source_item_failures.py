@@ -239,25 +239,69 @@ async def test_a_new_release_retries_each_failure_of_the_earlier_release_once(db
     assert (await failed_item_health(db)).status == "ok"
 
 
-async def _first_sync_failing_to_fetch(db: Database, monkeypatch) -> Harness:
-    """A new Source whose first sync could not fetch PAY-1, so PAY-1 never committed a Unit."""
+class ConnectingProvider(BreakableProvider):
+    """A provider read only through the connection ``authenticate`` opens, as a real Gene's client is."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.connected = False
+
+    async def authenticate(self) -> None:
+        self.connected = True
+
+    async def rediscover(self, item):
+        if not self.connected:
+            raise RuntimeError("provider is not connected: call authenticate() first")
+        return await super().rediscover(item)
+
+    async def fetch(self, item):
+        if not self.connected:
+            raise RuntimeError("provider is not connected: call authenticate() first")
+        return await super().fetch(item)
+
+
+def connecting_provider(source_type: str) -> ConnectingProvider:
+    """A :class:`ConnectingProvider` named as the Gene of ``source_type`` is, so it runs a Source of that type."""
+
+    class Provider(ConnectingProvider):
+        @classmethod
+        def metadata(cls):
+            return replace(super().metadata(), name=source_type)
+
+    return Provider()
+
+
+async def _first_sync_failing_to_fetch(db: Database, monkeypatch, *, source_type: str = "jira") -> Harness:
+    """A new Source whose first sync could not fetch PAY-1, so PAY-1 never committed a Unit.
+
+    The release then changes, and the next run opens its own Gene, as each
+    run of the sync worker does.
+    """
     monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "release-1")
     await db.upsert_source(
-        id=SOURCE_ID, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+        id=SOURCE_ID, type=source_type, name="Source", config_json="{}", access_policy="workspace",
+        owner_user_id="dev",
     )
     harness = Harness(db)
-    harness.provider = BreakableProvider()
+    harness.provider = connecting_provider(source_type)
     harness.provider.broken["PAY-1"] = ("fetch", ValueError)
     assert (await harness.sync(retry=SCHEDULED)).last_sync_status == "partial"
     assert await db.find_source_unit_by_document_id(SOURCE_ID, doc_id("PAY-1"), current_only=True) is None
-    harness.provider.broken.clear()
+    harness.provider = connecting_provider(source_type)
     monkeypatch.setenv("MEMFORGE_DEPLOYMENT_REVISION", "release-2")
     return harness
 
 
 @pytest.mark.asyncio
-async def test_a_document_that_never_committed_is_reprocessed_from_the_item_its_failure_recorded(db, monkeypatch):
-    harness = await _first_sync_failing_to_fetch(db, monkeypatch)
+@pytest.mark.parametrize(
+    ("source_type", "rediscovered"),
+    [("jira", ["PAY-1"]), ("github_pages", [])],
+    ids=["rediscovers", "keeps_recorded_item"],
+)
+async def test_a_document_that_never_committed_is_reprocessed_from_the_item_its_failure_recorded(
+    db, monkeypatch, source_type, rediscovered
+):
+    harness = await _first_sync_failing_to_fetch(db, monkeypatch, source_type=source_type)
     service = SyncService(db, AppConfig(sync=SyncConfig(max_extraction_workers=1)))
 
     assert await service.enqueue_release_recovery() == 1
@@ -266,7 +310,10 @@ async def test_a_document_that_never_committed_is_reprocessed_from_the_item_its_
     state = await harness.reprocess("PAY-1")
 
     assert (state.last_sync_status, state.docs_failed) == ("success", 0)
-    assert "PAY-1" in harness.provider.rediscovered
+    # A Source that cannot ask its provider for one Document fetches the item
+    # the failure recorded, through the connection the run opened.
+    assert harness.provider.rediscovered == rediscovered
+    assert harness.provider.fetches == ["PAY-1"]
     assert await db.find_source_unit_by_document_id(SOURCE_ID, doc_id("PAY-1"), current_only=True) is not None
     assert await _ledger(db) == {}
 
