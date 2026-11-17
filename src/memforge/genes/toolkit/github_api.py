@@ -121,7 +121,12 @@ _RATE_LIMIT_STATUSES = frozenset({httpx.codes.FORBIDDEN, httpx.codes.TOO_MANY_RE
 
 
 class GitHubRateLimitError(RuntimeError):
-    """GitHub's rate limit resets later than a request waits; the message says when."""
+    """GitHub's rate limit resets later than a request waits; the message says when.
+
+    The limit resets, so the failure is retryable.
+    """
+
+    retryable = True
 
 
 class GitHubTreeBudgetExceeded(RuntimeError):

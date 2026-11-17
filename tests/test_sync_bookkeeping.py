@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from PIL import Image
 from markdown_it import MarkdownIt
@@ -7384,7 +7385,7 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
             self.lifecycle_cycle_ids.append(str(kwargs["lifecycle_cycle_id"]))
             self.scope_transition_run_ids.append(str(kwargs["scope_transition_run_id"]))
             if len(self.lifecycle_cycle_ids) == 1:
-                raise RuntimeError("retry this attempt")
+                raise httpx.ConnectError("provider unreachable on this attempt")
             return SyncState(
                 source=source_id,
                 last_sync_at=datetime.now(timezone.utc),
@@ -8196,7 +8197,7 @@ async def test_source_sync_worker_delays_retryable_failure(db: Database):
 
         async def run_source_sync(self, **kwargs):
             del kwargs
-            raise RuntimeError("temporary failure")
+            raise httpx.ConnectError("provider temporarily unreachable")
 
     enqueued = await db.enqueue_source_sync_run(source_id=source_id, trigger="manual")
     worker = runtime.SourceSyncWorker(

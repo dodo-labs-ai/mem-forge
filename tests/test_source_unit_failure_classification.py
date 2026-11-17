@@ -1,4 +1,4 @@
-"""A Source Unit derivation or lifecycle failure is retryable only when its cause proves it transient."""
+"""A Source Unit derivation, lifecycle or sync run failure is retryable only when its cause proves it transient."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
+from memforge.genes.base import SourceConfigurationError
 from memforge.llm.embedding import EmbeddingDeadlineExceeded, EmbeddingProviderError
 from memforge.llm.structured import StructuredLlmError, failure_retryable
 from memforge.memory.candidate_admission import CandidateAdmissionError
@@ -112,6 +113,42 @@ class _ProviderAnswer(Exception):
     ],
 )
 def test_only_a_cause_that_proves_itself_transient_is_retryable(error: BaseException, retryable: bool) -> None:
+    assert failure_retryable(error) is retryable
+
+
+def _raised_from(error: BaseException, cause: BaseException) -> BaseException:
+    error.__cause__ = cause
+    return error
+
+
+def _raised_while_handling(error: BaseException, handled: BaseException) -> BaseException:
+    error.__context__ = handled
+    return error
+
+
+@pytest.mark.parametrize(
+    ("error", "retryable"),
+    [
+        (_raised_from(RuntimeError("Failed to fetch Confluence page 7"), httpx.ConnectError("refused")), True),
+        (_raised_from(RuntimeError("Jira search failed"), _http_answer(503)), True),
+        (_raised_from(RuntimeError("Jira search failed"), _http_answer(401)), False),
+        (
+            _raised_from(
+                RuntimeError("Failed to list pages"),
+                _raised_from(RuntimeError("request failed"), httpx.ReadTimeout("read timed out")),
+            ),
+            True,
+        ),
+        # A declaration answers for the whole chain.
+        (_raised_from(SourceUnitLifecycleExecutionError("wrapped", None, retryable=False), _http_answer(503)), False),
+        (_raised_from(SourceConfigurationError("scope cannot be configured"), httpx.ConnectError("refused")), False),
+        # Only the explicit cause counts.
+        (_raised_while_handling(KeyError("obs"), httpx.ReadTimeout("read timed out")), False),
+    ],
+)
+def test_an_error_that_declares_nothing_is_as_retryable_as_the_cause_it_was_raised_from(
+    error: BaseException, retryable: bool
+) -> None:
     assert failure_retryable(error) is retryable
 
 
