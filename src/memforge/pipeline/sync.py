@@ -907,7 +907,9 @@ class GeneSyncOrchestrator:
         Parameters
         ----------
         gene:
-            An authenticated gene instance (authenticate() is called here).
+            The Source's configured gene; the run calls ``authenticate()``
+            before it reads the provider, and a reprocess of stored input
+            never does.
         source_name:
             Human-readable name of this source (e.g. "Confluence - Engineering").
         source_id:
@@ -1088,6 +1090,9 @@ class GeneSyncOrchestrator:
                     raise RuntimeError(
                         "reprocess waits for the open Projection Scope transition to complete"
                     )
+                # A reprocess reads stored input, and connects to the provider
+                # only to rediscover its Documents or to fetch an item no
+                # stored input holds, such as one a failure recorded.
                 if rediscovering:
                     await gene.authenticate()
                 items = []
@@ -1108,6 +1113,8 @@ class GeneSyncOrchestrator:
                     if stored is not None:
                         stored_documents[doc_id] = stored
                     items.append(item)
+                if not rediscovering and any(item.item_id not in stored_documents for item in items):
+                    await gene.authenticate()
                 indexed_doc_ids: set[str] = set()
                 last_sync_time = None
                 total_item_count = len(items)
