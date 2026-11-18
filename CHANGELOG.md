@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0b5 - 2026-11-18
 
 - Docker Compose: a release publishes its API and admin UI images to
   `ghcr.io/dodo-labs-ai` for `linux/amd64` and `linux/arm64`, and a clone of that
@@ -19,6 +19,29 @@
   `image-tag` CI job and both publish workflows run `scripts/verify_image_tag.py`,
   a release sets the tag and then sets it back, and `compose_smoke.sh` keeps
   testing the source tree under image names of its own.
+
+- Source sync: a failed sync run is retried only when its cause is transient,
+  such as a timeout, a dropped connection, a rate limit or a server error. A
+  rejected credential or a missing repository now fails the run at once and shows
+  on the Sources page, where it used to be retried five times over about 15
+  minutes first. A run follows the same rule as Source Unit recovery: an error
+  that does not say whether it is transient takes the answer of the error it was
+  raised from.
+
+- Source reprocess: a reprocess that rediscovers its Documents, or fetches an item
+  that no stored input holds, such as one the failure ledger recorded, now
+  authenticates with the provider before it reads from it, instead of failing
+  as not connected. A reprocess of stored input still never contacts the
+  provider.
+
+- Install commands: the quickstart, the local repository sync guide and the
+  plugins' daemon setup skill install and upgrade `memforge-ai` with the
+  pre-release options of `uv` and `pipx`. Without them an installer skips beta
+  releases and stops at the older stable one.
+
+- The memory plugin for Codex and Claude Code moves to 0.2.0-beta.5 with this
+  release. Its daemon setup skill installs the newest beta, as above; its code
+  is unchanged.
 
 ## 0.2.0b4 - 2026-11-10
 

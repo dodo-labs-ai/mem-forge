@@ -7,7 +7,7 @@ name: memforge
 # `docker compose up --build` always builds the checkout.
 services:
   api:
-    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-api:dev-${COMPOSE_PROJECT_NAME}
+    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-api:0.2.0b5
     build:
       context: .
       dockerfile: Dockerfile
@@ -46,7 +46,7 @@ services:
       start_period: 20s
 
   admin-ui:
-    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-admin-ui:dev-${COMPOSE_PROJECT_NAME}
+    image: ${MEMFORGE_IMAGE_REGISTRY:-ghcr.io/dodo-labs-ai}/memforge-admin-ui:0.2.0b5
     build:
       context: .
       dockerfile: admin/Dockerfile
