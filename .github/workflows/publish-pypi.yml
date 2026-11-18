@@ -11,6 +11,12 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # A version on PyPI cannot be published twice, so a release whose images
+      # would be refused publishes nothing here either.
+      - name: Verify the release tag and the images compose.yaml names
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python3 scripts/verify_image_tag.py --release-tag "$RELEASE_TAG"
       - uses: astral-sh/setup-uv@v5
       - uses: actions/setup-python@v5
         with:

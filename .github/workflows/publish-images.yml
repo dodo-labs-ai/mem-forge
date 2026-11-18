@@ -1,0 +1,62 @@
+name: Publish container images
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # The platform the runner is not gets built under emulation.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # An image that published stays published; rerun only the one that failed.
+      fail-fast: false
+      matrix:
+        include:
+          - image: memforge-api
+            dockerfile: Dockerfile
+          - image: memforge-admin-ui
+            dockerfile: admin/Dockerfile
+    steps:
+      # This job can push what newcomers run, so its actions and the emulator and
+      # builder images they start are pinned. The Dockerfiles' base images keep
+      # their tags, so that a release picks up their security updates.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Verify the release tag and the images compose.yaml names
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(python3 scripts/verify_image_tag.py --release-tag "$RELEASE_TAG")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          cache-image: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/dodo-labs-ai/${{ matrix.image }}:${{ steps.release.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.source=https://github.com/dodo-labs-ai/mem-forge
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0

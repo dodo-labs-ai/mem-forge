@@ -47,6 +47,14 @@ belongs to the prompts and extraction row, treat it as if it does. A release
 runs `provider_smoke.py` and `compose_smoke.sh --quality`, as
 [the release guide](docs/releasing-python-distribution.md) states.
 
+On `main`, `compose.yaml` names the image tag `dev-${COMPOSE_PROJECT_NAME}`, which
+is never published, so `docker compose up` builds your checkout. Use
+`docker compose up --build` after you change the source, because Compose reuses
+an image it already has. Give a second checkout its own `--project-name`: it then
+gets its own containers, volume and images, and in the same project it shares all
+three. `compose_smoke.sh` always tests the source tree: it builds the checkout
+under image names of its own, and only a release commit names a published tag.
+
 `--quality` adds the quick offline quality evaluation to the Compose smoke. It
 syncs the synthetic documents in `evals/quality/quick/docs`, then replaces the
 ones in `revisions/` with their second version and syncs again, and replays
