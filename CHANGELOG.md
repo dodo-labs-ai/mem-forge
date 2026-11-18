@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Docker Compose: a release publishes its API and admin UI images to
+  `ghcr.io/dodo-labs-ai` for `linux/amd64` and `linux/arm64`, and a clone of that
+  release runs them with a plain `docker compose up` instead of building them.
+  `compose.yaml` names the tag of its own checkout: a release commit names its
+  version, and any other commit names a tag of its Compose project that is never
+  published, so `main` builds the checkout and two projects do not share an image.
+  When a pull fails, Compose builds the checkout instead.
+  `docker compose up --build` still builds, with the build mirrors.
+  `MEMFORGE_IMAGE_REGISTRY` points the images at a mirror of `ghcr.io`; the tag
+  cannot be overridden, so a `.env` kept across an upgrade cannot pin an old
+  release. The setup guides now check out the latest release, and upgrading is
+  `git checkout` of the new release and `docker compose up -d`, or
+  `docker compose up -d --build` for a release that names no image, as every
+  release up to 0.2.0b4 does. Recovery points work as before. Contributors: the
+  `image-tag` CI job and both publish workflows run `scripts/verify_image_tag.py`,
+  a release sets the tag and then sets it back, and `compose_smoke.sh` keeps
+  testing the source tree under image names of its own.
+
 ## 0.2.0b4 - 2026-11-10
 
 - Relation discovery asks the classifier about at most 15 candidates per
@@ -28,24 +48,6 @@
   the later memory's job, which now owns the pair, has not run again. Exhausted
   work is re-run when a release starts, so the same applies to what that work
   recorded.
-
-- Docker Compose: a release publishes its API and admin UI images to
-  `ghcr.io/dodo-labs-ai` for `linux/amd64` and `linux/arm64`, and a clone of that
-  release runs them with a plain `docker compose up` instead of building them.
-  `compose.yaml` names the tag of its own checkout: a release commit names its
-  version, and any other commit names a tag of its Compose project that is never
-  published, so `main` builds the checkout and two projects do not share an image.
-  When a pull fails, Compose builds the checkout instead.
-  `docker compose up --build` still builds, with the build mirrors.
-  `MEMFORGE_IMAGE_REGISTRY` points the images at a mirror of `ghcr.io`; the tag
-  cannot be overridden, so a `.env` kept across an upgrade cannot pin an old
-  release. The setup guides now check out the latest release, and upgrading is
-  `git checkout` of the new release and `docker compose up -d`, or
-  `docker compose up -d --build` for a release that names no image, as every
-  release up to 0.2.0b3 does. Recovery points work as before. Contributors: the
-  `image-tag` CI job and both publish workflows run `scripts/verify_image_tag.py`,
-  a release sets the tag and then sets it back, and `compose_smoke.sh` keeps
-  testing the source tree under image names of its own.
 
 - Compose smoke: the summaries of `scripts/compose_smoke.sh --quality` name each
   case by its cohort title, with its snapshot set or situation file, in every

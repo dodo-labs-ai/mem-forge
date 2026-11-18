@@ -46,7 +46,7 @@ release, see [Upgrading](#upgrading).
 | Checkout | What `docker compose up` does |
 | --- | --- |
 | A release | Pulls that release's `ghcr.io/dodo-labs-ai/memforge-api` and `memforge-admin-ui` images, built for `linux/amd64` and `linux/arm64`, unless you already have them. |
-| A release whose `compose.yaml` names no image, as every release up to 0.2.0b3 does | Builds the checkout, unless images from an earlier build exist. Compose then runs those without a message, so add `--build` to run this checkout. |
+| A release whose `compose.yaml` names no image, as every release up to 0.2.0b4 does | Builds the checkout, unless images from an earlier build exist. Compose then runs those without a message, so add `--build` to run this checkout. |
 | `main` or any other commit | Tries a tag that is never published, `dev-` and the Compose project's name, so the pull fails and Compose builds the checkout. |
 
 When a pull fails, because the registry cannot be reached or the release has no
@@ -700,7 +700,7 @@ docker compose up -d
 Compose pulls the release's images and replaces the containers. The images of the
 release you left stay on disk until you remove them with `docker image rm`.
 
-If `grep image: compose.yaml` prints nothing, as for every release up to 0.2.0b3,
+If `grep image: compose.yaml` prints nothing, as for every release up to 0.2.0b4,
 the release has no images to pull. Use `docker compose up -d --build` for it: a
 plain `up -d` goes on running the images you already have, without a message.
 
