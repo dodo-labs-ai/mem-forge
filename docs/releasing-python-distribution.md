@@ -132,7 +132,10 @@ organization's settings:
    ```
 
    Then run the other platform the same way, under emulation. Docker Desktop
-   provides it; on Linux, register QEMU first.
+   provides it; on Linux, register QEMU first. Every project on this machine
+   names the release's images by the same tag, so the run ends by removing the
+   other platform's images; a later install of the release then pulls this
+   machine's own.
 
    ```bash
    export DOCKER_DEFAULT_PLATFORM=linux/amd64 # or linux/arm64: the one this machine is not
@@ -140,7 +143,7 @@ organization's settings:
    docker compose exec -T api uname -m
    curl -fsS "http://$(docker compose port api 8765)/api/v1/health"
    curl -fsS -o /dev/null "http://$(docker compose port admin-ui 8080)/api/v1/health"
-   docker compose down -v
+   docker compose down -v --rmi all
    unset DOCKER_DEFAULT_PLATFORM COMPOSE_PROJECT_NAME
    ```
 
