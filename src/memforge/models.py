@@ -947,12 +947,11 @@ class SearchResult:
     # Metadata
     corroborated_by: int = 1
     last_observed_at: str | None = None
-    freshness: str = "current"  # current | stale | unverified
+    freshness: str = "current"  # current | outdated | stale | unverified
     relation_notice: str | None = None
     relations: tuple[MemoryRelationContext, ...] = ()
     status: str = "active"
     repo_identifier: str | None = None
-    follow_up: dict[str, str] | None = None
     retrieval_evidence: dict[str, Any] | None = None
 
 

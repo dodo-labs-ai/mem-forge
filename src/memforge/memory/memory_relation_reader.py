@@ -211,6 +211,16 @@ async def read_memory_relations(
     return await relation_contexts(store, graph, memory_ids, scope)
 
 
+def _updated_by_newer(context: MemoryRelationContext) -> bool:
+    return context.label == MemoryRelationLabel.UPDATES.value and context.role == RelationRole.OLDER.value
+
+
+def is_outdated(contexts: Sequence[MemoryRelationContext]) -> bool:
+    """Whether a newer Memory the caller sees updates this one."""
+
+    return any(_updated_by_newer(context) for context in contexts)
+
+
 def relation_notice(contexts: Sequence[MemoryRelationContext]) -> str | None:
     """One sentence per relation a reader must weigh; equivalent and newer need none."""
 
@@ -218,7 +228,7 @@ def relation_notice(contexts: Sequence[MemoryRelationContext]) -> str | None:
     for context in contexts:
         if context.label == MemoryRelationLabel.CONTRADICTS.value:
             notes.append(f"Conflicts with {_describe(context.counterpart)}.")
-        elif context.label == MemoryRelationLabel.UPDATES.value and context.role == RelationRole.OLDER.value:
+        elif _updated_by_newer(context):
             notes.append(f"Updated by the newer {_describe(context.counterpart)}.")
     return " ".join(notes) or None
 

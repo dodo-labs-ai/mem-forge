@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- Search: a Memory that a newer Memory updates reports `freshness: outdated` in
+  search results and recent-memory listings, beside the `relation_notice` that
+  names the newer Memory. It is `outdated` for as long as the caller sees that
+  relation: once the relation is dismissed, or when the caller cannot read the
+  newer Memory, the older one reports what it would without the relation. A
+  conflict does not change freshness. The search tool description tells agents
+  to prefer the newer Memory where the two differ.
+
+- Search: a superseded Memory, which search returns only when asked to include
+  superseded Memories, reports `freshness: stale` where it used to report
+  `current` beside `status: superseded`.
+
+- Search results no longer carry `follow_up`. `freshness`, `relation_notice` and
+  the agent guidance say when to open a Memory with `get_memory`. An API client
+  that reads `follow_up` from `POST /api/v1/memories/search` or
+  `POST /api/v1/memories/recent` should stop reading it.
+
+- Memory plugin: the session guidance tells agents what to do when results are
+  related but do not state the detail the task needs. They search again with the
+  task's own identifiers or with different terms, and read the source of a close
+  Memory that lacks the detail, before falling back on general knowledge. The
+  guidance and the search tool description reach an installed plugin with the
+  next plugin release.
+
 ## 0.2.0b5 - 2026-11-18
 
 - Docker Compose: a release publishes its API and admin UI images to

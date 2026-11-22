@@ -29,6 +29,7 @@ def test_search_compaction_keeps_relations_and_notice() -> None:
         {
             "memory_id": "mem-older",
             "summary": "Payroll closes on the 20th.",
+            "freshness": "outdated",
             "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (recorded 2026-08-01).",
             "relations": [_relation()],
             "corroborated_by": 2,
@@ -38,6 +39,7 @@ def test_search_compaction_keeps_relations_and_notice() -> None:
     assert result == {
         "memory_id": "mem-older",
         "summary": "Payroll closes on the 20th.",
+        "freshness": "outdated",
         "relation_notice": "Updated by the newer Memory mem-newer from Payroll Jira (recorded 2026-08-01).",
         "relations": [_relation()],
     }

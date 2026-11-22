@@ -1714,7 +1714,6 @@ async def test_admin_memory_search_response_keeps_each_page_shape(db: Database, 
                 "relations": [],
                 "status": "active",
                 "repo_identifier": None,
-                "follow_up": {"suggested_tool": "get_memory", "reason": "summary_may_omit_operational_steps"},
                 "retrieval_evidence": {"channels": ["source_time_listing"]},
             }
         ],

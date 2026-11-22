@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -25,6 +25,7 @@ from memforge.memory.memory_relation_reader import (
     RelationGraph,
     RelationRole,
     dismiss_relation,
+    is_outdated,
     list_relation_pairs,
     load_relation_graph,
     order_by_relations,
@@ -33,6 +34,7 @@ from memforge.memory.memory_relation_reader import (
     relation_role,
 )
 from memforge.models import DocumentRecord, Memory, MemoryRelationContext, MemorySourceRef, RelatedMemory, content_hash
+from memforge.retrieval.filters import MemoryTimeRange
 from memforge.retrieval.search import SearchEngine
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID, AccessScope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
@@ -532,6 +534,8 @@ def test_notice_names_conflicts_and_newer_memories_only():
     assert relation_notice([context("contradicts", "peer")]) == (
         "Conflicts with Memory mem-new from Payroll Jira (recorded 2026-08-01)."
     )
+    assert is_outdated([context("contradicts", "peer"), context("updates", "older")])
+    assert not is_outdated([context("contradicts", "peer"), context("equivalent", "peer"), context("updates", "newer")])
 
 
 @pytest.mark.asyncio
@@ -617,8 +621,8 @@ async def test_search_attaches_a_conflict_to_both_memories(db, tmp_path):
     assert context.counterpart.evidence_time == EARLIER
     assert by_id[second.id].relations[0].counterpart.evidence_time == LATER
     assert by_id[first.id].relation_notice.startswith(f"Conflicts with Memory {second.id} from Payroll Jira")
-    assert by_id[first.id].follow_up == {"suggested_tool": "get_memory", "reason": "result_has_relation_notice"}
     assert by_id[second.id].relations[0].counterpart.memory_id == first.id
+    assert by_id[second.id].freshness == "current"
 
 
 @pytest.mark.asyncio
@@ -628,6 +632,8 @@ async def test_search_ranks_the_newer_memory_ahead_and_notes_the_older(db, tmp_p
     await db.insert_memory(older)
     await db.insert_memory(newer)
     await _relate(db, older, newer, UPDATES, times={older.id: EARLIER, newer.id: LATER})
+    for memory in (older, newer):
+        await _attach_source(db, memory.id, "src-wiki", "confluence")
     engine = _engine(db, tmp_path, [older.id, newer.id])
 
     result = await engine.search("Payroll closes", top_k=2)
@@ -636,7 +642,102 @@ async def test_search_ranks_the_newer_memory_ahead_and_notes_the_older(db, tmp_p
     newer_result, older_result = result["results"]
     assert newer_result.relation_notice is None
     assert newer_result.relations[0].role == "newer"
+    assert newer_result.freshness == "current"
     assert older_result.relation_notice.startswith(f"Updated by the newer Memory {newer.id}")
+    assert older_result.freshness == "outdated"
+
+
+async def _updated_pair(db: Database, older: Memory, newer: Memory) -> None:
+    """Store ``older`` and ``newer`` with an ``updates`` relation; ``older`` has a source."""
+
+    await db.insert_memory(older)
+    await db.insert_memory(newer)
+    await _relate(db, older, newer, UPDATES, times={older.id: EARLIER, newer.id: LATER})
+    await _attach_source(db, older.id, "src-wiki", "confluence")
+
+
+@pytest.mark.asyncio
+async def test_search_reports_an_updated_memory_as_outdated_whatever_else_holds(db, tmp_path):
+    without_source = _memory("mem-no-source", "Payroll closes on the 20th.")
+    expired = _memory("mem-expired", "Payroll approvals close on the 18th.", valid_until=date(2026, 1, 1))
+    newer = _memory("mem-newer", "Payroll closes and approvals end on the 25th.")
+    for memory in (without_source, expired, newer):
+        await db.insert_memory(memory)
+    for older in (without_source, expired):
+        await _relate(db, older, newer, UPDATES, times={older.id: EARLIER, newer.id: LATER})
+    await _attach_source(db, expired.id, "src-wiki", "confluence")
+    engine = _engine(db, tmp_path, [without_source.id, expired.id, newer.id])
+
+    result = await engine.search("Payroll", top_k=3)
+
+    by_id = {item.memory_id: item for item in result["results"]}
+    assert by_id[without_source.id].freshness == "outdated"
+    assert by_id[expired.id].freshness == "outdated"
+
+
+@pytest.mark.asyncio
+async def test_search_reports_a_memory_as_current_once_its_update_is_dismissed(db, tmp_path):
+    older = _memory("mem-older", "Payroll closes on the 20th.")
+    newer = _memory("mem-newer", "Salary cutoff moved to the 25th.")
+    await _updated_pair(db, older, newer)
+    await db.record_memory_relation_dismissal(
+        memory_id=older.id,
+        counterpart_memory_id=newer.id,
+        label=UPDATES,
+        expected_content_hash=older.content_hash,
+        counterpart_expected_content_hash=newer.content_hash,
+        actor="reader-1",
+    )
+    engine = _engine(db, tmp_path, [older.id, newer.id])
+
+    result = await engine.search("Payroll closes", top_k=2)
+
+    by_id = {item.memory_id: item for item in result["results"]}
+    assert by_id[older.id].freshness == "current"
+    assert by_id[older.id].relation_notice is None
+
+
+@pytest.mark.asyncio
+async def test_search_reports_outdated_only_for_a_newer_memory_the_caller_sees(db, tmp_path):
+    older = _memory("mem-older", "Payroll closes on the 20th.")
+    private_newer = _memory(
+        "mem-private-newer",
+        "Salary cutoff moved to the 25th.",
+        visibility="private",
+        owner_user_id=OTHER_USER_ID,
+    )
+    await _updated_pair(db, older, private_newer)
+    engine = _engine(db, tmp_path, [older.id, private_newer.id])
+
+    as_caller = await engine.search("Payroll closes", top_k=2)
+    as_owner = await engine.search("Payroll closes", top_k=2, request_scope=_scope(OTHER_USER_ID))
+
+    [seen] = as_caller["results"]
+    assert (seen.memory_id, seen.freshness, seen.relation_notice) == (older.id, "current", None)
+    assert {item.memory_id: item.freshness for item in as_owner["results"]}[older.id] == "outdated"
+
+
+@pytest.mark.asyncio
+async def test_recent_listing_reports_the_updated_memory_as_outdated(db, tmp_path):
+    older = _memory("mem-older", "Payroll closes on the 20th.")
+    newer = _memory("mem-newer", "Salary cutoff moved to the 25th.")
+    await _updated_pair(db, older, newer)
+    engine = _engine(db, tmp_path, [])
+    now = datetime.now(timezone.utc)
+
+    listing = await engine.list_recent_memories(
+        source_filter=None,
+        time_range=MemoryTimeRange(
+            after=now - timedelta(days=1),
+            before=now + timedelta(days=1),
+            date_type="memory_updated_at",
+        ),
+    )
+
+    by_id = {item["memory_id"]: item for item in listing["results"]}
+    assert by_id[older.id]["freshness"] == "outdated"
+    assert by_id[older.id]["relation_notice"].startswith(f"Updated by the newer Memory {newer.id}")
+    assert by_id[newer.id]["freshness"] != "outdated"
 
 
 @pytest.mark.asyncio
@@ -718,6 +819,29 @@ async def test_admin_memory_detail_dismissal_and_restore(db, tmp_path):
     assert restored_again.status_code == 404
     assert len(shown["relations"]) == 1
     assert shown["dismissed_relations"] == []
+
+
+@pytest.mark.asyncio
+async def test_admin_search_reports_the_updated_memory_as_outdated(db, tmp_path, monkeypatch):
+    from memforge import runtime
+    from memforge.server.admin_api import create_admin_app
+
+    older = _memory("mem-older", "Payroll closes on the 20th.")
+    newer = _memory("mem-newer", "Salary cutoff moved to the 25th.")
+    await _updated_pair(db, older, newer)
+
+    async def build_search_engine(_provider, _db, _config, *, audit_logger=None):
+        return _engine(db, tmp_path, [older.id, newer.id])
+
+    monkeypatch.setattr(runtime.DefaultRuntimeProvider, "build_search_engine", build_search_engine)
+    app = create_admin_app(db=db, config=_config(tmp_path))
+    with TestClient(app) as client:
+        response = client.post("/api/v1/memories/search", json={"query": "Payroll closes", "top_k": 2})
+
+    assert response.status_code == 200, response.text
+    by_id = {item["memory_id"]: item for item in response.json()["results"]}
+    assert by_id[older.id]["freshness"] == "outdated"
+    assert by_id[older.id]["relation_notice"].startswith(f"Updated by the newer Memory {newer.id}")
 
 
 @pytest.mark.asyncio

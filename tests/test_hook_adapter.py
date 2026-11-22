@@ -169,6 +169,10 @@ def test_session_start_guidance_explains_agentic_memforge_usage(monkeypatch, cap
     assert "Use it agentically" in guidance
     assert "Treat memory as context, not current truth" in guidance
     assert "Never mutate memory silently" in guidance
+    assert "or when a close Memory lacks a detail the task needs" in guidance
+    assert "search again with the task's own identifiers" in guidance
+    assert "before falling back to general knowledge" in guidance
+    assert "If no relevant memory is found, continue normally" in guidance
 
 
 @pytest.mark.parametrize(
@@ -2290,6 +2294,7 @@ def test_mcp_proxy_source_selection_descriptions_guide_scoped_and_global_search(
     assert "total_candidates and offset" in search_description
     assert "ranked queries are not exhaustive" in search_description
     assert "Call get_memory for provenance" in search_description
+    assert "freshness outdated marks the older one: where they differ, prefer the newer" in search_description
     assert "self-contained query in the user's language" in search_description
     assert "preserve identifiers and domain terms" in search_description
     assert "translation or keyword stuffing" in search_description
@@ -3313,7 +3318,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                             "relevance_score": 0.99,
                             "freshness": "current",
                             "status": "active",
-                            "follow_up": {"suggested_tool": "get_memory"},
                             "retrieval_evidence": {"metadata_lexical": {"matched_text": ["large debug text"]}},
                             "repo_identifier": "repo",
                         }
@@ -3348,7 +3352,6 @@ def test_mcp_proxy_compacts_search_response_for_agent_context(monkeypatch):
                 "relevance_score": 0.99,
                 "freshness": "current",
                 "status": "active",
-                "follow_up": {"suggested_tool": "get_memory"},
             }
         ],
         "retrieval_intent": {

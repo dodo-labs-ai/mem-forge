@@ -6692,20 +6692,6 @@
             "title": "Corroborated By",
             "type": "integer"
           },
-          "follow_up": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "type": "string"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Follow Up"
-          },
           "freshness": {
             "title": "Freshness",
             "type": "string"
