@@ -9,6 +9,7 @@ import pytest
 from memforge.models import DocumentRecord, Memory, content_hash
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.query_plan import build_lexical_query_plan
+from memforge.retrieval.search import sanitize_fts_query
 from memforge.storage.database import Database
 from memforge.storage.adapters.context import AccessScope, LOCAL_DEV_USER_ID
 from memforge.storage.adapters.protocols import KeywordSearch
@@ -64,6 +65,41 @@ async def test_search_matches_active_memory_by_content(db):
     keyword = SqliteKeywordSearch(db)
     hits = await keyword.search('"PostgreSQL"', _scope(), None, limit=10)
     assert [mid for mid, _ in hits] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_sanitized_query_matches_dotted_identifier_in_content(db):
+    await db.insert_memory(_memory("m-new", "Use server.service.name on the client side."))
+    await db.insert_memory(_memory("m-other", "The service name of the server is set at startup."))
+    keyword = SqliteKeywordSearch(db)
+    for query in ("server.service.name", "server.service.name,", "`server.service.name`"):
+        hits = await keyword.search(sanitize_fts_query(query), _scope(), None, limit=10)
+        assert [mid for mid, _ in hits] == ["m-new"], query
+
+
+@pytest.mark.asyncio
+async def test_sanitized_query_keeps_fts_operator_characters_literal(db):
+    await db.insert_memory(_memory("m1", "Set rpc.status_code from the gRPC status (see spec:v1)."))
+    keyword = SqliteKeywordSearch(db)
+    query = 'rpc.status_code* "gRPC" (see spec:v1) ^status — NEAR rpc"status'
+    assert sanitize_fts_query(query) == '"rpc.status_code" "gRPC" "see" "spec:v1" "status" "NEAR" "rpc""status"'
+    hits = await keyword.search(sanitize_fts_query("rpc.status_code* (see spec:v1) ^status"), _scope(), None, limit=10)
+    assert [mid for mid, _ in hits] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_sanitized_query_removes_characters_an_fts_string_cannot_carry(db):
+    await db.insert_memory(_memory("m1", "The gRPC status maps to rpc.status_code."))
+    keyword = SqliteKeywordSearch(db)
+    query = "rpc.status\x00_code gRPC\ud800"
+    assert sanitize_fts_query(query) == '"rpc.status_code" "gRPC"'
+    hits = await keyword.search(sanitize_fts_query(query), _scope(), None, limit=10)
+    assert [mid for mid, _ in hits] == ["m1"]
+
+
+def test_sanitized_query_trims_a_long_punctuation_run_in_linear_time():
+    assert sanitize_fts_query("a" + "." * 200_000 + "b") == '"a' + "." * 200_000 + 'b"'
+    assert sanitize_fts_query("." * 200_000) == ""
 
 
 @pytest.mark.asyncio
