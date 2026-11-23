@@ -44,6 +44,12 @@ _REPRESENTATION_CONTRACTS: Mapping[tuple[str, str], EvidenceRepresentationProfil
     for observation_type, profile in descriptor.evidence_profiles.items()
 }
 
+_ALTERNATIVE_REPRESENTATION_CONTRACTS: Mapping[tuple[str, str], frozenset[EvidenceRepresentationProfile]] = {
+    (descriptor.source_type, observation_type): profiles
+    for descriptor in registered_source_types()
+    for observation_type, profiles in descriptor.alternative_evidence_profiles.items()
+}
+
 _CANONICAL_RECORD_SCHEMAS: Mapping[tuple[str, int], CanonicalRecordSchema] = {
     key: schema
     for descriptor in registered_source_types()
@@ -91,6 +97,7 @@ _SUPPORTED_REPRESENTATION_CONTRACTS: Mapping[
         BINARY_ARTIFACT_PROFILE,
         PLAIN_TEXT_PROFILE,
         *_REPRESENTATION_CONTRACTS.values(),
+        *(profile for profiles in _ALTERNATIVE_REPRESENTATION_CONTRACTS.values() for profile in profiles),
         *(canonical_record_profile(name, version) for name, version in _CANONICAL_RECORD_SCHEMAS),
     }
 }
@@ -190,6 +197,7 @@ def representation_profile_for_observation_contract(
     source_type: str,
     observation_type: str,
     record_schema: str | None = None,
+    chosen: EvidenceRepresentationProfile | None = None,
 ) -> EvidenceRepresentationProfile | None:
     """The profile an Observation of one adapter contract is read under, without inspecting content or MIME.
 
@@ -197,9 +205,16 @@ def representation_profile_for_observation_contract(
     canonical record schema it was collected under (``record_schema``, as
     ``name:version``). The payload is then read under that schema, which must be
     one of the contract's ``declared_representation_profiles``; any other
-    schema cannot be read, and raises ``ValueError``.
+    schema cannot be read, and raises ``ValueError``. An adapter that chose one
+    of the contract's alternative profiles for this Observation names it as
+    ``chosen``; a profile that is not one of those alternatives raises
+    ``ValueError``.
     """
 
+    if chosen is not None:
+        if chosen not in _ALTERNATIVE_REPRESENTATION_CONTRACTS.get((source_type, observation_type), frozenset()):
+            raise ValueError(f"{source_type}/{observation_type} declares no alternative profile {chosen.name}")
+        return chosen
     if observation_type == SOURCE_ARTIFACT_OBSERVATION_TYPE:
         return BINARY_ARTIFACT_PROFILE
     if observation_type == "document_content":
@@ -223,10 +238,10 @@ def declared_representation_profiles(
 ) -> frozenset[EvidenceRepresentationProfile]:
     """Every profile a new Observation Revision of one adapter contract may be stored under.
 
-    That is the profile the contract declares and, for a canonical record, every
-    registered version of its schema, since a stored payload may name any of
-    them as the schema it was collected under. The shared projector alone
-    decides which one a revision is read under
+    That is the profile the contract declares, its alternative profiles and,
+    for a canonical record, every registered version of its schema, since a
+    stored payload may name any of them as the schema it was collected under.
+    The shared projector alone decides which one a revision is read under
     (``representation_profile_for_observation_contract``); storage checks only
     that it is registered for the contract. A contract without a declaration
     has none.
@@ -238,7 +253,7 @@ def declared_representation_profiles(
     if declared is None:
         return frozenset()
     if declared.schema_name is None:
-        return frozenset({declared})
+        return frozenset({declared, *_ALTERNATIVE_REPRESENTATION_CONTRACTS.get((source_type, observation_type), ())})
     return frozenset(
         canonical_record_profile(name, version)
         for name, version in _CANONICAL_RECORD_SCHEMAS

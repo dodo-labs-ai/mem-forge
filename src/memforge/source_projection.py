@@ -147,6 +147,24 @@ class EvidenceRepresentationProfile:
             or self.coordinate_space is EvidenceCoordinateSpace.WHOLE_ARTIFACT
         )
 
+    @property
+    def is_markdown(self) -> bool:
+        """Whether content is read as Markdown blocks: headings, lists, tables, code and paragraphs."""
+
+        return self.name in {"markdown-structural", "markdown-rst-titles"}
+
+    @property
+    def is_range_addressable_text(self) -> bool:
+        """Whether Evidence is addressed by ranges of the raw text: Markdown or plain text."""
+
+        return self.is_markdown or self.name == "plain-text"
+
+    @property
+    def reads_rst_titles(self) -> bool:
+        """Whether a reStructuredText section title (an underlined line) reads as a Markdown heading."""
+
+        return self.name == "markdown-rst-titles"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceAnchor:

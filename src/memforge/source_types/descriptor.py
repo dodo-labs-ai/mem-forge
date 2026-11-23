@@ -106,7 +106,10 @@ class SourceTypeDescriptor:
     scope without it changes. ``canonical_scope`` drops the fields a
     configured mode leaves unused. ``project_native`` turns one fetched item into Units and
     Observations; a type without one is projected generically, with partial
-    coverage. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
+    coverage. ``evidence_profiles`` names the profile each Observation type is
+    read under; ``alternative_evidence_profiles`` names the other profiles the
+    adapter may choose for one Observation of that type, such as by a file's
+    extension. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
     a Unit's stored input must then hold. ``config`` checks and prepares the
     Source's configuration. ``conversation_provider`` opens a conversation
     type's provider on the device.
@@ -121,6 +124,7 @@ class SourceTypeDescriptor:
     canonical_scope: Callable[[dict[str, object]], dict[str, object]] | None = None
     project_native: Callable[..., Any] | None = None
     evidence_profiles: Mapping[str, EvidenceRepresentationProfile] = field(default_factory=dict)
+    alternative_evidence_profiles: Mapping[str, frozenset[EvidenceRepresentationProfile]] = field(default_factory=dict)
     legacy_evidence_profiles: Mapping[str, EvidenceRepresentationProfile] = field(default_factory=dict)
     record_schemas: Mapping[tuple[str, int], CanonicalRecordSchema] = field(default_factory=dict)
     local_agent: LocalAgentCollection | None = None
@@ -133,6 +137,9 @@ class SourceTypeDescriptor:
             raise ValueError(f"{self.source_type} declares a default for a field that is not a scope field")
         object.__setattr__(self, "scope_defaults", _frozen(self.scope_defaults))
         object.__setattr__(self, "evidence_profiles", _frozen(self.evidence_profiles))
+        if set(self.alternative_evidence_profiles) - set(self.evidence_profiles):
+            raise ValueError(f"{self.source_type} declares an alternative profile for an undeclared Observation type")
+        object.__setattr__(self, "alternative_evidence_profiles", _frozen(self.alternative_evidence_profiles))
         object.__setattr__(self, "legacy_evidence_profiles", _frozen(self.legacy_evidence_profiles))
         object.__setattr__(self, "record_schemas", _frozen(self.record_schemas))
 

@@ -156,12 +156,13 @@ def build_revision_reading_index(
 
     profile_name = contract.profile.name
     groups: list[ReadingGroup] = []
-    if profile_name == "markdown-structural":
+    if contract.profile.is_markdown:
         groups.extend(
             _text_groups(
                 revision.content,
                 ordered_fragments,
                 coordinates=_Coordinates(),
+                rst_titles=contract.profile.reads_rst_titles,
             )
         )
     elif profile_name == "canonical-record":
@@ -230,9 +231,10 @@ def _text_groups(
     kind_prefix: str = "",
     owner: str | None = None,
     raw_bounds: tuple[int, int] | None = None,
+    rst_titles: bool = False,
 ) -> tuple[ReadingGroup, ...]:
     try:
-        tokens = _markdown_parser().parse(text)
+        tokens = _markdown_parser(rst_titles=rst_titles).parse(text)
     except Exception:
         return ()
     line_starts = _line_starts(text)

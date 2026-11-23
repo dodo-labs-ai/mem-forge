@@ -69,9 +69,6 @@ from memforge.source_representation import CanonicalRecordSchema, representation
 ReadingKey = tuple[object, ...]
 Range = tuple[int, int]
 
-_RANGE_ADDRESSABLE_PROFILES = frozenset({"markdown-structural", "plain-text"})
-_COMPARED_PROFILES = frozenset({"canonical-record", *_RANGE_ADDRESSABLE_PROFILES})
-
 
 @dataclass(frozen=True, slots=True)
 class _Reading:
@@ -191,9 +188,9 @@ class ReadingComparison:
             return _NO_CHANGE
         if profile is None:
             return None
-        if profile.name not in _COMPARED_PROFILES:
+        structured = profile.is_range_addressable_text
+        if not structured and profile.name != "canonical-record":
             return None
-        structured = profile.name in _RANGE_ADDRESSABLE_PROFILES
         if structured and self._base.evidence_profile != profile:
             return None
         target = self._target_side
