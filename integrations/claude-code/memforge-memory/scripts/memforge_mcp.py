@@ -277,7 +277,8 @@ TOOLS: list[dict[str, Any]] = [
             "Send a self-contained query in the user's language; preserve identifiers and domain terms, "
             "without retrieval-only translation or keyword stuffing. Use total_candidates and offset only "
             "within the ranked window; ranked queries are not exhaustive. relation_notice flags a "
-            "conflicting or newer Memory (see relations[] and get_memory). "
+            "conflicting or newer Memory (see relations[]); freshness outdated marks the older one: "
+            "where they differ, prefer the newer. "
             "Call get_memory for provenance."
         ),
         "inputSchema": {
@@ -1814,7 +1815,6 @@ def _compact_search_result(result: dict[str, Any]) -> dict[str, Any]:
         "status",
         "relation_notice",
         "relations",
-        "follow_up",
     ):
         if key in result:
             compact[key] = result[key]

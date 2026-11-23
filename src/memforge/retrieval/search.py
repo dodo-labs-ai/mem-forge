@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
@@ -26,13 +27,14 @@ from memforge.llm.embedding import EmbeddingIndexMismatch, EmbeddingRuntime, emb
 from memforge.llm.structured import RerankResponse
 from memforge.memory.memory_relation_reader import (
     RelationGraph,
+    is_outdated,
     load_relation_graph,
     order_by_relations,
     relation_contexts,
     relation_notice,
 )
 from memforge.memory.lifecycle import allowed_search_statuses
-from memforge.models import Memory, SHARED_PROJECT_KEY, SearchResult
+from memforge.models import Memory, MemoryRelationContext, SHARED_PROJECT_KEY, SearchResult
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.intents import (
     RankedRetrievalIntent,
@@ -260,35 +262,6 @@ def _weighted_rrf_fusion(
         )
         for item in fused
     ]
-
-
-def _search_follow_up_for_memory(
-    memory: Memory,
-    *,
-    relation_notice: str | None,
-) -> dict[str, str] | None:
-    """Return a small next-tool hint when summary-only use is likely weak."""
-    if relation_notice:
-        return {
-            "suggested_tool": "get_memory",
-            "reason": "result_has_relation_notice",
-        }
-    if memory.status != "active":
-        return {
-            "suggested_tool": "get_memory",
-            "reason": "memory_lifecycle_may_matter",
-        }
-    if memory.memory_type == "procedure":
-        return {
-            "suggested_tool": "get_memory",
-            "reason": "summary_may_omit_operational_steps",
-        }
-    if memory.memory_type in {"decision", "convention"}:
-        return {
-            "suggested_tool": "get_memory",
-            "reason": "provenance_or_lifecycle_may_matter",
-        }
-    return None
 
 
 def sanitize_fts_query(text: str) -> str:
@@ -1229,11 +1202,7 @@ class SearchEngine:
                 logger.exception("Failed to fetch sources for memory %s", mid)
                 has_source = False
 
-            # Determine freshness
-            freshness = _compute_freshness(memory, has_source)
-
             relations = relations_by_memory.get(mid, ())
-            notice = relation_notice(relations)
 
             results.append(
                 SearchResult(
@@ -1243,15 +1212,11 @@ class SearchEngine:
                     relevance_score=round(candidate.final_score, 4),
                     corroborated_by=memory.corroboration_count,
                     last_observed_at=(memory.updated_at.isoformat() if memory.updated_at else None),
-                    freshness=freshness,
-                    relation_notice=notice,
+                    freshness=_compute_freshness(memory, has_source, relations),
+                    relation_notice=relation_notice(relations),
                     relations=relations,
                     status=memory.status,
                     repo_identifier=candidate.repo_identifier or memory.repo_identifier,
-                    follow_up=_search_follow_up_for_memory(
-                        memory,
-                        relation_notice=notice,
-                    ),
                     retrieval_evidence=candidate.retrieval_evidence,
                 )
             )
@@ -1491,18 +1456,26 @@ def _rerank_memory_card(
     return card
 
 
-def _compute_freshness(memory: Memory, has_source: bool) -> str:
+def _compute_freshness(
+    memory: Memory,
+    has_source: bool,
+    relations: Sequence[MemoryRelationContext],
+) -> str:
     """Determine the freshness label for a memory.
 
-    - ``current`` : memory updated within the last 7 days, or source accessible.
-    - ``stale``   : memory older than 7 days and the source doc was updated
-                    more recently (detected via updated_at lag).
-    - ``unverified``: no known source or source inaccessible.
+    - ``outdated``  : a newer Memory the caller sees updates this one; its
+                      ``relation_notice`` names that Memory.
+    - ``unverified``: the Memory has no source.
+    - ``stale``     : the Memory was superseded or retired, or its validity ended.
+    - ``current``   : none of the above.
     """
+    if is_outdated(relations):
+        return "outdated"
+
     if not has_source:
         return "unverified"
 
-    if memory.status in ("retired", "decayed"):
+    if memory.status in ("superseded", "retired", "decayed"):
         return "stale"
 
     if memory.valid_until:

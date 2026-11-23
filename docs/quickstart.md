@@ -580,8 +580,9 @@ could change your recommendation.
 ```
 
 Search returns compact memory cards. When a memory conflicts with or has been
-updated by another memory, the card carries a `relation_notice` and a
-`follow_up` hint. Agents call `get_memory` for provenance. Revision-pinned Evidence carries readable citation `text`,
+updated by another memory, the card carries a `relation_notice`, and a memory
+that a newer one updates reports `freshness: outdated`. Agents call `get_memory`
+for provenance. Revision-pinned Evidence carries readable citation `text`,
 which may be model-produced focused wording, and a `resource_url` for the pinned
 citation material. Manually created memories may instead return an `excerpt`
 without a resource link. Revision and range locators identify source-backed

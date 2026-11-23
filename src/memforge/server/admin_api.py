@@ -1646,7 +1646,6 @@ class MemorySearchResultDetail(BaseModel):
     relations: list[MemoryRelationDetail] = []
     status: str
     repo_identifier: str | None = None
-    follow_up: dict[str, str] | None = None
     retrieval_evidence: dict[str, Any] | None = None
 
 

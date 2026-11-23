@@ -193,64 +193,6 @@ async def test_search_result_with_source_row_but_no_source_url_is_current(db, tm
 
 
 @pytest.mark.asyncio
-async def test_search_result_suggests_detail_for_procedure_memory(
-    db,
-    tmp_path,
-    monkeypatch,
-):
-    procedure = _memory(
-        "mem-procedure-follow-up",
-        "Run the deploy script, bootstrap the admin user, then smoke test.",
-        "active",
-    )
-    procedure.memory_type = "procedure"
-    await db.insert_memory(procedure)
-
-    adapters = build_sqlite_adapters(db, FakeCollection([procedure.id]))
-    engine = SearchEngine(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embedding=unconfigured_embedding(),
-        config=_config(tmp_path).retrieval,
-    )
-    engine._embed_query = AsyncMock(return_value=[0.1])
-
-    result = await engine.search("deploy runbook", top_k=1)
-    search_result = result["results"][0]
-
-    assert search_result.follow_up == {
-        "suggested_tool": "get_memory",
-        "reason": "summary_may_omit_operational_steps",
-    }
-
-
-@pytest.mark.asyncio
-async def test_search_result_omits_follow_up_for_simple_fact_memory(
-    db,
-    tmp_path,
-    monkeypatch,
-):
-    fact = _memory("mem-fact-no-follow-up", "Service uses HANA.", "active")
-    await db.insert_memory(fact)
-
-    adapters = build_sqlite_adapters(db, FakeCollection([fact.id]))
-    engine = SearchEngine(
-        relational=adapters.relational,
-        keyword=adapters.keyword,
-        vector=adapters.vector,
-        embedding=unconfigured_embedding(),
-        config=_config(tmp_path).retrieval,
-    )
-    engine._embed_query = AsyncMock(return_value=[0.1])
-
-    result = await engine.search("hana", top_k=1)
-    search_result = result["results"][0]
-
-    assert search_result.follow_up is None
-
-
-@pytest.mark.asyncio
 async def test_search_results_do_not_resolve_artifacts_through_configured_store(
     db,
     tmp_path,
@@ -294,6 +236,31 @@ async def test_search_results_do_not_resolve_artifacts_through_configured_store(
     assert not hasattr(search_result, "source_doc_id")
     assert not hasattr(search_result, "content_url")
     assert not hasattr(search_result, "pdf_url")
+
+
+@pytest.mark.asyncio
+async def test_superseded_memory_reports_stale_freshness(db, tmp_path):
+    active = _memory("mem-active-fresh", "Payroll closes on the 25th.", "active")
+    superseded = _memory("mem-superseded-fresh", "Payroll closes on the 20th.", "superseded")
+    doc = await _document(db, tmp_path, "doc-payroll-close")
+    for memory in (active, superseded):
+        await db.insert_memory(memory)
+        await db.add_memory_source(memory.id, doc.doc_id, "confluence", source_updated_at=None)
+
+    adapters = build_sqlite_adapters(db, FakeCollection([superseded.id, active.id]))
+    engine = SearchEngine(
+        relational=adapters.relational,
+        keyword=adapters.keyword,
+        vector=adapters.vector,
+        embedding=unconfigured_embedding(),
+        config=_config(tmp_path).retrieval,
+    )
+    engine._embed_query = AsyncMock(return_value=[0.1])
+
+    result = await engine.search("Payroll", include_superseded=True, top_k=2)
+
+    freshness = {item.memory_id: item.freshness for item in result["results"]}
+    assert freshness == {active.id: "current", superseded.id: "stale"}
 
 
 @pytest.mark.asyncio

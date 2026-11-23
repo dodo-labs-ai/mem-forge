@@ -4997,10 +4997,6 @@ export interface components {
         MemorySearchResultDetail: {
             /** Corroborated By */
             corroborated_by: number;
-            /** Follow Up */
-            follow_up?: {
-                [key: string]: string;
-            } | null;
             /** Freshness */
             freshness: string;
             /** Last Observed At */
