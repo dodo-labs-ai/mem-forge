@@ -22,6 +22,7 @@ from markdown_it.rules_inline.html_inline import html_inline as _markdown_it_htm
 
 from memforge.memory.evidence import EvidenceRole
 from memforge.memory.text_view import TextEvidenceView, TextViewOrigin
+from memforge.pipeline.rst_titles import enable_rst_titles
 from memforge.source_artifacts import source_artifact_content_sha256, source_artifact_inference_eligibility
 from memforge.source_projection import (
     AnchorKind,
@@ -54,10 +55,12 @@ def _record_html_inline_source_range(state, silent: bool) -> bool:
     return matched
 
 
-def _markdown_parser() -> MarkdownIt:
+def _markdown_parser(*, rst_titles: bool = False) -> MarkdownIt:
+    """A fresh CommonMark parser with tables; ``rst_titles`` also reads reStructuredText titles as headings."""
+
     parser = MarkdownIt("commonmark").enable("table")
     parser.inline.ruler.at("html_inline", _record_html_inline_source_range)
-    return parser
+    return enable_rst_titles(parser) if rst_titles else parser
 
 
 class EvidenceFragmentKind(str, Enum):
@@ -107,7 +110,7 @@ def revision_structural_ranges(
     if (
         profile is None
         or profile.requires_whole_observation_authority
-        or profile.name not in {"markdown-structural", "plain-text"}
+        or not profile.is_range_addressable_text
     ):
         return (
             (StructuralUnit(0, len(revision.content)),)
@@ -115,8 +118,8 @@ def revision_structural_ranges(
             else ()
         )
     protected = (
-        _markdown_protected_ranges(revision.content)
-        if profile.name == "markdown-structural"
+        _markdown_protected_ranges(revision.content, rst_titles=profile.reads_rst_titles)
+        if profile.is_markdown
         else _paragraph_ranges(revision.content)
     )
     if not protected and revision.content:
@@ -136,8 +139,7 @@ def revision_changed_structural_ranges(
         base.observation_id != target.observation_id
         or base.evidence_profile != target.evidence_profile
         or target.evidence_profile is None
-        or target.evidence_profile.name
-        not in {"markdown-structural", "plain-text"}
+        or not target.evidence_profile.is_range_addressable_text
     ):
         raise ValueError("range-addressable Revision pair has incompatible identity")
     base_units = revision_structural_ranges(base)
@@ -174,11 +176,11 @@ def _revision_structural_identities(
     """Bind Markdown structures to their deterministic heading ancestry."""
 
     profile = revision.evidence_profile
-    if profile is None or profile.name != "markdown-structural":
+    if profile is None or not profile.is_markdown:
         return tuple(
             (revision.content[unit.start : unit.end], ()) for unit in units
         )
-    tokens = _markdown_parser().disable("inline").parse(revision.content)
+    tokens = _markdown_parser(rst_titles=profile.reads_rst_titles).disable("inline").parse(revision.content)
     line_starts = _line_starts(revision.content)
     headings: dict[int, tuple[int, str]] = {}
     for token in tokens:
@@ -497,12 +499,12 @@ def _compile_markdown_profile(
     contract: EvidenceRepresentationContract,
     authority_ranges: tuple[EvidenceCandidateRange, ...],
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
-    del contract
     candidates, errors = _markdown_candidates(
         revision,
         revision.content,
         base=0,
         roles=_SUPPORTING_ROLES,
+        rst_titles=contract.profile.reads_rst_titles,
     )
     bound, authority_errors = _bind_candidates_to_authority(
         revision,
@@ -775,7 +777,7 @@ def observation_presentation(revision: SourceObservationRevision) -> str | None:
     """
 
     profile = revision.evidence_profile
-    if profile is None or profile.name not in {"canonical-record", "markdown-structural", "plain-text"}:
+    if profile is None or not (profile.name == "canonical-record" or profile.is_range_addressable_text):
         return None
     if profile.name != "canonical-record":
         return revision.content
@@ -857,6 +859,7 @@ _ProfileCompiler = Callable[
 
 _PROFILE_COMPILERS: Mapping[tuple[str, int], _ProfileCompiler] = {
     ("markdown-structural", 1): _compile_markdown_profile,
+    ("markdown-rst-titles", 1): _compile_markdown_profile,
     ("canonical-record", 1): _compile_canonical_record_profile,
     ("plain-text", 1): _compile_plain_text_profile,
     ("binary-artifact", 1): _compile_binary_artifact_profile,
@@ -963,13 +966,13 @@ def _compile_authorized_candidates(
     return compiler(revision, contract, authority_ranges)
 
 
-def _markdown_protected_ranges(text: str) -> tuple[tuple[int, int], ...]:
+def _markdown_protected_ranges(text: str, *, rst_titles: bool = False) -> tuple[tuple[int, int], ...]:
     """Return outermost CommonMark structures in one ordered parser pass."""
 
     try:
         # Planning consumes block coordinates only. Inline validation belongs to
         # Fragment compilation, where its tokens and source ranges are needed.
-        tokens = _markdown_parser().disable("inline").parse(text)
+        tokens = _markdown_parser(rst_titles=rst_titles).disable("inline").parse(text)
     except Exception as exc:
         raise ValueError(
             f"Markdown parser rejected structural planning: {type(exc).__name__}"
@@ -1014,9 +1017,10 @@ def _markdown_candidates(
     *,
     base: int,
     roles: frozenset[EvidenceRole],
+    rst_titles: bool = False,
 ) -> tuple[tuple[_FragmentCandidate, ...], tuple[FragmentCompilationError, ...]]:
     try:
-        tokens = _markdown_parser().parse(text)
+        tokens = _markdown_parser(rst_titles=rst_titles).parse(text)
     except Exception as exc:
         return (), (
             _error(

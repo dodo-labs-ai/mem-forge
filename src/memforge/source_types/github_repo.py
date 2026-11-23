@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import github_repo as adapter
-from memforge.source_adapters.contracts import MARKDOWN_STRUCTURAL_PROFILE
+from memforge.source_adapters.contracts import FILE_ALTERNATIVE_EVIDENCE_PROFILES, MARKDOWN_STRUCTURAL_PROFILE
 from memforge.source_types.config import LocalInbox, SourceConfigPolicy
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
@@ -56,6 +56,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     scope_fields=("ref", "include_paths", "exclude_paths", "include_extensions"),
     project_native=adapter.project_native,
     evidence_profiles={"file_content": MARKDOWN_STRUCTURAL_PROFILE},
+    alternative_evidence_profiles={"file_content": FILE_ALTERNATIVE_EVIDENCE_PROFILES},
     local_agent=LocalAgentCollection(
         operation="github_repo_sync",
         job_config_fields=frozenset({"repo_url", "ref", "include_paths", "exclude_paths", "include_extensions"}),

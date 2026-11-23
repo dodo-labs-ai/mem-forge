@@ -201,7 +201,7 @@ class RevisionAssessmentContext:
         self.full_fragments = tuple(f for entries in self._entries.values() for f in entries)
         # Both sides, so removed old text keeps its heading path too.
         for revision in {r.id: r for r in (*self.previous.values(), *self.current.values())}.values():
-            if revision.evidence_profile and revision.evidence_profile.name == "markdown-structural":
+            if revision.evidence_profile and revision.evidence_profile.is_markdown:
                 units = revision_structural_ranges(revision)
                 identities = _revision_structural_identities(revision, units)
                 self.structural_context[revision.id] = tuple(

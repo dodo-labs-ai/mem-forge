@@ -6,7 +6,9 @@ def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage
     from memforge.source_time import SOURCE_UPDATED_AT_KEY
-    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title
+    from memforge.source_adapters.contracts import (
+        _ObservationInput, _NativeProjection, _unit_title, file_evidence_profile,
+    )
 
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     data = native if isinstance(native, dict) else {}
@@ -17,7 +19,12 @@ def project_native(*, source_id, item, native, normalized):
     return _NativeProjection(
         unit_type="local_file",
         provider_key=f"{vault}:{lineage}",
-        observations=(_ObservationInput("file_content", "content", body, body, {"path": path}, body_time),),
+        observations=(
+            _ObservationInput(
+                "file_content", "content", body, body, {"path": path}, body_time,
+                evidence_profile=file_evidence_profile(path),
+            ),
+        ),
         relations=(),
         coverage=ProjectionCoverage.COMPLETE_SNAPSHOT,
         locator={"vault_id": vault, "path": path, "url": item.source_url},

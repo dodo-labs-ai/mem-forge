@@ -23,7 +23,12 @@ from memforge.pipeline.revision_work import RevisionWorkExecutor
 from memforge.pipeline.source_projection_adapters import _stable_id, project_source_item
 from memforge.pipeline.support_reading import EvidenceCorrespondence, SupportRoute, plan_support_revision
 from memforge.source_adapters import jira as jira_adapter
-from memforge.source_adapters.contracts import MARKDOWN_STRUCTURAL_PROFILE, canonical_record_profile
+from memforge.source_adapters import contracts
+from memforge.source_adapters.contracts import (
+    MARKDOWN_RST_TITLES_PROFILE,
+    MARKDOWN_STRUCTURAL_PROFILE,
+    canonical_record_profile,
+)
 from memforge.source_artifacts import StoredSourceArtifact
 from memforge.source_projection import ProjectionIdentityConflict
 from memforge.storage.database import Database
@@ -246,18 +251,51 @@ async def test_an_unchanged_artifact_named_before_profiles_reads_the_same() -> N
     await _assert_reads_the_same(base, target, "", new, kind=EvidenceFragmentKind.ARTIFACT)
 
 
-def _markdown(text, base=None):
+def _markdown(text, base=None, *, path="docs/guide.md", run_id="run-md"):
     item = ContentItem(
-        item_id="local-guide", title="Guide", source_url="file:///vault/docs/guide.md",
+        item_id="local-guide", title="Guide", source_url=f"file:///vault/{path}",
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
-        extra={"relative_path": "docs/guide.md", "file_lineage_id": "file-77"},
+        extra={"relative_path": path, "file_lineage_id": "file-77"},
     )
-    raw = {"vault_id": "vault-a", "relative_path": "docs/guide.md", "file_lineage_id": "file-77", "markdown": text}
+    raw = {"vault_id": "vault-a", "relative_path": path, "file_lineage_id": "file-77", "markdown": text}
     return project_source_item(
-        source_id="src-md", source_type="local_markdown", run_id="run-md", item=item,
+        source_id="src-md", source_type="local_markdown", run_id=run_id, item=item,
         raw=RawContent(item=item, body=json.dumps(raw).encode(), content_type="application/json"),
         normalized=NormalizedContent(item=item, markdown_body=text), **prior_of(base),
     )
+
+
+async def test_a_text_file_stored_as_markdown_is_read_again_whole_with_rst_titles(monkeypatch, tmp_path) -> None:
+    text = "Release\n=======\n\nTesting\n~~~~~~~\n\nUse approval before release.\n"
+    with monkeypatch.context() as stored_before:
+        stored_before.setattr(contracts, "file_evidence_profile", lambda path: None)
+        base = _markdown(text, path="docs/release.txt")
+
+    target = _markdown(text, base, path="docs/release.txt", run_id="run-md-2")
+    [old], [new] = base.observation_revisions, target.observation_revisions
+
+    assert old.evidence_profile == MARKDOWN_STRUCTURAL_PROFILE
+    assert new.evidence_profile == MARKDOWN_RST_TITLES_PROFILE
+    assert new.content == old.content and new.id != old.id
+    assert [anchor.observation_id for anchor in target.deltas[0].changed_anchors] == [new.observation_id]
+    authority = _plan(base, target)
+    assert isinstance(authority, ExtractionAuthority)
+    assert authority.ranges_by_observation_id == {new.observation_id: None}
+
+    db = Database(str(tmp_path / "local.db"))
+    await db.connect()
+    try:
+        await db.upsert_source(
+            id=base.source_id, type="local_markdown", name="Notes", config_json="{}",
+            access_policy="workspace", owner_user_id="owner-1",
+        )
+        await db.record_source_projection(base)
+        await db.record_source_projection(target)
+        current = await db.get_current_source_unit_revision(target.source_units[0].id)
+        assert current is not None and new.id in current.observation_revision_ids
+        assert (await db.get_source_observation_revisions((new.id,)))[new.id].evidence_profile == new.evidence_profile
+    finally:
+        await db.close()
 
 
 def test_an_unchanged_document_under_a_new_markdown_profile_is_read_again_whole(monkeypatch) -> None:

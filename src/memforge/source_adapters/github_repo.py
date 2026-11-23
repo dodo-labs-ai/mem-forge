@@ -6,7 +6,9 @@ def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage
     from memforge.source_time import SOURCE_UPDATED_AT_KEY
-    from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title
+    from memforge.source_adapters.contracts import (
+        _ObservationInput, _NativeProjection, _unit_title, file_evidence_profile,
+    )
 
     body_time = normalized.source_semantics.get(SOURCE_UPDATED_AT_KEY)
     semantics = normalized.source_semantics
@@ -38,6 +40,7 @@ def project_native(*, source_id, item, native, normalized):
                 normalized.markdown_body,
                 {"path": path},
                 body_time,
+                evidence_profile=file_evidence_profile(path),
             ),
         ),
         relations=(),

@@ -26,6 +26,16 @@
   guidance and the search tool description reach an installed plugin with the
   next plugin release.
 
+- GitHub repository and local folder Sources read `.rst` and `.txt` files with
+  reStructuredText section titles: a line underlined, and optionally overlined,
+  by one repeated punctuation character is a heading, its level set by the order
+  in which each underline style first appears. A `~~~` or backtick underline used
+  to open a code block that ran to the end of the file, so the section text under
+  it was one oversized code block that extraction and relation checks read whole.
+  Markdown files read as before. A `.rst` or `.txt` file synced before this
+  release is read again in full, and its Memories extracted again, when the file
+  next changes or its Source is synced in full or reprocessed.
+
 ## 0.2.0b5 - 2026-11-18
 
 - Docker Compose: a release publishes its API and admin UI images to

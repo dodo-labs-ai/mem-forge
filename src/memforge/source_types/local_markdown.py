@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import local_markdown as adapter
-from memforge.source_adapters.contracts import MARKDOWN_STRUCTURAL_PROFILE
+from memforge.source_adapters.contracts import FILE_ALTERNATIVE_EVIDENCE_PROFILES, MARKDOWN_STRUCTURAL_PROFILE
 from memforge.source_types.config import LocalInbox, SourceConfigPolicy
 from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
 
@@ -32,6 +32,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     scope_fields=("include", "exclude"),
     project_native=adapter.project_native,
     evidence_profiles={"file_content": MARKDOWN_STRUCTURAL_PROFILE},
+    alternative_evidence_profiles={"file_content": FILE_ALTERNATIVE_EVIDENCE_PROFILES},
     local_agent=LocalAgentCollection(
         operation="local_markdown_sync",
         job_config_fields=frozenset({"root", "vault_id", "include", "exclude"}),

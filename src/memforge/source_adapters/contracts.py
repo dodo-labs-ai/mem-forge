@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Callable, Mapping
 
 from memforge.source_projection import (
@@ -160,6 +161,10 @@ class _ObservationInput:
     record is read under that schema rather than the one the adapter declares
     today. A record the current adapter maps from the provider's response names
     none.
+
+    ``evidence_profile`` is the profile this Observation is read under when the
+    adapter chooses one of its contract's alternatives; ``None`` reads it under
+    the profile the contract declares.
     """
 
     observation_type: str
@@ -171,6 +176,7 @@ class _ObservationInput:
     metadata: Mapping[str, object] = field(default_factory=dict)
     semantic_hash: str | None = None
     record_schema: str | None = None
+    evidence_profile: EvidenceRepresentationProfile | None = None
 
     def __post_init__(self) -> None:
         # One UTC form for every provider's time, whatever format it reported.
@@ -222,6 +228,12 @@ MARKDOWN_STRUCTURAL_PROFILE = EvidenceRepresentationProfile(
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
+# Markdown that also reads a reStructuredText section title (an underlined line) as a heading.
+MARKDOWN_RST_TITLES_PROFILE = EvidenceRepresentationProfile(
+    name="markdown-rst-titles",
+    version=1,
+    coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
+)
 BINARY_ARTIFACT_PROFILE = EvidenceRepresentationProfile(
     name="binary-artifact",
     version=1,
@@ -239,6 +251,19 @@ UNIT_TITLE_OBSERVATION_PROFILE = EvidenceRepresentationProfile(
     version=1,
     coordinate_space=EvidenceCoordinateSpace.UNICODE_SCALAR,
 )
+
+
+# Text files not declared Markdown are often reStructuredText: Sphinx projects
+# write it as .rst or .txt, and mark section titles by underlining them.
+_RST_TITLED_FILE_SUFFIXES = frozenset({".rst", ".txt"})
+# The alternative profiles a file adapter may choose by a file's extension.
+FILE_ALTERNATIVE_EVIDENCE_PROFILES = frozenset({MARKDOWN_RST_TITLES_PROFILE})
+
+
+def file_evidence_profile(path: str) -> EvidenceRepresentationProfile | None:
+    """The alternative profile a file's text is read under, chosen by its extension; None keeps the declared one."""
+
+    return MARKDOWN_RST_TITLES_PROFILE if PurePosixPath(path).suffix.lower() in _RST_TITLED_FILE_SUFFIXES else None
 
 
 def canonical_record_profile(schema_name: str, schema_version: int = 1) -> EvidenceRepresentationProfile:

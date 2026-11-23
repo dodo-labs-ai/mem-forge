@@ -215,6 +215,7 @@ def project_source_item(
             source_type=source_type,
             observation_type=value.observation_type,
             record_schema=value.record_schema,
+            chosen=value.evidence_profile,
         )
         if evidence_profile is None:
             raise ValueError(
