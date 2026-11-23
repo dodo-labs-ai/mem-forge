@@ -91,6 +91,10 @@ _METADATA_SUBCHANNEL_WEIGHTS = {
 _METADATA_IDENTIFIER_CHANNELS = {"bm25_metadata_tokens", "metadata_alias"}
 
 _QUOTED_IDENTITY_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
+# A token's searchable core runs from its first to its last letter or digit.
+_FTS_TOKEN_CORE_RE = re.compile(r"[^\W_](?:.*[^\W_])?", re.DOTALL)
+# Characters an FTS5 string cannot carry: NUL ends it and lone surrogates cannot be encoded.
+_FTS_UNSAFE_CHARS_RE = re.compile(r"[\x00\ud800-\udfff]")
 _MAX_QUOTED_IDENTITY_LENGTH = 256
 
 
@@ -265,25 +269,28 @@ def _weighted_rrf_fusion(
 
 
 def sanitize_fts_query(text: str) -> str:
-    """Escape characters that are special in FTS5 MATCH syntax.
+    """Quote each whitespace-separated token as a literal FTS5 phrase.
 
-    FTS5 interprets ``*``, ``^``, ``(``, ``)``, ``:``, ``"`` as operators.
-    Each whitespace-separated token is stripped of punctuation and re-quoted
-    as an FTS5 phrase, so the result is always a flat AND of literal phrases.
+    Inside a quoted string FTS5 treats every character literally and leaves
+    word splitting to the table's tokenizer, so a token is tokenized exactly as
+    indexed content is: ``server.service.name`` becomes the phrase
+    ``server service name`` and matches that identifier in a Memory. Leading
+    and trailing punctuation is trimmed so ``name,`` and ``name`` are the same
+    phrase, embedded double quotes are escaped by doubling, characters a
+    string cannot carry are removed, and a token with no letter or digit is
+    skipped. The result is always a flat AND of literal phrases.
 
     This sanitizer is for unstructured plain text only. Engine-built FTS5 fragments
     (parenthesized OR groups, quoted phrases produced by the alias expander,
     etc.) MUST NOT be passed through this function: it is structure-blind and
     will demote operators to literal tokens, destroying the query.
     """
-    words = text.split()
     safe: list[str] = []
-    for w in words:
-        # Strip non-alphanumeric edges (punctuation) but keep the core word
-        cleaned = "".join(ch for ch in w if ch.isalnum() or ch in ("-", "_"))
-        if cleaned:
-            # Quote each token to prevent FTS5 operator interpretation
-            safe.append(f'"{cleaned}"')
+    for word in _FTS_UNSAFE_CHARS_RE.sub("", text).split():
+        core = _FTS_TOKEN_CORE_RE.search(word)
+        if core:
+            literal = core.group().replace('"', '""')
+            safe.append(f'"{literal}"')
     return " ".join(safe)
 
 
