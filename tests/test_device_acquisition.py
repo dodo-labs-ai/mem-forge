@@ -747,3 +747,323 @@ def test_the_job_carries_the_configuration_without_secrets_since_and_the_due_exc
             "config": {"root_pages": ["0a0b0c0d0e0f40718293a4b5c6d7e8f9"]},
         }
     ]
+
+
+def _own(database: Database) -> None:
+    """Make the local user the Source's execution owner, whose device runs its jobs."""
+
+    asyncio.run(
+        database.upsert_source(
+            id=SOURCE_ID,
+            type="wiki",
+            name="Team wiki",
+            config_json=json.dumps(CONFIG),
+            access_policy="workspace",
+            owner_user_id=LOCAL_DEV_USER_ID,
+            execution_owner_user_id=LOCAL_DEV_USER_ID,
+        )
+    )
+
+
+def _process(client, *, job: str, attempt: int = 1):
+    return client.post(
+        f"/api/v1/sources/{SOURCE_ID}/process",
+        json={"local_agent_job_id": job, "local_agent_attempt_count": attempt},
+    )
+
+
+def test_a_lost_lease_rejects_the_attempts_later_submissions_and_the_retried_attempt_acquires_again(
+    deployments, wiki
+):
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    wiki.write("a", "body of a, edited", FIRST_RUN + timedelta(minutes=30))
+    _lease_job(device, lease, since=FIRST_RUN.isoformat(), config={"root_pages": [PAGE_ROOT]})
+    first = _RouteTransport(client, job="job-1", attempt=1)
+    item = wiki.item("a")
+    manifest = AcquisitionManifest(
+        listing=AcquiredListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset({"wiki-a"})), discovered=(item,)
+    )
+    asyncio.run(first.submit_manifest(manifest))
+
+    lease.current = False
+    package = AcquiredInputPackage(item=item, body=b"body of a, edited", content_type="text/markdown")
+    attempt_one = {"local_agent_job_id": "job-1", "local_agent_attempt_count": 1}
+    refused = {
+        "manifest": _manifest_route(client, manifest),
+        "inputs": client.post(
+            f"/api/v1/sources/{SOURCE_ID}/acquisition/inputs", json={**attempt_one, "package": package.to_payload()}
+        ),
+        "answers": client.post(
+            f"/api/v1/sources/{SOURCE_ID}/acquisition/answers",
+            json={
+                **attempt_one,
+                "manifest_sha256": first.manifest_sha256,
+                "answers": AcquisitionAnswers().to_payload(),
+            },
+        ),
+        "process": _process(client, job="job-1"),
+    }
+    lease.current = True
+    # The retried attempt starts again: the first attempt's manifest is not its own.
+    before_its_manifest = _process(client, job="job-1", attempt=2)
+    second = _RouteTransport(client, job="job-1", attempt=2)
+    asyncio.run(
+        acquire_document_source(
+            lease.payload,
+            open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
+            transport=second,
+            exports_pdf=False,
+            sleep=_no_pause,
+        )
+    )
+    processed = _process(client, job="job-1", attempt=2)
+
+    assert {name: (response.status_code, response.json()["detail"]) for name, response in refused.items()} == {
+        name: (409, "local_agent_lease_not_current") for name in refused
+    }
+    assert (before_its_manifest.status_code, before_its_manifest.json()["detail"]) == (
+        409,
+        "acquisition_manifest_required",
+    )
+    assert processed.status_code == 202, processed.text
+    assert wiki.calls.count("list_scope") == 2
+    stored = asyncio.run(
+        device.db.get_source_acquisition(source_id=SOURCE_ID, workspace_id=WORKSPACE, snapshot_id="job-1:attempt:2")
+    )
+    assert stored is not None and [entry.item_id for entry in stored.manifest.discovered] == ["wiki-a"]
+
+
+def test_a_run_that_disagrees_with_its_acquisition_fails_and_a_new_job_acquires_again(deployments, wiki):
+    _server, device, client, lease = deployments
+    _own(device.db)
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    held_before = asyncio.run(device.held())
+    second_run = FIRST_RUN + timedelta(hours=1)
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    lease.lease(payload, leased_at=second_run)
+    asyncio.run(
+        acquire_document_source(
+            payload,
+            open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
+            transport=_RouteTransport(client, job="job-1"),
+            exports_pdf=False,
+            sleep=_no_pause,
+        )
+    )
+    receipt = _process(client, job="job-1")
+    # a fails after the manifest response was issued, so the run retries a Document the device was not asked about.
+    _fail(device.db, "wiki-a", wiki.item("a"))
+
+    asyncio.run(
+        SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
+    )
+
+    assert receipt.status_code == 202, receipt.text
+    run = asyncio.run(device.db.get_source_sync_run(receipt.json()["run_id"]))
+    assert run is not None and run.status == "failed"
+    assert "was not asked to rediscover wiki-a" in (run.error_message or "")
+    # The run is not retried on the same acquisition, and nothing it read is kept.
+    assert run.next_attempt_at is None
+    assert asyncio.run(device.cursor()) == FIRST_RUN
+    assert asyncio.run(device.held()) == held_before
+    jobs = asyncio.run(device.db.list_current_local_agent_jobs(workspace_id=WORKSPACE, user_id=LOCAL_DEV_USER_ID))
+    assert [(job["operation"], job["status"]) for job in jobs] == [(DOCUMENT_ACQUISITION_OPERATION, "queued")]
+    assert jobs[0]["payload"]["since"] == payload["since"]
+    assert jobs[0]["payload"]["config"] == {"root_pages": [PAGE_ROOT]}
+
+
+def test_the_daemon_lists_each_excluded_scope_with_an_instance_of_its_own_after_the_fetches(wiki):
+    wiki.write("a", "body of a", FIRST_RUN)
+    opened: list[dict] = []
+    events: list[str] = []
+
+    class Recording:
+        async def submit_manifest(self, manifest):
+            events.append("manifest")
+            events.extend(
+                f"excluded:{listing.scope_key}:{sorted(listing.doc_ids)}" for listing in manifest.excluded_listings
+            )
+            return AcquisitionRequests()
+
+        async def upload_input(self, package):
+            events.append(f"input:{package.item.item_id}")
+
+        async def submit_answers(self, answers):
+            raise AssertionError("nothing was asked")
+
+    def open_gene(config):
+        opened.append(dict(config))
+        return WikiGene(dict(config), SOURCE_ID)
+
+    other_root = {"root_pages": ["0a0b0c0d0e0f40718293a4b5c6d7e8f9"]}
+    asyncio.run(
+        acquire_document_source(
+            {
+                "config": dict(CONFIG),
+                "since": None,
+                LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD: [{"scope_key": "scope-1", "config": other_root}],
+            },
+            open_gene=open_gene,
+            transport=Recording(),  # type: ignore[arg-type]
+            exports_pdf=False,
+        )
+    )
+
+    assert opened == [dict(CONFIG), other_root]
+    assert wiki.calls == ["discover", "list_scope", "fetch", "list_scope"]
+    assert events == ["input:wiki-a", "manifest", "excluded:scope-1:['wiki-a']"]
+
+
+def _routed_client(client):
+    """A daemon API client whose requests reach the device deployment's routes."""
+
+    from urllib.parse import urlsplit
+
+    from memforge.api_target import build_target
+    from memforge.tool_client import ToolClient
+
+    tool_client = ToolClient(target=build_target(origin="http://127.0.0.1:8765", edition="oss"), api_token=None)
+
+    def http_json(method: str, url: str, body: dict | None) -> dict:
+        response = client.request(method, urlsplit(url).path, json=body)
+        if response.status_code >= 400:
+            detail = response.json().get("detail")
+            return {"error": "MemForge API request failed", "status_code": response.status_code, "detail": detail}
+        return response.json() if response.content else {}
+
+    tool_client._http_json = http_json  # type: ignore[method-assign]
+    return tool_client
+
+
+def test_the_daemon_job_acquires_through_the_api_and_starts_the_run(deployments, wiki):
+    import memforge.main as main
+
+    server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    _server_run(server, FIRST_RUN)
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    lease.lease(payload, leased_at=FIRST_RUN)
+    job = {"job_id": "job-0", "attempt_count": 1, "operation": DOCUMENT_ACQUISITION_OPERATION, "payload": payload}
+
+    result = main._run_cloud_document_acquisition_job(job, _routed_client(client))
+    asyncio.run(
+        SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
+    )
+
+    assert result.get("error") is None, result
+    assert result["counts"] == {"discovered": 1, "uploaded": 1, "failed": 0}
+    assert result["sync_started"] is True
+    assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
+
+
+def test_the_daemon_job_stops_when_its_lease_is_lost(deployments, wiki):
+    import memforge.main as main
+    from memforge.local_agent.runner import CloudJobLeaseLost
+
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    lease.lease(payload, leased_at=FIRST_RUN)
+    lease.current = False
+    job = {"job_id": "job-0", "attempt_count": 1, "operation": DOCUMENT_ACQUISITION_OPERATION, "payload": payload}
+
+    with pytest.raises(CloudJobLeaseLost):
+        main._run_cloud_document_acquisition_job(job, _routed_client(client))
+
+
+def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wiki, tmp_path):
+    import memforge.main as main
+    from memforge.api_target import build_target
+    from memforge.local_agent.runner import LocalAgentRunner
+    from memforge.local_agent.state import LocalAgentStateStore
+    from memforge.tool_client import ToolClient
+
+    count = SNAPSHOT_MANIFEST_MAX_ITEMS + 1
+    for page_id in range(count):
+        wiki.write(str(page_id), "body", FIRST_RUN)
+    client = ToolClient(target=build_target(origin="http://127.0.0.1:8765", edition="oss"), api_token=None)
+    completed: list[tuple] = []
+    runner = LocalAgentRunner(
+        state_store=LocalAgentStateStore(tmp_path / "state.json"),
+        cloud_job_handler=lambda job: main._run_cloud_local_agent_job(job, client),
+        cloud_jobs_provider=lambda: {
+            "jobs": [
+                {
+                    "job_id": "job-large",
+                    "operation": DOCUMENT_ACQUISITION_OPERATION,
+                    "source_id": SOURCE_ID,
+                    "attempt_count": 1,
+                    "payload": {"source_type": "wiki", "config": {"root_pages": [PAGE_ROOT]}, "since": None},
+                }
+            ]
+        },
+        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
+            completed.append((job_id, status, result, error)) or {"ok": True}
+        ),
+    )
+
+    runner.run_once(now=FIRST_RUN)
+
+    [(job_id, status, result, error)] = completed
+    assert (job_id, status) == ("job-large", "failed")
+    assert (result["item_count"], result["retryable"]) == (count, False)
+    assert str(count) in (error or "")
+    assert "fetch" not in wiki.calls
+
+
+def test_a_reprocess_on_the_device_ends_as_a_reprocess_on_the_server(deployments, wiki):
+    from memforge.pipeline.sync import SourceSyncMode
+
+    server, device, client, lease = deployments
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    _server_run(server, FIRST_RUN)
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    before = asyncio.run(device.held())
+    # The provider changed a's body without a new edit time, so only a reprocess reads it.
+    wiki.pages["a"].body = "body of a, corrected"
+
+    asyncio.run(
+        server.orchestrator().sync_gene(
+            gene=WikiGene(dict(CONFIG), SOURCE_ID),
+            source_name="Team wiki",
+            source_id=SOURCE_ID,
+            execution_mode=SourceSyncMode.REPROCESS,
+            reprocess_doc_ids=frozenset({"wiki-a"}),
+        )
+    )
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(
+        document_acquisition_job_payload(device.db, device.doc_store, source, reprocess_document_ids=("wiki-a",))
+    )
+    lease.lease(payload, leased_at=FIRST_RUN + timedelta(hours=1))
+    wiki.calls.clear()
+    asyncio.run(
+        acquire_document_source(
+            payload,
+            open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
+            transport=_RouteTransport(client, job="job-1"),
+            exports_pdf=False,
+            sleep=_no_pause,
+        )
+    )
+    processed = _process(client, job="job-1")
+    asyncio.run(
+        SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
+    )
+
+    assert processed.status_code == 202, processed.text
+    # A reprocess discovers and lists nothing; it reads the Document again by id.
+    assert wiki.calls == ["rediscover", "fetch"]
+    held = asyncio.run(device.held())
+    assert held == asyncio.run(server.held())
+    assert held["wiki-a"][1] != before["wiki-a"][1]
+    assert held["wiki-b"] == before["wiki-b"]
+    assert asyncio.run(device.cursor()) == asyncio.run(server.cursor()) == FIRST_RUN

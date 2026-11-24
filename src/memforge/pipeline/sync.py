@@ -1045,6 +1045,7 @@ class GeneSyncOrchestrator:
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
+        acquisition_mismatch = False
         absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
         unlisted_present_count: int | None = None
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
@@ -1863,6 +1864,7 @@ class GeneSyncOrchestrator:
             except Exception:
                 logger.exception("Failed to record the failed Documents of %s", source_id)
             failure_retryable = retries_failure(e, store=self.db)
+            acquisition_mismatch = isinstance(e, AcquisitionRecordMismatch)
             if (runtime_bundle := getattr(e, "runtime_bundle", None)) is not None:
                 runtime_bundles.append(runtime_bundle)
             if scope_transition is not None and transition_started:
@@ -1928,6 +1930,7 @@ class GeneSyncOrchestrator:
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
+            acquisition_mismatch=acquisition_mismatch,
             absence_check_skipped_reason=absence_check_skipped_reason,
             unlisted_present_count=unlisted_present_count,
             runtime_bundles=tuple(runtime_bundles),

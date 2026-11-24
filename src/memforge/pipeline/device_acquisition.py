@@ -9,6 +9,8 @@ the server decides and keeps for such a run:
   without secrets, the ``since`` a server run would discover from, the
   excluded scopes once the open transition's ``excluded_scopes_due`` gate
   says so, and the Documents of a reprocess.
+- :func:`enqueue_document_acquisition_job` queues that job for the Source's
+  execution owner.
 - :func:`acquisition_requests` answers a submitted manifest with what the
   server run will ask beyond discovery, by the server run's own rules.
 - :func:`retain_acquired_input` keeps one acquired input for its attempt.
@@ -50,6 +52,7 @@ from memforge.local_agent.document_acquisition import (
 from memforge.local_agent.snapshot_manifest import ExcludedScopeListing
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
+    execution_owner_user_id,
     LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS,
     LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD,
     local_agent_source_config_revision,
@@ -85,6 +88,7 @@ __all__ = [
     "acquisition_requests",
     "device_excluded_scope_gene_factory",
     "document_acquisition_job_payload",
+    "enqueue_document_acquisition_job",
     "ready_acquisition",
     "recorded_device_gene",
     "retain_acquired_input",
@@ -180,6 +184,39 @@ async def document_acquisition_job_payload(
                 for scope in scopes
             ]
     return payload
+
+
+async def enqueue_document_acquisition_job(
+    db: Database,
+    doc_store: DocumentStore,
+    source: Mapping[str, Any],
+    request_payload: Mapping[str, Any] | None = None,
+    *,
+    workspace_id: str,
+    trigger: str,
+) -> tuple[str, bool] | None:
+    """Queue a ``document_acquisition`` job for the Source's execution owner, as of now.
+
+    The job coalesces with one already queued or leased, as every local-agent
+    job does. Returns its id and whether a new job was created, or ``None``
+    for a Source without an execution owner, whose runs no device takes.
+    """
+
+    owner = execution_owner_user_id(source)
+    if owner is None:
+        return None
+    payload = await document_acquisition_job_payload(db, doc_store, source, request_payload)
+    return await db.enqueue_local_agent_job(
+        job_id=f"laj-{uuid.uuid4().hex}",
+        workspace_id=workspace_id,
+        source_id=str(source["id"]),
+        source_type=str(source["type"]),
+        operation=DOCUMENT_ACQUISITION_OPERATION,
+        payload=payload,
+        created_by_user_id=owner,
+        execution_owner_user_id=owner,
+        trigger=trigger,
+    )
 
 
 async def acquisition_requests(

@@ -53,7 +53,11 @@ from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
 from memforge.local_agent.document_acquisition import StoredAcquisition
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
-from memforge.pipeline.device_acquisition import device_excluded_scope_gene_factory, recorded_device_gene
+from memforge.pipeline.device_acquisition import (
+    device_excluded_scope_gene_factory,
+    enqueue_document_acquisition_job,
+    recorded_device_gene,
+)
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
@@ -1556,22 +1560,31 @@ class SourceSyncWorker:
             reprocessing = bool(run.reprocess_document_ids)
             input_snapshot: SnapshotBinding | None = None
             reusable_projection_doc_ids: frozenset[str] = frozenset()
-            # A device that acquired the run with the type's own Gene hands
-            # over its acquisition; the run interprets it with the recorded Gene.
-            acquisition = (
-                await self.db.get_source_acquisition(
+            descriptor = source_type_descriptor(str(source.get("type") or ""))
+            local_operation = local_agent_sync_operation(source["type"], source.get("config"))
+            # A document Source's run bound to a job attempt interprets what
+            # the device acquired with the type's own Gene, through the
+            # recorded Gene, unless the Source collects through its type's
+            # package path.
+            acquired_on_device = (
+                run.input_snapshot_id is not None
+                and descriptor is not None
+                and descriptor.family is CollectionFamilyKind.DOCUMENT
+                and local_operation is None
+            )
+            acquisition: StoredAcquisition | None = None
+            if acquired_on_device:
+                acquisition = await self.db.get_source_acquisition(
                     source_id=run.source_id, workspace_id=run.workspace_id, snapshot_id=run.input_snapshot_id
                 )
-                if run.input_snapshot_id is not None
-                else None
-            )
-            if not reprocessing and acquisition is None:
+                if acquisition is None:
+                    raise SourceSyncBoundaryError("the device acquisition of this run is not kept")
+            if not reprocessing and not acquired_on_device:
                 inputs = await self.db.list_source_sync_inputs(
                     source_id=run.source_id,
                     workspace_id=run.workspace_id,
                     input_snapshot_id=run.input_snapshot_id,
                 )
-                local_operation = local_agent_sync_operation(source["type"], source.get("config"))
                 if run.input_snapshot_id is None:
                     if local_operation is not None and run.input_generation_watermark is None:
                         raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
@@ -1581,7 +1594,9 @@ class SourceSyncWorker:
                             for source_input in inputs
                             if source_input.input_generation <= run.input_generation_watermark
                         ]
-                descriptor = source_type_descriptor(str(source.get("type") or ""))
+                # The package path of Jira, GitHub repository and local
+                # Markdown binds the run to the complete snapshot its daemon
+                # submitted.
                 if (
                     run.input_snapshot_id is not None
                     and descriptor is not None
@@ -1688,6 +1703,8 @@ class SourceSyncWorker:
                     _publish_terminal_runtime_bundles(runtime, final_state)
                 if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
+                if final_state.acquisition_mismatch and acquisition is not None and not reprocessing:
+                    await self._acquire_again(run, source, runtime.doc_store)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1735,6 +1752,24 @@ class SourceSyncWorker:
             if not failed:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
+
+    async def _acquire_again(self, run: SourceSyncRun, source: Mapping[str, Any], doc_store: LocalDocumentStore) -> None:
+        """Retry a device run that disagreed with its acquisition with a new ``document_acquisition`` job.
+
+        The device acquires the Source again from the start of the job, so the
+        new attempt answers what its own run asks (ADR 0058). A Source that is
+        no longer active runs no new job.
+        """
+
+        with contextlib.suppress(ValueError):
+            await enqueue_document_acquisition_job(
+                self.db,
+                doc_store,
+                source,
+                {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},
+                workspace_id=run.workspace_id,
+                trigger="retry",
+            )
 
     async def _end_stopped_run(self, run: SourceSyncRun, source: Mapping[str, Any] | None) -> SourceSyncRun:
         """Fail a run a person stopped, not retryable, and release its Source.

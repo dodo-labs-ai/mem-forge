@@ -775,6 +775,9 @@ class SyncState:
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
+    # The run asked its acquisition record something the record holds no
+    # answer to (ADR 0058), so the device acquires the Source again.
+    acquisition_mismatch: bool = False
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
     # Unlisted Units of a query listing confirmed still present (``exists`` or
     # ``hidden``); each is confirmed again every run. ``None`` when the run

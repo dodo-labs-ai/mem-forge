@@ -550,15 +550,22 @@ def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
     """Fingerprint the saved configuration one daemon job collects with.
 
     It is the configuration the job hands the device: the fields of the
-    type's local-agent collection, or, for a document type the device
-    acquires with its own Gene (ADR 0058), every field but the secrets.
+    type's local-agent collection for a Source that collects through it (a
+    conversation Source, or a Jira, GitHub repository or local Markdown
+    Source on its package path), and otherwise, for a document Source the
+    device acquires with its type's own Gene (ADR 0058), every field but the
+    secrets.
     """
     from memforge.genes.family import CollectionFamilyKind
     from memforge.local_agent.document_acquisition import acquisition_job_config
 
     source_type = str(source.get("type") or "").strip()
     descriptor = source_type_descriptor(source_type)
-    if descriptor is not None and descriptor.local_agent is None and descriptor.family is CollectionFamilyKind.DOCUMENT:
+    if (
+        descriptor is not None
+        and descriptor.family is CollectionFamilyKind.DOCUMENT
+        and local_agent_sync_operation(source_type, source.get("config")) is None
+    ):
         job_config = acquisition_job_config(source_type, _source_config(source.get("config")))
     else:
         job_config = local_agent_job_config(source_type, source.get("config"))
