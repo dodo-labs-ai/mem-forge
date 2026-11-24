@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -62,6 +63,8 @@ from memforge.source_artifacts import (
 )
 
 __all__ = ["AcquisitionSummary", "AcquisitionTransport", "acquire_document_source"]
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -168,7 +171,8 @@ async def _list_excluded_scope(open_gene: GeneOpener, entry: Mapping[str, Any]) 
         listing = await gene.list_scope()
     except SourceConfigurationError as exc:
         return ExcludedScopeListing(scope_key=scope_key, rejection=str(exc) or type(exc).__name__)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not list excluded scope %s; its transition stays open: %s", scope_key, exc)
         return None
     finally:
         await gene.close()
@@ -204,7 +208,8 @@ async def _answer(gene: DocumentGene, requests: AcquisitionRequests, acquirer: _
         except Exception as exc:
             rediscover_failures[item.item_id] = AcquisitionError.from_exception(exc)
             continue
-        rediscovered[item.item_id] = current
+        # The answer is the item as rediscover returned it; fetch may change the item it reads.
+        rediscovered[item.item_id] = copy.deepcopy(current)
         if current is not None and current.item_id == item.item_id:
             await acquirer.upload(current)
     return AcquisitionAnswers(

@@ -3538,7 +3538,6 @@ def _run_cloud_document_acquisition_job(
     from memforge.genes import gene_class
     from memforge.llm.structured import failure_retryable
     from memforge.local_agent.acquisition_daemon import acquire_document_source
-    from memforge.local_agent.document_acquisition import AcquisitionManifestTooLarge
     from memforge.local_agent.runner import CloudJobLeaseLost
     from memforge.source_types import source_type_descriptor
 
@@ -3566,15 +3565,6 @@ def _run_cloud_document_acquisition_job(
         )
     except CloudJobLeaseLost:
         raise
-    except AcquisitionManifestTooLarge as exc:
-        return {
-            "operation": operation,
-            "source_id": source_id,
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            "item_count": exc.count,
-            "retryable": False,
-        }
     except Exception as exc:
         return {
             "operation": operation,

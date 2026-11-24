@@ -6793,7 +6793,13 @@ class Database:
         workspace_id: str = "default",
         trigger: str = "manual",
         retry_job_id: str | None = None,
+        next_attempt_at: datetime | None = None,
     ) -> tuple[str, bool]:
+        """Queue a local-agent job, or coalesce it with the Source's current one.
+
+        ``next_attempt_at`` is the earliest time a daemon may lease a job this
+        call creates; a job it coalesces with keeps its own.
+        """
         async with self._write_lock:
             try:
                 result = await self._enqueue_local_agent_job_locked(
@@ -6808,6 +6814,7 @@ class Database:
                     trigger=trigger,
                     retry_job_id=retry_job_id,
                     now_iso=_utc_iso(None),
+                    next_attempt_at=_utc_iso(next_attempt_at) if next_attempt_at is not None else None,
                 )
                 await self.db.commit()
                 return result
@@ -6829,6 +6836,7 @@ class Database:
         trigger: str,
         now_iso: str,
         retry_job_id: str | None = None,
+        next_attempt_at: str | None = None,
     ) -> tuple[str, bool]:
         """Coalesce work inside the caller's source-write transaction.
 
@@ -6906,11 +6914,11 @@ class Database:
             """INSERT INTO local_agent_jobs (
                 job_id, workspace_id, source_id, source_type, operation,
                 payload_json, created_by_user_id, execution_owner_user_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, workspace_id, source_id, source_type, operation,
              json.dumps(dict(payload), sort_keys=True), created_by_user_id,
-             execution_owner_user_id, now_iso, now_iso),
+             execution_owner_user_id, next_attempt_at, now_iso, now_iso),
         )
         return job_id, True
 

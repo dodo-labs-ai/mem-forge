@@ -26,6 +26,7 @@ from memforge.config import AppConfig
 from memforge.genes.notion_gene import NotionGene
 from memforge.local_agent.acquisition_daemon import acquire_document_source
 from memforge.local_agent.document_acquisition import (
+    ACQUISITION_ATTEMPT_PAYLOAD_FIELD,
     AcquiredArtifact,
     AcquiredInputPackage,
     AcquiredListing,
@@ -52,7 +53,7 @@ from memforge.models import (
     ScopeListingKind,
     SyncState,
 )
-from memforge.pipeline.device_acquisition import document_acquisition_job_payload
+from memforge.pipeline.device_acquisition import document_acquisition_job_payload, enqueue_document_acquisition_job
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker
@@ -467,6 +468,22 @@ def _device_run(device: _Side, client, lease: _Lease, started_at: datetime, *, j
 
     source = asyncio.run(device.db.get_source(SOURCE_ID))
     payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    return _acquire_and_process(device, client, lease, payload, started_at, job=job)
+
+
+def _acquire_and_process(
+    device: _Side,
+    client,
+    lease: _Lease,
+    payload: Mapping[str, object],
+    started_at: datetime,
+    *,
+    job: str,
+    config: AppConfig | None = None,
+    before_sync=None,
+) -> AcquisitionRequests:
+    """Acquire one leased job's ``payload`` on the device, process it on the server and run its sync."""
+
     lease.lease(payload, leased_at=started_at)
     transport = _RouteTransport(client, job=job)
     requests: list[AcquisitionRequests] = []
@@ -490,8 +507,12 @@ def _device_run(device: _Side, client, lease: _Lease, started_at: datetime, *, j
         json={"local_agent_job_id": job, "local_agent_attempt_count": 1},
     )
     assert processed.status_code == 202, processed.text
+    if before_sync is not None:
+        before_sync()
     asyncio.run(
-        SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
+        SourceSyncWorker(
+            device.db, config or AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test"
+        ).run_once()
     )
     return requests[0]
 
@@ -811,7 +832,7 @@ def test_the_device_fails_a_listing_above_the_bound_before_it_fetches_anything(w
             )
         )
 
-    assert raised.value.count == SNAPSHOT_MANIFEST_MAX_ITEMS + 1
+    assert f"holds {SNAPSHOT_MANIFEST_MAX_ITEMS + 1} items" in str(raised.value)
     assert "fetch" not in wiki.calls
 
 
@@ -1007,29 +1028,18 @@ def test_a_run_that_disagrees_with_its_acquisition_fails_and_a_new_job_acquires_
         wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
     _device_run(device, client, lease, FIRST_RUN, job="job-0")
     held_before = asyncio.run(device.held())
-    second_run = FIRST_RUN + timedelta(hours=1)
     source = asyncio.run(device.db.get_source(SOURCE_ID))
-    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
-    lease.lease(payload, leased_at=second_run)
     asyncio.run(
-        acquire_document_source(
-            payload,
-            open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
-            transport=_RouteTransport(client, job="job-1"),
-            exports_pdf=False,
-            sleep=_no_pause,
-        )
-    )
-    receipt = _process(client, job="job-1")
-    # a fails after the manifest response was issued, so the run retries a Document the device was not asked about.
-    _fail(device.db, "wiki-a", wiki.item("a"))
-
-    asyncio.run(
-        SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
+        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
     )
 
-    assert receipt.status_code == 202, receipt.text
-    run = asyncio.run(device.db.get_source_sync_run(receipt.json()["run_id"]))
+    def fail_a() -> None:
+        # a fails after the manifest response was issued, so the run retries a Document the device was not asked about.
+        _fail(device.db, "wiki-a", wiki.item("a"))
+
+    leased = _run_queued_job(device, client, lease, AppConfig(), before_sync=fail_a)
+
+    run = asyncio.run(device.db.get_latest_source_sync_run(source_id=SOURCE_ID, workspace_id=WORKSPACE))
     assert run is not None and run.status == "failed"
     assert "was not asked to rediscover wiki-a" in (run.error_message or "")
     # The run is not retried on the same acquisition, and nothing it read is kept.
@@ -1038,7 +1048,8 @@ def test_a_run_that_disagrees_with_its_acquisition_fails_and_a_new_job_acquires_
     assert asyncio.run(device.held()) == held_before
     jobs = asyncio.run(device.db.list_current_local_agent_jobs(workspace_id=WORKSPACE, user_id=LOCAL_DEV_USER_ID))
     assert [(job["operation"], job["status"]) for job in jobs] == [(DOCUMENT_ACQUISITION_OPERATION, "queued")]
-    assert jobs[0]["payload"]["since"] == payload["since"]
+    assert jobs[0]["payload"][ACQUISITION_ATTEMPT_PAYLOAD_FIELD] == 2
+    assert jobs[0]["payload"]["since"] == leased["payload"]["since"]
     assert jobs[0]["payload"]["config"] == {"root_pages": [PAGE_ROOT]}
 
 
@@ -1178,7 +1189,8 @@ def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wi
 
     [(job_id, status, result, error)] = completed
     assert (job_id, status) == ("job-large", "failed")
-    assert (result["item_count"], result["retryable"]) == (count, False)
+    assert result["retryable"] is False
+    assert f"holds {count} items" in result["error"]
     assert str(count) in (error or "")
     assert "fetch" not in wiki.calls
 
@@ -1308,27 +1320,95 @@ def test_an_acquired_input_must_name_only_artifacts_that_were_uploaded(deploymen
     assert failed.status_code == 200, failed.text
 
 
-def test_a_run_that_fails_on_a_recorded_provider_error_acquires_again(deployments, wiki):
+def _queued_job(device: _Side) -> dict | None:
+    jobs = asyncio.run(device.db.list_current_local_agent_jobs(workspace_id=WORKSPACE, user_id=LOCAL_DEV_USER_ID))
+    queued = [job for job in jobs if job["status"] == "queued"]
+    assert len(queued) <= 1
+    return queued[0] if queued else None
+
+
+def _run_queued_job(device: _Side, client, lease: _Lease, config: AppConfig, *, before_sync=None) -> dict:
+    """Lease the Source's queued job once a daemon may, acquire and process it, end it as the daemon does, and sync."""
+
+    job = _queued_job(device)
+    assert job is not None
+    not_before = datetime.fromisoformat(job["next_attempt_at"]) if job["next_attempt_at"] else None
+    leased_at = not_before or datetime.now(timezone.utc)
+    if not_before is not None:
+        # No daemon takes the job before its time.
+        early = asyncio.run(
+            device.db.lease_local_agent_jobs(
+                user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=not_before - timedelta(seconds=1)
+            )
+        )
+        assert early == []
+    [leased] = asyncio.run(
+        device.db.lease_local_agent_jobs(user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=leased_at)
+    )
+
+    def complete() -> None:
+        assert asyncio.run(
+            device.db.complete_local_agent_job(
+                job_id=leased["job_id"],
+                user_id=LOCAL_DEV_USER_ID,
+                attempt_count=leased["attempt_count"],
+                status="succeeded",
+                result={},
+                error=None,
+            )
+        )
+        if before_sync is not None:
+            before_sync()
+
+    _acquire_and_process(
+        device, client, lease, leased["payload"], leased_at, job=leased["job_id"], config=config, before_sync=complete
+    )
+    return leased
+
+
+def test_a_run_that_fails_on_a_recorded_provider_error_acquires_again_within_the_retry_budget(deployments, wiki):
     _server, device, client, lease = deployments
     _own(device.db)
+    config = AppConfig()
+    config.sync.worker_max_attempts = 3
     for page_id in ("a", "b"):
         wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
     _device_run(device, client, lease, FIRST_RUN, job="job-0")
     _fail(device.db, "wiki-b", wiki.item("b"))
-    # The provider cannot look b up this time, so the run cannot read the Document it retries.
+    # The provider cannot look b up any more, so each run cannot read the Document it retries.
     wiki.refused = {"b"}
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    asyncio.run(
+        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
+    )
 
-    requests = _device_run(device, client, lease, FIRST_RUN + timedelta(hours=1), job="job-1")
+    attempts: list[int] = []
+    delays: list[float] = []
+    while _queued_job(device) is not None:
+        wiki.calls.clear()
+        leased = _run_queued_job(device, client, lease, config)
+        attempts.append(leased["payload"][ACQUISITION_ATTEMPT_PAYLOAD_FIELD])
+        # Each acquisition asks the provider again.
+        assert "rediscover" in wiki.calls
+        run = asyncio.run(device.db.get_latest_source_sync_run(source_id=SOURCE_ID, workspace_id=WORKSPACE))
+        assert run is not None and run.status == "failed"
+        assert "could not look up page b" in (run.error_message or "")
+        # The same acquisition answers the same error, so the run is not
+        # retried on it: a new job asks the provider again, later.
+        assert run.next_attempt_at is None
+        following = _queued_job(device)
+        if following is not None:
+            delays.append(
+                (datetime.fromisoformat(following["next_attempt_at"]) - datetime.fromisoformat(following["created_at"]))
+                .total_seconds()
+            )
 
-    assert [item.item_id for item in requests.rediscover] == ["wiki-b"]
-    run = asyncio.run(device.db.get_latest_source_sync_run(source_id=SOURCE_ID, workspace_id=WORKSPACE))
-    assert run is not None and run.status == "failed"
-    assert "could not look up page b" in (run.error_message or "")
-    # The same acquisition answers the same error, so the run is not retried on
-    # it: a new job asks the provider again.
-    assert run.next_attempt_at is None
-    jobs = asyncio.run(device.db.list_current_local_agent_jobs(workspace_id=WORKSPACE, user_id=LOCAL_DEV_USER_ID))
-    assert [(job["operation"], job["status"]) for job in jobs] == [(DOCUMENT_ACQUISITION_OPERATION, "queued")]
+    # Acquisitions share a server run's retry budget and back off as its attempts do.
+    assert attempts == [1, 2, 3]
+    base = config.sync.worker_retry_base_seconds
+    assert len(delays) == 2
+    assert base - 5 < delays[0] <= base
+    assert 2 * base - 5 < delays[1] <= 2 * base
 
 
 def test_the_manifest_response_asks_for_the_documents_of_staged_derivations(deployments, wiki):

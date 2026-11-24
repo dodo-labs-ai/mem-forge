@@ -40,17 +40,6 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
 
-
-@dataclass(frozen=True, slots=True)
-class LocalAgentLease:
-    """A current lease of one local-agent job attempt, as the server validates it for each submission.
-
-    ``payload`` is the job's payload, and ``leased_at`` when the attempt was
-    leased: a device run reads its provider from then on.
-    """
-
-    payload: Mapping[str, Any]
-    leased_at: datetime
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
 LOCAL_PACKAGE_CONTRACT_VERSION = 3
 """The package contract this local agent collects under, declared in its manifest.
@@ -71,6 +60,18 @@ The manifest response then names the items to confirm, and the agent posts
 its answers before it asks for processing.
 """
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAgentLease:
+    """A current lease of one local-agent job attempt, as the server validates it for each submission.
+
+    ``payload`` is the job's payload, and ``leased_at`` when the attempt was
+    leased: a device run reads its provider from then on.
+    """
+
+    payload: Mapping[str, Any]
+    leased_at: datetime
 
 
 def teams_config_within_history_bound(config: Mapping[str, Any]) -> dict[str, Any] | None:

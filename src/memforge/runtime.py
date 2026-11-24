@@ -51,7 +51,7 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
-from memforge.local_agent.document_acquisition import StoredAcquisition
+from memforge.local_agent.document_acquisition import ACQUISITION_ATTEMPT_PAYLOAD_FIELD, StoredAcquisition
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
 from memforge.pipeline.device_acquisition import (
     device_excluded_scope_gene_factory,
@@ -1456,9 +1456,17 @@ class SourceSyncWorker:
                 await progress_task
 
     def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
-        if run.lease_attempt_count >= self.config.sync.worker_max_attempts:
+        return self._retry_at(run.lease_attempt_count, failed_at)
+
+    def _retry_at(self, attempt: int, failed_at: datetime) -> datetime | None:
+        """When the attempt after ``attempt``, which failed at ``failed_at``, starts.
+
+        ``None`` once ``attempt`` reaches ``worker_max_attempts``; the delay
+        doubles with each attempt up to ``worker_retry_max_seconds``.
+        """
+        if attempt >= self.config.sync.worker_max_attempts:
             return None
-        exponent = max(0, run.lease_attempt_count - 1)
+        exponent = max(0, attempt - 1)
         delay = min(
             self.config.sync.worker_retry_max_seconds,
             self.config.sync.worker_retry_base_seconds * (2**exponent),
@@ -1708,7 +1716,7 @@ class SourceSyncWorker:
                 if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
                 if acquisition_failed and final_state.failure_retryable and not reprocessing:
-                    await self._acquire_again(run, runtime.doc_store)
+                    await self._acquire_again(run, runtime.doc_store, failed_at)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1757,16 +1765,28 @@ class SourceSyncWorker:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
 
-    async def _acquire_again(self, run: SourceSyncRun, doc_store: LocalDocumentStore) -> None:
+    async def _acquire_again(self, run: SourceSyncRun, doc_store: LocalDocumentStore, failed_at: datetime) -> None:
         """Retry a device run that failed on its acquisition with a new ``document_acquisition`` job.
 
         The device acquires the Source again from the start of the job, so the
         new attempt answers what its own run asks and asks the provider again
-        (ADR 0058). A Source that is no longer active runs no new job.
+        (ADR 0058). The acquisitions share the retry budget of a server run's
+        attempts: the new job is the next acquisition attempt of the job the
+        run processed, and a daemon leases it after the delay a server run's
+        next attempt waits. Once the attempts reach ``worker_max_attempts``,
+        or for a Source that is no longer active or a run whose job is not
+        recorded, no job is queued, and the next scheduled run acquires again.
         """
 
         source = await self.db.get_source(run.source_id)
-        if source is None or source.get("status") != "active":
+        if source is None or source.get("status") != "active" or run.predecessor_activity_id is None:
+            return
+        job = await self.db.get_local_agent_job(run.predecessor_activity_id)
+        if job is None:
+            return
+        attempt = int(job["payload"][ACQUISITION_ATTEMPT_PAYLOAD_FIELD])
+        next_attempt_at = self._retry_at(attempt, failed_at)
+        if next_attempt_at is None:
             return
         await enqueue_document_acquisition_job(
             self.db,
@@ -1775,6 +1795,8 @@ class SourceSyncWorker:
             {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},
             workspace_id=run.workspace_id,
             trigger="retry",
+            acquisition_attempt=attempt + 1,
+            next_attempt_at=next_attempt_at,
         )
 
     async def _end_stopped_run(self, run: SourceSyncRun, source: Mapping[str, Any] | None) -> SourceSyncRun:

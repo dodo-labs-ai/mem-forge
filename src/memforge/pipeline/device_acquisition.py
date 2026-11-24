@@ -27,6 +27,7 @@ import hashlib
 import io
 import uuid
 from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from memforge.genes import gene_class, source_rediscovers_documents
@@ -38,6 +39,7 @@ from memforge.genes.recorded import (
     recorded_gene_class,
 )
 from memforge.local_agent.document_acquisition import (
+    ACQUISITION_ATTEMPT_PAYLOAD_FIELD,
     CONFIG_PAYLOAD_FIELD,
     DOCUMENT_ACQUISITION_OPERATION,
     REPROCESS_PAYLOAD_FIELD,
@@ -110,6 +112,7 @@ async def document_acquisition_job_payload(
     request_payload: Mapping[str, Any] | None = None,
     *,
     reprocess_document_ids: Collection[str] = (),
+    acquisition_attempt: int = 1,
 ) -> dict[str, Any]:
     """The payload of one ``document_acquisition`` job, as of the moment it is enqueued.
 
@@ -124,6 +127,9 @@ async def document_acquisition_job_payload(
       distinct excluded scope, which the device lists with its own Gene.
     - ``reprocess``: the Documents of a Reprocess at Current Revision, which
       discovers and lists nothing.
+    - ``acquisition_attempt``: which acquisition of the Source's run this job
+      is; a job that acquires again after its predecessor's run failed on its
+      acquisition is the next.
 
     It also names the Source, its type and configuration revision, and the
     request's control fields (``force_full_sync``, ``retry_failed_items``).
@@ -142,6 +148,7 @@ async def document_acquisition_job_payload(
             "source_type": source_type,
             "source_config_revision": local_agent_source_config_revision(source),
             CONFIG_PAYLOAD_FIELD: acquisition_job_config(source_type, config),
+            ACQUISITION_ATTEMPT_PAYLOAD_FIELD: acquisition_attempt,
         }
     )
     if reprocess_document_ids:
@@ -195,18 +202,24 @@ async def enqueue_document_acquisition_job(
     *,
     workspace_id: str,
     trigger: str,
+    acquisition_attempt: int = 1,
+    next_attempt_at: datetime | None = None,
 ) -> tuple[str, bool] | None:
     """Queue a ``document_acquisition`` job for the Source's execution owner, as of now.
 
-    The job coalesces with one already queued or leased, as every local-agent
-    job does. Returns its id and whether a new job was created, or ``None``
-    for a Source without an execution owner, whose runs no device takes.
+    ``acquisition_attempt`` is the job's acquisition attempt, and
+    ``next_attempt_at`` the earliest time a daemon may lease it. The job
+    coalesces with one already queued or leased, as every local-agent job
+    does. Returns its id and whether a new job was created, or ``None`` for a
+    Source without an execution owner, whose runs no device takes.
     """
 
     owner = execution_owner_user_id(source)
     if owner is None:
         return None
-    payload = await document_acquisition_job_payload(db, doc_store, source, request_payload)
+    payload = await document_acquisition_job_payload(
+        db, doc_store, source, request_payload, acquisition_attempt=acquisition_attempt
+    )
     return await db.enqueue_local_agent_job(
         job_id=f"laj-{uuid.uuid4().hex}",
         workspace_id=workspace_id,
@@ -217,6 +230,7 @@ async def enqueue_document_acquisition_job(
         created_by_user_id=owner,
         execution_owner_user_id=owner,
         trigger=trigger,
+        next_attempt_at=next_attempt_at,
     )
 
 

@@ -49,6 +49,7 @@ from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListi
 from memforge.source_artifacts import RawSourceArtifact
 
 __all__ = [
+    "ACQUISITION_ATTEMPT_PAYLOAD_FIELD",
     "CONFIG_PAYLOAD_FIELD",
     "DOCUMENT_ACQUISITION_OPERATION",
     "REPROCESS_PAYLOAD_FIELD",
@@ -72,6 +73,9 @@ SINCE_PAYLOAD_FIELD = "since"
 """The job payload field holding the instant discovery reads changes from, or ``None`` to discover everything."""
 REPROCESS_PAYLOAD_FIELD = "reprocess"
 """The job payload field naming the Documents of a reprocess; such a job neither discovers nor lists."""
+ACQUISITION_ATTEMPT_PAYLOAD_FIELD = "acquisition_attempt"
+"""The job payload field counting the job's acquisition attempt: 1, and one more for each job that acquires
+again after its predecessor's run failed on what its acquisition answered."""
 
 _MAX_RETAINED_ERROR_CHARS = 512
 """The longest error text a failure keeps, the bound the sync's failure ledger keeps."""
@@ -174,13 +178,17 @@ def _error(payload: object) -> AcquisitionError | None:
 
 
 class AcquisitionManifestTooLarge(ValueError):
-    """A listing or discovery holds more items than one device manifest may name."""
+    """A listing or discovery holds more items than one device manifest may name.
+
+    The Source stays that large, so its job fails without a retry.
+    """
+
+    retryable = False
 
     def __init__(self, what: str, count: int) -> None:
         super().__init__(
             f"the {what} holds {count} items, more than the {SNAPSHOT_MANIFEST_MAX_ITEMS} one device manifest may name"
         )
-        self.count = count
 
 
 @dataclass(frozen=True, slots=True)
