@@ -207,6 +207,31 @@ class _Side:
             retry_sleep=_skip_retry_delay,
         )
 
+    async def documents(self) -> dict[str, tuple]:
+        """Each Document as its row describes it, without the times the write itself sets."""
+
+        return {
+            doc.doc_id: (
+                doc.title,
+                doc.source_url,
+                doc.space_or_project,
+                doc.last_modified,
+                tuple(doc.labels),
+                doc.version,
+                doc.content_hash,
+                doc.item_extra,
+            )
+            for doc in await self.db.list_documents(source=SOURCE_ID, limit=1000)
+        }
+
+    async def units(self) -> dict[str, tuple]:
+        """The Source's current Units by id."""
+
+        return {
+            unit.id: (unit.unit_type, unit.provider_key, dict(unit.locator))
+            for unit in await self.db.list_current_source_units(SOURCE_ID)
+        }
+
     async def held(self) -> dict[str, tuple]:
         """Each held Document's stored input: the item the Unit records, its raw bytes and normalized hash."""
 
@@ -331,10 +356,10 @@ def deployments(tmp_path, wiki):
         asyncio.run(device_db.close())
 
 
-def _server_run(server: _Side, started_at: datetime) -> None:
+def _server_run(server: _Side, started_at: datetime, config: Mapping[str, object] = CONFIG) -> None:
     """A scheduled server run, as the device job's run is."""
 
-    gene = WikiGene(dict(CONFIG), SOURCE_ID)
+    gene = WikiGene(dict(config), SOURCE_ID)
     state = asyncio.run(
         server.orchestrator().sync_gene(
             gene=gene,
@@ -382,12 +407,36 @@ def _device_run(device: _Side, client, lease: _Lease, started_at: datetime, *, j
 
 
 async def _end_state(side: _Side) -> tuple:
-    return (await side.held(), await side.ledger(), await side.cursor(), await side.last_run())
+    return (
+        await side.documents(),
+        await side.units(),
+        await side.held(),
+        await side.ledger(),
+        await side.cursor(),
+        await side.last_run(),
+    )
 
 
-def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deployments, wiki):
+def _configure(side: _Side, config: Mapping[str, object]) -> None:
+    asyncio.run(
+        side.db.upsert_source(
+            id=SOURCE_ID,
+            type="wiki",
+            name="Team wiki",
+            config_json=json.dumps(config),
+            access_policy="workspace",
+            owner_user_id=LOCAL_DEV_USER_ID,
+        )
+    )
+
+
+@pytest.mark.parametrize("rediscovers", [True, False], ids=["rediscovers", "does-not-rediscover"])
+def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deployments, wiki, rediscovers):
     server, device, client, lease = deployments
-    for page_id in ("a", "b", "c", "d"):
+    config = {**CONFIG, "rediscovers": rediscovers}
+    for side in (server, device):
+        _configure(side, config)
+    for page_id in ("a", "b", "c", "d", "g"):
         wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
     wiki.refused = {"d"}
     runs = [FIRST_RUN, FIRST_RUN + timedelta(hours=1), FIRST_RUN + timedelta(hours=2)]
@@ -402,13 +451,18 @@ def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deplo
             wiki.write("e", "body of e", runs[1] - timedelta(minutes=20))
             wiki.refused = set()
         if index == 2:
+            # g is touched without a change to its body, and f is new.
+            wiki.write("g", "body of g", runs[2] - timedelta(minutes=10))
             wiki.write("f", "body of f", runs[2] - timedelta(minutes=5))
 
     device_requests: list[AcquisitionRequests] = []
+    before_touch: tuple = ()
     for index, started_at in enumerate(runs):
+        if index == 2:
+            before_touch = asyncio.run(device.documents())["wiki-g"]
         changes(index)
-        _server_run(server, started_at)
-        server_listing = asyncio.run(WikiGene(dict(CONFIG), SOURCE_ID).list_scope())
+        _server_run(server, started_at, config)
+        server_listing = asyncio.run(WikiGene(dict(config), SOURCE_ID).list_scope())
         device_requests.append(_device_run(device, client, lease, started_at, job=f"job-{index}"))
         stored = asyncio.run(
             device.db.get_source_acquisition(source_id=SOURCE_ID, workspace_id=WORKSPACE, snapshot_id=f"job-{index}:attempt:1")
@@ -418,14 +472,29 @@ def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deplo
         assert stored.manifest.listing.scope_listing() == server_listing
         assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
 
-    # The second run asked the device to confirm what the listing left out and to read the failed page again.
+    # The first run left the refused page in the ledger.
+    assert list(device_requests[0].confirm + device_requests[0].rediscover + device_requests[0].fetch) == []
+    # The second run asked the device to confirm what the listing left out, and
+    # to read the failed page again: rediscovered by a type that rediscovers,
+    # fetched by its stored item by one that does not.
     second = device_requests[1]
     assert sorted(item.item_id for item in second.confirm) == ["wiki-b", "wiki-c"]
-    assert [item.item_id for item in second.rediscover] == ["wiki-d"]
+    retried = second.rediscover if rediscovers else second.fetch
+    assert [item.item_id for item in retried] == ["wiki-d"]
+    assert (second.fetch if rediscovers else second.rediscover) == ()
+    assert asyncio.run(device.ledger()) == {}
+
+    documents = asyncio.run(device.documents())
     held = asyncio.run(device.held())
-    assert sorted(held) == ["wiki-a", "wiki-b", "wiki-d", "wiki-e", "wiki-f"]
-    # Each Unit holds the item as the device's fetch left it.
+    # b left the listing and is kept; c is confirmed absent and its Document is gone.
+    assert sorted(documents) == sorted(held) == ["wiki-a", "wiki-b", "wiki-d", "wiki-e", "wiki-f", "wiki-g"]
+    assert len(asyncio.run(device.units())) == len(held)
+    # The touched page has a new version and the same content; each Unit holds
+    # the item as the device's fetch left it.
+    assert documents["wiki-g"][5] != before_touch[5]
+    assert documents["wiki-g"][6] == before_touch[6]
     assert held["wiki-a"][0]["extra"]["read_from"] == "wiki"
+    assert asyncio.run(device.last_run())["unlisted_present_count"] == 1
     assert asyncio.run(device.cursor()) == runs[2]
 
 
