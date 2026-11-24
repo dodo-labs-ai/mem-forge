@@ -82,6 +82,7 @@ __all__ = [
     "LedgerPartition",
     "SnapshotBinding",
     "collection_family",
+    "listing_partition",
 ]
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,28 @@ configuration and credential with that scope's fields in place of the current
 ones (see :func:`memforge.source_projection_config.excluded_scope_config`).
 The Gene is closed when its ``async with`` block exits.
 """
+
+
+def listing_partition(
+    listing: ScopeListing | None,
+    ledger_doc_ids: Collection[str],
+    *,
+    rediscovering: bool,
+) -> LedgerPartition:
+    """The failure ledger rows a run's own scope listing settles or leaves untried.
+
+    An existence listing settles every row it does not name. A query listing
+    leaves an unlisted row to ``rediscover``, which settles it when its item
+    is gone or has left the query, or keeps it untried when the Source cannot
+    rediscover. A run without a listing settles and keeps nothing.
+    """
+
+    if listing is None:
+        return LedgerPartition()
+    unlisted = frozenset(ledger_doc_ids) - listing.doc_ids
+    if listing.kind is ScopeListingKind.EXISTENCE:
+        return LedgerPartition(settled=unlisted)
+    return LedgerPartition() if rediscovering else LedgerPartition(untried=unlisted)
 
 
 class _TransitionStaysOpen(Exception):
@@ -433,16 +456,12 @@ class DocumentFamily(CollectionFamily):
         """
 
         listing = self.scope_listing
-        if listing is None:
-            return LedgerPartition()
-        unlisted = frozenset(ledger_doc_ids) - listing.doc_ids
-        if listing.kind is ScopeListingKind.EXISTENCE:
-            return LedgerPartition(settled=unlisted)
-        if self.input_snapshot is not None:
+        if listing is not None and listing.kind is ScopeListingKind.QUERY and self.input_snapshot is not None:
+            unlisted = frozenset(ledger_doc_ids) - listing.doc_ids
             self._unlisted_ledger_doc_ids = unlisted
             settled = unlisted & self._device_absent() if self._device_confirmation_failed() is None else frozenset()
             return LedgerPartition(settled=settled, untried=unlisted - settled)
-        return LedgerPartition() if rediscovering else LedgerPartition(untried=unlisted)
+        return listing_partition(listing, ledger_doc_ids, rediscovering=rediscovering)
 
     async def _requires_full_discovery(self) -> bool:
         if not gene_exports_pdf(self.gene):
@@ -733,8 +752,8 @@ class DocumentFamily(CollectionFamily):
 
         if listing.kind is ScopeListingKind.EXISTENCE:
             return AbsenceOutcome(removals=_removed_from_scope(unlisted))
+        self.excluded_scopes_due = True
         if self.input_snapshot is not None:
-            self.excluded_scopes_due = True
             excluded = await self._device_excluded_listings(transition)
         else:
             excluded = await self._list_excluded_scopes(transition)

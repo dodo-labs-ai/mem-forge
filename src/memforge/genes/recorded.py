@@ -20,7 +20,10 @@ every document type, whatever store holds the record.
 A run and its record must agree. A call the record holds no answer to, such
 as ``fetch`` of an item that was never acquired, raises
 :class:`AcquisitionRecordMismatch`, which fails the run instead of one
-Document, so the run is retried with a record that does answer it.
+Document, so the run is retried with a record that does answer it. A call
+whose recorded answer is the error acquisition raised, such as a ``fetch``
+the provider refused, raises :class:`AcquisitionFailed`, so the run treats it
+as it treats that error from the provider itself.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 
 __all__ = [
     "AcquiredInput",
+    "AcquisitionFailed",
     "AcquisitionRecord",
     "AcquisitionRecordMismatch",
     "AcquisitionRecordStore",
@@ -55,14 +59,53 @@ class AcquisitionRecordMismatch(RuntimeError):
     """
 
 
+class AcquisitionFailed(RuntimeError):
+    """The error acquisition raised for one call, raised again where the record answers that call.
+
+    The run treats it as it treats that error from the provider itself.
+    ``failure_class`` names the class of the error and ``error_code`` its
+    code, which the failure ledger records. ``retryable`` is set only when the
+    error declared it, because the run reads that declaration to decide
+    whether to try the Document again. Whether the error was transient, which
+    the ledger records, is its cause's answer
+    (:func:`memforge.llm.structured.failure_retryable`).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        transient: bool,
+        declared_retryable: bool | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        if declared_retryable is not None:
+            self.retryable = declared_retryable
+        if error_code is not None:
+            self.error_code = error_code
+        self.__cause__ = _Transience(transient)
+
+
+class _Transience(Exception):
+    """Whether the error acquisition raised was transient, as the cause of its :class:`AcquisitionFailed`."""
+
+    def __init__(self, transient: bool) -> None:
+        super().__init__("transient" if transient else "not transient")
+        self.retryable = transient
+
+
 @dataclass(frozen=True, slots=True)
 class AcquiredInput:
     """What acquisition read for one item: the input its Unit stores when the item commits.
 
     ``item`` is the item as ``fetch`` left it. ``body`` and ``content_type``
     are the bytes ``fetch`` returned, ``pdf`` the item's PDF export when its
-    type exports one, and ``artifacts`` the bodies ``fetch`` described, each
-    opened through :meth:`AcquisitionRecord.open_artifact`.
+    type exports one, or ``pdf_failure`` the error that export raised, and
+    ``artifacts`` the bodies ``fetch`` described, each opened through
+    :meth:`AcquisitionRecord.open_artifact`.
     """
 
     item: ContentItem
@@ -70,13 +113,15 @@ class AcquiredInput:
     content_type: str
     pdf: bytes | None = None
     artifacts: tuple[RawSourceArtifact, ...] = ()
+    pdf_failure: AcquisitionFailed | None = None
 
 
 class AcquisitionRecord(Protocol):
     """What one run's acquisition returned, open for the run that interprets it.
 
     Each question the record holds no answer to raises
-    :class:`AcquisitionRecordMismatch`.
+    :class:`AcquisitionRecordMismatch`; each one whose answer is the error
+    acquisition raised raises it as :class:`AcquisitionFailed`.
     """
 
     def discovered(self) -> Sequence[ContentItem]:
@@ -167,7 +212,10 @@ def recorded_gene_class(gene_cls: type[G]) -> type[G]:
             return replace(raw, artifacts=acquired.artifacts)
 
         async def fetch_pdf(self, item: ContentItem) -> bytes | None:
-            return (await self._opened().acquired(item.item_id)).pdf
+            acquired = await self._opened().acquired(item.item_id)
+            if acquired.pdf_failure is not None:
+                raise acquired.pdf_failure
+            return acquired.pdf
 
         @asynccontextmanager
         async def open_source_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:

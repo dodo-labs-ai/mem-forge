@@ -645,10 +645,18 @@ def _failure_stage(exc: BaseException, stage: str) -> str:
 
 
 def _failure_class(exc: BaseException) -> str:
-    """The qualified class of a failure: the class of the failure a lifecycle error wraps."""
+    """The qualified class of a failure.
+
+    It is the class of the failure a lifecycle error wraps, and the class a
+    failure names as its own ``failure_class``, as an error an acquisition
+    record answers with names the error acquisition raised.
+    """
 
     if isinstance(exc, SourceUnitLifecycleExecutionError) and exc.__cause__ is not None:
         exc = exc.__cause__
+    declared = getattr(exc, "failure_class", None)
+    if isinstance(declared, str) and declared:
+        return declared
     return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
 
@@ -686,7 +694,7 @@ def _derivation_item(context: SourceUnitDerivationContext) -> ContentItem:
     return document_content_item(context.document)
 
 
-def _select_failed_items(
+def select_failed_items(
     ledger: Mapping[str, SourceItemFailure],
     *,
     retry: FailedItemRetry,
@@ -901,6 +909,7 @@ class GeneSyncOrchestrator:
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
         excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
+        started_at: datetime | None = None,
     ) -> SyncState:
         """Run the full sync pipeline for a gene.
 
@@ -947,6 +956,11 @@ class GeneSyncOrchestrator:
             Builds an authenticated Gene for a scope the Source's open
             transition excluded, so a document Source with a query listing
             can list it to complete the transition.
+        started_at:
+            When the run's acquisition began reading the provider: the run's
+            start for the incremental cursor. A device run passes the time
+            its job attempt was leased; a run that reads the provider itself
+            starts now.
 
         Every per-Document failure is recorded in the failure ledger, which
         owns its retry, so a run whose failures are all per-Document ones
@@ -969,7 +983,7 @@ class GeneSyncOrchestrator:
         run_id = uuid.uuid4().hex[:12]
         durable_cycle_id = lifecycle_cycle_id or run_id
         transition_run_id = scope_transition_run_id or durable_cycle_id
-        started_at = datetime.now(timezone.utc)
+        started_at = started_at or datetime.now(timezone.utc)
         bind_document_store = getattr(gene, "bind_document_store", None)
         if callable(bind_document_store):
             bind_document_store(self.doc_store)
@@ -1071,7 +1085,7 @@ class GeneSyncOrchestrator:
             retried_doc_ids: set[str] = set()
             left_alone: dict[str, ContentItem | None] = {}
             if not reprocessing and scope_transition is None:
-                retried_doc_ids, left_alone = _select_failed_items(
+                retried_doc_ids, left_alone = select_failed_items(
                     ledger,
                     retry=failed_item_retry,
                     release=release,

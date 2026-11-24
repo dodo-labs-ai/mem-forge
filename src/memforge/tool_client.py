@@ -444,6 +444,68 @@ class ToolClient:
             body,
         )
 
+    def submit_acquisition_manifest(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit a device run's manifest; the response names what the server run will ask beyond discovery."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/manifest",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "manifest": manifest,
+            },
+        )
+
+    def upload_acquired_input(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        package: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Upload one acquired input of a device run, bound to its job attempt."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/inputs",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "package": package,
+            },
+        )
+
+    def submit_acquisition_answers(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        manifest_sha256: str,
+        answers: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit a device run's answers to what its manifest response asked."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/answers",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "manifest_sha256": manifest_sha256,
+                "answers": answers,
+            },
+        )
+
     def push_jira_package(
         self,
         *,

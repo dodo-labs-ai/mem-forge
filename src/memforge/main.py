@@ -108,6 +108,14 @@ from memforge.workspace_bindings import (
 
 if TYPE_CHECKING:
     from memforge.genes.jira_gene import JiraGene
+    from memforge.local_agent.document_acquisition import (
+        AcquiredInputPackage,
+        AcquisitionAnswers,
+        AcquisitionManifest,
+        AcquisitionRequests,
+    )
+    from memforge.models import ContentItem
+    from memforge.source_artifacts import RawSourceArtifact
 
 console = Console()
 log_console = Console(stderr=True)
@@ -3405,6 +3413,8 @@ def _run_cloud_local_agent_job(
     browser: str | None = None,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    from memforge.local_agent.document_acquisition import DOCUMENT_ACQUISITION_OPERATION
+
     operation = str(job.get("operation") or "").strip()
     handlers = {
         "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
@@ -3422,6 +3432,9 @@ def _run_cloud_local_agent_job(
             client,
             report_progress=report_progress,
         ),
+        DOCUMENT_ACQUISITION_OPERATION: lambda: _run_cloud_document_acquisition_job(
+            job, client, report_progress=report_progress
+        ),
     }
     handler = handlers.get(operation)
     if handler is None:
@@ -3430,6 +3443,163 @@ def _run_cloud_local_agent_job(
             "error": f"unsupported cloud local-agent job operation: {operation or '<empty>'}",
         }
     return handler()
+
+
+class _ClientAcquisitionTransport:
+    """Hands one job attempt's acquisition to the server through the API client."""
+
+    def __init__(self, client: ToolClient, *, source_id: str, job_id: str, attempt_count: int) -> None:
+        self._client = client
+        self._source_id = source_id
+        self._job_id = job_id
+        self._attempt_count = attempt_count
+        self._manifest_sha256 = ""
+
+    def _checked(self, response: dict[str, Any], what: str) -> dict[str, Any]:
+        _raise_if_local_agent_lease_not_current(response)
+        if response.get("error"):
+            raise RuntimeError(f"{what} failed: {response.get('detail') or response.get('error')}")
+        return response
+
+    async def submit_manifest(self, manifest: AcquisitionManifest) -> AcquisitionRequests:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.submit_acquisition_manifest,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                manifest=manifest.to_payload(),
+            ),
+            "submitting the acquisition manifest",
+        )
+        self._manifest_sha256 = str(response["manifest_sha256"])
+        from memforge.local_agent.document_acquisition import AcquisitionRequests
+
+        return AcquisitionRequests.from_payload(response.get("requests") or {})
+
+    async def upload_artifact(self, item: ContentItem, artifact: RawSourceArtifact, body: bytes) -> str:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.push_source_artifact,
+                source_id=self._source_id,
+                source_unit_key=item.item_id,
+                provider_key=artifact.provider_key,
+                provider_revision=artifact.provider_revision,
+                parent_observation_type=artifact.parent_observation_type,
+                parent_provider_key=artifact.parent_provider_key,
+                filename=artifact.filename,
+                media_type=artifact.media_type,
+                content=body,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+            ),
+            f"uploading artifact {artifact.provider_key}",
+        )
+        return str(response["input_sha256"])
+
+    async def upload_input(self, package: AcquiredInputPackage) -> None:
+        self._checked(
+            await asyncio.to_thread(
+                self._client.upload_acquired_input,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                package=package.to_payload(),
+            ),
+            f"uploading the acquired input of {package.item.item_id}",
+        )
+
+    async def submit_answers(self, answers: AcquisitionAnswers) -> None:
+        self._checked(
+            await asyncio.to_thread(
+                self._client.submit_acquisition_answers,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                manifest_sha256=self._manifest_sha256,
+                answers=answers.to_payload(),
+            ),
+            "submitting the acquisition answers",
+        )
+
+
+def _run_cloud_document_acquisition_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Acquire one document Source's run with its type's own Gene, then ask the server to process it.
+
+    A manifest above the bound every device manifest has fails the job with
+    the count, and does not retry: the same scope is as large next time.
+    """
+
+    from memforge.genes import gene_class
+    from memforge.local_agent.acquisition_daemon import acquire_document_source
+    from memforge.source_types import source_type_descriptor
+    from memforge.local_agent.document_acquisition import AcquisitionManifestTooLarge
+    from memforge.local_agent.runner import CloudJobLeaseLost
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, client, error = _local_agent_job_source_client(job, payload, operation=operation, client=client)
+    if error:
+        return error
+    source_type = str(payload.get("source_type") or job.get("source_type") or "")
+    job_id = str(job["job_id"])
+    attempt_count = int(job["attempt_count"])
+    gene_cls = gene_class(source_type)
+    descriptor = source_type_descriptor(source_type)
+    _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
+    try:
+        summary = asyncio.run(
+            acquire_document_source(
+                payload,
+                open_gene=lambda config: gene_cls(config=dict(config), source_id=source_id),
+                transport=_ClientAcquisitionTransport(
+                    client, source_id=source_id, job_id=job_id, attempt_count=attempt_count
+                ),
+                exports_pdf=bool(descriptor and descriptor.exports_pdf),
+            )
+        )
+    except CloudJobLeaseLost:
+        raise
+    except AcquisitionManifestTooLarge as exc:
+        return {
+            "operation": operation,
+            "source_id": source_id,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "item_count": exc.count,
+            "retryable": False,
+        }
+    except Exception as exc:
+        from memforge.llm.structured import failure_retryable
+
+        return {
+            "operation": operation,
+            "source_id": source_id,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "retryable": failure_retryable(exc),
+        }
+    sync_result = client.start_source_processing(
+        source_id=source_id,
+        local_agent_job_id=job_id,
+        local_agent_attempt_count=attempt_count,
+    )
+    _raise_if_local_agent_lease_not_current(sync_result)
+    result: dict[str, Any] = {
+        "operation": operation,
+        "source_id": source_id,
+        "counts": {"discovered": summary.discovered, "uploaded": summary.uploaded, "failed": summary.failed},
+        "sync_started": not bool(sync_result.get("error")),
+        **source_processing_receipt(sync_result),
+    }
+    if sync_result.get("error"):
+        result.update({"error": "source sync failed to start", "sync_error": sync_result, "retryable": True})
+    return result
 
 
 def _setup_result(result: LocalSetupJobResult) -> dict[str, Any]:

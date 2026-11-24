@@ -188,6 +188,22 @@ async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, documen
     return document_content_item(document)
 
 
+async def committed_source_item(
+    db: RelationalStore,
+    *,
+    source_id: str,
+    document_id: str,
+) -> ContentItem:
+    """The item that describes one Document whose Unit has committed, to ask its provider for it by id."""
+
+    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
+    return await _unit_stored_item(
+        db,
+        source_unit_id=committed.source_unit_revisions[0].source_unit_id,
+        document_id=document_id,
+    )
+
+
 async def rediscover_source_document(
     db: RelationalStore,
     gene: DocumentGene,
@@ -197,12 +213,7 @@ async def rediscover_source_document(
 ) -> ContentItem:
     """Ask the provider for the current item of one Document whose Unit is current."""
 
-    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
-    stored_item = await _unit_stored_item(
-        db,
-        source_unit_id=committed.source_unit_revisions[0].source_unit_id,
-        document_id=document_id,
-    )
+    stored_item = await committed_source_item(db, source_id=source_id, document_id=document_id)
     current = await gene.rediscover(stored_item)
     if current is None or current.item_id != document_id:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)

@@ -21,7 +21,7 @@ from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider
-from memforge.local_agent.source_contract import LOCAL_AGENT_SYNC_OPERATIONS
+from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION, LOCAL_AGENT_SYNC_OPERATIONS
 from memforge.genes import github_pages_gene, github_repo_gene, jira_gene
 from memforge.models import (
     ConfigCondition,
@@ -371,7 +371,8 @@ import memforge.genes
 
 def test_registry_tables_built_at_import_hold_every_type() -> None:
     assert LOCAL_AGENT_SYNC_OPERATIONS == {
-        d.local_agent.operation for d in registered_source_types() if d.local_agent is not None
+        DOCUMENT_ACQUISITION_OPERATION,
+        *(d.local_agent.operation for d in registered_source_types() if d.local_agent is not None),
     }
     assert "teams_sync" in LOCAL_AGENT_SYNC_OPERATIONS
 

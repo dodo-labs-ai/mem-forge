@@ -1949,9 +1949,11 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             failed_item_retry=None,
             collection_attempt=None,
             excluded_scope_gene=None,
+            started_at=None,
         ):
             del (
                 excluded_scope_gene,
+                started_at,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,
@@ -2086,9 +2088,11 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             failed_item_retry=None,
             collection_attempt=None,
             excluded_scope_gene=None,
+            started_at=None,
         ):
             del (
                 excluded_scope_gene,
+                started_at,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,
@@ -3139,8 +3143,10 @@ async def test_local_agent_process_endpoint_rejects_server_owned_source(db, tmp_
     with TestClient(app) as client:
         response = client.post(f"/api/v1/sources/{source_id}/process")
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "source_is_not_local_agent_backed"
+    # A document Source is processed only for the device job attempt that acquired it.
+    assert response.status_code == 409
+    assert response.json()["detail"] == "local_agent_lease_context_required"
+    assert await db.get_latest_source_sync_run(source_id=source_id, workspace_id="local") is None
 
 
 @pytest.mark.asyncio

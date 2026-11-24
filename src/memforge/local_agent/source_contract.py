@@ -14,10 +14,17 @@ from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.source_types import registered_source_types, source_type_descriptor
 
 
+DOCUMENT_ACQUISITION_OPERATION = "document_acquisition"
+"""The local-agent operation that acquires a document Source on its owner's device with the type's own Gene."""
 LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
-    descriptor.local_agent.operation
-    for descriptor in registered_source_types()
-    if descriptor.local_agent is not None
+    {
+        DOCUMENT_ACQUISITION_OPERATION,
+        *(
+            descriptor.local_agent.operation
+            for descriptor in registered_source_types()
+            if descriptor.local_agent is not None
+        ),
+    }
 )
 # ``retry_failed_items`` marks a job a person requested: the sync its snapshot
 # starts retries every failed Document of the Source. ``dry_run`` asks a
@@ -540,11 +547,24 @@ async def _previous_run_left_none_waiting(db: Any, transition: Any) -> bool:
 
 
 def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
-    """Fingerprint the saved collection scope used by one daemon job."""
+    """Fingerprint the saved configuration one daemon job collects with.
+
+    It is the configuration the job hands the device: the fields of the
+    type's local-agent collection, or, for a document type the device
+    acquires with its own Gene (ADR 0058), every field but the secrets.
+    """
+    from memforge.genes.family import CollectionFamilyKind
+    from memforge.local_agent.document_acquisition import acquisition_job_config
+
     source_type = str(source.get("type") or "").strip()
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is not None and descriptor.local_agent is None and descriptor.family is CollectionFamilyKind.DOCUMENT:
+        job_config = acquisition_job_config(source_type, _source_config(source.get("config")))
+    else:
+        job_config = local_agent_job_config(source_type, source.get("config"))
     canonical = {
         "source_type": source_type,
-        "config": local_agent_job_config(source_type, source.get("config")),
+        "config": job_config,
     }
     encoded = json.dumps(
         canonical,

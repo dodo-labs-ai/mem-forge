@@ -322,6 +322,12 @@ from memforge.storage.admin_source import (
 
 if TYPE_CHECKING:
     from memforge.config import LlmConfig
+    from memforge.local_agent.document_acquisition import (
+        AcquisitionAnswers,
+        AcquisitionManifest,
+        AcquisitionRequests,
+        StoredAcquisition,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1957,6 +1963,30 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_excluded_listings (
 CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_excluded_listings_snapshot
     ON source_sync_snapshot_excluded_listings(workspace_id, source_id, snapshot_id, scope_key);
 
+-- One device run's acquisition of a document Source (ADR 0058): the manifest
+-- the device submitted (its listing, the items it discovered in order and the
+-- listings of excluded scopes), what the manifest response asked of the
+-- device, the device's answers (NULL until it answers), and when the job
+-- attempt was leased, which is the run's start for the sync cursor. Each
+-- acquired input is a source_sync_inputs row the attempt's
+-- source_sync_snapshot_items row names.
+CREATE TABLE IF NOT EXISTS source_acquisition_manifests (
+    workspace_id        TEXT NOT NULL,
+    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    snapshot_id         TEXT NOT NULL,
+    manifest_sha256     TEXT NOT NULL,
+    manifest_json       TEXT NOT NULL,
+    requests_json       TEXT NOT NULL,
+    answers_json        TEXT,
+    acquisition_started_at TEXT NOT NULL,
+    local_agent_job_id  TEXT NOT NULL,
+    local_agent_attempt_count INTEGER NOT NULL,
+    source_config_revision TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    answered_at         TEXT,
+    PRIMARY KEY (workspace_id, source_id, snapshot_id)
+);
+
 -- The collection request the server issued to each conversation collection
 -- attempt, the immutable Collection Manifest that answered it, and the message
 -- bodies that attempt collected which the Source did not hold.
@@ -2006,6 +2036,7 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
     execution_owner_user_id TEXT NOT NULL,
     lease_owner_user_id TEXT,
     leased_until TEXT,
+    leased_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     result_json TEXT,
     last_error TEXT,
@@ -5067,6 +5098,32 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # defaults to a personal access token.
         [],
     ),
+    (
+        134,
+        "Store device acquisition manifests and when each local-agent job attempt was leased",
+        # A device run of a document Source submits its acquisition manifest,
+        # is asked what the server run will need beyond discovery, and
+        # answers; the attempt's lease time is the run's start for the cursor.
+        [
+            """CREATE TABLE IF NOT EXISTS source_acquisition_manifests (
+                workspace_id TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                requests_json TEXT NOT NULL,
+                answers_json TEXT,
+                acquisition_started_at TEXT NOT NULL,
+                local_agent_job_id TEXT NOT NULL,
+                local_agent_attempt_count INTEGER NOT NULL,
+                source_config_revision TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                answered_at TEXT,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id)
+            )""",
+            "ALTER TABLE local_agent_jobs ADD COLUMN leased_at TEXT",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -6926,7 +6983,7 @@ class Database:
             for row in rows:
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
-                       lease_owner_user_id = ?, leased_until = ?,
+                       lease_owner_user_id = ?, leased_at = ?, leased_until = ?,
                        attempt_count = attempt_count + 1, result_json = NULL,
                        last_error = NULL, next_attempt_at = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
@@ -6944,6 +7001,7 @@ class Database:
                          )""",
                     (
                         user_id,
+                        now_iso,
                         leased_until,
                         now_iso,
                         row["job_id"],
@@ -18276,7 +18334,8 @@ class Database:
         """Queue one sync run, or coalesce into the Source's active run.
 
         ``reprocess_document_ids`` queue an operator reprocess of those
-        Documents instead. It never coalesces: it is refused with
+        Documents instead, bound to ``input_snapshot_id`` when a device
+        acquired them. It never coalesces: it is refused with
         :class:`SourceSyncRunActive` while another run is pending or running.
         A sync requested while a reprocess is active runs after it.
 
@@ -18327,10 +18386,8 @@ class Database:
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
-        if reprocess_document_ids and (
-            trigger != "reprocess" or force_full_sync or input_snapshot_id or retry_run_id
-        ):
-            raise ValueError("a reprocess run names its Documents only")
+        if reprocess_document_ids and (trigger != "reprocess" or force_full_sync or retry_run_id):
+            raise ValueError("a reprocess run names its Documents and the attempt that acquired them only")
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
         normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)
@@ -20008,6 +20065,234 @@ class Database:
         return excluded_listings_from_rows(
             (str(row["scope_key"]), row["doc_id"], row["rejection"]) for row in rows
         )
+
+    async def record_source_acquisition(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        manifest: AcquisitionManifest,
+        requests: AcquisitionRequests,
+        started_at: datetime,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        source_config_revision: str,
+    ) -> StoredAcquisition:
+        """Keep the manifest one device run submitted, with what its response asks, and return what is kept.
+
+        The manifest belongs to its job attempt. A replay of the same manifest
+        by the same attempt returns the stored record, including the requests
+        it was issued, without asking again; a different manifest for the
+        attempt is refused. The embedded job broker's lease is checked again
+        in the same transaction.
+        """
+        from memforge.local_agent.document_acquisition import StoredAcquisition
+
+        digest = manifest.digest()
+        now = _now_iso()
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT status, attempt_count, leased_until, payload_json
+                       FROM local_agent_jobs
+                       WHERE job_id = ? AND source_id = ?""",
+                    (local_agent_job_id, source_id),
+                ) as cursor:
+                    job = await cursor.fetchone()
+                if job is not None:
+                    job_payload = json.loads(job["payload_json"] or "{}")
+                    leased_until = _parse_dt(job["leased_until"])
+                    if not (
+                        job["status"] == "leased"
+                        and int(job["attempt_count"] or 0) == local_agent_attempt_count
+                        and leased_until is not None
+                        and leased_until > datetime.now(timezone.utc)
+                        and str(job_payload.get("source_config_revision") or "") == source_config_revision
+                    ):
+                        raise SourceActivityConflict("local agent lease changed")
+                stored = await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
+                if stored is not None:
+                    if (
+                        stored.manifest_sha256,
+                        stored.local_agent_job_id,
+                        stored.local_agent_attempt_count,
+                        stored.source_config_revision,
+                    ) != (digest, local_agent_job_id, local_agent_attempt_count, source_config_revision):
+                        raise SourceActivityConflict("source acquisition manifest changed")
+                    return stored
+                await self.db.execute(
+                    """INSERT INTO source_acquisition_manifests (
+                        workspace_id, source_id, snapshot_id, manifest_sha256, manifest_json, requests_json,
+                        acquisition_started_at, local_agent_job_id, local_agent_attempt_count,
+                        source_config_revision, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        workspace_id,
+                        source_id,
+                        snapshot_id,
+                        digest,
+                        json.dumps(manifest.to_payload(), sort_keys=True),
+                        json.dumps(requests.to_payload(), sort_keys=True),
+                        _utc_iso(started_at),
+                        local_agent_job_id,
+                        local_agent_attempt_count,
+                        source_config_revision,
+                        now,
+                    ),
+                )
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return StoredAcquisition(
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            manifest=manifest,
+            manifest_sha256=digest,
+            requests=requests,
+            answers=None,
+            started_at=started_at,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+            source_config_revision=source_config_revision,
+        )
+
+    async def record_source_acquisition_answers(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        manifest_sha256: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        answers: AcquisitionAnswers,
+    ) -> None:
+        """Keep a device's answers to what its manifest response asked.
+
+        The answers bind to the manifest's job attempt and digest, and must
+        answer exactly what the response asked. Repeating the stored answers
+        is accepted; a submission for another digest or attempt, and answers
+        that differ from the stored ones, are refused, and nothing is written.
+        """
+        async with self._write_lock:
+            try:
+                stored = await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
+                if stored is None:
+                    raise ValueError("source acquisition manifest not found")
+                if stored.manifest_sha256 != manifest_sha256:
+                    raise SourceActivityConflict("acquisition answers answer another manifest digest")
+                if (stored.local_agent_job_id, stored.local_agent_attempt_count) != (
+                    local_agent_job_id,
+                    local_agent_attempt_count,
+                ):
+                    raise SourceActivityConflict("acquisition answers belong to another collection attempt")
+                answers.check_answers(stored.requests)
+                if stored.answers is not None:
+                    if stored.answers.to_payload() != answers.to_payload():
+                        raise SourceActivityConflict("acquisition answers were already answered differently")
+                    return
+                cursor = await self.db.execute(
+                    """UPDATE source_acquisition_manifests SET answers_json = ?, answered_at = ?
+                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND answers_json IS NULL""",
+                    (
+                        json.dumps(answers.to_payload(), sort_keys=True),
+                        _now_iso(),
+                        workspace_id,
+                        source_id,
+                        snapshot_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise SourceActivityConflict("acquisition answers were answered by another submission")
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    async def get_source_acquisition(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> StoredAcquisition | None:
+        """The acquisition one device run's job attempt submitted, ``None`` when it submitted none."""
+        return await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
+
+    async def _get_source_acquisition_unlocked(
+        self,
+        workspace_id: str,
+        source_id: str,
+        snapshot_id: str,
+    ) -> StoredAcquisition | None:
+        from memforge.local_agent.document_acquisition import (
+            AcquisitionAnswers,
+            AcquisitionManifest,
+            AcquisitionRequests,
+            StoredAcquisition,
+        )
+
+        async with self.db.execute(
+            """SELECT * FROM source_acquisition_manifests
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+            (workspace_id, source_id, snapshot_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        started_at = _parse_dt(row["acquisition_started_at"])
+        assert started_at is not None
+        return StoredAcquisition(
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            manifest=AcquisitionManifest.from_payload(json.loads(row["manifest_json"])),
+            manifest_sha256=str(row["manifest_sha256"]),
+            requests=AcquisitionRequests.from_payload(json.loads(row["requests_json"])),
+            answers=(
+                AcquisitionAnswers.from_payload(json.loads(row["answers_json"]))
+                if row["answers_json"] is not None
+                else None
+            ),
+            started_at=started_at,
+            local_agent_job_id=str(row["local_agent_job_id"]),
+            local_agent_attempt_count=int(row["local_agent_attempt_count"]),
+            source_config_revision=str(row["source_config_revision"]),
+        )
+
+    async def get_source_sync_snapshot_input(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+        doc_id: str,
+    ) -> SourceSyncInput | None:
+        """The input a collection attempt holds for one Document, ``None`` when it holds none."""
+        async with self.db.execute(
+            """SELECT i.* FROM source_sync_snapshot_items si
+               JOIN source_sync_inputs i ON i.input_id = si.input_id
+               WHERE si.workspace_id = ? AND si.source_id = ? AND si.snapshot_id = ? AND si.doc_id = ?""",
+            (workspace_id, source_id, snapshot_id, doc_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _source_sync_input_from_row(row) if row is not None else None
+
+    async def list_source_sync_snapshot_doc_ids(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> frozenset[str]:
+        """The Documents a collection attempt holds an input for."""
+        rows = await self.db.execute_fetchall(
+            """SELECT doc_id FROM source_sync_snapshot_items
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
+            (workspace_id, source_id, snapshot_id),
+        )
+        return frozenset(str(row["doc_id"]) for row in rows)
 
     async def record_conversation_collection_request(
         self,

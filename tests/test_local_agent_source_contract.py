@@ -86,6 +86,7 @@ def _valid_jira_raw(*, summary: str = "Issue", comments: list[dict] | None = Non
 def test_local_agent_sync_operations_are_exported_from_the_domain_contract() -> None:
     assert LOCAL_AGENT_SYNC_OPERATIONS == frozenset(
         {
+            "document_acquisition",
             "github_repo_sync",
             "jira_sync",
             "local_markdown_sync",

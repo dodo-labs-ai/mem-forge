@@ -51,7 +51,9 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
+from memforge.local_agent.document_acquisition import StoredAcquisition
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
+from memforge.pipeline.device_acquisition import device_excluded_scope_gene_factory, recorded_device_gene
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
@@ -313,6 +315,7 @@ class RuntimeProvider(Protocol):
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
+        acquisition: StoredAcquisition | None = None,
     ) -> SyncState: ...
 
 
@@ -459,6 +462,7 @@ class DefaultRuntimeProvider:
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
+        acquisition: StoredAcquisition | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -477,6 +481,7 @@ class DefaultRuntimeProvider:
             source_activity=source_activity,
             failed_item_retry=failed_item_retry,
             collection_attempt=collection_attempt,
+            acquisition=acquisition,
         )
 
 
@@ -1000,12 +1005,17 @@ async def run_source_sync(
     source_activity: SourceActivityLease | None = None,
     failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     collection_attempt: CollectionAttempt | None = None,
+    acquisition: StoredAcquisition | None = None,
 ) -> SyncState:
     """Run one Source sync under a Source activity lease.
 
     ``collection_attempt`` names the collection attempt a conversation Source
     syncs within; a document Source ignores it. ``input_snapshot`` binds a
-    document Source's run to the complete snapshot its device submitted.
+    document Source's run to the complete snapshot its device package path
+    submitted. ``acquisition`` is what a device acquired for a document
+    Source's run (ADR 0058): the run interprets it with the type's recorded
+    Gene, from the time the device's job attempt was leased, and reaches
+    neither the provider nor its session.
     """
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
@@ -1043,12 +1053,18 @@ async def run_source_sync(
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
         source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
-        await browser_session.inject_cookie_for_source(db, source["type"], source_config)
-        gene = create_gene(
-            name=source["type"],
-            config=source_config,
-            source_id=source["id"],
-        )
+        excluded_scope_gene: ExcludedScopeGeneFactory
+        if acquisition is not None:
+            gene = recorded_device_gene(db, runtime.doc_store, source, source_config, acquisition)
+            excluded_scope_gene = device_excluded_scope_gene_factory(source, source_config, acquisition)
+        else:
+            await browser_session.inject_cookie_for_source(db, source["type"], source_config)
+            gene = create_gene(
+                name=source["type"],
+                config=source_config,
+                source_id=source["id"],
+            )
+            excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
         sync_task: asyncio.Task[Any] | None = None
         try:
             sync_kwargs: dict[str, Any] = {
@@ -1067,7 +1083,8 @@ async def run_source_sync(
                 "record_terminal_result": record_terminal_result,
                 "failed_item_retry": failed_item_retry,
                 "collection_attempt": collection_attempt,
-                "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
+                "excluded_scope_gene": excluded_scope_gene,
+                "started_at": acquisition.started_at if acquisition is not None else None,
             }
             sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
             if heartbeat_task is None:
@@ -1539,7 +1556,16 @@ class SourceSyncWorker:
             reprocessing = bool(run.reprocess_document_ids)
             input_snapshot: SnapshotBinding | None = None
             reusable_projection_doc_ids: frozenset[str] = frozenset()
-            if not reprocessing:
+            # A device that acquired the run with the type's own Gene hands
+            # over its acquisition; the run interprets it with the recorded Gene.
+            acquisition = (
+                await self.db.get_source_acquisition(
+                    source_id=run.source_id, workspace_id=run.workspace_id, snapshot_id=run.input_snapshot_id
+                )
+                if run.input_snapshot_id is not None
+                else None
+            )
+            if not reprocessing and acquisition is None:
                 inputs = await self.db.list_source_sync_inputs(
                     source_id=run.source_id,
                     workspace_id=run.workspace_id,
@@ -1611,6 +1637,7 @@ class SourceSyncWorker:
                 record_terminal_result=False,
                 source_activity=run.source_activity,
                 failed_item_retry=failed_item_retry_for_run(run),
+                acquisition=acquisition,
                 collection_attempt=CollectionAttempt(
                     workspace_id=run.workspace_id,
                     # A device collected into the run's input snapshot; a
@@ -1827,14 +1854,13 @@ class SyncService:
         carries that intent from the job a person requested.
         """
         source = await self._ensure_source_can_sync(source_id)
-        current_config_revision = (
+        if source_config_revision is not None and source_config_revision != local_agent_source_config_revision(source):
+            raise ValueError("source config revision changed before sync enqueue")
+        effective_config_revision = source_config_revision or (
             local_agent_source_config_revision(source)
             if local_agent_sync_operation(source["type"], source.get("config")) is not None
             else None
         )
-        if source_config_revision is not None and source_config_revision != current_config_revision:
-            raise ValueError("source config revision changed before sync enqueue")
-        effective_config_revision = source_config_revision or current_config_revision
         return await self.db.enqueue_source_sync_run(
             source_id=source_id,
             workspace_id=self.workspace_id,
@@ -1847,18 +1873,31 @@ class SyncService:
             retry_failed_items=retry_failed_items,
         )
 
-    async def enqueue_reprocess(self, source_id: str, document_ids: tuple[str, ...]) -> SourceSyncRun:
+    async def enqueue_reprocess(
+        self,
+        source_id: str,
+        document_ids: tuple[str, ...],
+        *,
+        input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
+    ) -> SourceSyncRun:
         """Queue an operator reprocess of the Source Units of these Documents.
 
         It keeps the sync cursor, so the Source must have one; it is refused
-        while another run of the Source is pending or running.
+        while another run of the Source is pending or running. A reprocess a
+        device acquired is bound to that job attempt (``input_snapshot_id``)
+        and the configuration revision it acquired with.
         """
         source = await self._ensure_source_can_sync(source_id)
         if not document_ids:
             raise ValueError("reprocess needs at least one Document")
         if not await self._has_sync_cursor(source_id):
             raise SourceSyncBoundaryError(f"Source {source_id} has not completed a sync to reprocess")
-        return await self._enqueue_reprocess_run(source, document_ids)
+        if source_config_revision is not None and source_config_revision != local_agent_source_config_revision(source):
+            raise ValueError("source config revision changed before sync enqueue")
+        return await self._enqueue_reprocess_run(
+            source, document_ids, input_snapshot_id=input_snapshot_id, source_config_revision=source_config_revision
+        )
 
     async def enqueue_release_recovery(self) -> int:
         """Queue one run per Source to retry the failed Documents another release recorded.
@@ -1910,12 +1949,21 @@ class SyncService:
         state = await self.db.get_sync_state(source_id)
         return state is not None and state.last_sync_at is not None
 
-    async def _enqueue_reprocess_run(self, source: dict, document_ids: tuple[str, ...]) -> SourceSyncRun:
+    async def _enqueue_reprocess_run(
+        self,
+        source: dict,
+        document_ids: tuple[str, ...],
+        *,
+        input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
+    ) -> SourceSyncRun:
         return await self.db.enqueue_source_sync_run(
             source_id=str(source["id"]),
             workspace_id=self.workspace_id,
             trigger="reprocess",
-            source_config_revision=(
+            input_snapshot_id=input_snapshot_id,
+            source_config_revision=source_config_revision
+            or (
                 local_agent_source_config_revision(source)
                 if local_agent_sync_operation(source["type"], source.get("config")) is not None
                 else None

@@ -224,6 +224,12 @@ from memforge.runtime import (
 from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
 from memforge.pipeline.stored_document import reprocess_preview
+from memforge.pipeline.device_acquisition import (
+    AcquisitionNotReady,
+    acquisition_requests,
+    ready_acquisition,
+    retain_acquired_input,
+)
 from memforge.scheduler import SyncScheduler
 from memforge.server.model_settings_api import (
     ModelHealthResponse,
@@ -289,6 +295,15 @@ from memforge.local_agent.readiness import (
     connection_status_from_browser_session,
 )
 from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
+from memforge.local_agent.document_acquisition import (
+    DOCUMENT_ACQUISITION_OPERATION,
+    REPROCESS_PAYLOAD_FIELD,
+    AcquiredInputPackage,
+    AcquiredListing,
+    AcquisitionAnswers,
+    AcquisitionManifest,
+    AcquisitionManifestTooLarge,
+)
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     SNAPSHOT_MANIFEST_MAX_ITEMS,
@@ -630,6 +645,10 @@ def _require_source_sync_support(source: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="source_sync_not_supported")
 
 
+LOCAL_AGENT_LEASED_AT_FIELD = "leased_at"
+"""The field of a current lease that holds when its job attempt was leased, as an ISO time."""
+
+
 async def _require_current_local_agent_lease(
     request: Request,
     db: Database,
@@ -637,7 +656,13 @@ async def _require_current_local_agent_lease(
     source: Mapping[str, Any],
     job_id: str | None,
     attempt_count: int | None,
-) -> None:
+) -> dict[str, Any]:
+    """The payload of the Source's job attempt while the caller holds its lease; 409 otherwise.
+
+    The payload carries the Source's current configuration revision and, as
+    :data:`LOCAL_AGENT_LEASED_AT_FIELD`, when the attempt was leased. A
+    deployment's own lease validator returns the payload it holds.
+    """
     source_id = str(source.get("id") or "").strip()
     expected_config_revision = local_agent_source_config_revision(source)
     normalized_job_id = str(job_id or "").strip()
@@ -659,7 +684,7 @@ async def _require_current_local_agent_lease(
     else:
         job = await db.get_local_agent_job(normalized_job_id)
         if job:
-            job_payload = job.get("payload") or {}
+            job_payload = {**(job.get("payload") or {}), LOCAL_AGENT_LEASED_AT_FIELD: job.get("leased_at")}
         leased_until = None
         if job and job.get("leased_until"):
             try:
@@ -2911,6 +2936,32 @@ class LocalSourceConfirmationsRequest(BaseModel):
     failure_cause: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
+class AcquisitionAttemptRequest(BaseModel):
+    """The ``document_acquisition`` job attempt an upload of a device run belongs to."""
+
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
+
+
+class AcquisitionManifestRequest(AcquisitionAttemptRequest):
+    """A device run's manifest (:class:`~memforge.local_agent.document_acquisition.AcquisitionManifest`)."""
+
+    manifest: dict[str, Any]
+
+
+class AcquiredInputRequest(AcquisitionAttemptRequest):
+    """One acquired input of a device run, bound to its job attempt."""
+
+    package: dict[str, Any]
+
+
+class AcquisitionAnswersRequest(AcquisitionAttemptRequest):
+    """A device run's answers to what its manifest response asked, bound to the manifest's digest."""
+
+    manifest_sha256: str = Field(min_length=64, max_length=64)
+    answers: dict[str, Any]
+
+
 CONVERSATION_MANIFEST_MAX_MESSAGES = 200_000
 CONVERSATION_RECORD_MAX_BYTES = 1_000_000
 
@@ -2993,6 +3044,34 @@ async def _require_ready_snapshot_manifest(
         raise HTTPException(status_code=409, detail="source_snapshot_confirmations_pending")
     if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
+
+
+async def _require_acquisition_lease(
+    request: Request,
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    attempt: AcquisitionAttemptRequest,
+) -> tuple[dict[str, Any], str]:
+    """The payload of the current ``document_acquisition`` job attempt of a document Source, and its attempt id.
+
+    A Source of another family, and a job of another operation, answer 409
+    ``document_acquisition_job_required``.
+    """
+
+    lease_payload = await _require_current_local_agent_lease(
+        request,
+        db,
+        source=source,
+        job_id=attempt.local_agent_job_id,
+        attempt_count=attempt.local_agent_attempt_count,
+    )
+    if (
+        not _is_document_source_type(str(source.get("type") or ""))
+        or lease_payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION
+    ):
+        raise HTTPException(status_code=409, detail="document_acquisition_job_required")
+    return lease_payload, local_agent_sync_snapshot_id(attempt.local_agent_job_id, attempt.local_agent_attempt_count)
 
 
 def _is_document_source_type(source_type: str) -> bool:
@@ -8827,6 +8906,73 @@ def create_admin_app(
         _require_source_sync_support(source)
         return await _stop_source_sync(request, db, sync_service, source)
 
+    async def _process_acquisition(
+        request: Request,
+        db: Database,
+        sync_service: SyncService,
+        source: dict[str, Any],
+        req: SourceSyncRequest | None,
+        workspace_id: str,
+    ) -> dict[str, Any]:
+        """Enqueue the run of one device run's acquisition once it is ready, bound to its attempt."""
+
+        source_id = str(source["id"])
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        if req is None or not req.local_agent_job_id or req.local_agent_attempt_count is None:
+            raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
+        lease_payload, snapshot_id = await _require_acquisition_lease(
+            request,
+            db,
+            source=source,
+            attempt=AcquisitionAttemptRequest(
+                local_agent_job_id=req.local_agent_job_id, local_agent_attempt_count=req.local_agent_attempt_count
+            ),
+        )
+        if req.sync_snapshot_id and req.sync_snapshot_id != snapshot_id:
+            raise HTTPException(status_code=409, detail="local agent snapshot does not match the leased job attempt")
+        config_revision = str(lease_payload["source_config_revision"])
+        try:
+            await ready_acquisition(
+                db,
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                source_config_revision=config_revision,
+            )
+        except AcquisitionNotReady as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
+        reprocess = tuple(str(doc_id) for doc_id in lease_payload.get(REPROCESS_PAYLOAD_FIELD) or ())
+        try:
+            if reprocess:
+                run = await sync_service.enqueue_reprocess(
+                    source_id, reprocess, input_snapshot_id=snapshot_id, source_config_revision=config_revision
+                )
+            else:
+                run = await sync_service.enqueue_source(
+                    source_id,
+                    trigger="local_agent",
+                    force_full_sync=bool(lease_payload.get("force_full_sync")),
+                    input_snapshot_id=snapshot_id,
+                    source_config_revision=config_revision,
+                    predecessor_activity_id=req.local_agent_job_id,
+                    retry_failed_items=bool(lease_payload.get("retry_failed_items")),
+                )
+        except SourcePausedError:
+            raise _source_paused_http_error()
+        except (SourceActivityConflict, SourceSyncBoundaryError, SourceSyncUnsupportedError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "created_at": run.created_at.isoformat(),
+            "coalesced": run.coalesced,
+        }
+
     @source_router.post("/{source_id}/process", status_code=202)
     async def process_collected_local_source(
         request: Request,
@@ -8836,12 +8982,20 @@ def create_admin_app(
         workspace_id: str = Depends(get_workspace_id),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Enqueue server processing after the owner daemon persisted raw input."""
+        """Enqueue server processing after the owner daemon persisted raw input.
+
+        A document Source the device acquired with its type's own Gene is
+        processed once its attempt is ready (:func:`ready_acquisition`), in
+        a run bound to that attempt; one collected through its type's
+        local-agent package path, once its snapshot manifest is materialized.
+        """
         source = await db.get_source(source_id)
         if source is None:
             raise HTTPException(status_code=404, detail="Source not found")
         if local_agent_sync_operation(source["type"], source.get("config")) is None:
-            raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
+            if not _is_document_source_type(str(source.get("type") or "")):
+                raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
+            return await _process_acquisition(request, db, sync_service, source, req, workspace_id)
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         current_source = await db.get_source(source_id)
@@ -9112,17 +9266,23 @@ def create_admin_app(
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
         collection = _local_agent_collection(source.get("type"))
-        if not (collection is not None and collection.accepts_artifact_inputs) and not _is_conversation_source(source):
+        package_inputs = (collection is not None and collection.accepts_artifact_inputs) or _is_conversation_source(
+            source
+        )
+        if not package_inputs and not _is_document_source_type(str(source.get("type") or "")):
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
+        lease_payload = await _require_current_local_agent_lease(
             request,
             db,
             source=source,
             job_id=local_agent_job_id,
             attempt_count=local_agent_attempt_count,
         )
+        if not package_inputs and lease_payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION:
+            # A document Source's device run uploads the artifacts its fetches describe.
+            raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         normalized_media_type = normalize_source_artifact_media_type(media_type)
         request_media_type = normalize_source_artifact_media_type(request.headers.get("content-type"))
         if normalized_media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
@@ -9674,6 +9834,156 @@ def create_admin_app(
             "answered_count": len(req.answers),
             "failed": req.failure_cause is not None,
         }
+
+    async def _acquisition_source(request: Request, db: Database, source_id: str) -> dict[str, Any]:
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        return source
+
+    @source_router.post("/{source_id}/acquisition/manifest")
+    async def submit_acquisition_manifest(
+        source_id: str,
+        req: AcquisitionManifestRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep the manifest of one device run and answer what the server run will ask beyond discovery.
+
+        The response's ``requests`` name the unlisted Units to confirm, the
+        failed Documents to rediscover and the failed items to fetch, by the
+        server run's own rules, computed once in the manifest's transaction:
+        a replay of the same manifest returns the stored requests. A manifest
+        above the bound every device manifest has, a listing of a scope the
+        job did not carry, and a reprocess that discovers or lists answer 422.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        leased_at = lease_payload.get(LOCAL_AGENT_LEASED_AT_FIELD)
+        if not leased_at:
+            raise HTTPException(status_code=409, detail="local_agent_lease_time_unknown")
+        reprocess = tuple(str(doc_id) for doc_id in lease_payload.get(REPROCESS_PAYLOAD_FIELD) or ())
+        try:
+            manifest = AcquisitionManifest.from_payload(req.manifest)
+            manifest.check_bound()
+            if reprocess and (manifest.discovered or manifest.listing != AcquiredListing() or manifest.excluded_listings):
+                raise ValueError("a reprocess discovers and lists nothing")
+            validate_excluded_listings_for_job(
+                manifest.excluded_listings,
+                (
+                    str(entry.get("scope_key") or "")
+                    for entry in lease_payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ()
+                    if isinstance(entry, Mapping)
+                ),
+            )
+        except (AcquisitionManifestTooLarge, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        requests = await acquisition_requests(db, source, manifest, reprocess_document_ids=reprocess)
+        try:
+            stored = await db.record_source_acquisition(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                manifest=manifest,
+                requests=requests,
+                started_at=datetime.fromisoformat(str(leased_at).replace("Z", "+00:00")),
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                source_config_revision=str(lease_payload["source_config_revision"]),
+            )
+        except (SourceActivityConflict, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "manifest_sha256": stored.manifest_sha256,
+            "requests": stored.requests.to_payload(),
+        }
+
+    @source_router.post("/{source_id}/acquisition/inputs")
+    async def upload_acquired_input(
+        source_id: str,
+        req: AcquiredInputRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep one acquired input of a device run for its job attempt.
+
+        The device fetches each discovered item before it submits the
+        manifest, so an input belongs to the attempt, not to a manifest
+        digest; the run reads only the inputs of items it asks for. Each
+        artifact the input names must already be an uploaded input of the
+        Source. The same input uploaded again is kept once.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        _lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        try:
+            package = AcquiredInputPackage.from_payload(req.package)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        artifact_hashes = tuple(dict.fromkeys(acquired.input_sha256 for acquired in package.artifacts))
+        if artifact_hashes:
+            held = await db.get_source_sync_inputs_by_raw_hashes(
+                source_id=source_id, workspace_id=workspace_id, raw_sha256s=artifact_hashes
+            )
+            if {held_input.raw_sha256 for held_input in held} != set(artifact_hashes):
+                raise HTTPException(status_code=409, detail="acquired input names an artifact that was not uploaded")
+        input_sha256 = await retain_acquired_input(
+            db,
+            artifact_store,
+            source_id=source_id,
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            package=package,
+        )
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "doc_id": package.item.item_id,
+            "input_sha256": input_sha256,
+        }
+
+    @source_router.post("/{source_id}/acquisition/answers")
+    async def submit_acquisition_answers(
+        source_id: str,
+        req: AcquisitionAnswersRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep a device run's answers to what its manifest response asked.
+
+        The answers must answer exactly what the response asked, bound to the
+        manifest's digest and attempt. An identical replay is accepted;
+        anything else that differs from the stored answers is refused with 409.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        _lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        try:
+            answers = AcquisitionAnswers.from_payload(req.answers)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            await db.record_source_acquisition_answers(
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                manifest_sha256=req.manifest_sha256,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                answers=answers,
+            )
+        except (SourceActivityConflict, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"source_id": source_id, "snapshot_id": snapshot_id}
 
     # ===================================================================
     # 4b. Agent Hook Context
