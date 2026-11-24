@@ -1676,11 +1676,15 @@ class SourceSyncWorker:
                 # the complete durable run would duplicate successful provider
                 # and lifecycle work without improving the failure boundary.
                 # An operator reprocess is not retried; the operator requests it again.
+                # A device run that failed on what its acquisition answered is
+                # not retried on the same acquisition, which answers the same.
+                acquisition_failed = acquisition is not None and final_state.acquisition_failed
                 next_attempt_at = (
                     self._next_retry_at(run, failed_at)
                     if final_state.last_sync_status == "failed"
                     and final_state.failure_retryable
                     and not reprocessing
+                    and not acquisition_failed
                     else None
                 )
                 failed = await self.db.fail_source_sync_run(
@@ -1703,8 +1707,8 @@ class SourceSyncWorker:
                     _publish_terminal_runtime_bundles(runtime, final_state)
                 if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
-                if final_state.acquisition_mismatch and acquisition is not None and not reprocessing:
-                    await self._acquire_again(run, source, runtime.doc_store)
+                if acquisition_failed and final_state.failure_retryable and not reprocessing:
+                    await self._acquire_again(run, runtime.doc_store)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1753,23 +1757,25 @@ class SourceSyncWorker:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
 
-    async def _acquire_again(self, run: SourceSyncRun, source: Mapping[str, Any], doc_store: LocalDocumentStore) -> None:
-        """Retry a device run that disagreed with its acquisition with a new ``document_acquisition`` job.
+    async def _acquire_again(self, run: SourceSyncRun, doc_store: LocalDocumentStore) -> None:
+        """Retry a device run that failed on its acquisition with a new ``document_acquisition`` job.
 
         The device acquires the Source again from the start of the job, so the
-        new attempt answers what its own run asks (ADR 0058). A Source that is
-        no longer active runs no new job.
+        new attempt answers what its own run asks and asks the provider again
+        (ADR 0058). A Source that is no longer active runs no new job.
         """
 
-        with contextlib.suppress(ValueError):
-            await enqueue_document_acquisition_job(
-                self.db,
-                doc_store,
-                source,
-                {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},
-                workspace_id=run.workspace_id,
-                trigger="retry",
-            )
+        source = await self.db.get_source(run.source_id)
+        if source is None or source.get("status") != "active":
+            return
+        await enqueue_document_acquisition_job(
+            self.db,
+            doc_store,
+            source,
+            {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},
+            workspace_id=run.workspace_id,
+            trigger="retry",
+        )
 
     async def _end_stopped_run(self, run: SourceSyncRun, source: Mapping[str, Any] | None) -> SourceSyncRun:
         """Fail a run a person stopped, not retryable, and release its Source.

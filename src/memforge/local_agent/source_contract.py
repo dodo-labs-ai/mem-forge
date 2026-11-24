@@ -6,7 +6,8 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
@@ -38,6 +39,18 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
     }
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAgentLease:
+    """A current lease of one local-agent job attempt, as the server validates it for each submission.
+
+    ``payload`` is the job's payload, and ``leased_at`` when the attempt was
+    leased: a device run reads its provider from then on.
+    """
+
+    payload: Mapping[str, Any]
+    leased_at: datetime
 LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
 LOCAL_PACKAGE_CONTRACT_VERSION = 3
 """The package contract this local agent collects under, declared in its manifest.

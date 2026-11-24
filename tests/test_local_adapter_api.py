@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
 from memforge.github_repo_utils import build_github_repo_doc_id
-from memforge.local_agent.source_contract import source_with_sync_inputs
+from memforge.local_agent.source_contract import LocalAgentLease, source_with_sync_inputs
 from memforge.local_adapter import submit_github_repo_document
 from memforge.models import ContentItem, require_attested_content
 from memforge.storage.database import Database
@@ -2037,7 +2037,7 @@ def test_local_adapter_revalidates_lease_before_committing_snapshot_membership(t
 
     async def validate(*args):
         calls.append(args)
-        return True
+        return await _allow_local_agent_lease()
 
     try:
         app = create_admin_app(
@@ -2292,10 +2292,10 @@ def test_local_adapter_push_cleans_artifact_when_lease_expires_after_write(
     database = _connect_database(tmp_path)
     validation_count = 0
 
-    async def validate_lease(*args, **kwargs) -> bool:
+    async def validate_lease(*args, **kwargs) -> LocalAgentLease | None:
         nonlocal validation_count
         validation_count += 1
-        return validation_count == 1
+        return await _allow_local_agent_lease() if validation_count == 1 else None
 
     try:
         app = create_admin_app(
@@ -2474,8 +2474,8 @@ def test_local_markdown_gene_converts_by_content_type(tmp_path):
         asyncio.run(database.close())
 
 
-async def _allow_local_agent_lease(*args, **kwargs) -> bool:
-    return True
+async def _allow_local_agent_lease(*args, **kwargs) -> LocalAgentLease:
+    return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
 
 
 class LeaseAwareTestClient(TestClient):

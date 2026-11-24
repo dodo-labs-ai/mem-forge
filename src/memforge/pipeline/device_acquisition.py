@@ -52,9 +52,9 @@ from memforge.local_agent.document_acquisition import (
 from memforge.local_agent.snapshot_manifest import ExcludedScopeListing
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
-    execution_owner_user_id,
     LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS,
     LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD,
+    execution_owner_user_id,
     local_agent_source_config_revision,
 )
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
@@ -63,19 +63,20 @@ from memforge.pipeline.stored_document import (
     StoredDocumentUnavailable,
     StoredDocumentUnavailableReason,
     committed_source_item,
+    document_content_item,
     stored_source_item,
 )
-from memforge.pipeline.sync import select_failed_items
+from memforge.pipeline.sync import STAGED_DERIVATION_STATUSES, select_failed_items
 from memforge.release import current_release
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
-from memforge.source_item_failures import FailedItemRetry, SourceItemFailure
+from memforge.source_item_failures import FailedItemRetry
 from memforge.source_projection_config import (
+    ExcludedScopesUnavailable,
     canonical_projection_scope,
     canonical_scope_transition,
     excluded_projection_scopes,
     excluded_scope_config,
     projection_scope_fingerprint,
-    ExcludedScopesUnavailable,
 )
 
 if TYPE_CHECKING:
@@ -233,15 +234,24 @@ async def acquisition_requests(
       confirms these, or the ones of them a completing transition does not
       remove by its excluded listings.
     - ``rediscover``, for a Source that can ask its provider for one Document
-      by id: each failure-ledger row the run retries, by the item its
-      committed Unit records or, for a row that never became a Unit, by the
-      row's own item. The run retries the rows a sync a person requested
-      retries, which hold every row a scheduled run retries, less the
-      Documents this manifest discovered and the rows its listing settles or
-      keeps untried. A run of an open transition retries no row.
-    - ``fetch``, for any other Source: the item each such row recorded, as
-      discovery returned it. A row without one is replayed from its Unit's
-      stored input on the server, and asks nothing of the device.
+      by id: each Document the run may retry, by the item its committed Unit
+      records or, for one that never became a Unit, by the item its failure
+      recorded. Those are the failure-ledger rows a sync a person requested
+      retries, and the Documents of the staged derivations its recovery may
+      end, less the Documents this manifest discovered and the rows its
+      listing settles or keeps untried. A run of an open transition retries
+      none.
+    - ``fetch``, for any other Source: the item each such Document's failure
+      recorded, as discovery returned it. One without such an item is
+      replayed from its Unit's stored input on the server, and asks nothing
+      of the device.
+
+    The response is a superset of what the run asks. A scheduled run retries
+    fewer rows than a requested one, but a person's request that coalesces
+    into the run asks for every row, and a run that asks for an item the
+    device was not asked about fails and acquires again. Recovery may end a
+    staged derivation, or a run of a later release may record its Document
+    as failed, only once the run starts, so each of them is asked for.
 
     A reprocess asks for its Documents the same way, and confirms nothing.
     """
@@ -249,6 +259,7 @@ async def acquisition_requests(
     source_id = str(source["id"])
     rediscovering = source_rediscovers_documents(str(source["type"]), source.get("config") or {})
     ledger = {failure.document_id: failure for failure in await db.list_source_item_failures(source_id=source_id)}
+    failed_items = {doc_id: failure.item for doc_id, failure in ledger.items() if failure.item is not None}
     confirm: list[ContentItem] = []
     if reprocess_document_ids:
         retried = sorted(reprocess_document_ids)
@@ -256,9 +267,16 @@ async def acquisition_requests(
         listing = manifest.listing.scope_listing()
         retried_doc_ids: set[str] = set()
         if await db.get_open_projection_scope_transition(source_id) is None:
+            staged = {
+                attempt.context.document.doc_id: document_content_item(attempt.context.document)
+                for attempt in await db.list_source_derivation_attempts(
+                    source_id=source_id, statuses=STAGED_DERIVATION_STATUSES
+                )
+            }
             retried_doc_ids, _left_alone = select_failed_items(
-                ledger, retry=FailedItemRetry.ALL, release=current_release(), recovered_doc_ids=set(), ended={}
+                ledger, retry=FailedItemRetry.ALL, release=current_release(), recovered_doc_ids=set(), ended=staged
             )
+            failed_items = {**staged, **failed_items}
         partition = listing_partition(listing, ledger, rediscovering=rediscovering)
         discovered = {item.item_id for item in manifest.discovered}
         retried = sorted(retried_doc_ids - discovered - partition.settled - partition.untried)
@@ -269,27 +287,27 @@ async def acquisition_requests(
     rediscover: list[ContentItem] = []
     fetch: list[ContentItem] = []
     for doc_id in retried:
-        failure = ledger.get(doc_id)
+        failed_item = failed_items.get(doc_id)
         if not rediscovering:
-            if failure is not None and failure.item is not None:
-                fetch.append(failure.item)
+            if failed_item is not None:
+                fetch.append(failed_item)
             continue
-        item = await _rediscovery_item(db, source_id, doc_id, failure)
+        item = await _rediscovery_item(db, source_id, doc_id, failed_item)
         if item is not None:
             rediscover.append(item)
     return AcquisitionRequests(confirm=tuple(confirm), rediscover=tuple(rediscover), fetch=tuple(fetch))
 
 
 async def _rediscovery_item(
-    db: Database, source_id: str, doc_id: str, failure: SourceItemFailure | None
+    db: Database, source_id: str, doc_id: str, failed_item: ContentItem | None
 ) -> ContentItem | None:
     """The item a server run asks ``rediscover`` with for one Document, ``None`` when it asks nothing."""
 
     try:
         return await committed_source_item(db, source_id=source_id, document_id=doc_id)
     except StoredDocumentUnavailable as exc:
-        if exc.reason is StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING and failure is not None:
-            return failure.item
+        if exc.reason is StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING:
+            return failed_item
         return None
 
 
@@ -478,19 +496,21 @@ class DeviceAcquisitionRecord:
 
     @contextlib.asynccontextmanager
     async def open_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:
-        input_sha256 = next(
+        acquired = next(
             (
-                acquired.input_sha256
+                acquired
                 for package in self._packages.values()
                 for acquired in package.artifacts
                 if acquired.artifact == artifact
             ),
             None,
         )
-        if input_sha256 is None:
+        if acquired is None:
             raise AcquisitionRecordMismatch(f"artifact {artifact.provider_key} was not acquired")
+        if acquired.failure is not None:
+            raise acquired.failure.raised()
         inputs = await self._db.get_source_sync_inputs_by_raw_hashes(
-            source_id=self._source_id, workspace_id=self._workspace_id, raw_sha256s=(input_sha256,)
+            source_id=self._source_id, workspace_id=self._workspace_id, raw_sha256s=(str(acquired.input_sha256),)
         )
         if not inputs:
             raise AcquisitionRecordMismatch(f"the input of artifact {artifact.provider_key} is not kept")

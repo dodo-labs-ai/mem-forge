@@ -9,7 +9,8 @@ server. The calls are the ones a server run makes, in this order:
 1. ``discover(since)``, then ``list_scope`` when the configuration lists;
 2. ``fetch`` of each discovered item, with its PDF export when the type
    exports PDFs and the artifacts it describes, each uploaded as an acquired
-   input;
+   input; an artifact that cannot be read is the item's failure, as it is in
+   a server run, and not the attempt's;
 3. ``list_scope`` of each excluded scope the job carries;
 4. the manifest is submitted, and its response names what the server run
    will ask beyond discovery;
@@ -54,7 +55,11 @@ from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS, 
 from memforge.local_agent.source_contract import LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.pipeline.sync import MAX_RETRIES
-from memforge.source_artifacts import RawSourceArtifact
+from memforge.source_artifacts import (
+    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
+    RawSourceArtifact,
+    read_source_artifact_bytes,
+)
 
 __all__ = ["AcquisitionSummary", "AcquisitionTransport", "acquire_document_source"]
 
@@ -249,19 +254,44 @@ class _Acquirer:
                 pdf = await self._again(lambda: self._gene.fetch_pdf(item))
             except Exception as exc:
                 pdf_failure = AcquisitionError.from_exception(exc)
-        artifacts: list[AcquiredArtifact] = []
-        for artifact in raw.artifacts:
-            async with self._gene.open_source_artifact(artifact) as download:
-                body = b"".join([chunk async for chunk in download.chunks])
-            artifacts.append(AcquiredArtifact(artifact, await self._transport.upload_artifact(item, artifact, body)))
         return AcquiredInputPackage(
             item=item,
             body=raw.body,
             content_type=raw.content_type,
             pdf=pdf,
             pdf_failure=pdf_failure,
-            artifacts=tuple(artifacts),
+            artifacts=await self._acquire_artifacts(item, raw.artifacts),
         )
+
+    async def _acquire_artifacts(
+        self, item: ContentItem, artifacts: tuple[RawSourceArtifact, ...]
+    ) -> tuple[AcquiredArtifact, ...]:
+        """Read and upload each artifact ``fetch`` described, as the server run materializes them.
+
+        Each body is read through the bounds the server's store applies, so a
+        body the server would refuse fails here with the error the server run
+        raises. An artifact that cannot be read keeps its error, which the
+        server run raises where it opens that artifact and fails the Document.
+        """
+
+        acquired: list[AcquiredArtifact] = []
+        remaining_unit_bytes = MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT
+        for artifact in artifacts:
+            try:
+                body = await self._again(
+                    lambda artifact=artifact, remaining=remaining_unit_bytes: read_source_artifact_bytes(
+                        artifact=artifact,
+                        remaining_unit_bytes=remaining,
+                        open_artifact=self._gene.open_source_artifact,
+                    )
+                )
+            except Exception as exc:
+                acquired.append(AcquiredArtifact(artifact, failure=AcquisitionError.from_exception(exc)))
+                continue
+            remaining_unit_bytes -= len(body)
+            input_sha256 = await self._transport.upload_artifact(item, artifact, body)
+            acquired.append(AcquiredArtifact(artifact, input_sha256=input_sha256))
+        return tuple(acquired)
 
     async def _again(self, call: Callable[[], Awaitable[T]]) -> T:
         """Make one provider call, again after a pause when it fails, as the server run retries a Document."""

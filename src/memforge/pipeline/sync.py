@@ -37,7 +37,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.genes import gene_exports_pdf, source_rediscovers_documents
 from memforge.genes.conversation_gene import CollectionAttempt
-from memforge.genes.recorded import AcquisitionRecordMismatch
+from memforge.genes.recorded import AcquisitionFailed, AcquisitionRecordMismatch
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
@@ -694,6 +694,10 @@ def _derivation_item(context: SourceUnitDerivationContext) -> ContentItem:
     return document_content_item(context.document)
 
 
+STAGED_DERIVATION_STATUSES = ("pending", "retryable_failure", "completed")
+"""The statuses of a staged Source derivation, which a run resumes before it reads the provider."""
+
+
 def select_failed_items(
     ledger: Mapping[str, SourceItemFailure],
     *,
@@ -1045,7 +1049,7 @@ class GeneSyncOrchestrator:
         reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
-        acquisition_mismatch = False
+        acquisition_failed = False
         absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
         unlisted_present_count: int | None = None
         recovered_completed_results: tuple[dict[str, Any], ...] = ()
@@ -1484,8 +1488,11 @@ class GeneSyncOrchestrator:
                             explicitly_retryable = bool(
                                 getattr(exc, "retryable", True)
                             )
+                            # An error the run's acquisition record answers
+                            # with gives the same answer when asked again: the
+                            # device already tried the provider again.
                             retry_document = (
-                                not isinstance(exc, MemoryExtractionFailure)
+                                not isinstance(exc, (MemoryExtractionFailure, AcquisitionFailed))
                                 and explicitly_retryable
                             )
                             if not explicitly_retryable:
@@ -1498,7 +1505,7 @@ class GeneSyncOrchestrator:
                         last_error = attempt_error
                         if not retry_document:
                             logger.error(
-                                "Failed to process %s after extraction retry exhaustion: %s",
+                                "Failed to process %s; the error is not retried within the run: %s",
                                 item.item_id,
                                 attempt_error,
                             )
@@ -1864,7 +1871,7 @@ class GeneSyncOrchestrator:
             except Exception:
                 logger.exception("Failed to record the failed Documents of %s", source_id)
             failure_retryable = retries_failure(e, store=self.db)
-            acquisition_mismatch = isinstance(e, AcquisitionRecordMismatch)
+            acquisition_failed = isinstance(e, (AcquisitionRecordMismatch, AcquisitionFailed))
             if (runtime_bundle := getattr(e, "runtime_bundle", None)) is not None:
                 runtime_bundles.append(runtime_bundle)
             if scope_transition is not None and transition_started:
@@ -1930,7 +1937,7 @@ class GeneSyncOrchestrator:
             error_message=error_message,
             failed_docs=failed_docs,
             failure_retryable=failure_retryable,
-            acquisition_mismatch=acquisition_mismatch,
+            acquisition_failed=acquisition_failed,
             absence_check_skipped_reason=absence_check_skipped_reason,
             unlisted_present_count=unlisted_present_count,
             runtime_bundles=tuple(runtime_bundles),
@@ -2161,11 +2168,7 @@ class GeneSyncOrchestrator:
         results: list[dict[str, Any]] = []
         attempts = await self.db.list_source_derivation_attempts(
             source_id=source_id,
-            statuses=(
-                "pending",
-                "retryable_failure",
-                "completed",
-            ),
+            statuses=STAGED_DERIVATION_STATUSES,
         )
         latest_by_projection: dict[
             tuple[str, str, str],

@@ -17,7 +17,7 @@ from memforge.local_agent.snapshot_manifest import (
     SnapshotManifestItem,
     snapshot_manifest_sha256,
 )
-from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
+from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION, LocalAgentLease
 from memforge.config import AppConfig
 from memforge.models import ContentItem, NormalizedContent, RawContent, SyncState
 from memforge.pipeline.collection_family import SnapshotBinding
@@ -44,8 +44,8 @@ class _Lease:
         self.current = True
         self.payload: dict = {"leased": True}
 
-    async def __call__(self, *args, **kwargs) -> dict | bool:
-        return self.payload if self.current else False
+    async def __call__(self, *args, **kwargs) -> LocalAgentLease | None:
+        return LocalAgentLease(payload=self.payload, leased_at=datetime.now(timezone.utc)) if self.current else None
 
 
 def _hold(database: Database, source_id: str, issues: dict[str, str], *, incarnation: str | None = None) -> None:

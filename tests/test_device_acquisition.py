@@ -13,19 +13,24 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 import memforge.server.admin_api as admin_api
 from memforge.config import AppConfig
 from memforge.genes.notion_gene import NotionGene
 from memforge.local_agent.acquisition_daemon import acquire_document_source
 from memforge.local_agent.document_acquisition import (
+    AcquiredArtifact,
     AcquiredInputPackage,
     AcquiredListing,
     AcquisitionAnswers,
+    AcquisitionError,
     AcquisitionManifest,
     AcquisitionManifestTooLarge,
     AcquisitionRequests,
@@ -34,11 +39,13 @@ from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.source_contract import (
     DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
+    LocalAgentLease,
     local_agent_source_config_revision,
 )
 from memforge.models import (
     AbsenceAnswer,
     ContentItem,
+    DocumentRecord,
     NormalizedContent,
     RawContent,
     ScopeListing,
@@ -46,8 +53,11 @@ from memforge.models import (
     SyncState,
 )
 from memforge.pipeline.device_acquisition import document_acquisition_job_payload
+from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker
+from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
+from memforge.source_derivation import SourceUnitDerivationContext, source_derivation_manifest
 from memforge.source_item_failures import FailedItemRetry, SourceItemFailure
 from memforge.source_projection import ProjectionScopeTransition
 from memforge.source_projection_config import canonical_projection_scope, projection_scope_fingerprint
@@ -79,12 +89,14 @@ class Page:
 
 
 class Wiki:
-    """The provider: its pages, the ones in the configured tree, and the pages it refuses to read."""
+    """The provider: its pages, the ones in the configured tree, their attachments, and what it refuses to read."""
 
     def __init__(self) -> None:
         self.pages: dict[str, Page] = {}
         self.in_tree: set[str] = set()
         self.refused: set[str] = set()
+        self.attachments: dict[str, bytes] = {}
+        self.unreadable_attachments: set[str] = set()
         self.calls: list[str] = []
 
     def write(self, page_id: str, body: str, edited_at: datetime) -> None:
@@ -109,6 +121,16 @@ class WikiUnavailable(RuntimeError):
     """The wiki could not serve a page this time."""
 
     retryable = True
+
+
+class AttachmentUnreadable(RuntimeError):
+    """The wiki could not serve an attachment; the error says nothing of whether it may pass."""
+
+
+def _png() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color=(20, 40, 60)).save(output, format="PNG")
+    return output.getvalue()
 
 
 class WikiGene(FakeGene):
@@ -158,6 +180,8 @@ class WikiGene(FakeGene):
     async def rediscover(self, item):
         wiki = self._wiki("rediscover")
         page_id = str(item.extra["page_id"])
+        if page_id in wiki.refused:
+            raise WikiUnavailable(f"the wiki could not look up page {page_id}")
         return wiki.item(page_id) if page_id in wiki.in_tree else None
 
     async def fetch(self, item):
@@ -167,7 +191,36 @@ class WikiGene(FakeGene):
             raise WikiUnavailable(f"the wiki could not serve page {page_id}")
         # What fetch read is noted on the item, as a Gene that hydrates during fetch does.
         item.extra["read_from"] = "wiki"
-        return RawContent(item=item, body=wiki.pages[page_id].body.encode(), content_type="text/markdown")
+        artifacts: tuple[RawSourceArtifact, ...] = ()
+        if page_id in wiki.attachments:
+            artifacts = (
+                RawSourceArtifact(
+                    provider_key=f"attachment-{page_id}",
+                    parent_observation_type="document",
+                    parent_provider_key=item.item_id,
+                    provider_revision=wiki.pages[page_id].edited_at.isoformat(),
+                    filename="diagram.png",
+                    media_type="image/png",
+                    declared_size_bytes=len(wiki.attachments[page_id]),
+                    locator={"page_id": page_id},
+                ),
+            )
+        return RawContent(
+            item=item, body=wiki.pages[page_id].body.encode(), content_type="text/markdown", artifacts=artifacts
+        )
+
+    @asynccontextmanager
+    async def open_source_artifact(self, artifact):
+        wiki = self._wiki("open_source_artifact")
+        page_id = str(artifact.locator["page_id"])
+        if page_id in wiki.unreadable_attachments:
+            raise AttachmentUnreadable(f"the wiki could not serve the attachment of page {page_id}")
+        body = wiki.attachments[page_id]
+
+        async def chunks():
+            yield body
+
+        yield SourceArtifactDownload(chunks=chunks(), media_type=artifact.media_type, content_length=len(body))
 
     async def normalize(self, raw):
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\n{raw.body.decode()}")
@@ -178,13 +231,18 @@ class _Lease:
 
     def __init__(self) -> None:
         self.current = True
-        self.payload: dict = {}
+        self.held: LocalAgentLease | None = None
+
+    @property
+    def payload(self) -> Mapping[str, object]:
+        assert self.held is not None
+        return self.held.payload
 
     def lease(self, payload: Mapping[str, object], *, leased_at: datetime) -> None:
-        self.payload = {**payload, "leased_at": leased_at.isoformat()}
+        self.held = LocalAgentLease(payload=dict(payload), leased_at=leased_at)
 
-    async def __call__(self, *args, **kwargs) -> dict | bool:
-        return self.payload if self.current else False
+    async def __call__(self, *args, **kwargs) -> LocalAgentLease | None:
+        return self.held if self.current else None
 
 
 class _Side:
@@ -195,6 +253,11 @@ class _Side:
         self.doc_store = doc_store
         self.engine = _OrderRecordingMemoryEngine(defer=False)
         self.engine.db = db
+        self.retry_sleeps: list[float] = []
+
+    async def _retry_sleep(self, delay: float) -> None:
+        self.retry_sleeps.append(delay)
+        await _skip_retry_delay(delay)
 
     def orchestrator(self) -> GeneSyncOrchestrator:
         return GeneSyncOrchestrator(
@@ -204,7 +267,7 @@ class _Side:
             memory_engine=self.engine,
             memory_store=RecordingDocumentDeleteMemoryStore(self.db),
             max_concurrent=1,
-            retry_sleep=_skip_retry_delay,
+            retry_sleep=self._retry_sleep,
         )
 
     async def documents(self) -> dict[str, tuple]:
@@ -243,6 +306,14 @@ class _Side:
             assert stored is not None
             held[doc_id] = (stored.item.to_payload(), stored.raw_content_sha256, stored.normalized_content_hash)
         return held
+
+    async def artifacts(self) -> list[tuple[str, dict]]:
+        """Each current Document's stored artifacts, without where each deployment's store keeps the bytes."""
+
+        return [
+            (doc_id, {key: value for key, value in metadata["source_artifact"].items() if key != "uri"})
+            for doc_id, metadata in await self.db.list_current_document_artifacts(SOURCE_ID)
+        ]
 
     async def ledger(self) -> dict[str, tuple]:
         return {
@@ -296,8 +367,27 @@ class _RouteTransport:
         self.manifest_sha256 = answer["manifest_sha256"]
         return AcquisitionRequests.from_payload(answer["requests"])
 
+    def _upload_artifact(self, item, artifact, body) -> str:
+        response = self._client.post(
+            f"/api/v1/sources/{SOURCE_ID}/adapter/artifacts",
+            params={
+                "source_unit_key": item.item_id,
+                "provider_key": artifact.provider_key,
+                "provider_revision": artifact.provider_revision,
+                "parent_observation_type": artifact.parent_observation_type,
+                "parent_provider_key": artifact.parent_provider_key,
+                "filename": artifact.filename,
+                "media_type": artifact.media_type,
+                **self._attempt,
+            },
+            content=body,
+            headers={"content-type": artifact.media_type},
+        )
+        assert response.status_code == 200, response.text
+        return str(response.json()["input_sha256"])
+
     async def upload_artifact(self, item, artifact, body) -> str:
-        raise AssertionError("the wiki describes no artifacts")
+        return await asyncio.to_thread(self._upload_artifact, item, artifact, body)
 
     async def upload_input(self, package: AcquiredInputPackage) -> None:
         await asyncio.to_thread(self._post, "inputs", {"package": package.to_payload()})
@@ -411,6 +501,7 @@ async def _end_state(side: _Side) -> tuple:
         await side.documents(),
         await side.units(),
         await side.held(),
+        await side.artifacts(),
         await side.ledger(),
         await side.cursor(),
         await side.last_run(),
@@ -439,6 +530,7 @@ def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deplo
     for page_id in ("a", "b", "c", "d", "g"):
         wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
     wiki.refused = {"d"}
+    wiki.attachments["a"] = _png()
     runs = [FIRST_RUN, FIRST_RUN + timedelta(hours=1), FIRST_RUN + timedelta(hours=2)]
 
     def changes(index: int) -> None:
@@ -494,6 +586,10 @@ def test_a_device_run_and_a_server_run_against_the_same_provider_end_alike(deplo
     assert documents["wiki-g"][5] != before_touch[5]
     assert documents["wiki-g"][6] == before_touch[6]
     assert held["wiki-a"][0]["extra"]["read_from"] == "wiki"
+    # The page's attachment went through the artifact route and is stored as the server stores it.
+    assert [(doc_id, artifact["filename"]) for doc_id, artifact in asyncio.run(device.artifacts())] == [
+        ("wiki-a", "diagram.png")
+    ]
     assert asyncio.run(device.last_run())["unlisted_present_count"] == 1
     assert asyncio.run(device.cursor()) == runs[2]
 
@@ -1136,3 +1232,154 @@ def test_a_reprocess_on_the_device_ends_as_a_reprocess_on_the_server(deployments
     assert held["wiki-a"][1] != before["wiki-a"][1]
     assert held["wiki-b"] == before["wiki-b"]
     assert asyncio.run(device.cursor()) == asyncio.run(server.cursor()) == FIRST_RUN
+
+
+def test_an_attachment_the_device_cannot_read_fails_its_document_as_on_the_server(deployments, wiki):
+    server, device, client, lease = deployments
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    wiki.attachments["a"] = _png()
+    wiki.unreadable_attachments = {"a"}
+
+    _server_run(server, FIRST_RUN)
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+
+    assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
+    # The attachment fails its page, not the run: b commits and a is in the ledger.
+    assert sorted(asyncio.run(device.held())) == ["wiki-b"]
+    stage, error_class, message, retryable = asyncio.run(device.ledger())["wiki-a"]
+    assert error_class.endswith("AttachmentUnreadable")
+    assert message == "the wiki could not serve the attachment of page a"
+    assert retryable is False
+    # The server run tries the page again within its run; the device run tried
+    # the provider again on the device, so its run replays the recorded error once.
+    assert server.retry_sleeps == [2, 4]
+    assert device.retry_sleeps == []
+    package = AcquiredInputPackage.decode(
+        asyncio.run(
+            asyncio.to_thread(
+                device.doc_store.read_artifact,
+                asyncio.run(
+                    device.db.get_source_sync_snapshot_input(
+                        source_id=SOURCE_ID, workspace_id=WORKSPACE, snapshot_id="job-0:attempt:1", doc_id="wiki-a"
+                    )
+                ).raw_uri,
+            )
+        )
+    )
+    assert [(entry.input_sha256, entry.failure is not None) for entry in package.artifacts] == [(None, True)]
+
+
+def test_an_acquired_input_must_name_only_artifacts_that_were_uploaded(deployments, wiki):
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN)
+    _lease_job(device, lease)
+    artifact = RawSourceArtifact(
+        provider_key="attachment-a",
+        parent_observation_type="document",
+        parent_provider_key="wiki-a",
+        provider_revision="1",
+        filename="diagram.png",
+        media_type="image/png",
+        declared_size_bytes=None,
+        locator={"page_id": "a"},
+    )
+
+    def upload(acquired: AcquiredArtifact):
+        package = AcquiredInputPackage(
+            item=wiki.item("a"), body=b"body of a", content_type="text/markdown", artifacts=(acquired,)
+        )
+        return client.post(
+            f"/api/v1/sources/{SOURCE_ID}/acquisition/inputs",
+            json={"local_agent_job_id": "job-1", "local_agent_attempt_count": 1, "package": package.to_payload()},
+        )
+
+    never_uploaded = upload(AcquiredArtifact(artifact, input_sha256="0" * 64))
+    failed = upload(
+        AcquiredArtifact(
+            artifact,
+            failure=AcquisitionError(failure_class="tests.AttachmentUnreadable", message="gone", transient=False),
+        )
+    )
+
+    assert never_uploaded.status_code == 409
+    assert never_uploaded.json()["detail"] == "acquired input names an artifact that was not uploaded"
+    # An artifact the device could not read names its error, and no upload.
+    assert failed.status_code == 200, failed.text
+
+
+def test_a_run_that_fails_on_a_recorded_provider_error_acquires_again(deployments, wiki):
+    _server, device, client, lease = deployments
+    _own(device.db)
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    _fail(device.db, "wiki-b", wiki.item("b"))
+    # The provider cannot look b up this time, so the run cannot read the Document it retries.
+    wiki.refused = {"b"}
+
+    requests = _device_run(device, client, lease, FIRST_RUN + timedelta(hours=1), job="job-1")
+
+    assert [item.item_id for item in requests.rediscover] == ["wiki-b"]
+    run = asyncio.run(device.db.get_latest_source_sync_run(source_id=SOURCE_ID, workspace_id=WORKSPACE))
+    assert run is not None and run.status == "failed"
+    assert "could not look up page b" in (run.error_message or "")
+    # The same acquisition answers the same error, so the run is not retried on
+    # it: a new job asks the provider again.
+    assert run.next_attempt_at is None
+    jobs = asyncio.run(device.db.list_current_local_agent_jobs(workspace_id=WORKSPACE, user_id=LOCAL_DEV_USER_ID))
+    assert [(job["operation"], job["status"]) for job in jobs] == [(DOCUMENT_ACQUISITION_OPERATION, "queued")]
+
+
+def test_the_manifest_response_asks_for_the_documents_of_staged_derivations(deployments, wiki):
+    _server, device, client, lease = deployments
+    _configure(device, {**CONFIG, "rediscovers": False})
+    wiki.write("s", "body of s", FIRST_RUN)
+    staged_item = wiki.item("s")
+    body = "body of s"
+    projection = project_source_item(
+        source_id=SOURCE_ID,
+        source_type="wiki",
+        run_id="run-1",
+        item=staged_item,
+        raw=RawContent(item=staged_item, body=body.encode(), content_type="text/markdown"),
+        normalized=NormalizedContent(item=staged_item, markdown_body=body),
+        scope={},
+        access_context={"visibility": "workspace"},
+    )
+    document = DocumentRecord(
+        doc_id=staged_item.item_id,
+        source=SOURCE_ID,
+        source_url=staged_item.source_url,
+        title=staged_item.title,
+        space_or_project="team_alpha",
+        author=None,
+        last_modified=FIRST_RUN,
+        labels=[],
+        version=staged_item.version,
+        content_hash="hash",
+        token_count=20,
+        last_synced=FIRST_RUN,
+    )
+    context = SourceUnitDerivationContext(
+        document=document,
+        doc_type="document",
+        project_key=None,
+        repo_identifier=None,
+        document_content=projection.observation_revisions[0].content,
+        update_mode="new",
+        changed_hunks=None,
+        update_plan_stats=None,
+        source_updated_at=FIRST_RUN.isoformat(),
+        user_id=None,
+    )
+    asyncio.run(device.db.stage_source_derivation(source_derivation_manifest(projection, (), context=context)))
+    _lease_job(device, lease)
+    listing = AcquiredListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset({"wiki-s"}))
+
+    response = _manifest_route(client, AcquisitionManifest(listing=listing))
+
+    assert response.status_code == 200, response.text
+    # Recovery may end the staged derivation, and a requested run then fetches its Document again.
+    requests = AcquisitionRequests.from_payload(response.json()["requests"])
+    assert [item.item_id for item in requests.fetch] == ["wiki-s"]

@@ -3462,6 +3462,8 @@ class _ClientAcquisitionTransport:
         return response
 
     async def submit_manifest(self, manifest: AcquisitionManifest) -> AcquisitionRequests:
+        from memforge.local_agent.document_acquisition import AcquisitionRequests
+
         response = self._checked(
             await asyncio.to_thread(
                 self._client.submit_acquisition_manifest,
@@ -3473,8 +3475,6 @@ class _ClientAcquisitionTransport:
             "submitting the acquisition manifest",
         )
         self._manifest_sha256 = str(response["manifest_sha256"])
-        from memforge.local_agent.document_acquisition import AcquisitionRequests
-
         return AcquisitionRequests.from_payload(response.get("requests") or {})
 
     async def upload_artifact(self, item: ContentItem, artifact: RawSourceArtifact, body: bytes) -> str:
@@ -3536,10 +3536,11 @@ def _run_cloud_document_acquisition_job(
     """
 
     from memforge.genes import gene_class
+    from memforge.llm.structured import failure_retryable
     from memforge.local_agent.acquisition_daemon import acquire_document_source
-    from memforge.source_types import source_type_descriptor
     from memforge.local_agent.document_acquisition import AcquisitionManifestTooLarge
     from memforge.local_agent.runner import CloudJobLeaseLost
+    from memforge.source_types import source_type_descriptor
 
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -3575,8 +3576,6 @@ def _run_cloud_document_acquisition_job(
             "retryable": False,
         }
     except Exception as exc:
-        from memforge.llm.structured import failure_retryable
-
         return {
             "operation": operation,
             "source_id": source_id,

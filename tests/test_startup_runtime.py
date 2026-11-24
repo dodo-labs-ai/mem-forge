@@ -15,6 +15,7 @@ from rich.logging import RichHandler
 
 from memforge.config import AppConfig
 from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.local_agent.source_contract import LocalAgentLease
 from memforge.models import Memory, SyncState, Visibility, content_hash
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
@@ -2604,7 +2605,7 @@ async def test_source_scope_update_cancels_active_sync(db, tmp_path, monkeypatch
     fake_sync_service = FakeSyncService()
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
 
     app = create_admin_app(
         db=db,
@@ -2877,7 +2878,7 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
         raise SourceActivityConflict("source activity started during local enqueue")
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
 
     monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
     app = create_admin_app(
@@ -3070,7 +3071,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     fake_sync_service = FakeSyncService()
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
 
     app = create_admin_app(
         db=db,

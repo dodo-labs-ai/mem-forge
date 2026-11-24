@@ -319,6 +319,7 @@ from memforge.local_agent.snapshot_manifest import (
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
+    LocalAgentLease,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
@@ -645,10 +646,6 @@ def _require_source_sync_support(source: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="source_sync_not_supported")
 
 
-LOCAL_AGENT_LEASED_AT_FIELD = "leased_at"
-"""The field of a current lease that holds when its job attempt was leased, as an ISO time."""
-
-
 async def _require_current_local_agent_lease(
     request: Request,
     db: Database,
@@ -656,12 +653,12 @@ async def _require_current_local_agent_lease(
     source: Mapping[str, Any],
     job_id: str | None,
     attempt_count: int | None,
-) -> dict[str, Any]:
-    """The payload of the Source's job attempt while the caller holds its lease; 409 otherwise.
+) -> LocalAgentLease:
+    """The Source's job attempt while the caller holds its lease; 409 otherwise.
 
-    The payload carries the Source's current configuration revision and, as
-    :data:`LOCAL_AGENT_LEASED_AT_FIELD`, when the attempt was leased. A
-    deployment's own lease validator returns the payload it holds.
+    The lease's payload carries the Source's current configuration revision.
+    A deployment's own lease validator returns the :class:`LocalAgentLease`
+    it holds while the lease is current, and ``None`` otherwise.
     """
     source_id = str(source.get("id") or "").strip()
     expected_config_revision = local_agent_source_config_revision(source)
@@ -669,29 +666,20 @@ async def _require_current_local_agent_lease(
     if not normalized_job_id or attempt_count is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
     validator = getattr(request.app.state, "local_agent_lease_validator", None)
-    job_payload: Mapping[str, Any] = {}
+    lease: LocalAgentLease | None = None
     if validator is not None:
-        validation = await validator(
+        lease = await validator(
             request,
             source_id,
             normalized_job_id,
             int(attempt_count or 0),
             expected_config_revision,
         )
-        valid = bool(validation)
-        if isinstance(validation, Mapping):
-            job_payload = validation
     else:
         job = await db.get_local_agent_job(normalized_job_id)
-        if job:
-            job_payload = {**(job.get("payload") or {}), LOCAL_AGENT_LEASED_AT_FIELD: job.get("leased_at")}
-        leased_until = None
-        if job and job.get("leased_until"):
-            try:
-                leased_until = datetime.fromisoformat(str(job["leased_until"]).replace("Z", "+00:00"))
-            except ValueError:
-                leased_until = None
-        valid = bool(
+        leased_until = _lease_time(job.get("leased_until")) if job else None
+        leased_at = _lease_time(job.get("leased_at")) if job else None
+        if (
             job
             and job.get("status") == "leased"
             and job.get("source_id") == source_id
@@ -700,13 +688,22 @@ async def _require_current_local_agent_lease(
             and (job.get("payload") or {}).get("source_config_revision") == expected_config_revision
             and leased_until is not None
             and leased_until > datetime.now(timezone.utc)
-        )
-    if not valid:
+            and leased_at is not None
+        ):
+            lease = LocalAgentLease(payload=dict(job.get("payload") or {}), leased_at=leased_at)
+    if lease is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
-    return {
-        **job_payload,
-        "source_config_revision": expected_config_revision,
-    }
+    return LocalAgentLease(
+        payload={**lease.payload, "source_config_revision": expected_config_revision},
+        leased_at=lease.leased_at,
+    )
+
+
+def _lease_time(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -3052,14 +3049,14 @@ async def _require_acquisition_lease(
     *,
     source: Mapping[str, Any],
     attempt: AcquisitionAttemptRequest,
-) -> tuple[dict[str, Any], str]:
-    """The payload of the current ``document_acquisition`` job attempt of a document Source, and its attempt id.
+) -> tuple[LocalAgentLease, str]:
+    """The current ``document_acquisition`` job attempt of a document Source, and its attempt id.
 
     A Source of another family, and a job of another operation, answer 409
     ``document_acquisition_job_required``.
     """
 
-    lease_payload = await _require_current_local_agent_lease(
+    lease = await _require_current_local_agent_lease(
         request,
         db,
         source=source,
@@ -3068,10 +3065,10 @@ async def _require_acquisition_lease(
     )
     if (
         not _is_document_source_type(str(source.get("type") or ""))
-        or lease_payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION
+        or lease.payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION
     ):
         raise HTTPException(status_code=409, detail="document_acquisition_job_required")
-    return lease_payload, local_agent_sync_snapshot_id(attempt.local_agent_job_id, attempt.local_agent_attempt_count)
+    return lease, local_agent_sync_snapshot_id(attempt.local_agent_job_id, attempt.local_agent_attempt_count)
 
 
 def _is_document_source_type(source_type: str) -> bool:
@@ -5094,7 +5091,9 @@ def create_admin_app(
     workspace_role_resolver: Callable[[Request], str] | None = None,
     maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
-    local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
+    local_agent_lease_validator: (
+        Callable[[Request, str, str, int, str], Awaitable[LocalAgentLease | None]] | None
+    ) = None,
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
     local_agent_job_stopper: Callable[[str], Awaitable[list[str]]] | None = None,
     langfuse_annotation_adapter: object | None = None,
@@ -8921,7 +8920,7 @@ def create_admin_app(
         _require_source_sync_support(source)
         if req is None or not req.local_agent_job_id or req.local_agent_attempt_count is None:
             raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
-        lease_payload, snapshot_id = await _require_acquisition_lease(
+        lease, snapshot_id = await _require_acquisition_lease(
             request,
             db,
             source=source,
@@ -8929,6 +8928,7 @@ def create_admin_app(
                 local_agent_job_id=req.local_agent_job_id, local_agent_attempt_count=req.local_agent_attempt_count
             ),
         )
+        lease_payload = lease.payload
         if req.sync_snapshot_id and req.sync_snapshot_id != snapshot_id:
             raise HTTPException(status_code=409, detail="local agent snapshot does not match the leased job attempt")
         config_revision = str(lease_payload["source_config_revision"])
@@ -9013,13 +9013,15 @@ def create_admin_app(
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=current_source,
-            job_id=req.local_agent_job_id if req else None,
-            attempt_count=req.local_agent_attempt_count if req else None,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                db,
+                source=current_source,
+                job_id=req.local_agent_job_id if req else None,
+                attempt_count=req.local_agent_attempt_count if req else None,
+            )
+        ).payload
         if lease_payload.get("dry_run"):
             # A dry run reports its plan; nothing it collected is processed.
             raise HTTPException(status_code=409, detail="dry_run_job_is_not_processed")
@@ -9273,13 +9275,15 @@ def create_admin_app(
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=local_agent_job_id,
-            attempt_count=local_agent_attempt_count,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                db,
+                source=source,
+                job_id=local_agent_job_id,
+                attempt_count=local_agent_attempt_count,
+            )
+        ).payload
         if not package_inputs and lease_payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION:
             # A document Source's device run uploads the artifacts its fetches describe.
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
@@ -9522,13 +9526,15 @@ def create_admin_app(
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         gene = cast(ConversationGene, _conversation_gene(source))
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=attempt.local_agent_job_id,
-            attempt_count=attempt.local_agent_attempt_count,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                db,
+                source=source,
+                job_id=attempt.local_agent_job_id,
+                attempt_count=attempt.local_agent_attempt_count,
+            )
+        ).payload
         collections = StoredCollections(db, workspace_id=workspace_id)
         return _ConversationUpload(
             gene=gene,
@@ -9696,13 +9702,15 @@ def create_admin_app(
             raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                db,
+                source=source,
+                job_id=req.local_agent_job_id,
+                attempt_count=req.local_agent_attempt_count,
+            )
+        ).payload
         try:
             snapshot_id = local_agent_collection_attempt_id(
                 source.get("type"),
@@ -9855,17 +9863,16 @@ def create_admin_app(
 
         The response's ``requests`` name the unlisted Units to confirm, the
         failed Documents to rediscover and the failed items to fetch, by the
-        server run's own rules, computed once in the manifest's transaction:
-        a replay of the same manifest returns the stored requests. A manifest
+        server run's own rules. They are computed when the attempt's manifest
+        is first recorded and returned unchanged on a replay. The attempt's
+        lease time is the run's start for the sync cursor. A manifest
         above the bound every device manifest has, a listing of a scope the
         job did not carry, and a reprocess that discovers or lists answer 422.
         """
 
         source = await _acquisition_source(request, db, source_id)
-        lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
-        leased_at = lease_payload.get(LOCAL_AGENT_LEASED_AT_FIELD)
-        if not leased_at:
-            raise HTTPException(status_code=409, detail="local_agent_lease_time_unknown")
+        lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        lease_payload = lease.payload
         reprocess = tuple(str(doc_id) for doc_id in lease_payload.get(REPROCESS_PAYLOAD_FIELD) or ())
         try:
             manifest = AcquisitionManifest.from_payload(req.manifest)
@@ -9890,7 +9897,7 @@ def create_admin_app(
                 snapshot_id=snapshot_id,
                 manifest=manifest,
                 requests=requests,
-                started_at=datetime.fromisoformat(str(leased_at).replace("Z", "+00:00")),
+                started_at=lease.leased_at,
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
@@ -9918,17 +9925,20 @@ def create_admin_app(
         The device fetches each discovered item before it submits the
         manifest, so an input belongs to the attempt, not to a manifest
         digest; the run reads only the inputs of items it asks for. Each
-        artifact the input names must already be an uploaded input of the
-        Source. The same input uploaded again is kept once.
+        artifact body the input names must already be an uploaded input of
+        the Source; an artifact the device could not read names its error
+        instead. The same input uploaded again is kept once.
         """
 
         source = await _acquisition_source(request, db, source_id)
-        _lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        _lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
         try:
             package = AcquiredInputPackage.from_payload(req.package)
         except (KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        artifact_hashes = tuple(dict.fromkeys(acquired.input_sha256 for acquired in package.artifacts))
+        artifact_hashes = tuple(
+            dict.fromkeys(acquired.input_sha256 for acquired in package.artifacts if acquired.input_sha256 is not None)
+        )
         if artifact_hashes:
             held = await db.get_source_sync_inputs_by_raw_hashes(
                 source_id=source_id, workspace_id=workspace_id, raw_sha256s=artifact_hashes
@@ -9966,7 +9976,7 @@ def create_admin_app(
         """
 
         source = await _acquisition_source(request, db, source_id)
-        _lease_payload, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        _lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
         try:
             answers = AcquisitionAnswers.from_payload(req.answers)
         except (KeyError, TypeError, ValueError) as exc:

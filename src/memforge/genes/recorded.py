@@ -23,7 +23,9 @@ as ``fetch`` of an item that was never acquired, raises
 Document, so the run is retried with a record that does answer it. A call
 whose recorded answer is the error acquisition raised, such as a ``fetch``
 the provider refused, raises :class:`AcquisitionFailed`, so the run treats it
-as it treats that error from the provider itself.
+as it treats that error from the provider itself. Neither is asked of the
+same record again: a run that fails on either is retried, when it may
+succeed, over a new acquisition.
 """
 
 from __future__ import annotations
@@ -55,19 +57,24 @@ class AcquisitionRecordMismatch(RuntimeError):
     """The run asked its acquisition record something the record holds no answer to.
 
     The run and the record disagree about what was acquired, so no Document
-    of the run can be trusted to the record: the run fails.
+    of the run can be trusted to the record: the run fails. A run over a new
+    acquisition may succeed, so the failure is retryable.
     """
+
+    retryable = True
 
 
 class AcquisitionFailed(RuntimeError):
     """The error acquisition raised for one call, raised again where the record answers that call.
 
-    The run treats it as it treats that error from the provider itself.
+    The run treats it as it treats that error from the provider itself,
+    except that it does not ask again within the run: the record gives the
+    same answer, and acquisition already asked the provider again.
     ``failure_class`` names the class of the error and ``error_code`` its
     code, which the failure ledger records. ``retryable`` is set only when the
     error declared it, because the run reads that declaration to decide
-    whether to try the Document again. Whether the error was transient, which
-    the ledger records, is its cause's answer
+    whether its failure may pass. Whether the error was transient, which the
+    ledger records, is its cause's answer
     (:func:`memforge.llm.structured.failure_retryable`).
     """
 

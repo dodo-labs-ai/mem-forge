@@ -413,10 +413,21 @@ class AcquisitionAnswers:
 
 @dataclass(frozen=True, slots=True)
 class AcquiredArtifact:
-    """One artifact an acquired input describes, and the uploaded input holding its body."""
+    """One artifact an acquired input describes: the uploaded input holding its body, or the error reading it raised.
+
+    ``input_sha256`` names the uploaded input that holds the body. ``failure``
+    is the error opening or reading the body raised instead, which the server
+    run raises again where it opens the artifact, so the Document fails as it
+    fails when the server reads the provider itself.
+    """
 
     artifact: RawSourceArtifact
-    input_sha256: str
+    input_sha256: str | None = None
+    failure: AcquisitionError | None = None
+
+    def __post_init__(self) -> None:
+        if (self.input_sha256 is None) == (self.failure is None):
+            raise ValueError("an acquired artifact holds its uploaded body or its failure")
 
     def to_payload(self) -> dict[str, object]:
         artifact = self.artifact
@@ -430,11 +441,13 @@ class AcquiredArtifact:
             "declared_size_bytes": artifact.declared_size_bytes,
             "locator": dict(artifact.locator),
             "input_sha256": self.input_sha256,
+            "failure": self.failure.to_payload() if self.failure is not None else None,
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> AcquiredArtifact:
         size = payload.get("declared_size_bytes")
+        input_sha256 = payload.get("input_sha256")
         return cls(
             artifact=RawSourceArtifact(
                 provider_key=str(payload["provider_key"]),
@@ -446,7 +459,8 @@ class AcquiredArtifact:
                 declared_size_bytes=int(size) if size is not None else None,
                 locator=dict(payload.get("locator") or {}),
             ),
-            input_sha256=str(payload["input_sha256"]),
+            input_sha256=str(input_sha256) if input_sha256 is not None else None,
+            failure=_error(payload.get("failure")),
         )
 
 
@@ -458,8 +472,8 @@ class AcquiredInputPackage:
     it when ``failure`` holds the error ``fetch`` raised. ``body`` and
     ``content_type`` are the bytes ``fetch`` returned. ``pdf`` is the item's
     PDF export when its type exports PDFs, or ``pdf_failure`` the error that
-    export raised. ``artifacts`` are the bodies ``fetch`` described, each
-    uploaded before the package that names it.
+    export raised. ``artifacts`` are the bodies ``fetch`` described, in its
+    order, each uploaded before the package that names it or failed.
     """
 
     item: ContentItem
@@ -528,9 +542,11 @@ def expected_input_ids(
 class StoredAcquisition:
     """One device run's acquisition as the server keeps it.
 
-    ``snapshot_id`` names the job attempt of the Source in ``workspace_id``. ``requests`` are what the manifest
-    response asked, computed once in the manifest's transaction, and
-    ``answers`` the device's answers, ``None`` until it answers.
+    ``snapshot_id`` names the job attempt of the Source in
+    ``workspace_id``. ``requests`` are what the manifest response asked,
+    computed when the attempt's manifest is first recorded and returned
+    unchanged on a replay, and ``answers`` the device's answers, ``None``
+    until it answers.
     ``started_at`` is when the attempt was leased: the device read the
     provider from then on, so it is the run's start for the sync cursor.
     """
