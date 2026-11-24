@@ -8,11 +8,10 @@ product uses it.
 
 - A document type's snapshot is the stored input of one Unit revision: the
   item its Gene discovered, the raw bytes and their content type, the PDF
-  export when the type exports one, and the artifacts. A snapshot Gene
-  (:func:`snapshot_gene_class`) subclasses the type's real Gene and replaces
-  only how it acquires items: ``authenticate``, ``discover``, ``rediscover``,
-  ``fetch``, ``fetch_pdf`` and ``open_source_artifact``, with the listing and
-  the absence answers a discovery implies. Normalization, ``project_native``,
+  export when the type exports one, and the artifacts. A set is an
+  acquisition record store (:class:`SnapshotRecordStore`) behind the type's
+  recorded Gene (:func:`memforge.genes.recorded.recorded_gene_class`), which
+  answers only acquisition from it. Normalization, ``project_native``,
   readings, derivation and Support are the type's own.
 - A conversation type's snapshot is the provider's messages for one
   conversation, in the type's canonical record schema. A
@@ -42,7 +41,7 @@ The acquisition is off by default. A deployment turns it on by naming the
 snapshot root in ``MEMFORGE_EVALUATION_SNAPSHOT_ROOT``; while it is unset,
 creating or syncing a Source that names a set is refused, and a set must
 resolve below the root. The construction seams choose the acquisition from
-the Source (:func:`memforge.genes.gene_class`, the conversation provider
+the Source (:func:`memforge.genes.create_gene`, the conversation provider
 reference of the type's descriptor, and the executor choice of
 :func:`memforge.local_agent.source_contract.local_agent_sync_operation`), so
 the sync pipeline never branches on it.
@@ -50,7 +49,6 @@ the sync pipeline never branches on it.
 
 from __future__ import annotations
 
-import functools
 import json
 import os
 import re
@@ -76,14 +74,8 @@ from memforge.conversations.port import (
     ThreadingModel,
 )
 from memforge.genes.base import SourceConfigurationError
-from memforge.genes.document_gene import DocumentGene
-from memforge.models import (
-    AbsenceAnswer,
-    ContentItem,
-    RawContent,
-    ScopeListing,
-    ScopeListingKind,
-)
+from memforge.genes.recorded import AcquiredInput, AcquisitionRecordMismatch
+from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 from memforge.source_time import parse_source_time
 
@@ -96,6 +88,7 @@ __all__ = [
     "ConversationSnapshot",
     "DocumentSnapshot",
     "SnapshotConversationProvider",
+    "SnapshotRecordStore",
     "SnapshotReference",
     "SnapshotsDisabled",
     "complete_snapshot_config",
@@ -105,7 +98,6 @@ __all__ = [
     "open_snapshot_provider",
     "replay_offset",
     "revision_dirs",
-    "snapshot_gene_class",
     "snapshot_reference",
     "snapshot_root",
     "snapshot_set_dir",
@@ -499,117 +491,73 @@ def conversation_snapshots(
     return tuple(snapshots)
 
 
-# -- Document family: the snapshot Gene ------------------------------------------------------
+# -- Document family: the snapshot record store ------------------------------------------------
 
 
-@functools.cache
-def snapshot_gene_class(gene_cls: type[DocumentGene]) -> type[DocumentGene]:
-    """The snapshot Gene of a document type: its real Gene, acquiring items from a snapshot set.
+class SnapshotRecordStore:
+    """A snapshot set as the acquisition record store of a recorded Gene.
 
-    Everything but acquisition is inherited, so normalization, the PDF
-    requirement and the stored-input reading are the type's own.
+    Its record is what a run that read the whole provider would have
+    acquired: every item of the set at the Source's revision discovered, an
+    existence listing of them, and the absence and rediscovery answers they
+    imply.
     """
 
-    class SnapshotGene(gene_cls):  # type: ignore[valid-type, misc]
-        __doc__ = f"{gene_cls.__name__} replaying an evaluation snapshot set."
+    def __init__(self, reference: SnapshotReference) -> None:
+        self._reference = reference
 
-        def __init__(self, config: dict, source_id: str) -> None:
-            super().__init__(config, source_id)
-            reference = snapshot_reference(config)
-            assert reference is not None, "a snapshot Gene is created only for a Source that names a set"
-            self._snapshot_reference = reference
-            self._snapshot_set_dir = snapshot_set_dir(reference)
-            self._snapshots: dict[str, DocumentSnapshot] | None = None
+    async def open(self) -> SnapshotRecord:
+        set_dir = snapshot_set_dir(self._reference)
+        return SnapshotRecord(set_dir, document_snapshots(set_dir, self._reference.revision), self._reference)
 
-        def _current(self) -> dict[str, DocumentSnapshot]:
-            if self._snapshots is None:
-                self._snapshots = {
-                    snapshot.item.item_id: snapshot
-                    for snapshot in document_snapshots(self._snapshot_set_dir, self._snapshot_reference.revision)
-                }
-            return self._snapshots
 
-        def _snapshot(self, item: ContentItem) -> DocumentSnapshot:
-            snapshot = self._current().get(item.item_id)
-            if snapshot is None:
-                raise SnapshotUnavailable(
-                    f"item {item.item_id} is not in revision {self._snapshot_reference.revision} of the "
-                    f"evaluation snapshot set {self._snapshot_reference.set!r}"
-                )
-            return snapshot
+class SnapshotRecord:
+    """One revision of a snapshot set, open as an acquisition record."""
 
-        @classmethod
-        def lists_scope(cls, config: Mapping[str, Any]) -> bool:
-            """A snapshot set lists every item it holds."""
-            return True
+    def __init__(
+        self, set_dir: Path, snapshots: Sequence[DocumentSnapshot], reference: SnapshotReference
+    ) -> None:
+        self._set_dir = set_dir
+        self._reference = reference
+        self._snapshots = {snapshot.item.item_id: snapshot for snapshot in snapshots}
 
-        async def rediscover(self, item: ContentItem) -> ContentItem | None:
-            """The set's current item, for whenever the type's own ``rediscovers_documents`` lets the pipeline ask."""
-            snapshot = self._current().get(item.item_id)
-            return _discovered(snapshot) if snapshot is not None else None
+    def discovered(self) -> Sequence[ContentItem]:
+        return [snapshot.item for snapshot in self._snapshots.values()]
 
-        async def authenticate(self) -> None:
-            """Nothing to authenticate: the set is read from the snapshot root."""
-            self._snapshots = None
-            self._current()
+    def listing(self) -> ScopeListing:
+        return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset(self._snapshots))
 
-        async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-            """Every item of the set at the Source's revision; an unchanged one is not extracted again."""
-            snapshots = self._current()
-            for snapshot in snapshots.values():
-                yield _discovered(snapshot)
-            self.record_scope_listing(_listing_kind(gene_cls), frozenset(snapshots))
+    def absence_answer(self, item_id: str) -> AbsenceAnswer:
+        return AbsenceAnswer.EXISTS if item_id in self._snapshots else AbsenceAnswer.ABSENT
 
-        async def list_scope(self) -> ScopeListing:
-            return self._discovered_scope or ScopeListing(
-                kind=_listing_kind(gene_cls), doc_ids=frozenset(self._current())
+    def rediscovered(self, item_id: str) -> ContentItem | None:
+        snapshot = self._snapshots.get(item_id)
+        return snapshot.item if snapshot is not None else None
+
+    async def acquired(self, item_id: str) -> AcquiredInput:
+        snapshot = self._snapshots.get(item_id)
+        if snapshot is None:
+            raise AcquisitionRecordMismatch(
+                f"item {item_id} is not in revision {self._reference.revision} of the "
+                f"evaluation snapshot set {self._reference.set!r}"
             )
+        return AcquiredInput(
+            item=snapshot.item,
+            body=snapshot.body,
+            content_type=snapshot.content_type,
+            pdf=snapshot.pdf,
+            artifacts=tuple(artifact.descriptor for artifact in snapshot.artifacts),
+        )
 
-        async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
-            held = self._current()
-            return {
-                item.item_id: AbsenceAnswer.EXISTS if item.item_id in held else AbsenceAnswer.ABSENT for item in items
-            }
+    @asynccontextmanager
+    async def open_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:
+        path = _contained(self._set_dir, artifact.locator.get("snapshot_file"))
+        yield SourceArtifactDownload(
+            chunks=_chunks(path), media_type=artifact.media_type, content_length=path.stat().st_size
+        )
 
-        async def fetch(self, item: ContentItem) -> RawContent:
-            snapshot = self._snapshot(item)
-            raw = self.raw_from_stored_input(item, snapshot.body, snapshot.content_type)
-            return replace(raw, artifacts=tuple(artifact.descriptor for artifact in snapshot.artifacts))
-
-        async def fetch_pdf(self, item: ContentItem) -> bytes | None:
-            return self._snapshot(item).pdf
-
-        @asynccontextmanager
-        async def open_source_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:
-            path = _contained(self._snapshot_set_dir, artifact.locator.get("snapshot_file"))
-            yield SourceArtifactDownload(
-                chunks=_chunks(path), media_type=artifact.media_type, content_length=path.stat().st_size
-            )
-
-        async def health_check(self) -> dict:
-            return {
-                "healthy": True,
-                "evaluation_snapshot": self._snapshot_reference.set,
-                "revision": self._snapshot_reference.revision,
-                "items": len(self._current()),
-            }
-
-    SnapshotGene.__name__ = SnapshotGene.__qualname__ = f"Snapshot{gene_cls.__name__}"
-    return SnapshotGene
-
-
-def _discovered(snapshot: DocumentSnapshot) -> ContentItem:
-    """A snapshot's item as discovery yields it: a copy the pipeline may change."""
-
-    return replace(snapshot.item, extra=dict(snapshot.item.extra), labels=list(snapshot.item.labels))
-
-
-def _listing_kind(gene_cls: type[DocumentGene]) -> ScopeListingKind:
-    """The kind of listing a set is: existence when the real Gene declares it, since a set names all it holds."""
-
-    if ScopeListingKind.EXISTENCE in gene_cls.listing_kinds or not gene_cls.listing_kinds:
-        return ScopeListingKind.EXISTENCE
-    return ScopeListingKind.QUERY
+    async def close(self) -> None:
+        return None
 
 
 async def _chunks(path: Path) -> AsyncIterator[bytes]:

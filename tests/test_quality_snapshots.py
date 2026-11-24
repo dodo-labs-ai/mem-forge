@@ -5,7 +5,7 @@ Source per source type from ``evals/quality/quick/snapshots/<source_type>``,
 revision 1 and then revision 2, so a change to how a type is read is gated by
 a model run like Markdown's. These tests keep that cohort complete: a
 registered type without a snapshot fails here, and so does a snapshot its
-type no longer normalizes and projects, read through the same snapshot Gene or
+type no longer normalizes and projects, read through the same recorded Gene or
 snapshot provider the cohort replays it with.
 """
 
@@ -113,7 +113,7 @@ def _assert_reads(projection: SourceProjection, label: str) -> None:
 
 
 async def _document_projections(source_type: str, revision: int) -> dict[str, tuple]:
-    """Each item of one revision, acquired by the snapshot Gene and read by the type's own code."""
+    """Each item of one revision, acquired by the recorded Gene over the set and read by the type's own code."""
 
     descriptor = next(d for d in DESCRIPTORS if d.source_type == source_type)
     gene = create_gene(source_type, _config(source_type, revision), f"src-snapshot-{source_type}")

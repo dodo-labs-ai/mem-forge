@@ -17,6 +17,7 @@ from memforge.genes.base import Gene
 from memforge.genes.contract import validate_registered_source_types
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
+from memforge.genes.recorded import recorded_gene_class
 from memforge.models import GeneMetadata, SourceExecutionKind
 from memforge.source_types import registered_source_types, source_type_descriptor
 
@@ -56,41 +57,38 @@ class _GeneRegistry(Mapping[str, type[Gene]]):
 GENE_REGISTRY: Mapping[str, type[Gene]] = _GeneRegistry()
 
 
-def gene_class(name: str, config: Mapping[str, Any]) -> type[Gene]:
-    """The Gene class a Source of a registered source type uses with this configuration.
+def gene_class(name: str) -> type[Gene]:
+    """The Gene class of a registered source type.
 
-    A Source that replays an evaluation snapshot set uses the snapshot Gene of
-    a document type (:mod:`memforge.evals.source_snapshots`), so the class
-    methods asked before any Gene exists answer for the set; a conversation
-    type keeps its own Gene, since its device executor replays the set.
     Raises ``KeyError`` when no source type of that name is registered.
     """
     if name not in GENE_REGISTRY:
         available = ", ".join(sorted(GENE_REGISTRY)) or "(none)"
         raise KeyError(f"Unknown gene {name!r}.  Available genes: {available}")
-
-    cls = GENE_REGISTRY[name]
-    from memforge.evals.source_snapshots import SNAPSHOT_CONFIG_FIELD, snapshot_gene_class
-
-    if SNAPSHOT_CONFIG_FIELD in (config or {}) and gene_family(cls) is CollectionFamilyKind.DOCUMENT:
-        return snapshot_gene_class(cast(type[DocumentGene], cls))
-    return cls
+    return GENE_REGISTRY[name]
 
 
 def create_gene(name: str, config: dict, source_id: str) -> Gene:
-    """Instantiate the Gene a Source of a registered source type uses (:func:`gene_class`).
+    """Instantiate the Gene a Source of a registered source type uses.
 
-    A Source that replays an evaluation snapshot set is refused while the
-    deployment does not replay snapshots. Raises ``KeyError`` when no source
-    type of that name is registered.
+    A Source that replays an evaluation snapshot set
+    (:mod:`memforge.evals.source_snapshots`) is refused while the deployment
+    does not replay snapshots. A document Source that replays one gets its
+    type's recorded Gene (:func:`memforge.genes.recorded.recorded_gene_class`)
+    over the set; a conversation Source keeps its own Gene, since its device
+    executor replays the set. Raises ``KeyError`` when no source type of that
+    name is registered.
     """
-    cls = gene_class(name, config)
-    from memforge.evals.source_snapshots import snapshot_reference, snapshot_set_dir
+    cls = gene_class(name)
+    from memforge.evals.source_snapshots import SnapshotRecordStore, snapshot_reference, snapshot_set_dir
 
     reference = snapshot_reference(config)
+    logger.debug("Creating gene %r (class=%s, source_id=%s)", name, cls.__qualname__, source_id)
     if reference is not None:
         snapshot_set_dir(reference)
-    logger.debug("Creating gene %r (class=%s, source_id=%s)", name, cls.__qualname__, source_id)
+        if gene_family(cls) is CollectionFamilyKind.DOCUMENT:
+            recorded = recorded_gene_class(cast(type[DocumentGene], cls))
+            return recorded(config=config, source_id=source_id, record_store=SnapshotRecordStore(reference))
     return cls(config=config, source_id=source_id)
 
 
@@ -120,7 +118,7 @@ def gene_exports_pdf(gene: Gene) -> bool:
 
 def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) -> bool:
     """Whether a configured Source can ask its provider for one Document by id."""
-    gene_cls = _configured_gene_class(source_type, config)
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
     return (
         gene_cls is not None
         and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
@@ -130,19 +128,12 @@ def source_rediscovers_documents(source_type: str, config: Mapping[str, Any]) ->
 
 def source_lists_scope(source_type: str, config: Mapping[str, Any]) -> bool:
     """Whether a configured document Source can list its whole scope (``DocumentGene.lists_scope``)."""
-    gene_cls = _configured_gene_class(source_type, config)
+    gene_cls = GENE_REGISTRY.get(str(source_type or "").strip())
     return (
         gene_cls is not None
         and gene_family(gene_cls) is CollectionFamilyKind.DOCUMENT
         and gene_cls.lists_scope(config)
     )
-
-
-def _configured_gene_class(source_type: str, config: Mapping[str, Any]) -> type[Gene] | None:
-    try:
-        return gene_class(str(source_type or "").strip(), config)
-    except KeyError:
-        return None
 
 
 # Every registered Gene loads with this package, and every source type is

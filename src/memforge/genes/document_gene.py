@@ -89,6 +89,21 @@ suite in ``tests/contracts/test_document_connector_contract.py`` checks the
 behaviour against fakes of the provider; its ``document_fakes`` package says
 how to add a connector's fakes.
 
+Acquisition and interpretation
+------------------------------
+
+The methods that reach the provider are the Gene's *acquisition*:
+``authenticate``, ``discover``, ``list_scope``, ``confirm_absent``,
+``rediscover``, ``fetch``, ``fetch_pdf`` and ``open_source_artifact``.
+Everything else, ``normalize``, ``raw_from_stored_input`` and the type's
+``project_native`` above all, is *interpretation*: it reads only what
+acquisition returned and never reaches the provider. Keep every provider
+request inside an acquisition method, and keep what interpretation needs in
+the item, the raw content or the artifacts ``fetch`` returns. The recorded
+Gene (:mod:`memforge.genes.recorded`) relies on this: it answers acquisition
+from a record of a run that read the provider elsewhere, and inherits
+interpretation.
+
 Collected on a device
 ---------------------
 

@@ -342,8 +342,9 @@ def local_agent_sync_operation(
     """Return the daemon sync operation for a canonical source configuration.
 
     A document Source that replays an evaluation snapshot set runs on the
-    server with its snapshot Gene, whoever collects its type otherwise; a
-    conversation Source replays its set through the device executor.
+    server with its type's recorded Gene over the set, whoever collects its
+    type otherwise; a conversation Source replays its set through the device
+    executor.
     """
     from memforge.evals.source_snapshots import SNAPSHOT_CONFIG_FIELD
     from memforge.genes.family import CollectionFamilyKind

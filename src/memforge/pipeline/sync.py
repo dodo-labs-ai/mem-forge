@@ -37,6 +37,7 @@ from memforge.evals.agent_evaluation import (
 )
 from memforge.genes import gene_exports_pdf, source_rediscovers_documents
 from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.genes.recorded import AcquisitionRecordMismatch
 from memforge.llm.structured import (
     LiteLlmStructuredClient,
     StructuredLlmMetricsCollector,
@@ -1449,6 +1450,10 @@ class GeneSyncOrchestrator:
                             stats["runtime_bundle"] = exc.runtime_bundle
                             attempt_error = None
                             retry_document = False
+                        except AcquisitionRecordMismatch:
+                            # The run and its acquisition record disagree, so
+                            # the whole run fails rather than this Document.
+                            raise
                         except Exception as exc:
                             attempt_error = _retained_document_error(exc)
                             last_failure = _run_item_failure(

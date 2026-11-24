@@ -31,6 +31,7 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
+from memforge.genes.recorded import AcquisitionRecordMismatch
 from memforge.local_agent.snapshot_manifest import (
     ExcludedScopeListing,
     SnapshotConfirmation,
@@ -390,7 +391,9 @@ class DocumentFamily(CollectionFamily):
         A configuration that cannot list, and one collected on a device whose
         run is bound to no snapshot, has no listing. A connector listing that
         raises leaves the run without one and records ``scope_listing_failed``,
-        so nothing is removed or settled by listing in this run.
+        so nothing is removed or settled by listing in this run. A listing
+        the run's acquisition record does not hold fails the run
+        (:class:`~memforge.genes.recorded.AcquisitionRecordMismatch`).
         """
 
         if not self.gene.lists_scope(self.gene.config):
@@ -404,6 +407,8 @@ class DocumentFamily(CollectionFamily):
             return
         try:
             self.scope_listing = await self.gene.list_scope()
+        except AcquisitionRecordMismatch:
+            raise
         except Exception as exc:
             # The provider's error stays in the log; the run records which
             # step failed, so its sync activity shows that nothing was removed.
@@ -777,6 +782,8 @@ class DocumentFamily(CollectionFamily):
             try:
                 async with self._excluded_scope_gene(scope) as gene:
                     excluded_listing = await gene.list_scope()
+            except AcquisitionRecordMismatch:
+                raise
             except SourceConfigurationError as exc:
                 logger.warning(
                     "An excluded scope of %s was rejected (%s); every unlisted Document follows the ordinary rule",
@@ -917,7 +924,8 @@ class DocumentFamily(CollectionFamily):
         One that exists or is hidden keeps its Unit and Support and is not
         refreshed while it stays outside the query. One whose stored item
         cannot be rebuilt identifies nothing to ask for, so it is kept. A
-        confirmation that fails raises ``AbsenceCheckSkipped``.
+        confirmation that fails raises ``AbsenceCheckSkipped``; one the run's
+        acquisition record holds no answer to fails the run.
         """
 
         try:
@@ -928,6 +936,8 @@ class DocumentFamily(CollectionFamily):
                 except StoredDocumentUnavailable as exc:
                     logger.warning("Cannot confirm whether unlisted Document %s still exists: %s", doc_id, exc)
             answers = await self.gene.confirm_absent(items)
+        except AcquisitionRecordMismatch:
+            raise
         except Exception as exc:
             raise AbsenceCheckSkipped("absence_confirmation_failed") from exc
         absent = {doc_id for doc_id, answer in answers.items() if answer == AbsenceAnswer.ABSENT} & unlisted

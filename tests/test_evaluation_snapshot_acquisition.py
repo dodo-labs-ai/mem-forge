@@ -29,6 +29,7 @@ from memforge.evals.source_snapshots import (
 )
 from memforge.genes import create_gene, source_lists_scope, source_rediscovers_documents
 from memforge.genes.jira_gene import JiraGene
+from memforge.genes.recorded import AcquisitionRecordMismatch, recorded_gene_class
 from memforge.genes.teams_gene import TeamsGene
 from memforge.local_agent.source_contract import local_agent_job_config, local_agent_sync_operation
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListingKind
@@ -89,7 +90,7 @@ def test_a_source_that_reads_its_provider_keeps_its_gene(replay_off) -> None:
     assert type(gene) is JiraGene
 
 
-async def test_a_document_snapshot_gene_is_the_real_gene_acquiring_from_the_set(replay_on) -> None:
+async def test_a_document_snapshot_source_runs_its_recorded_gene_over_the_set(replay_on) -> None:
     gene = create_gene("jira", _replaying("jira", revision=2), "src-jira")
     await gene.authenticate()
 
@@ -99,10 +100,11 @@ async def test_a_document_snapshot_gene_is_the_real_gene_acquiring_from_the_set(
     answers = await gene.confirm_absent([items[0], stray])
     raw = await gene.fetch(items[0])
 
-    assert isinstance(gene, JiraGene) and type(gene).__name__ == "SnapshotJiraGene"
+    assert isinstance(gene, JiraGene) and type(gene) is recorded_gene_class(JiraGene)
     # Discovery yields the whole set whatever the cursor; an unchanged item is not extracted again.
     assert [item.item_id for item in items] == ["jira-KES-42"]
-    assert listing.doc_ids == {"jira-KES-42"} and listing.kind is ScopeListingKind.QUERY
+    # The set names everything it holds, so its listing is one of existence.
+    assert listing.doc_ids == {"jira-KES-42"} and listing.kind is ScopeListingKind.EXISTENCE
     assert answers == {"jira-KES-42": AbsenceAnswer.EXISTS, "jira-KES-1": AbsenceAnswer.ABSENT}
     assert len(json.loads(raw.body)["_comments"]) == 3
     assert [artifact.media_type for artifact in raw.artifacts] == ["image/png"]
@@ -111,6 +113,11 @@ async def test_a_document_snapshot_gene_is_the_real_gene_acquiring_from_the_set(
     # A Document the run did not discover is asked of the set, never of the provider.
     assert (await gene.rediscover(items[0])).item_id == "jira-KES-42"
     assert await gene.rediscover(stray) is None
+    # An item the set does not hold was never acquired, so fetching it fails the run.
+    with pytest.raises(AcquisitionRecordMismatch, match="jira-KES-1"):
+        await gene.fetch(stray)
+    await gene.close()
+    # Whether a configuration lists or rediscovers is the type's own answer.
     assert source_rediscovers_documents("confluence", _replaying("confluence"))
     assert source_lists_scope("github_pages", _replaying("github_pages"))
 
@@ -159,6 +166,7 @@ async def test_an_item_stands_at_its_highest_revision_not_above_the_one_replayed
 
     async def items(revision: int) -> list[str]:
         gene = create_gene("jira", _replaying("jira", revision=revision), "src-jira")
+        await gene.authenticate()
         return [item.item_id async for item in gene.discover(None)]
 
     assert await items(1) == ["jira-KES-42"]
