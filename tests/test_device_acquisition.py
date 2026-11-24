@@ -57,6 +57,7 @@ from memforge.pipeline.device_acquisition import document_acquisition_job_payloa
 from memforge.pipeline.source_projection_adapters import project_source_item
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.runtime import DefaultRuntimeProvider, SourceSyncWorker
+from memforge.source_activity import SOURCE_SYNC_CANCELLED_BY_USER
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 from memforge.source_derivation import SourceUnitDerivationContext, source_derivation_manifest
 from memforge.source_item_failures import FailedItemRetry, SourceItemFailure
@@ -1409,6 +1410,66 @@ def test_a_run_that_fails_on_a_recorded_provider_error_acquires_again_within_the
     assert len(delays) == 2
     assert base - 5 < delays[0] <= base
     assert 2 * base - 5 < delays[1] <= 2 * base
+
+
+def _fail_a_run_on_a_recorded_provider_error(device: _Side, client, lease: _Lease, wiki: Wiki, config: AppConfig):
+    """Run a queued job whose acquisition answers a provider error its run fails on, retryably."""
+
+    _own(device.db)
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    _fail(device.db, "wiki-b", wiki.item("b"))
+    wiki.refused = {"b"}
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    asyncio.run(
+        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
+    )
+    _run_queued_job(device, client, lease, config)
+
+
+def test_stopping_the_source_stops_the_job_that_would_acquire_again(deployments, wiki):
+    _server, device, client, lease = deployments
+    config = AppConfig()
+    config.sync.worker_max_attempts = 3
+    _fail_a_run_on_a_recorded_provider_error(device, client, lease, wiki, config)
+    following = _queued_job(device)
+    assert following is not None and following["next_attempt_at"] is not None
+
+    stopped = client.post(f"/api/v1/sources/{SOURCE_ID}/sync/stop")
+
+    assert stopped.status_code == 200, stopped.text
+    assert stopped.json()["outcome"] == "stopped"
+    assert stopped.json()["local_agent_job_ids"] == [following["job_id"]]
+    job = asyncio.run(device.db.get_local_agent_job(following["job_id"]))
+    assert (job["status"], job["last_error"]) == ("failed", SOURCE_SYNC_CANCELLED_BY_USER)
+    # No daemon takes it, however late it asks.
+    later = datetime.fromisoformat(following["next_attempt_at"]) + timedelta(days=1)
+    assert (
+        asyncio.run(device.db.lease_local_agent_jobs(user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=later))
+        == []
+    )
+
+
+def test_a_run_stopped_while_it_fails_on_its_acquisition_does_not_acquire_again(deployments, wiki, monkeypatch):
+    _server, device, client, lease = deployments
+    config = AppConfig()
+    config.sync.worker_max_attempts = 3
+    fail_run = device.db.fail_source_sync_run
+
+    async def stopped_while_failing(run_id, **kwargs):
+        # The stop arrives after the run's last heartbeat.
+        assert await device.db.request_source_sync_stop(source_id=SOURCE_ID) is not None
+        return await fail_run(run_id, **kwargs)
+
+    monkeypatch.setattr(device.db, "fail_source_sync_run", stopped_while_failing)
+
+    _fail_a_run_on_a_recorded_provider_error(device, client, lease, wiki, config)
+
+    run = asyncio.run(device.db.get_latest_source_sync_run(source_id=SOURCE_ID, workspace_id=WORKSPACE))
+    assert run is not None and run.status == "failed" and run.stop_requested_at is not None
+    # As a server run a person stopped is not retried, the device does not acquire again.
+    assert _queued_job(device) is None
 
 
 def test_the_manifest_response_asks_for_the_documents_of_staged_derivations(deployments, wiki):

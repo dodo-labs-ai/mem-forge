@@ -1455,9 +1455,6 @@ class SourceSyncWorker:
             with contextlib.suppress(asyncio.CancelledError):
                 await progress_task
 
-    def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
-        return self._retry_at(run.lease_attempt_count, failed_at)
-
     def _retry_at(self, attempt: int, failed_at: datetime) -> datetime | None:
         """When the attempt after ``attempt``, which failed at ``failed_at``, starts.
 
@@ -1688,7 +1685,7 @@ class SourceSyncWorker:
                 # not retried on the same acquisition, which answers the same.
                 acquisition_failed = acquisition is not None and final_state.acquisition_failed
                 next_attempt_at = (
-                    self._next_retry_at(run, failed_at)
+                    self._retry_at(run.lease_attempt_count, failed_at)
                     if final_state.last_sync_status == "failed"
                     and final_state.failure_retryable
                     and not reprocessing
@@ -1715,8 +1712,8 @@ class SourceSyncWorker:
                     _publish_terminal_runtime_bundles(runtime, final_state)
                 if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
-                if acquisition_failed and final_state.failure_retryable and not reprocessing:
-                    await self._acquire_again(run, runtime.doc_store, failed_at)
+                if acquisition_failed and final_state.failure_retryable and not reprocessing and ended is not None:
+                    await self._acquire_again(ended, runtime.doc_store, failed_at)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1746,7 +1743,7 @@ class SourceSyncWorker:
                     str(exc),
                 )
             failed_at = datetime.now(timezone.utc)
-            next_attempt_at = self._next_retry_at(run, failed_at)
+            next_attempt_at = self._retry_at(run.lease_attempt_count, failed_at)
             retryable = (
                 failure_retryable(exc, store=self.db)
                 and next_attempt_at is not None
@@ -1768,22 +1765,32 @@ class SourceSyncWorker:
     async def _acquire_again(self, run: SourceSyncRun, doc_store: LocalDocumentStore, failed_at: datetime) -> None:
         """Retry a device run that failed on its acquisition with a new ``document_acquisition`` job.
 
-        The device acquires the Source again from the start of the job, so the
-        new attempt answers what its own run asks and asks the provider again
-        (ADR 0058). The acquisitions share the retry budget of a server run's
-        attempts: the new job is the next acquisition attempt of the job the
-        run processed, and a daemon leases it after the delay a server run's
-        next attempt waits. Once the attempts reach ``worker_max_attempts``,
-        or for a Source that is no longer active or a run whose job is not
-        recorded, no job is queued, and the next scheduled run acquires again.
+        ``run`` is the run as it ended. The device acquires the Source again
+        from the start of the job, so the new attempt answers what its own run
+        asks and asks the provider again (ADR 0058). The acquisitions share
+        the retry budget of a server run's attempts: the new job is the next
+        acquisition attempt of the job the run processed, and a daemon leases
+        it after the delay a server run's next attempt waits.
+
+        No job is queued once the attempts reach ``worker_max_attempts``, for
+        a run a person asked to stop, which a server run would not retry
+        either, for a run whose successor already processes a newer
+        acquisition, or for a Source that is no longer active; the next
+        scheduled run acquires again.
         """
 
+        if run.stop_requested_at is not None or run.rerun_requested:
+            return
         source = await self.db.get_source(run.source_id)
-        if source is None or source.get("status") != "active" or run.predecessor_activity_id is None:
+        if source is None or source.get("status") != "active":
             return
-        job = await self.db.get_local_agent_job(run.predecessor_activity_id)
+        job = (
+            await self.db.get_local_agent_job(run.predecessor_activity_id)
+            if run.predecessor_activity_id is not None
+            else None
+        )
         if job is None:
-            return
+            raise SourceSyncBoundaryError(f"device run {run.run_id} has no recorded acquisition job")
         attempt = int(job["payload"][ACQUISITION_ATTEMPT_PAYLOAD_FIELD])
         next_attempt_at = self._retry_at(attempt, failed_at)
         if next_attempt_at is None:

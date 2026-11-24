@@ -2738,20 +2738,22 @@ async def _stop_source_sync(
     sync_service: SyncService,
     source: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Stop the collection jobs of the Source's local daemon, then its sync run.
+    """Stop the Source's local-agent jobs, then its sync run.
 
-    The jobs go first, so that a job that completes meanwhile hands over a run
+    The jobs are every job a device collects or acquires for the Source:
+    those of a package operation and the ``document_acquisition`` jobs of a
+    document Source the device acquires with its type's Gene, including one
+    waiting to acquire again after its run failed on its acquisition. The
+    jobs go first, so that a job that completes meanwhile hands over a run
     that the run's stop then reaches.
     """
 
     source_id = str(source["id"])
-    job_ids: list[str] = []
-    if local_agent_sync_operation(source["type"], source.get("config")) is not None:
-        stopper = getattr(request.app.state, "local_agent_job_stopper", None)
-        if stopper is not None:
-            job_ids = await stopper(source_id)
-        else:
-            job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
+    stopper = getattr(request.app.state, "local_agent_job_stopper", None)
+    if stopper is not None:
+        job_ids = await stopper(source_id)
+    else:
+        job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
     run = await sync_service.stop_source(source_id)
     if run is not None and run.status == "running":
         outcome = "stopping"
