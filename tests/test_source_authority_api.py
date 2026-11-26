@@ -19,6 +19,7 @@ from memforge.models import (
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.storage.database import Database
+from tests.device_report_fixture import DAEMON_DEVICE
 from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_sync_bookkeeping import (
@@ -957,7 +958,7 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert leased.status_code == 200, leased.text
@@ -1004,7 +1005,7 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             )
 
         assert updated.status_code == 200, updated.text
@@ -1047,7 +1048,7 @@ def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicali
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             )
 
         assert triggered.status_code == 202, triggered.text
@@ -1114,7 +1115,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             ).json()["jobs"][0]
             context = {
                 "local_agent_job_id": leased["job_id"],
@@ -1312,7 +1313,7 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
             ).json()["id"]
             client.post(f"/api/v1/sources/{preview_id}/sync", headers=headers, json={"dry_run": True})
             leased = client.post(
-                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"limit": 5, "lease_seconds": 60}
+                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60}
             ).json()["jobs"]
             [dry_job] = [job for job in leased if job["source_id"] == preview_id]
             dry_processed = client.post(
@@ -1351,7 +1352,7 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             ).json()["jobs"][0]
             updated_payload = _jira_payload(sync_mode="local_agent")
             updated_payload["config"]["projects"] = ["PAY", "TIME"]
@@ -1410,17 +1411,17 @@ def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp
             other_jobs = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
             owner_jobs = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert forbidden.status_code == 403, forbidden.text
         assert accepted.status_code == 201, accepted.text
-        assert other_jobs.json() == {"jobs": []}
+        assert other_jobs.json()["jobs"] == []
         assert [job["job_id"] for job in owner_jobs.json()["jobs"]] == [accepted.json()["job_id"]]
         assert owner_jobs.json()["jobs"][0]["payload"]["conversation_ids"] == ["19:conversation-a@example.test"]
         assert "config" not in owner_jobs.json()["jobs"][0]["payload"]
@@ -1451,7 +1452,7 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert accepted.status_code == 201, accepted.text
@@ -1480,7 +1481,7 @@ def test_jira_auth_job_uses_the_current_workspace(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert accepted.status_code == 201, accepted.text
@@ -1535,7 +1536,7 @@ def test_local_source_force_resync_collects_fresh_raw_data_before_processing(tmp
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert force.status_code == 202, force.text

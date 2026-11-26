@@ -53,12 +53,18 @@ _CONNECTION = {"base_url": BASE_URL, "pat": "token", "exclude_labels": ["draft"]
 
 
 def _page(page_id: str) -> dict:
+    """The page as a read by identifier answers it: its header, ancestors, storage body and no attachments."""
     space, parent, labels, changed_at = PAGES[page_id]
     ancestors = []
     while parent is not None:
         ancestors.insert(0, _page_header(parent))
         parent = PAGES[parent][1]
-    return {**_page_header(page_id), "ancestors": ancestors}
+    return {
+        **_page_header(page_id),
+        "ancestors": ancestors,
+        "body": {"storage": {"value": f"<h1>Page {page_id}</h1><p>The {space} rules of page {page_id}.</p>"}},
+        "children": {"attachment": _results([], 0)},
+    }
 
 
 def _page_header(page_id: str) -> dict:

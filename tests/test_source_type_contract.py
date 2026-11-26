@@ -19,6 +19,7 @@ from memforge.genes.contract import (
 )
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION, LOCAL_AGENT_SYNC_OPERATIONS
@@ -49,6 +50,8 @@ DEVICE = LocalAgentCollection(operation="test_sync", job_config_fields=frozenset
 
 
 def _descriptor(gene, **fields) -> SourceTypeDescriptor:
+    if isinstance(gene, type) and issubclass(gene, DocumentGene):
+        fields.setdefault("acquisition_contract", 1)
     return SourceTypeDescriptor(source_type="test_type", gene=gene, **fields)
 
 
@@ -71,6 +74,31 @@ def test_every_built_in_source_type_meets_its_contract() -> None:
 def test_a_document_gene_with_its_contract_is_accepted() -> None:
     validate_source_type(_descriptor(FakeGene))
     validate_source_type(_descriptor(QueryGene))
+
+
+@pytest.mark.parametrize("contract", [None, 0, -1, True, "1"])
+def test_a_document_type_must_declare_a_positive_acquisition_contract(contract) -> None:
+    _refused(FakeGene, "must declare a positive integer acquisition_contract", acquisition_contract=contract)
+
+
+def test_every_built_in_document_type_declares_an_acquisition_contract() -> None:
+    for descriptor in registered_source_types():
+        if descriptor.family is CollectionFamilyKind.DOCUMENT:
+            assert descriptor.acquisition_contract == 1, descriptor.source_type
+        else:
+            assert descriptor.acquisition_contract is None, descriptor.source_type
+
+
+def test_a_conversation_type_has_no_acquisition_contract() -> None:
+    teams = source_type_descriptor("teams")
+    assert teams is not None
+    _refused(
+        TeamsGene,
+        "a conversation type has no acquisition_contract",
+        local_agent=teams.local_agent,
+        conversation_provider=teams.conversation_provider,
+        acquisition_contract=1,
+    )
 
 
 def test_a_gene_of_neither_family_is_refused() -> None:

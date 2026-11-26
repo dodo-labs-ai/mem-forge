@@ -37,7 +37,9 @@ from memforge.local_agent.snapshot_manifest import (
     validate_snapshot_manifest_extras,
     validate_snapshot_manifest_values,
 )
+from memforge.local_agent.device_report import DeviceReport, LocalAgentDevice
 from memforge.local_agent.source_contract import (
+    DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_SYNC_OPERATIONS,
     local_agent_completion_status,
     local_agent_retry_delay,
@@ -2024,6 +2026,10 @@ CREATE TABLE IF NOT EXISTS conversation_collection_bodies (
     PRIMARY KEY (workspace_id, source_id, collection_attempt_id, conversation_id, message_id)
 );
 
+-- A job's uncounted_attempt_count counts the attempts that ended without
+-- counting toward its retry budget: those whose submission came under an
+-- acquisition contract the server no longer has. acquisition_contract is the
+-- contract a document_acquisition attempt was leased under.
 CREATE TABLE IF NOT EXISTS local_agent_jobs (
     job_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -2038,6 +2044,8 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
     leased_until TEXT,
     leased_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    uncounted_attempt_count INTEGER NOT NULL DEFAULT 0,
+    acquisition_contract INTEGER,
     result_json TEXT,
     last_error TEXT,
     next_attempt_at TEXT,
@@ -2047,9 +2055,19 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_local_agent_jobs_owner_status
     ON local_agent_jobs(execution_owner_user_id, status, leased_until);
-CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
-    user_id TEXT PRIMARY KEY,
-    last_seen_at TEXT NOT NULL
+-- Each daemon installation of a user is one device; the row keeps its latest
+-- device report (ADR 0058): its name and MemForge version, the acquisition
+-- contract of each document type, the device Sources whose credentials it
+-- holds, and when the report arrived.
+CREATE TABLE IF NOT EXISTS local_agent_devices (
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    acquisition_contracts_json TEXT NOT NULL,
+    source_ids_json TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, device_id)
 );
 
 -- ---------------------------------------------------------------
@@ -5124,6 +5142,31 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE local_agent_jobs ADD COLUMN leased_at TEXT",
         ],
     ),
+    (
+        135,
+        "Keep one row per daemon device with its latest device report",
+        # Every lease and job heartbeat carries the device report; the server
+        # keeps each device's latest report instead of one online time per
+        # user. A document_acquisition attempt records the acquisition
+        # contract it was leased under, and a job counts the attempts that
+        # ended under a contract the server no longer has outside its retry
+        # budget.
+        [
+            "DROP TABLE IF EXISTS local_agent_heartbeats",
+            """CREATE TABLE IF NOT EXISTS local_agent_devices (
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                acquisition_contracts_json TEXT NOT NULL,
+                source_ids_json TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            )""",
+            "ALTER TABLE local_agent_jobs ADD COLUMN uncounted_attempt_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE local_agent_jobs ADD COLUMN acquisition_contract INTEGER",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -6954,26 +6997,44 @@ class Database:
         self,
         *,
         user_id: str,
+        device: DeviceReport,
+        acquisition_contracts: Mapping[str, int],
         limit: int,
         lease_seconds: int,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        """Keep the device's report and lease it up to ``limit`` of its user's due jobs.
+
+        A ``document_acquisition`` job is leased only by a device whose report
+        names its Source and whose acquisition contract for its type equals
+        ``acquisition_contracts``, the server's; the attempt records that
+        contract. Any other job waits, queued, and counts no attempt.
+        """
+
         lease_time = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(lease_time)
         leased_until = _utc_iso(lease_time + timedelta(seconds=lease_seconds))
+        acquiring_types = {
+            source_type: contract
+            for source_type, contract in acquisition_contracts.items()
+            if device.acquires(source_type, acquisition_contracts)
+        }
+        routing = (
+            DOCUMENT_ACQUISITION_OPERATION,
+            json.dumps(sorted(device.source_ids)),
+            json.dumps(sorted(acquiring_types)),
+        )
         leased_ids: list[str] = []
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
-                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
-                   last_seen_at = excluded.last_seen_at""",
-                (user_id, now_iso),
-            )
+            await self._record_local_agent_device(user_id=user_id, device=device, seen_at=now_iso)
             async with self.db.execute(
-                """SELECT j.job_id FROM local_agent_jobs j
+                """SELECT j.job_id, j.operation, j.source_type FROM local_agent_jobs j
                    WHERE j.execution_owner_user_id = ?
                      AND ((j.status = 'queued' AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ?)) OR
                           (j.status = 'leased' AND j.leased_until <= ?))
+                     AND (j.operation <> ?
+                          OR (j.source_id IN (SELECT value FROM json_each(?))
+                              AND j.source_type IN (SELECT value FROM json_each(?))))
                      AND NOT EXISTS (
                          SELECT 1 FROM local_agent_jobs active
                          WHERE active.workspace_id = j.workspace_id
@@ -6985,13 +7046,18 @@ class Database:
                            AND active.job_id <> j.job_id
                      )
                    ORDER BY j.created_at, j.job_id LIMIT ?""",
-                (user_id, now_iso, now_iso, now_iso, limit),
+                (user_id, now_iso, now_iso, *routing, now_iso, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                contract = (
+                    acquiring_types[str(row["source_type"])]
+                    if row["operation"] == DOCUMENT_ACQUISITION_OPERATION
+                    else None
+                )
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
-                       lease_owner_user_id = ?, leased_at = ?, leased_until = ?,
+                       lease_owner_user_id = ?, leased_at = ?, leased_until = ?, acquisition_contract = ?,
                        attempt_count = attempt_count + 1, result_json = NULL,
                        last_error = NULL, next_attempt_at = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
@@ -7011,6 +7077,7 @@ class Database:
                         user_id,
                         now_iso,
                         leased_until,
+                        contract,
                         now_iso,
                         row["job_id"],
                         user_id,
@@ -7032,19 +7099,17 @@ class Database:
         user_id: str,
         attempt_count: int,
         lease_seconds: int,
+        device: DeviceReport,
         progress: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> bool:
+        """Keep the device's report and extend the attempt's lease while the device still holds it."""
+
         heartbeat_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(heartbeat_at)
         leased_until = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
-                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
-                   last_seen_at = excluded.last_seen_at""",
-                (user_id, now_iso),
-            )
+            await self._record_local_agent_device(user_id=user_id, device=device, seen_at=now_iso)
             result_json = None
             if progress is not None:
                 result_json = json.dumps(
@@ -7076,16 +7141,16 @@ class Database:
     ) -> bool:
         completed_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(completed_at)
-        stored_status = local_agent_completion_status(
-            status,
-            retryable=retryable,
-            attempt_count=attempt_count,
-        )
-        should_retry = stored_status == "queued"
-        delay = local_agent_retry_delay(status, retryable=retryable, attempt_count=attempt_count)
-        next_attempt_at = _utc_iso(completed_at + delay) if delay is not None else None
-        finished_at = None if should_retry else now_iso
         async with self._write_lock:
+            counted_attempts = await self._counted_local_agent_attempts(job_id, attempt_count)
+            stored_status = local_agent_completion_status(
+                status,
+                retryable=retryable,
+                attempt_count=counted_attempts,
+            )
+            delay = local_agent_retry_delay(status, retryable=retryable, attempt_count=counted_attempts)
+            next_attempt_at = _utc_iso(completed_at + delay) if delay is not None else None
+            finished_at = None if stored_status == "queued" else now_iso
             cursor = await self.db.execute(
                 """UPDATE local_agent_jobs SET status = ?, result_json = ?,
                    last_error = ?, lease_owner_user_id = NULL,
@@ -7145,13 +7210,89 @@ class Database:
                 raise
         return job_ids
 
-    async def get_local_agent_heartbeat(self, user_id: str) -> str | None:
+    async def _counted_local_agent_attempts(self, job_id: str, attempt_count: int) -> int:
+        """The attempts up to ``attempt_count`` that count toward the job's retry budget."""
+
         async with self.db.execute(
-            "SELECT last_seen_at FROM local_agent_heartbeats WHERE user_id = ?",
-            (user_id,),
+            "SELECT uncounted_attempt_count FROM local_agent_jobs WHERE job_id = ?",
+            (job_id,),
         ) as cursor:
             row = await cursor.fetchone()
-        return str(row["last_seen_at"]) if row else None
+        return attempt_count - int(row["uncounted_attempt_count"] or 0) if row else attempt_count
+
+    async def requeue_local_agent_job_uncounted(
+        self,
+        *,
+        job_id: str,
+        attempt_count: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Queue a leased attempt's job again without counting the attempt toward its retry budget.
+
+        A ``document_acquisition`` attempt whose submission comes under an
+        acquisition contract the server no longer has ends this way: the job
+        waits for a device whose contract matches. Returns whether that
+        attempt was still leased.
+        """
+
+        now_iso = _utc_iso(now)
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE local_agent_jobs SET status = 'queued',
+                       uncounted_attempt_count = uncounted_attempt_count + 1,
+                       lease_owner_user_id = NULL, leased_until = NULL, acquisition_contract = NULL,
+                       next_attempt_at = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = 'leased' AND attempt_count = ?""",
+                (now_iso, job_id, attempt_count),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def _record_local_agent_device(self, *, user_id: str, device: DeviceReport, seen_at: str) -> None:
+        """Keep the device's latest report; the caller holds the write lock and commits."""
+
+        await self.db.execute(
+            """INSERT INTO local_agent_devices (
+                   user_id, device_id, name, version, acquisition_contracts_json, source_ids_json, last_seen_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, device_id) DO UPDATE SET
+                   name = excluded.name, version = excluded.version,
+                   acquisition_contracts_json = excluded.acquisition_contracts_json,
+                   source_ids_json = excluded.source_ids_json, last_seen_at = excluded.last_seen_at""",
+            (
+                user_id,
+                device.device_id,
+                device.name,
+                device.version,
+                json.dumps(dict(sorted(device.acquisition_contracts.items()))),
+                json.dumps(sorted(device.source_ids)),
+                seen_at,
+            ),
+        )
+
+    async def list_local_agent_devices(self, user_id: str) -> list[LocalAgentDevice]:
+        """Each device of the user, as its latest report left it, most recently seen first."""
+
+        async with self.db.execute(
+            """SELECT * FROM local_agent_devices WHERE user_id = ?
+               ORDER BY last_seen_at DESC, device_id""",
+            (user_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            LocalAgentDevice(
+                user_id=str(row["user_id"]),
+                report=DeviceReport(
+                    device_id=str(row["device_id"]),
+                    name=str(row["name"]),
+                    version=str(row["version"]),
+                    acquisition_contracts=json.loads(row["acquisition_contracts_json"]),
+                    source_ids=frozenset(json.loads(row["source_ids_json"])),
+                ),
+                last_seen_at=datetime.fromisoformat(str(row["last_seen_at"])),
+            )
+            for row in rows
+        ]
 
     async def enqueue_due_local_agent_jobs(
         self,

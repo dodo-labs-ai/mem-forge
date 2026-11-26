@@ -10,6 +10,8 @@ import pytest
 
 import memforge.main as main
 import memforge.local_agent.service as daemon_service_module
+from memforge.local_agent import device_identity
+from memforge.local_agent.device_identity import DeviceIdentityStore
 from memforge.api_target import build_target
 from memforge.local_agent.service import (
     KEYRING_SERVICE,
@@ -733,6 +735,77 @@ def test_daemon_service_run_loads_stored_environment(monkeypatch, tmp_path):
     }
 
 
+def _this_device_status(status: str, last_seen_at: str | None, *, others: tuple[dict, ...] = ()) -> dict:
+    """A ``/local-agent/status`` answer in which this installation's device has ``status`` and ``last_seen_at``."""
+    identity = DeviceIdentityStore(device_identity.device_identity_path()).load()
+    devices = list(others)
+    if identity is not None and last_seen_at is not None:
+        devices.append(
+            {
+                "device_id": identity.device_id,
+                "name": identity.name,
+                "version": "0.2.0",
+                "status": status,
+                "last_seen_at": last_seen_at,
+            }
+        )
+    latest = max((device["last_seen_at"] for device in devices), default=None)
+    return {
+        "status": "online" if any(device["status"] == "online" for device in devices) else "offline",
+        "last_seen_at": latest,
+        "devices": devices,
+    }
+
+
+def test_setup_names_this_device_and_waits_for_its_own_report(monkeypatch, tmp_path):
+    manager = FakeServiceManager()
+    monkeypatch.setattr(main, "_daemon_service_manager", lambda: manager)
+    monkeypatch.setattr(main, "_current_cli_executable", lambda: "/opt/memforge/bin/memforge")
+    other = {
+        "device_id": "dev-desktop",
+        "name": "Desktop",
+        "version": "0.2.0",
+        "status": "online",
+        "last_seen_at": "2026-08-26T00:00:30+00:00",
+    }
+
+    class FakeToolClient:
+        def __init__(self, **kwargs):
+            # The owner's other computer reports freshly throughout; this one only on the third answer.
+            self.statuses = iter(
+                [
+                    ("online", "2026-08-25T23:59:00+00:00"),
+                    ("online", "2026-08-25T23:59:00+00:00"),
+                    ("online", "2026-08-26T00:01:00+00:00"),
+                ]
+            )
+
+        def health(self):
+            return {"status": "ok"}
+
+        def get_local_agent_status(self):
+            return _this_device_status(*next(self.statuses), others=(other,))
+
+    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--api-url", "http://127.0.0.1:8765", "--device-name", "Work laptop"],
+        env={"MEMFORGE_CLI_CONFIG": str(tmp_path / "cli.toml")},
+    )
+
+    assert result.exit_code == 0, result.output
+    identity = DeviceIdentityStore(device_identity.device_identity_path()).load()
+    assert identity is not None and identity.name == "Work laptop"
+    payload = json.loads(result.output[result.output.index("{") :])
+    assert payload["daemon"]["device_id"] == identity.device_id
+    assert payload["daemon"]["last_seen_at"] == "2026-08-26T00:01:00+00:00"
+
+    # Setting up again keeps the device's id; naming it again renames it.
+    again = DeviceIdentityStore(device_identity.device_identity_path()).ensure("Laptop")
+    assert (again.device_id, again.name) == (identity.device_id, "Laptop")
+
+
 def test_setup_configures_target_installs_service_and_verifies_heartbeat(monkeypatch, tmp_path):
     manager = FakeServiceManager()
     monkeypatch.delenv("MEMFORGE_API_URL", raising=False)
@@ -745,8 +818,8 @@ def test_setup_configures_target_installs_service_and_verifies_heartbeat(monkeyp
             self.kwargs = kwargs
             self.statuses = iter(
                 [
-                    {"status": "online", "last_seen_at": "2026-08-25T23:59:00+00:00"},
-                    {"status": "online", "last_seen_at": "2026-08-26T00:00:00+00:00"},
+                    ("online", "2026-08-25T23:59:00+00:00"),
+                    ("online", "2026-08-26T00:00:00+00:00"),
                 ]
             )
 
@@ -754,7 +827,7 @@ def test_setup_configures_target_installs_service_and_verifies_heartbeat(monkeyp
             return {"status": "ok"}
 
         def get_local_agent_status(self):
-            return next(self.statuses)
+            return _this_device_status(*next(self.statuses))
 
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     config_path = tmp_path / "cli.toml"
@@ -796,8 +869,8 @@ def test_setup_captures_heartbeat_baseline_after_replacing_old_daemon(monkeypatc
         def __init__(self, **kwargs):
             self.statuses = iter(
                 [
-                    {"status": "online", "last_seen_at": "2026-08-26T00:00:00+00:00"},
-                    {"status": "online", "last_seen_at": "2026-08-26T00:00:25+00:00"},
+                    ("online", "2026-08-26T00:00:00+00:00"),
+                    ("online", "2026-08-26T00:00:25+00:00"),
                 ]
             )
 
@@ -806,7 +879,7 @@ def test_setup_captures_heartbeat_baseline_after_replacing_old_daemon(monkeypatc
 
         def get_local_agent_status(self):
             events.append("heartbeat")
-            return next(self.statuses)
+            return _this_device_status(*next(self.statuses))
 
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     result = CliRunner().invoke(
@@ -831,8 +904,8 @@ def test_setup_guides_a_new_cloud_user_without_preconfigured_target(monkeypatch,
             self.kwargs = kwargs
             self.statuses = iter(
                 [
-                    {"status": "offline", "last_seen_at": None},
-                    {"status": "online", "last_seen_at": "2026-08-26T00:00:00+00:00"},
+                    ("offline", None),
+                    ("online", "2026-08-26T00:00:00+00:00"),
                 ]
             )
 
@@ -840,7 +913,7 @@ def test_setup_guides_a_new_cloud_user_without_preconfigured_target(monkeypatch,
             return {"status": "ok"}
 
         def get_local_agent_status(self):
-            return next(self.statuses)
+            return _this_device_status(*next(self.statuses))
 
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     config_path = tmp_path / "cli.toml"

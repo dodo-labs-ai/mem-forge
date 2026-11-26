@@ -135,6 +135,7 @@ DESCRIPTOR = SourceTypeDescriptor(
         replay_adapter="memforge.local_agent.replay_adapter:JiraReplayAdapter",
         accepts_artifact_inputs=True,
     ),
+    acquisition_contract=1,
     config=SourceConfigPolicy(
         extra_secret_fields=("jira_cookie",),
         complete=_complete_config,

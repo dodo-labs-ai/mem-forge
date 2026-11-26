@@ -52,5 +52,6 @@ DESCRIPTOR = SourceTypeDescriptor(
     legacy_evidence_profiles=adapter.LEGACY_OBSERVATION_PROFILES,
     record_schemas=adapter.CANONICAL_RECORD_SCHEMAS,
     exports_pdf=True,
+    acquisition_contract=1,
     config=SourceConfigPolicy(facts=_facts),
 )

@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -500,6 +500,17 @@ def _acquire_local_agent_daemon_lock(lock_path: Path | None = None) -> _LocalAge
     return _LocalAgentDaemonLock(path, fd)
 
 
+def _this_device_report() -> dict[str, Any]:
+    """This installation's device report, as of now: the Sources it holds credentials for can change at any time."""
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_report import this_device_report
+
+    identity = DeviceIdentityStore(device_identity_path()).ensure()
+    source_ids = DeviceCredentialStore(device_credentials_path()).source_ids()
+    return this_device_report(identity.device_id, identity.name, source_ids).to_payload()
+
+
 def _build_local_agent_runner(
     ctx,
     *,
@@ -508,12 +519,14 @@ def _build_local_agent_runner(
     from memforge.local_agent.runner import LocalAgentRunner
 
     client = _local_agent_tool_client(ctx)
+    device = _this_device_report
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
         cloud_job_handler=lambda job, report_progress=None: _run_cloud_local_agent_job(
             job, client, browser=browser, report_progress=report_progress
         ),
         cloud_jobs_provider=lambda limit=1, wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
+            device=device(),
             limit=limit,
             wait_seconds=wait_seconds,
             lease_seconds=lease_seconds,
@@ -529,6 +542,7 @@ def _build_local_agent_runner(
             client.heartbeat_local_agent_job(
                 job_id,
                 attempt_count=attempt_count,
+                device=device(),
                 lease_seconds=lease_seconds,
                 progress=progress,
             )
@@ -1970,25 +1984,40 @@ def _status_timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _reported_device(status: Mapping[str, Any], device_id: str) -> dict[str, Any] | None:
+    """One device of a ``/local-agent/status`` answer, by id."""
+    for device in status.get("devices") or ():
+        if isinstance(device, Mapping) and device.get("device_id") == device_id:
+            return dict(device)
+    return None
+
+
 def _wait_for_local_agent_online(
     client: ToolClient,
     *,
+    device_id: str,
     after_last_seen_at: str | None,
     timeout_seconds: float = 35.0,
 ) -> dict[str, Any]:
+    """Wait for a report from this installation's own device newer than ``after_last_seen_at``."""
     deadline = time.monotonic() + timeout_seconds
     baseline = _status_timestamp(after_last_seen_at)
     latest: dict[str, Any] = {"status": "offline"}
     while True:
         latest = client.get_local_agent_status()
-        observed = _status_timestamp(latest.get("last_seen_at"))
-        fresh = observed is not None and (baseline is None or observed > baseline)
-        if latest.get("status") == "online" and fresh:
-            return {**latest, "fresh": True}
         if latest.get("error"):
             return latest
+        device = _reported_device(latest, device_id) or {
+            "device_id": device_id,
+            "status": "offline",
+            "last_seen_at": None,
+        }
+        observed = _status_timestamp(device.get("last_seen_at"))
+        fresh = observed is not None and (baseline is None or observed > baseline)
+        if device.get("status") == "online" and fresh:
+            return {**device, "fresh": True}
         if time.monotonic() >= deadline:
-            return {**latest, "fresh": False}
+            return {**device, "fresh": False}
         time.sleep(0.5)
 
 
@@ -1998,10 +2027,12 @@ def _wait_for_local_agent_online(
 @click.option(
     "--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable holding the token."
 )
+@click.option("--device-name", default=None, help="Name of this computer in MemForge. Defaults to its host name.")
 @click.pass_context
-def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str):
-    """Configure a target and install the local daemon user service."""
+def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str, device_name: str | None):
+    """Configure a target, name this device and install the local daemon user service."""
     from memforge.api_target import Edition
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.service import DaemonServiceError
 
     cli_config_path = _cli_config_path()
@@ -2042,6 +2073,10 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
         _emit_tool_payload(ctx, health)
         return
     try:
+        device = DeviceIdentityStore(device_identity_path()).ensure(device_name)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    try:
         replacement = manager.replace(
             executable=_current_cli_executable(),
             api_url=resolved.target.origin,
@@ -2064,7 +2099,8 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
 
     daemon_status = _wait_for_local_agent_online(
         client,
-        after_last_seen_at=baseline_status.get("last_seen_at"),
+        device_id=device.device_id,
+        after_last_seen_at=(_reported_device(baseline_status, device.device_id) or {}).get("last_seen_at"),
     )
     if daemon_status.get("status") != "online" or daemon_status.get("fresh") is not True:
         try:
@@ -3667,10 +3703,17 @@ def _run_cloud_jira_auth_job(
 
 
 def _local_agent_lease_not_current(response: object) -> bool:
+    """Whether the server answered that the attempt is no longer this device's.
+
+    A submission under an acquisition contract the server no longer has
+    queues the job again, so it ends the attempt as a lost lease does.
+    """
+    from memforge.local_agent.source_contract import ACQUISITION_CONTRACT_CHANGED
+
     return (
         isinstance(response, dict)
         and response.get("status_code") == HTTPStatus.CONFLICT
-        and response.get("detail") == LOCAL_AGENT_LEASE_NOT_CURRENT
+        and response.get("detail") in {LOCAL_AGENT_LEASE_NOT_CURRENT, ACQUISITION_CONTRACT_CHANGED}
     )
 
 
@@ -3679,7 +3722,7 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
         return
     from memforge.local_agent.runner import CloudJobLeaseLost
 
-    raise CloudJobLeaseLost(LOCAL_AGENT_LEASE_NOT_CURRENT)
+    raise CloudJobLeaseLost(str(response["detail"]))  # type: ignore[index]
 
 
 @dataclass(frozen=True)

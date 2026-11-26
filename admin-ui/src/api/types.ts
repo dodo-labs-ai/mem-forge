@@ -785,9 +785,19 @@ export interface LocalAgentJobStatusResponse {
   last_error?: string | null;
 }
 
+/** One of the caller's devices, as its latest report left it. */
+export interface LocalAgentDeviceStatus {
+  device_id: string;
+  name: string;
+  version: string;
+  status: "online" | "offline";
+  last_seen_at: string;
+}
+
 export interface LocalAgentDaemonStatusResponse {
   status: "online" | "offline";
   last_seen_at: string | null;
+  devices: LocalAgentDeviceStatus[];
   checked_at: string;
   stale_after_seconds: number;
 }

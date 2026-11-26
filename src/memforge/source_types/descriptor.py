@@ -110,7 +110,11 @@ class SourceTypeDescriptor:
     read under; ``alternative_evidence_profiles`` names the other profiles the
     adapter may choose for one Observation of that type, such as by a file's
     extension. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
-    a Unit's stored input must then hold. ``config`` checks and prepares the
+    a Unit's stored input must then hold. ``acquisition_contract`` is a
+    document type's acquisition contract: an integer that changes whenever
+    what the Gene's acquisition returns changes in a way its interpretation
+    depends on, so a device acquires a type's runs only while its contract
+    equals the server's (ADR 0058). ``config`` checks and prepares the
     Source's configuration. ``conversation_provider`` opens a conversation
     type's provider on the device.
     """
@@ -129,6 +133,7 @@ class SourceTypeDescriptor:
     record_schemas: Mapping[tuple[str, int], CanonicalRecordSchema] = field(default_factory=dict)
     local_agent: LocalAgentCollection | None = None
     exports_pdf: bool = False
+    acquisition_contract: int | None = None
     config: SourceConfigPolicy = field(default_factory=SourceConfigPolicy)
     conversation_provider: ConversationProviderReference | None = None
 

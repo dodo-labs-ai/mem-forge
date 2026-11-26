@@ -1,0 +1,24 @@
+{
+  "confluence:1": {
+    "page-tree": "73878aeee7c14ad027ffb500db18fe9b06316c5aa33371d715103bc7b6b0bf88",
+    "space": "fcd46c515acd874286cd3cc4c0405162f897221f7878f40abed83f01f03a5a5c"
+  },
+  "github_pages:1": {
+    "authoritative-sitemap": "1b214d0ed4d756e65aea6121599e1a27d9704fcd4f2683f80fe57ce57e8a2e20",
+    "branch-tree": "d58531f86bca1b6f4e42b0bbe9924dd8055752af25bdb5d1b8d363c3735f0d76",
+    "crawl-or-sitemap": "776103843b7dcb2ab67306f29d1b930d47a69e263aaf918d4042c3c684cbd9a6",
+    "explicit-list": "9135bb7993c1c9b413d613b0ca5e5ecebeb76b8f6780a4900831e639c7b9d9df",
+    "single-page": "7ada7b245b4af97f51cd0fb206d2df5a4b705404c20a98acfedbd1ad1c3f7990"
+  },
+  "github_repo:1": {
+    "cloud-pull": "48b57149a033c002de0b67a88bbac56c494e70edd8584633f27e9372139d8e9f"
+  },
+  "jira:1": {
+    "advanced": "555857dafe1562ae1f49dff0528b067661966bbde712f69b18e4d6d2ee006040",
+    "simple": "7acd2980aa3aac9036c305fb5f58accead90becaec23c24a24dc6bae205c9e17"
+  },
+  "notion:1": {
+    "database": "39e993bc39ee26fa51cbefca27c145532e5d021728ceca24a002ea2bc634b2fd",
+    "root_page": "a1246e11397a4ca1a7342134f50d190a4405a8961220908e571d4630b49dff07"
+  }
+}

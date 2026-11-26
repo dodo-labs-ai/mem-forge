@@ -118,6 +118,7 @@ from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
+from tests.device_report_fixture import leasing_device
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.llm_fixture import AdmittingClient, NoopMemoryExtractor, fixture_request_planner
 from tests.unit_support_fixture import active_support_evidence
@@ -6643,6 +6644,7 @@ async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Dat
     local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
     server_runs = await db.enqueue_due_source_sync_runs(now=due_at)
     jobs = await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner-a",
         limit=5,
         lease_seconds=60,
@@ -6703,6 +6705,7 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         now=now,
     )
     first = await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner-a",
         limit=1,
         lease_seconds=60,
@@ -6727,9 +6730,11 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         now=now + timedelta(seconds=1),
     )
     assert await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner-a", limit=1, lease_seconds=60, now=now + timedelta(seconds=2),
     ) == []
     second = await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner-a",
         limit=1,
         lease_seconds=60,
@@ -6770,7 +6775,7 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    jobs = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
+    jobs = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=5, lease_seconds=60)
 
     assert first_created is True
     assert promoted_created is False
@@ -6798,7 +6803,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    leased = await db.lease_local_agent_jobs(user_id="owner-a", limit=1, lease_seconds=60)
+    leased = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=1, lease_seconds=60)
     promoted_id, created = await db.enqueue_local_agent_job(
         job_id="laj-leased-force",
         source_id="src-local",
@@ -6808,7 +6813,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    blocked = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
+    blocked = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=5, lease_seconds=60)
     await db.complete_local_agent_job(
         job_id=first_id,
         user_id="owner-a",
@@ -6818,7 +6823,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         error=None,
         retryable=False,
     )
-    successor = await db.lease_local_agent_jobs(user_id="owner-a", limit=5, lease_seconds=60)
+    successor = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=5, lease_seconds=60)
 
     assert leased[0]["job_id"] == first_id
     assert promoted_id != first_id
@@ -6848,7 +6853,7 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
     )
-    await db.lease_local_agent_jobs(user_id="owner-a", limit=1, lease_seconds=60, now=now)
+    await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=1, lease_seconds=60, now=now)
     successor_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-expired-successor",
         source_id="src-local",
@@ -6860,6 +6865,7 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
     )
 
     recovered = await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner-a",
         limit=5,
         lease_seconds=60,

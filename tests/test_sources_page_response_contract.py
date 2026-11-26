@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
+from tests.device_report_fixture import DAEMON_DEVICE
 
 SOURCE_KEYS = {
     "id",
@@ -478,7 +479,9 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
                 json={"source_type": "teams", "operation": "teams_auth", "payload": {}},
             )
             current = client.get("/api/cloud/local-agent/jobs/current")
-            leased = client.post("/api/cloud/local-agent/jobs/lease", json={"limit": 5}).json()["jobs"]
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease", json={"device": DAEMON_DEVICE, "limit": 5}
+            ).json()["jobs"]
             online = client.get("/api/cloud/local-agent/status")
 
             default_preferences = client.get("/api/v1/source-list/preferences")
@@ -510,10 +513,11 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
     assert current.json()["data"][0]["result"] == {}
     assert leased
 
-    assert set(offline.json()) == {"status", "last_seen_at", "checked_at", "stale_after_seconds"}
+    assert set(offline.json()) == {"status", "last_seen_at", "devices", "checked_at", "stale_after_seconds"}
     assert offline.json()["status"] == "offline"
     assert offline.json()["last_seen_at"] is None
     assert online.json()["status"] == "online"
+    assert [device["device_id"] for device in online.json()["devices"]] == [DAEMON_DEVICE["device_id"]]
 
     assert default_preferences.json() == {"sort_mode": "newest"}
     assert saved_preferences.json() == {"sort_mode": "recently_synced"}

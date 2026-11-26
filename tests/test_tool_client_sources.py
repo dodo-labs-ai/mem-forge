@@ -7,6 +7,7 @@ the parts most likely to drift from the admin API. The transport itself
 
 from __future__ import annotations
 
+
 import hashlib
 import json
 from typing import Any
@@ -18,6 +19,7 @@ import memforge.tool_client as tool_client
 from memforge.api_target import build_host_target, build_target
 from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.tool_client import ToolClient
+from tests.device_report_fixture import device_report
 
 
 class _RecordingClient(ToolClient):
@@ -37,6 +39,9 @@ class _RecordingClient(ToolClient):
     def _http_json(self, method, url, body):  # type: ignore[override]
         self.calls.append((method, url.removeprefix(self.target.origin), body))
         return self._response
+
+
+DEVICE = device_report(["src-local"]).to_payload()
 
 
 def test_health_uses_edition_owned_host_contract():
@@ -384,9 +389,9 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
-    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
+    lease = client.lease_local_agent_jobs(device=DEVICE, limit=3, lease_seconds=120, wait_seconds=25)
     status = client.get_local_agent_status()
-    heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, lease_seconds=120)
+    heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, device=DEVICE, lease_seconds=120)
     complete = client.complete_local_agent_job(
         "laj-1",
         attempt_count=2,
@@ -402,7 +407,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
+            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25, "device": DEVICE},
         ),
         (
             "GET",
@@ -412,7 +417,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/laj-1/heartbeat",
-            {"attempt_count": 2, "lease_seconds": 120},
+            {"attempt_count": 2, "lease_seconds": 120, "device": DEVICE},
         ),
         (
             "POST",
@@ -425,13 +430,13 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
 def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
     client = _RecordingClient({"jobs": []})
 
-    client.lease_local_agent_jobs()
+    client.lease_local_agent_jobs(device=DEVICE)
 
     assert client.calls == [
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 5, "lease_seconds": 60, "wait_seconds": 0},
+            {"limit": 5, "lease_seconds": 60, "wait_seconds": 0, "device": DEVICE},
         )
     ]
 
@@ -442,6 +447,7 @@ def test_local_agent_job_heartbeat_sends_user_progress():
     result = client.heartbeat_local_agent_job(
         "laj-1",
         attempt_count=2,
+        device=DEVICE,
         lease_seconds=120,
         progress={
             "schema_version": 1,
@@ -458,6 +464,7 @@ def test_local_agent_job_heartbeat_sends_user_progress():
             {
                 "attempt_count": 2,
                 "lease_seconds": 120,
+                "device": DEVICE,
                 "progress": {
                     "schema_version": 1,
                     "phase": "uploading",
@@ -523,7 +530,7 @@ def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch)
         workspace_id="ws-a",
     )
 
-    result = client.lease_local_agent_jobs()
+    result = client.lease_local_agent_jobs(device=DEVICE)
 
     assert result["error"] == "MemForge API unavailable"
     assert result["api_url"] == "https://memforge.example.com/api/cloud/local-agent/jobs/lease"

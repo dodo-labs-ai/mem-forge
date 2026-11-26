@@ -66,6 +66,7 @@ from memforge.source_projection_config import canonical_projection_scope, projec
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
+from tests.device_report_fixture import leasing_device
 from tests.gene_fixture import FakeGene
 from tests.source_type_fixture import register_test_source_type
 from tests.test_local_adapter_api import _config
@@ -240,8 +241,10 @@ class _Lease:
         assert self.held is not None
         return self.held.payload
 
-    def lease(self, payload: Mapping[str, object], *, leased_at: datetime) -> None:
-        self.held = LocalAgentLease(payload=dict(payload), leased_at=leased_at)
+    def lease(self, payload: Mapping[str, object], *, leased_at: datetime, acquisition_contract: int = 1) -> None:
+        self.held = LocalAgentLease(
+            payload=dict(payload), leased_at=leased_at, acquisition_contract=acquisition_contract
+        )
 
     async def __call__(self, *args, **kwargs) -> LocalAgentLease | None:
         return self.held if self.current else None
@@ -1339,12 +1342,13 @@ def _run_queued_job(device: _Side, client, lease: _Lease, config: AppConfig, *, 
         # No daemon takes the job before its time.
         early = asyncio.run(
             device.db.lease_local_agent_jobs(
+                **leasing_device([SOURCE_ID]),
                 user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=not_before - timedelta(seconds=1)
             )
         )
         assert early == []
     [leased] = asyncio.run(
-        device.db.lease_local_agent_jobs(user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=leased_at)
+        device.db.lease_local_agent_jobs(**leasing_device([SOURCE_ID]), user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=leased_at)
     )
 
     def complete() -> None:
@@ -1446,7 +1450,7 @@ def test_stopping_the_source_stops_the_job_that_would_acquire_again(deployments,
     # No daemon takes it, however late it asks.
     later = datetime.fromisoformat(following["next_attempt_at"]) + timedelta(days=1)
     assert (
-        asyncio.run(device.db.lease_local_agent_jobs(user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=later))
+        asyncio.run(device.db.lease_local_agent_jobs(**leasing_device([SOURCE_ID]), user_id=LOCAL_DEV_USER_ID, limit=1, lease_seconds=60, now=later))
         == []
     )
 

@@ -9,14 +9,20 @@ import pytest
 from memforge import source_types
 from memforge.genes.base import Gene
 from memforge.genes.contract import validate_source_type
+from memforge.genes.document_gene import DocumentGene
 from memforge.source_types import SourceTypeDescriptor, register_source_type
 
 
 def register_test_source_type(
     monkeypatch: pytest.MonkeyPatch, source_type: str, gene: type[Gene], **descriptor_fields: Any
 ) -> None:
-    """Register ``gene`` as ``source_type``; it must meet its family's contract, as at startup."""
+    """Register ``gene`` as ``source_type``; it must meet its family's contract, as at startup.
 
+    A document type declares acquisition contract 1 unless the test names another.
+    """
+
+    if issubclass(gene, DocumentGene):
+        descriptor_fields.setdefault("acquisition_contract", 1)
     # The test registers into a copy of the registry, which monkeypatch restores afterwards.
     monkeypatch.setattr(source_types, "_DESCRIPTORS", dict(source_types._DESCRIPTORS))
     descriptor = SourceTypeDescriptor(source_type=source_type, gene=gene, **descriptor_fields)

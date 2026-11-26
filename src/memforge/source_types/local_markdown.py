@@ -39,5 +39,6 @@ DESCRIPTOR = SourceTypeDescriptor(
         package_submitter="memforge.local_adapter:submit_local_markdown_request",
         replay_adapter="memforge.local_agent.replay_adapter:LocalMarkdownReplayAdapter",
     ),
+    acquisition_contract=1,
     config=SourceConfigPolicy(complete=_complete_config, store=_store_config),
 )

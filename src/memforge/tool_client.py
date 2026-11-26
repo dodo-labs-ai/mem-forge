@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -861,18 +862,20 @@ class ToolClient:
     def lease_local_agent_jobs(
         self,
         *,
+        device: Mapping[str, Any],
         limit: int = 5,
         lease_seconds: int = 60,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
+        """Lease this device's due jobs; ``device`` is its device report."""
         return self._host_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
+            {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds, "device": dict(device)},
         )
 
     def get_local_agent_status(self) -> dict[str, Any]:
-        """Return the authenticated user's server-observed daemon heartbeat."""
+        """Return the authenticated user's devices as the server last heard from each."""
         return self._host_json("GET", "/api/cloud/local-agent/status", None)
 
     def heartbeat_local_agent_job(
@@ -880,12 +883,14 @@ class ToolClient:
         job_id: str,
         *,
         attempt_count: int,
+        device: Mapping[str, Any],
         lease_seconds: int = 60,
         progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "attempt_count": attempt_count,
             "lease_seconds": lease_seconds,
+            "device": dict(device),
         }
         if progress is not None:
             body["progress"] = normalize_sync_progress_snapshot(progress)

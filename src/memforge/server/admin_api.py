@@ -208,6 +208,7 @@ from memforge.provenance import (
     source_unit_pdf_url,
     source_unit_resource_path,
 )
+from memforge.release import installed_version
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.runtime import (
@@ -316,7 +317,9 @@ from memforge.local_agent.snapshot_manifest import (
     snapshot_manifest_sha256,
     validate_excluded_listings_for_job,
 )
+from memforge.local_agent.device_report import DeviceReport, declared_acquisition_contracts
 from memforge.local_agent.source_contract import (
+    ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
     LocalAgentLease,
@@ -324,7 +327,6 @@ from memforge.local_agent.source_contract import (
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
     local_agent_semantic_input_sha256,
-    local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
@@ -690,13 +692,54 @@ async def _require_current_local_agent_lease(
             and leased_until > datetime.now(timezone.utc)
             and leased_at is not None
         ):
-            lease = LocalAgentLease(payload=dict(job.get("payload") or {}), leased_at=leased_at)
+            lease = LocalAgentLease(
+                payload=dict(job.get("payload") or {}),
+                leased_at=leased_at,
+                acquisition_contract=job.get("acquisition_contract"),
+            )
     if lease is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
+    if lease.payload.get("operation") == DOCUMENT_ACQUISITION_OPERATION:
+        await _require_current_acquisition_contract(
+            db, source=source, lease=lease, job_id=normalized_job_id, attempt_count=int(attempt_count)
+        )
     return LocalAgentLease(
         payload={**lease.payload, "source_config_revision": expected_config_revision},
         leased_at=lease.leased_at,
+        acquisition_contract=lease.acquisition_contract,
     )
+
+
+async def _require_current_acquisition_contract(
+    db: Database,
+    *,
+    source: Mapping[str, Any],
+    lease: LocalAgentLease,
+    job_id: str,
+    attempt_count: int,
+) -> None:
+    """Refuse a device run's submission made under an acquisition contract the server no longer has.
+
+    The server interprets only what its own contract for the type describes.
+    A deploy that changed the contract during the attempt queues the job
+    again without counting the attempt, so a device whose contract matches
+    takes it next, and answers 409 ``acquisition_contract_changed``.
+    """
+
+    descriptor = source_type_descriptor(str(source.get("type") or ""))
+    if descriptor is not None and lease.acquisition_contract == descriptor.acquisition_contract:
+        return
+    await db.requeue_local_agent_job_uncounted(job_id=job_id, attempt_count=attempt_count)
+    raise HTTPException(status_code=409, detail=ACQUISITION_CONTRACT_CHANGED)
+
+
+def _device_report(payload: Mapping[str, Any]) -> DeviceReport:
+    """The device report a lease or job heartbeat carries; 422 when it is malformed."""
+
+    try:
+        return DeviceReport.from_payload(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _lease_time(value: object) -> datetime | None:
@@ -2537,12 +2580,14 @@ class LocalAgentJobLeaseRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=20)
     lease_seconds: int = Field(default=60, ge=1, le=3600)
     wait_seconds: int = Field(default=0, ge=0, le=25)
+    device: dict[str, Any]
 
 
 class LocalAgentJobHeartbeatRequest(BaseModel):
     attempt_count: int = Field(ge=1)
     lease_seconds: int = Field(default=60, ge=1, le=3600)
     progress: dict[str, Any] | None = None
+    device: dict[str, Any]
 
 
 class LocalAgentJobCompleteRequest(BaseModel):
@@ -2590,9 +2635,20 @@ class LocalAgentJobListResponse(BaseModel):
     data: list[LocalAgentJobResponse]
 
 
+class LocalAgentDeviceStatus(BaseModel):
+    device_id: str
+    name: str
+    version: str
+    status: Literal["online", "offline"]
+    last_seen_at: str
+
+
 class LocalAgentDaemonStatusResponse(BaseModel):
+    """The caller's devices, and whether any of them is online."""
+
     status: Literal["online", "offline"]
     last_seen_at: str | None
+    devices: list[LocalAgentDeviceStatus]
     checked_at: str
     stale_after_seconds: int
 
@@ -10901,18 +10957,25 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
+        """Lease the device its due jobs; the answer also names the server's version and acquisition contracts."""
+
         requester = resolve_request_principal(request)
+        device = _device_report(req.device)
+        contracts = declared_acquisition_contracts()
+        server = {"version": installed_version(), "acquisition_contracts": contracts}
         deadline = time.monotonic() + req.wait_seconds
         while True:
             jobs = await db.lease_local_agent_jobs(
                 user_id=requester,
+                device=device,
+                acquisition_contracts=contracts,
                 limit=req.limit,
                 lease_seconds=req.lease_seconds,
             )
             if jobs or req.wait_seconds <= 0 or time.monotonic() >= deadline:
-                return {"jobs": [_shape_local_agent_job(job) for job in jobs]}
+                return {"jobs": [_shape_local_agent_job(job) for job in jobs], "server": server}
             if await request.is_disconnected():
-                return {"jobs": []}
+                return {"jobs": [], "server": server}
             await asyncio.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
 
     @local_agent_router.post("/jobs/{job_id}/heartbeat")
@@ -10932,6 +10995,7 @@ def create_admin_app(
             user_id=requester,
             attempt_count=req.attempt_count,
             lease_seconds=req.lease_seconds,
+            device=_device_report(req.device),
             progress=progress,
         )
         if not wrote:
@@ -10966,11 +11030,8 @@ def create_admin_app(
             if status not in {"queued", "succeeded", "failed"}:
                 raise HTTPException(status_code=404, detail="local_agent_job_not_found")
         else:
-            status = local_agent_completion_status(
-                req.status,
-                retryable=bool(req.result.get("retryable")),
-                attempt_count=req.attempt_count,
-            )
+            completed = await db.get_local_agent_job(job_id)
+            status = str((completed or {}).get("status") or "")
         return {"ok": True, "job_id": job_id, "status": status}
 
     @local_agent_router.get("/jobs/current", response_model=LocalAgentJobListResponse)
@@ -11002,13 +11063,27 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
+        """Each of the caller's devices by its latest report, online while that report is recent."""
+
         now = datetime.now(timezone.utc)
-        last_seen_at = await db.get_local_agent_heartbeat(resolve_request_principal(request))
-        last_seen = datetime.fromisoformat(last_seen_at) if last_seen_at else None
-        online = bool(last_seen and (now - last_seen).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS)
+        devices = [
+            {
+                "device_id": device.report.device_id,
+                "name": device.report.name,
+                "version": device.report.version,
+                "status": (
+                    "online"
+                    if (now - device.last_seen_at).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS
+                    else "offline"
+                ),
+                "last_seen_at": device.last_seen_at.isoformat(),
+            }
+            for device in await db.list_local_agent_devices(resolve_request_principal(request))
+        ]
         return {
-            "status": "online" if online else "offline",
-            "last_seen_at": last_seen_at,
+            "status": "online" if any(device["status"] == "online" for device in devices) else "offline",
+            "last_seen_at": devices[0]["last_seen_at"] if devices else None,
+            "devices": devices,
             "checked_at": now.isoformat(),
             "stale_after_seconds": LOCAL_AGENT_STATUS_STALE_SECONDS,
         }

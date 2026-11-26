@@ -7,6 +7,7 @@ import pytest
 
 from memforge.local_agent.source_contract import local_agent_sync_job_payload
 from memforge.storage.database import Database
+from tests.device_report_fixture import leasing_device
 
 
 @pytest.fixture
@@ -41,7 +42,7 @@ async def _queued_retry(db):
         created_by_user_id="owner",
         execution_owner_user_id="owner",
     )
-    [leased] = await db.lease_local_agent_jobs(user_id="owner", limit=1, lease_seconds=60, now=now)
+    [leased] = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now)
     assert await db.complete_local_agent_job(
         job_id=leased["job_id"],
         user_id="owner",
@@ -61,8 +62,9 @@ async def test_local_retry_waits_for_shared_delay_before_claim(db):
     queued = await db.get_local_agent_job("laj-retry")
     assert queued["status"] == "queued"
     assert queued["next_attempt_at"] == (now + timedelta(hours=1)).isoformat()
-    assert await db.lease_local_agent_jobs(user_id="owner", limit=1, lease_seconds=60, now=now) == []
+    assert await db.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now) == []
     [leased] = await db.lease_local_agent_jobs(
+        **leasing_device(),
         user_id="owner",
         limit=1,
         lease_seconds=60,
@@ -94,7 +96,7 @@ async def test_manual_advances_exact_job_without_resetting_history(db):
     for field in ("payload", "attempt_count", "last_error", "result", "created_at"):
         assert advanced[field] == before[field]
     assert await db.get_local_agent_job("laj-must-not-be-created") is None
-    [leased] = await db.lease_local_agent_jobs(user_id="owner", limit=1, lease_seconds=60, now=now)
+    [leased] = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now)
     assert await db.enqueue_local_agent_job(**common, retry_job_id="laj-retry") == ("laj-retry", False)
     assert (await db.get_local_agent_job("laj-retry"))["attempt_count"] == leased["attempt_count"]
 
@@ -213,7 +215,7 @@ async def test_two_connections_retry_one_job_without_resetting_attempts(db):
         assert await asyncio.gather(retry(db), retry(other)) == [("laj-retry", False)] * 2
         claimed = await asyncio.gather(
             *[
-                database.lease_local_agent_jobs(user_id="owner", limit=1, lease_seconds=60, now=now)
+                database.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now)
                 for database in (db, other)
             ]
         )

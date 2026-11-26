@@ -85,7 +85,11 @@ def _issue(key: str, profile_zone: ZoneInfo) -> dict:
             "status": None,
             "priority": None,
             "assignee": None,
+            "resolution": None,
+            "description": f"The rules {key} records.",
+            "comment": {"comments": [], "startAt": 0, "maxResults": 50, "total": 0},
         },
+        "changelog": {"histories": [], "startAt": 0, "maxResults": 0, "total": 0},
     }
 
 

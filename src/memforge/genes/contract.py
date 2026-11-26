@@ -139,6 +139,9 @@ def _validate_config_schema(name: str, schema: GeneConfigSchema) -> None:
 
 def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[DocumentGene]) -> None:
     name = descriptor.source_type
+    contract = descriptor.acquisition_contract
+    if isinstance(contract, bool) or not isinstance(contract, int) or contract < 1:
+        raise SourceTypeContractError(f"{name}: a document type must declare a positive integer acquisition_contract")
     kinds = getattr(gene_cls, "listing_kinds", None)
     if not isinstance(kinds, frozenset) or not all(isinstance(kind, ScopeListingKind) for kind in kinds):
         raise SourceTypeContractError(
@@ -175,6 +178,8 @@ def _overrides(gene_cls: type[DocumentGene], member: str) -> bool:
 
 def _validate_conversation_type(descriptor: SourceTypeDescriptor) -> None:
     name = descriptor.source_type
+    if descriptor.acquisition_contract is not None:
+        raise SourceTypeContractError(f"{name}: a conversation type has no acquisition_contract")
     reference = descriptor.conversation_provider
     if reference is None:
         raise SourceTypeContractError(f"{name}: a conversation type must name its conversation_provider")

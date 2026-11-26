@@ -16,6 +16,8 @@ from memforge.source_types import registered_source_types, source_type_descripto
 
 
 DOCUMENT_ACQUISITION_OPERATION = "document_acquisition"
+ACQUISITION_CONTRACT_CHANGED = "acquisition_contract_changed"
+"""Why a device run's submission was refused: the server's acquisition contract for the type changed."""
 """The local-agent operation that acquires a document Source on its owner's device with the type's own Gene."""
 LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
     {
@@ -68,10 +70,14 @@ class LocalAgentLease:
 
     ``payload`` is the job's payload, and ``leased_at`` when the attempt was
     leased: a device run reads its provider from then on.
+    ``acquisition_contract`` is the acquisition contract a
+    ``document_acquisition`` attempt was leased under, and ``None`` for any
+    other job.
     """
 
     payload: Mapping[str, Any]
     leased_at: datetime
+    acquisition_contract: int | None = None
 
 
 def teams_config_within_history_bound(config: Mapping[str, Any]) -> dict[str, Any] | None:
