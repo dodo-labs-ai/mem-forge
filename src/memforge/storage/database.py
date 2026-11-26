@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 
 import aiosqlite
 
@@ -45,7 +45,7 @@ from memforge.local_agent.source_contract import (
     local_agent_retry_delay,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
-    local_agent_sync_operation,
+    source_collection_operation,
     source_sync_input_metadata_with_artifact_attestation,
 )
 from memforge.storage.admin_source import is_pause_only_source_update
@@ -7417,10 +7417,19 @@ class Database:
     async def enqueue_due_local_agent_jobs(
         self,
         *,
+        device_acquisition_payload: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]],
         now: datetime | None = None,
         limit: int = 50,
         workspace_id: str = "default",
     ) -> int:
+        """Queue the scheduled job of each due Source collected on its execution owner's device.
+
+        A device Source's job is ``document_acquisition``, whose payload
+        ``device_acquisition_payload`` builds from the Source as of now; a
+        Source on its type's local-agent path gets that type's operation.
+        Returns how many jobs were created.
+        """
+
         claim_time = now or datetime.now(timezone.utc)
         due_at = _utc_iso(claim_time)
         enqueued = 0
@@ -7435,15 +7444,22 @@ class Database:
             (due_at, limit),
         ) as cursor:
             rows = [dict(row) async for row in cursor]
+        operations = {
+            row["id"]: operation for row in rows if (operation := source_collection_operation(row)) is not None
+        }
         payloads = {
-            row["id"]: await local_agent_sync_job_payload(self, row)
+            row["id"]: (
+                await device_acquisition_payload(_source_from_row(row))
+                if operations[row["id"]] == DOCUMENT_ACQUISITION_OPERATION
+                else await local_agent_sync_job_payload(self, row)
+            )
             for row in rows
-            if local_agent_sync_operation(row["type"], row["config"]) is not None
+            if row["id"] in operations
         }
         async with self._write_lock:
             try:
                 for row in rows:
-                    operation = local_agent_sync_operation(row["type"], row["config"])
+                    operation = operations.get(row["id"])
                     if operation is None:
                         continue
                     owner = str(row.get("execution_owner_user_id") or "").strip()
@@ -17597,7 +17613,7 @@ class Database:
                 ) as cursor:
                     rows = [dict(row) async for row in cursor]
                 for row in rows:
-                    if local_agent_sync_operation(row["type"], row["config"]) is not None:
+                    if source_collection_operation(row) is not None:
                         continue
                     interval_minutes = int(
                         row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES

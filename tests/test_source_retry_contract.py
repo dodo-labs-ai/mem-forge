@@ -10,6 +10,11 @@ from memforge.storage.database import Database
 from tests.device_report_fixture import leasing_device
 
 
+async def _no_device_source(source):
+    raise AssertionError(f"no device Source is due here: {source['id']}")
+
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "source-retry.db"))
@@ -177,7 +182,7 @@ async def test_local_scheduler_rolls_back_schedule_when_enqueue_fails(db, monkey
 
     monkeypatch.setattr(db, "_enqueue_local_agent_job_locked", fail)
     with pytest.raises(RuntimeError, match="injected"):
-        await db.enqueue_due_local_agent_jobs(now=now)
+        await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=now)
     assert not db.db.in_transaction
     assert (await db.get_source("src-retry"))["sync_schedule"] == before["sync_schedule"]
 
@@ -187,7 +192,7 @@ async def test_local_scheduler_coalesces_without_advancing_backoff(db):
     now, _ = await _queued_retry(db)
     before = await db.get_local_agent_job("laj-retry")
     await db.set_source_sync_schedule("src-retry", enabled=True, interval_minutes=60, next_run_at=now)
-    assert await db.enqueue_due_local_agent_jobs(now=now) == 0
+    assert await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=now) == 0
     assert (await db.get_local_agent_job("laj-retry"))["next_attempt_at"] == before["next_attempt_at"]
 
 

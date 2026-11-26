@@ -401,19 +401,34 @@ def is_local_agent_backed_source(source: Mapping[str, Any]) -> bool:
     )
 
 
-def source_execution_descriptor(
-    source_type: str,
-    config: Mapping[str, Any] | str | None,
-) -> dict[str, Any]:
-    """Return the canonical execution contract exposed to source clients."""
-    operation = local_agent_sync_operation(source_type, config)
-    descriptor = source_type_descriptor(str(source_type or "").strip().lower())
+def source_execution_descriptor(source: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the canonical execution contract exposed to source clients.
+
+    ``kind`` is ``local_agent`` for a Source collected on its owner's device,
+    by the device executor (ADR 0058) or a type's local-agent operation, and
+    ``server`` otherwise.
+    """
+    source_type = str(source.get("type") or "")
+    operation = source_collection_operation(source)
+    descriptor = source_type_descriptor(source_type.strip().lower())
     collection = descriptor.local_agent if descriptor is not None else None
     return {
         "kind": "local_agent" if operation is not None else "server",
         "operation": operation,
         "immutable_config_fields": list(collection.immutable_execution_fields if collection else ()),
     }
+
+
+def source_collection_operation(source: Mapping[str, Any]) -> str | None:
+    """The local-agent operation that collects the Source on its owner's device, or ``None`` when the server does.
+
+    A device Source is acquired by ``document_acquisition``; a Source on its
+    type's local-agent path by that type's operation.
+    """
+
+    if source_runs_on_device(source):
+        return DOCUMENT_ACQUISITION_OPERATION
+    return local_agent_sync_operation(str(source.get("type") or ""), source.get("config"))
 
 
 def source_executor(source: Mapping[str, Any]) -> str:

@@ -127,6 +127,11 @@ from tests.embedding_fixture import unconfigured_embedding
 from tests.gene_fixture import FakeGene
 
 
+async def _no_device_source(source):
+    raise AssertionError(f"no device Source is due here: {source['id']}")
+
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "sync-bookkeeping.db"), document_store=StubDocumentStore())
@@ -6645,7 +6650,7 @@ async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Dat
         next_run_at=due_at,
     )
 
-    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+    local_count = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=due_at)
     server_runs = await db.enqueue_due_source_sync_runs(now=due_at)
     jobs = await db.lease_local_agent_jobs(
         **leasing_device(),
@@ -6687,7 +6692,7 @@ async def test_due_ownerless_local_source_advances_schedule_without_job(db: Data
         next_run_at=due_at,
     )
 
-    local_count = await db.enqueue_due_local_agent_jobs(now=due_at)
+    local_count = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=due_at)
 
     assert local_count == 0
     source = await db.get_source(source_id)
@@ -6984,7 +6989,7 @@ async def test_scheduler_coalesces_active_due_source_and_advances_next_run(db: D
 async def test_scheduler_still_scans_server_sources_when_local_job_scan_fails(db: Database, monkeypatch):
     server_scan_calls: list[tuple[int, str, set[str]]] = []
 
-    async def fail_local_scan(*, limit):
+    async def fail_local_scan(*, device_acquisition_payload, limit):
         raise RuntimeError("local broker unavailable")
 
     async def record_server_scan(*, limit, workspace_id, exclude_source_ids):
@@ -7064,7 +7069,7 @@ async def test_scheduler_shutdown_waits_for_running_job() -> None:
     release = asyncio.Event()
 
     class BlockingDatabase:
-        async def enqueue_due_local_agent_jobs(self, *, limit: int) -> list:
+        async def enqueue_due_local_agent_jobs(self, *, device_acquisition_payload, limit: int) -> list:
             assert limit == 50
             started.set()
             await release.wait()

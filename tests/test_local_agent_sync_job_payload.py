@@ -37,6 +37,11 @@ NEW_JQL = "project = PAY"
 SUPERSEDED_JQL = "project = OPS"
 
 
+async def _no_device_source(source):
+    raise AssertionError(f"no device Source is due here: {source['id']}")
+
+
+
 def _scope(jql: str) -> dict[str, object]:
     return canonical_projection_scope("jira", {**BASE_CONFIG, "jql": jql})
 
@@ -260,7 +265,7 @@ def test_every_builder_enqueues_the_same_payload_for_the_same_source(tmp_path):
         async def schedule() -> int:
             due = datetime.now(timezone.utc) - timedelta(minutes=1)
             await scheduled.set_source_sync_schedule(SOURCE, enabled=True, interval_minutes=60, next_run_at=due)
-            return await scheduled.enqueue_due_local_agent_jobs()
+            return await scheduled.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
 
         assert asyncio.run(schedule()) == 1
         payloads["scheduled"] = _job_payload(scheduled)
@@ -291,9 +296,9 @@ async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source
         return payload
 
     monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read_then_save)
-    raced = await db.enqueue_due_local_agent_jobs()
+    raced = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
     monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read)
-    retried = await db.enqueue_due_local_agent_jobs()
+    retried = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
 
     [row] = await db.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
     assert (raced, retried) == (0, 1)

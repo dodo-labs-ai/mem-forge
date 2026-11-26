@@ -228,6 +228,7 @@ from memforge.pipeline.stored_document import reprocess_preview
 from memforge.pipeline.device_acquisition import (
     AcquisitionNotReady,
     acquisition_requests,
+    document_acquisition_job_payload,
     ready_acquisition,
     retain_acquired_input,
 )
@@ -298,9 +299,12 @@ from memforge.source_access_transition import (
     SourceAccessTransitionService,
 )
 from memforge.local_agent.readiness import (
+    LOCAL_AGENT_DEVICE_STALE_SECONDS,
+    DeviceState,
     SourceConnectionReason,
     SourceConnectionState,
     connection_status_from_browser_session,
+    device_source_readiness,
 )
 from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
 from memforge.local_agent.document_acquisition import (
@@ -331,7 +335,7 @@ from memforge.local_agent.credential_check import (
     signs_in_with_browser_session,
 )
 from memforge.local_agent.device_lease import RELEASED_SOURCE_IDS_FIELD
-from memforge.local_agent.device_report import DeviceReport, declared_acquisition_contracts
+from memforge.local_agent.device_report import DeviceReport, LocalAgentDevice, declared_acquisition_contracts
 from memforge.local_agent.source_contract import (
     ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
@@ -348,6 +352,7 @@ from memforge.local_agent.source_contract import (
     local_package_confirms_absence,
     local_package_requires_source_time,
     source_executor,
+    source_collection_operation,
     source_runs_on_device,
     validate_local_agent_replay_package,
 )
@@ -384,7 +389,6 @@ async def _run_source_access_background(
 
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
-LOCAL_AGENT_STATUS_STALE_SECONDS = 90
 DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
     "github_repo_preview_tree": "github_repo",
@@ -2183,10 +2187,30 @@ class SourceCapabilitiesResponse(BaseModel):
     can_change_access: bool
 
 
+class SourceExecutionDeviceResponse(BaseModel):
+    """The device a device Source runs on, from its execution owner's device reports."""
+
+    name: str | None = Field(
+        description="The device's name; null for a viewer other than the execution owner, or when the owner has no device.",
+    )
+    state: DeviceState = Field(
+        description=(
+            "online: it can take the Source's job; offline: no recent report; update_required: online, "
+            "but its acquisition contract for the type differs from the server's."
+        ),
+    )
+    installed_version: str | None = Field(description="The MemForge version the device runs; null without a device.")
+    required_version: str = Field(description="The server's MemForge version, which `memforge upgrade` installs.")
+
+
 class SourceExecutionResponse(BaseModel):
     kind: Literal["server", "local_agent"]
     operation: str | None
     immutable_config_fields: list[str]
+    device: SourceExecutionDeviceResponse | None = Field(
+        default=None,
+        description="Present for a Source whose acquisition runs on its execution owner's device.",
+    )
 
 
 class SourceSubscriptionResponse(BaseModel):
@@ -2294,7 +2318,11 @@ class SourceResponse(BaseModel):
     )
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
-        description="Readiness of a browser-session connection; present only for Sources that use one.",
+        description=(
+            "Readiness of the connection: a browser session's on the server, or, for a device Source, whether a "
+            "device report names it, which it does once its device holds the credential. Present only for "
+            "Sources with such a dependency."
+        ),
     )
     ownership: SourceOwnershipResponse
     capabilities: SourceCapabilitiesResponse
@@ -7403,7 +7431,26 @@ def create_admin_app(
 
         # Attach memory_count and sync status to each source
         jira_auth_service = JiraAuthSessionService(db)
+        viewer_id = resolve_request_principal(request)
+        owner_devices: dict[str, list[LocalAgentDevice]] = {}
+        server_contracts = declared_acquisition_contracts()
+        now = datetime.now(timezone.utc)
         for s in sources:
+            if source_runs_on_device(s):
+                owner = execution_owner_user_id(s) or ""
+                if owner not in owner_devices:
+                    owner_devices[owner] = await db.list_local_agent_devices(owner) if owner else []
+                device, connection = device_source_readiness(
+                    source_id=str(s["id"]),
+                    source_type=str(s["type"]),
+                    devices=owner_devices[owner],
+                    server_contracts=server_contracts,
+                    server_version=installed_version(),
+                    now=now,
+                    reveal_device=owner == viewer_id,
+                )
+                s["execution"] = {**s["execution"], "device": device}
+                s["connection_status"] = connection
             original_config = s.get("config", {})
             auth_mode = jira_auth_mode(original_config) if s["type"] == "jira" else None
             if s.get("capabilities", {}).get("can_configure"):
@@ -9063,7 +9110,13 @@ def create_admin_app(
         force_full_sync: bool,
         dry_run: bool = False,
     ) -> dict[str, Any] | None:
-        operation = local_agent_sync_operation(source["type"], source.get("config"))
+        """Queue the job that collects the Source on its execution owner's device, or ``None`` for a server Source.
+
+        A device Source's run starts with a ``document_acquisition`` job
+        (ADR 0058); a Source on its type's local-agent path, with that type's
+        operation.
+        """
+        operation = source_collection_operation(source)
         if operation is None:
             return None
         if source.get("status") != "active":
@@ -9074,16 +9127,21 @@ def create_admin_app(
                 status_code=409,
                 detail="local_agent_sync_execution_owner_required",
             )
-        job_id = f"laj-{uuid.uuid4().hex}"
-        payload = await local_agent_sync_job_payload(
-            db,
-            source,
-            {"force_full_sync": force_full_sync, "retry_failed_items": True, **({"dry_run": True} if dry_run else {})},
-        )
+        request_payload = {
+            "force_full_sync": force_full_sync,
+            "retry_failed_items": True,
+            **({"dry_run": True} if dry_run else {}),
+        }
+        if operation == DOCUMENT_ACQUISITION_OPERATION:
+            payload = await document_acquisition_job_payload(
+                db, request.app.state.document_store, source, request_payload
+            )
+        else:
+            payload = await local_agent_sync_job_payload(db, source, request_payload)
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
             db,
-            job_id=job_id,
+            job_id=f"laj-{uuid.uuid4().hex}",
             source_id=source["id"],
             source_type=source["type"],
             operation=operation,
@@ -11370,7 +11428,7 @@ def create_admin_app(
                 "version": device.report.version,
                 "status": (
                     "online"
-                    if (now - device.last_seen_at).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS
+                    if (now - device.last_seen_at).total_seconds() <= LOCAL_AGENT_DEVICE_STALE_SECONDS
                     else "offline"
                 ),
                 "last_seen_at": device.last_seen_at.isoformat(),
@@ -11392,7 +11450,7 @@ def create_admin_app(
             ],
             "server": {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()},
             "checked_at": now.isoformat(),
-            "stale_after_seconds": LOCAL_AGENT_STATUS_STALE_SECONDS,
+            "stale_after_seconds": LOCAL_AGENT_DEVICE_STALE_SECONDS,
         }
 
     app.include_router(auth_router)

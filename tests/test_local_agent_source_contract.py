@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 from memforge.genes.local_adapter_packages import has_package_manifest
 from memforge.local_agent.source_contract import (
+    DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_SYNC_OPERATIONS,
     snapshot_document_ids,
     SourceSyncRunReceiptError,
@@ -461,7 +462,17 @@ def test_source_execution_descriptor_is_canonical_ui_contract(
     config: dict[str, object],
     expected: dict[str, object],
 ) -> None:
-    assert source_execution_descriptor(source_type, config) == expected
+    assert source_execution_descriptor({"type": source_type, "config": config}) == expected
+
+
+def test_a_device_source_is_collected_by_device_acquisition() -> None:
+    source = {"type": "confluence", "config": {"base_url": "https://wiki.example.com"}, "executor": "device"}
+
+    assert source_execution_descriptor(source) == {
+        "kind": "local_agent",
+        "operation": DOCUMENT_ACQUISITION_OPERATION,
+        "immutable_config_fields": [],
+    }
 
 
 def test_local_agent_source_contract_accepts_serialized_config() -> None:
