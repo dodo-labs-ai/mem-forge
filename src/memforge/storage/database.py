@@ -6519,6 +6519,23 @@ class Database:
                     (json.dumps(audit, sort_keys=True), run_id),
                 )
 
+    async def take_recovery_point(self, reason: str) -> RecoveryPoint:
+        """Hold the data root alone and take a recovery point of the data as it is now.
+
+        For a data migration that rewrites what Sources hold. The data root
+        stays held alone until the database is closed, so nothing but this
+        process changes the data after the point is taken. Raises
+        ``DataRootBusy`` while another MemForge process has the data open, and
+        ``UpgradeError`` for a database opened without its recovery points.
+        """
+
+        if self._recovery_points is None or self._data_root_lock is None:
+            raise UpgradeError(f"The database {self.db_path} was opened without its recovery points.")
+        self._data_root_lock.acquire(exclusive=True)
+        point = await asyncio.to_thread(self._recovery_points.create, reason)
+        await asyncio.to_thread(self._recovery_points.prune, reason, keep=frozenset({point.id}))
+        return point
+
     async def close(self) -> None:
         """Close the database connection and release the data-root lock."""
         if self._db:

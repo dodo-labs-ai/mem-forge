@@ -24,8 +24,9 @@ removes what an interrupted one left behind.
 Of the points taken before an upgrade, the newest of each of the
 ``RETAINED_RECOVERY_POINTS`` most recent schema versions is kept, so the
 release each of those schemas came from still has a point it can restore.
-Of the points taken before a restore, the newest ``RETAINED_RECOVERY_POINTS``
-are kept.
+Of the points taken before a restore, and of those taken before a data
+migration such as moving device package Sources onto device acquisition, the
+newest ``RETAINED_RECOVERY_POINTS`` of each are kept.
 
 A restore marks itself in progress until both the vector store and the
 database are back in place; while the mark is there, MemForge refuses to open
@@ -71,6 +72,7 @@ __all__ = [
     "BACKUPS_DIRECTORY",
     "DataRootBusy",
     "DataRootLock",
+    "PRE_MIGRATION",
     "PRE_RESTORE",
     "PRE_UPGRADE",
     "RETAINED_RECOVERY_POINTS",
@@ -85,6 +87,7 @@ __all__ = [
 BACKUPS_DIRECTORY = "backups"
 PRE_UPGRADE = "pre-upgrade"
 PRE_RESTORE = "pre-restore"
+PRE_MIGRATION = "pre-migration"
 RETAINED_RECOVERY_POINTS = 3
 
 _DISTRIBUTION = "memforge-ai"
@@ -94,7 +97,7 @@ _VECTORS_DIRECTORY = "chroma"
 _MANIFEST_FORMAT = 1
 _PARTIAL_PREFIX = ".partial-"
 _RESTORE_IN_PROGRESS_FILE = ".restore-in-progress.json"
-_REASONS = (PRE_UPGRADE, PRE_RESTORE)
+_REASONS = (PRE_UPGRADE, PRE_RESTORE, PRE_MIGRATION)
 
 
 class UpgradeError(RuntimeError):
@@ -302,7 +305,8 @@ class RecoveryPoints:
 
         Of ``pre-upgrade`` points, the newest of each of the
         ``RETAINED_RECOVERY_POINTS`` most recent schema versions is retained;
-        of ``pre-restore`` points, the newest ``RETAINED_RECOVERY_POINTS``.
+        of ``pre-restore`` and of ``pre-migration`` points, the newest
+        ``RETAINED_RECOVERY_POINTS``.
         The points named in ``keep`` are kept as well.
         """
         same_reason = [point for point in self.list() if point.reason == reason]

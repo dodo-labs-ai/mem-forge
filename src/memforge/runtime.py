@@ -19,7 +19,7 @@ from memforge.evals.agent_evaluation import (
     publish_runtime_events,
 )
 from memforge.auth import browser_session
-from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
+from memforge.genes import GENE_REGISTRY, create_gene, gene_class, source_type_supports_sync
 from memforge.llm.bindings import embedding_identity, resolve_active_binding, usable_invocation
 from memforge.llm.embedding import (
     EmbeddingIndexMismatch,
@@ -52,6 +52,7 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
+from memforge.genes.recorded import AcquisitionRecordStore, recorded_gene_class
 from memforge.local_agent.document_acquisition import ACQUISITION_ATTEMPT_PAYLOAD_FIELD, StoredAcquisition
 from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
 from memforge.pipeline.device_acquisition import (
@@ -994,6 +995,42 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
     return excluded_scope_gene
 
 
+@contextlib.asynccontextmanager
+async def held_source_activity(db: "Database", source_id: str) -> AsyncIterator[tuple[SourceActivityLease, asyncio.Task[None]]]:
+    """Hold a Source's sync activity while the block runs, renewing it every minute.
+
+    Yields the lease and the task that renews it; the task ends with
+    ``SourceSyncActivityConflict`` when a renewal fails, so a caller that
+    runs work under the lease stops that work then. Raises
+    ``SourceSyncActivityConflict`` when another activity holds the Source.
+    """
+
+    activity_id = f"source-sync-{uuid.uuid4().hex}"
+    try:
+        lease = await db.acquire_source_activity(
+            activity_id=activity_id,
+            source_id=source_id,
+            kind=SourceActivityKind.SYNC,
+            lease_seconds=300,
+        )
+    except SourceActivityConflict as exc:
+        raise SourceSyncActivityConflict(str(exc)) from exc
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(60)
+            await db.renew_source_activity(activity_id=activity_id, lease_seconds=300)
+
+    heartbeat = asyncio.create_task(renew())
+    try:
+        yield lease, heartbeat
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        await db.release_source_activity(activity_id=activity_id)
+
+
 async def run_source_sync(
     db: "Database",
     config: AppConfig,
@@ -1012,6 +1049,7 @@ async def run_source_sync(
     failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     collection_attempt: CollectionAttempt | None = None,
     acquisition: StoredAcquisition | None = None,
+    replay: AcquisitionRecordStore | None = None,
 ) -> SyncState:
     """Run one Source sync under a Source activity lease.
 
@@ -1022,117 +1060,130 @@ async def run_source_sync(
     Source's run (ADR 0058): the run interprets it with the type's recorded
     Gene, from the time the device's job attempt was leased, and reaches
     neither the provider nor its session. A device Source runs only this way.
+    ``replay`` is the record of a REPLAY run: stored inputs a recoverable
+    migration rewrote, which the type's recorded Gene answers from.
+
+    Without ``source_activity`` the run holds the Source's activity itself,
+    and stops when it can no longer renew it.
     """
-    activity_id = source_activity.id if source_activity is not None else None
-    owns_activity = False
-    heartbeat_task: asyncio.Task[None] | None = None
-    activity_lease = source_activity
+    if (replay is not None) != (execution_mode is SourceSyncMode.REPLAY):
+        raise ValueError("a REPLAY run, and only one, interprets a replay record")
     if source_activity is not None:
         if source_activity.source_id != str(source["id"]):
             raise ValueError("durable Source activity does not belong to the synced Source")
         if source_activity.kind is not SourceActivityKind.SYNC:
             raise ValueError("durable Source activity must be a sync authority")
+        return await _run_source_sync_held(
+            db, config, source, runtime, progress_callback, force_full_sync, input_snapshot, reprocess_doc_ids,
+            execution_mode, lifecycle_cycle_id or source_activity.id, scope_transition_run_id,
+            reusable_projection_doc_ids, record_terminal_result, source_activity, failed_item_retry,
+            collection_attempt, acquisition, replay, heartbeat=None,
+        )
+    async with held_source_activity(db, str(source["id"])) as (lease, heartbeat):
+        return await _run_source_sync_held(
+            db, config, source, runtime, progress_callback, force_full_sync, input_snapshot, reprocess_doc_ids,
+            execution_mode, lifecycle_cycle_id or lease.id, scope_transition_run_id,
+            reusable_projection_doc_ids, record_terminal_result, lease, failed_item_retry,
+            collection_attempt, acquisition, replay, heartbeat=heartbeat,
+        )
+
+
+async def _run_source_sync_held(
+    db: "Database",
+    config: AppConfig,
+    source: dict,
+    runtime: SyncRuntime | None,
+    progress_callback: Callable[[dict], None] | None,
+    force_full_sync: bool,
+    input_snapshot: SnapshotBinding | None,
+    reprocess_doc_ids: frozenset[str] | None,
+    execution_mode: SourceSyncMode,
+    lifecycle_cycle_id: str,
+    scope_transition_run_id: str | None,
+    reusable_projection_doc_ids: frozenset[str],
+    record_terminal_result: bool,
+    activity_lease: SourceActivityLease,
+    failed_item_retry: FailedItemRetry,
+    collection_attempt: CollectionAttempt | None,
+    acquisition: StoredAcquisition | None,
+    replay: AcquisitionRecordStore | None,
+    *,
+    heartbeat: asyncio.Task[None] | None,
+) -> SyncState:
+    """Run one Source sync under ``activity_lease``; ``heartbeat`` renews it when the run holds it itself."""
+
+    if acquisition is None and replay is None and source_runs_on_device(source):
+        # The server never reaches a device Source's provider: its runs
+        # interpret what its device acquired.
+        raise SourceSyncBoundaryError(f"device Source {source['id']} runs only on what its device acquired")
+    runtime = runtime or await build_sync_runtime(db, config)
+    secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
+    source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
+    excluded_scope_gene: ExcludedScopeGeneFactory
+    if acquisition is not None:
+        gene = recorded_device_gene(db, runtime.doc_store, source, source_config, acquisition)
+        excluded_scope_gene = device_excluded_scope_gene_factory(source, source_config, acquisition)
+    elif replay is not None:
+        gene = recorded_gene_class(gene_class(source["type"]))(
+            config=source_config, source_id=source["id"], record_store=replay
+        )
+        excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
     else:
-        activity_id = f"source-sync-{uuid.uuid4().hex}"
-        try:
-            activity_lease = await db.acquire_source_activity(
-                activity_id=activity_id,
-                source_id=str(source["id"]),
-                kind=SourceActivityKind.SYNC,
-                lease_seconds=300,
-            )
-            owns_activity = True
-        except SourceActivityConflict as exc:
-            raise SourceSyncActivityConflict(str(exc)) from exc
-
-        async def heartbeat_activity() -> None:
-            while True:
-                await asyncio.sleep(60)
-                await db.renew_source_activity(
-                    activity_id=activity_id,
-                    lease_seconds=300,
-                )
-
-        heartbeat_task = asyncio.create_task(heartbeat_activity())
-    lifecycle_cycle_id = lifecycle_cycle_id or activity_id
+        await browser_session.inject_cookie_for_source(db, source["type"], source_config)
+        gene = create_gene(
+            name=source["type"],
+            config=source_config,
+            source_id=source["id"],
+        )
+        excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
+    sync_task: asyncio.Task[Any] | None = None
     try:
-        if acquisition is None and source_runs_on_device(source):
-            # The server never reaches a device Source's provider: its runs
-            # interpret what its device acquired.
-            raise SourceSyncBoundaryError(f"device Source {source['id']} runs only on what its device acquired")
-        runtime = runtime or await build_sync_runtime(db, config)
-        secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
-        source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
-        excluded_scope_gene: ExcludedScopeGeneFactory
-        if acquisition is not None:
-            gene = recorded_device_gene(db, runtime.doc_store, source, source_config, acquisition)
-            excluded_scope_gene = device_excluded_scope_gene_factory(source, source_config, acquisition)
-        else:
-            await browser_session.inject_cookie_for_source(db, source["type"], source_config)
-            gene = create_gene(
-                name=source["type"],
-                config=source_config,
-                source_id=source["id"],
-            )
-            excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
-        sync_task: asyncio.Task[Any] | None = None
+        sync_kwargs: dict[str, Any] = {
+            "gene": gene,
+            "source_name": source["name"],
+            "source_id": source["id"],
+            "progress_callback": progress_callback,
+            "force_full_sync": force_full_sync,
+            "input_snapshot": input_snapshot,
+            "reprocess_doc_ids": reprocess_doc_ids,
+            "execution_mode": execution_mode,
+            "source_activity": activity_lease,
+            "lifecycle_cycle_id": lifecycle_cycle_id,
+            "scope_transition_run_id": scope_transition_run_id,
+            "reusable_projection_doc_ids": reusable_projection_doc_ids,
+            "record_terminal_result": record_terminal_result,
+            "failed_item_retry": failed_item_retry,
+            "collection_attempt": collection_attempt,
+            "excluded_scope_gene": excluded_scope_gene,
+            "started_at": acquisition.started_at if acquisition is not None else None,
+        }
+        sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
+        if heartbeat is None:
+            return await sync_operation
+        sync_task = asyncio.create_task(sync_operation)
+        done, _ = await asyncio.wait({sync_task, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
+        if heartbeat in done:
+            sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sync_task
+            await heartbeat
+            raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_lease.id}")
+        return await sync_task
+    finally:
         try:
-            sync_kwargs: dict[str, Any] = {
-                "gene": gene,
-                "source_name": source["name"],
-                "source_id": source["id"],
-                "progress_callback": progress_callback,
-                "force_full_sync": force_full_sync,
-                "input_snapshot": input_snapshot,
-                "reprocess_doc_ids": reprocess_doc_ids,
-                "execution_mode": execution_mode,
-                "source_activity": activity_lease,
-                "lifecycle_cycle_id": lifecycle_cycle_id,
-                "scope_transition_run_id": scope_transition_run_id,
-                "reusable_projection_doc_ids": reusable_projection_doc_ids,
-                "record_terminal_result": record_terminal_result,
-                "failed_item_retry": failed_item_retry,
-                "collection_attempt": collection_attempt,
-                "excluded_scope_gene": excluded_scope_gene,
-                "started_at": acquisition.started_at if acquisition is not None else None,
-            }
-            sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
-            if heartbeat_task is None:
-                return await sync_operation
-            sync_task = asyncio.create_task(sync_operation)
-            done, _ = await asyncio.wait(
-                {sync_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat_task in done:
+            # A cancelled caller leaves the sync task running; stop it before its client closes.
+            if sync_task is not None and not sync_task.done():
                 sync_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sync_task
-                await heartbeat_task
-                raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
-            return await sync_task
         finally:
             try:
-                # A cancelled caller leaves the sync task running; stop it before its client closes.
-                if sync_task is not None and not sync_task.done():
-                    sync_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await sync_task
-            finally:
-                try:
-                    await gene.close()
-                except Exception:
-                    # The run's own result or error is what callers act on; a failed release must not replace it.
-                    logger.warning(
-                        "Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True
-                    )
-    finally:
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-        if owns_activity and activity_id is not None:
-            await db.release_source_activity(activity_id=activity_id)
+                await gene.close()
+            except Exception:
+                # The run's own result or error is what callers act on; a failed release must not replace it.
+                logger.warning(
+                    "Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True
+                )
 
 
 class SourceSyncWorker:

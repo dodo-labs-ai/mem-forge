@@ -428,7 +428,7 @@ def _mark_changelog_completeness(payload: dict) -> None:
         )
 
 
-def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
+def issue_content_item(issue: dict, base_url: str) -> ContentItem:
     """Map a Jira search issue to a ContentItem, tolerating null optional fields.
 
     Jira returns ``priority``/``assignee``/etc. as explicit ``null`` when unset,
@@ -727,7 +727,7 @@ class JiraGene(DocumentGene):
         if len(issues) > 1 or (issue_ref.isdigit() and str(issues[0]["id"]) != issue_ref):
             raise RuntimeError(f"Jira search for issue {issue_ref} returned another issue")
         issue = issues[0]
-        current = _issue_content_item(issue, self._base_url)
+        current = issue_content_item(issue, self._base_url)
         self._hydrated_issues[current.extra["issue_key"]] = issue
         return current
 
@@ -847,7 +847,7 @@ class JiraGene(DocumentGene):
             expand=expand,
             max_results=max_results,
         ):
-            item = _issue_content_item(issue, self._base_url)
+            item = issue_content_item(issue, self._base_url)
             if cache_hydrated:
                 self._hydrated_issues[str(issue["key"])] = issue
             else:

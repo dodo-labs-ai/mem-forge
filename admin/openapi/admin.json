@@ -86,6 +86,35 @@
         "title": "AcquisitionManifestRequest",
         "type": "object"
       },
+      "AcquisitionStoredExtrasRequest": {
+        "description": "The items of a device run whose ``fetch`` reads what the Source stored for them.",
+        "properties": {
+          "item_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "item_ids"
+        ],
+        "title": "AcquisitionStoredExtrasRequest",
+        "type": "object"
+      },
       "AddAliasRequest": {
         "properties": {
           "alias": {
@@ -17283,6 +17312,57 @@
           }
         },
         "summary": "Submit Acquisition Manifest",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/acquisition/stored-extras": {
+      "post": {
+        "description": "Give a device run's ``fetch`` the ``stored_extra`` a server run's ``fetch`` reads.\n\nFor each named item whose Document the Source has stored, the\n``extra`` recorded with its Unit's stored input, so a Gene that\nreuses a fact it recorded for an unchanged provider revision does so\non the device as on the server.",
+        "operationId": "read_acquisition_stored_extras_api_v1_sources__source_id__acquisition_stored_extras_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquisitionStoredExtrasRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Acquisition Stored Extras",
         "tags": [
           "sources"
         ]

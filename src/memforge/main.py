@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -3691,6 +3691,19 @@ class _ClientAcquisitionTransport:
         self._manifest_sha256 = str(response["manifest_sha256"])
         return AcquisitionRequests.from_payload(response.get("requests") or {})
 
+    async def stored_extras(self, item_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.read_acquisition_stored_extras,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                item_ids=list(item_ids),
+            ),
+            "reading the stored extras",
+        )
+        return {str(item_id): dict(extra) for item_id, extra in (response.get("stored_extras") or {}).items()}
+
     async def upload_artifact(self, item: ContentItem, artifact: RawSourceArtifact, body: bytes) -> str:
         response = self._checked(
             await asyncio.to_thread(
@@ -6050,6 +6063,111 @@ def maintenance_reindex(ctx, mode: str):
             await db.close()
 
     raise SystemExit(asyncio.run(_run()))
+
+
+@maintenance.command("migrate-device-packages")
+@click.option("--check", "mode", flag_value="check", default=True, help="List the Sources and what applying would do.")
+@click.option("--apply", "mode", flag_value="apply", help="Take a recovery point, then move each Source.")
+@click.option("--source", "source_ids", multiple=True, help="Only this Source (repeatable).")
+@click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
+@click.pass_context
+def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, ...], as_json: bool):
+    """Move Jira and GitHub repository Sources off their device package path onto device acquisition.
+
+    A Jira Source set to local agent sync, or a GitHub repository Source set
+    to local push, holds what the device submitted as packages. Each such
+    Source moves once: every package its Units hold is rewritten to the input
+    the type's Gene reads, replayed without forced extraction, so only Units
+    whose content the rewrite changes are extracted, and the Source then runs
+    on its owner's device. Jira issues move to their jira-<KEY> Documents with
+    their Memories' Support.
+
+    --check, the default, changes nothing. It names the Units whose content
+    the rewrite changes, and refuses a Source with a package the Gene's form
+    cannot be rebuilt from, with two Units that map to one Document, or with a
+    GitHub file whose Document the configured repository names differently.
+    --apply first takes a recovery point (`memforge backup list`), so stop
+    the MemForge server before it. A Source whose replay fails keeps its
+    package path and moves the next time --apply runs.
+    """
+
+    async def _run() -> int:
+        from memforge.pipeline.package_migration import (
+            apply_package_migration,
+            package_path_sources,
+            plan_package_migration,
+        )
+        from memforge.runtime import DefaultRuntimeProvider
+        from memforge.storage.document_store import LocalDocumentStore
+        from memforge.storage.recovery_points import PRE_MIGRATION, UpgradeError
+
+        config: AppConfig = ctx.obj["config"]
+        db = await _get_db(config)
+        try:
+            sources = [
+                source for source in await package_path_sources(db) if not source_ids or source["id"] in source_ids
+            ]
+            if mode == "check":
+                doc_store = LocalDocumentStore(config.storage.docs_path)
+                plans = [await plan_package_migration(db, doc_store, source) for source in sources]
+                _print_package_migration([plan.to_payload() for plan in plans], as_json=as_json)
+                if plans and not as_json:
+                    console.print("Run `memforge maintenance migrate-device-packages --apply` to move them.")
+                return 1 if any(plan.refused for plan in plans) else 0
+            if not sources:
+                _print_package_migration([], as_json=as_json)
+                return 0
+            try:
+                point = await db.take_recovery_point(PRE_MIGRATION)
+            except UpgradeError as exc:
+                raise click.ClickException(str(exc)) from exc
+            if not as_json:
+                console.print(f"Took recovery point {point.id}; `memforge backup restore {point.id}` undoes this run.")
+            runtime = await DefaultRuntimeProvider().build_sync_runtime(db, config)
+            results = [
+                await apply_package_migration(db, config, str(source["id"]), runtime=runtime) for source in sources
+            ]
+            _print_package_migration([result.to_payload() for result in results], as_json=as_json)
+            return 0 if all(result.status == "migrated" for result in results) else 1
+        finally:
+            await db.close()
+
+    raise SystemExit(asyncio.run(_run()))
+
+
+def _print_package_migration(rows: list[dict[str, Any]], *, as_json: bool) -> None:
+    if as_json:
+        click.echo(json.dumps({"sources": rows}, indent=2))
+        return
+    if not rows:
+        console.print("No Source is on a device package path.")
+        return
+    table = Table(title="Sources on a device package path")
+    table.add_column("Source", style="bold")
+    table.add_column("Type")
+    table.add_column("Packages", justify="right")
+    table.add_column("Changed", justify="right")
+    table.add_column("Moved", justify="right")
+    table.add_column("Result")
+    for row in rows:
+        if row["refused"]:
+            reasons = [*row["unrebuildable"], *row["id_changes_refused"]]
+            result = f"[red]refused[/]: {len(reasons)} item(s) not rebuildable, {len(row['collisions'])} collision(s)"
+        else:
+            result = {
+                None: "[green]ready[/]",
+                "migrated": "[green]moved to the device[/]",
+                "replay_failed": f"[red]replay {row.get('sync_status')}[/]: {row.get('error') or ''}",
+            }.get(row.get("status"), str(row.get("status")))
+        table.add_row(
+            f"{row['source_name']} ({row['source_id']})",
+            row["source_type"],
+            str(row["units"]),
+            str(len(row["changed_document_ids"])),
+            str(len(row["moved_document_ids"])),
+            result,
+        )
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------

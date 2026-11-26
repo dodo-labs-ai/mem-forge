@@ -485,6 +485,26 @@ class ToolClient:
             },
         )
 
+    def read_acquisition_stored_extras(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        item_ids: list[str],
+    ) -> dict[str, Any]:
+        """Read, for a device run's ``fetch``, the ``extra`` the Source stored with each named item."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/stored-extras",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "item_ids": item_ids,
+            },
+        )
+
     def submit_acquisition_answers(
         self,
         *,

@@ -463,7 +463,7 @@ class GitHubRepoGene(DocumentGene):
             )
             yield ContentItem(
                 item_id=doc_id,
-                title=_title_from_path(path),
+                title=title_from_path(path),
                 source_url=_file_url(repo_ref, ref, path),
                 # Discovery time. The file's source time is its commit time, read in fetch.
                 last_modified=datetime.now(timezone.utc),
@@ -798,7 +798,7 @@ def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
     return f"{ref.repo_url}/blob/{quote(repo_ref, safe='')}/{quote(relative_path, safe='/')}"
 
 
-def _title_from_path(relative_path: str) -> str:
+def title_from_path(relative_path: str) -> str:
     filename = relative_path.rstrip("/").rsplit("/", 1)[-1]
     return re.sub(r"\.[^.]+$", "", filename) or filename
 

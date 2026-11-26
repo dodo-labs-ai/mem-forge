@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 import memforge.server.admin_api as admin_api
 from memforge.config import AppConfig
-from memforge.genes import confluence_gene, github_pages_gene, notion_gene
+from memforge.genes import confluence_gene, github_pages_gene, github_repo_gene, notion_gene
 from memforge.local_agent.device_report import declared_acquisition_contracts
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION
 from memforge.pipeline.sync import GeneSyncOrchestrator
@@ -34,6 +34,7 @@ from memforge.storage.database import Database
 from tests.contracts.document_fakes import ProviderListing
 from tests.contracts.document_fakes import confluence as confluence_fakes
 from tests.contracts.document_fakes import github_pages as github_pages_fakes
+from tests.contracts.document_fakes import github_repo as github_repo_fakes
 from tests.contracts.document_fakes import notion as notion_fakes
 from tests.device_report_fixture import device_report
 from tests.test_device_acquisition import DAEMON_SERVER, _routed_client
@@ -92,6 +93,19 @@ TYPES = [
         github_pages_fakes,
         github_pages_gene,
         dict(github_pages_fakes.FAKES.listing_configs["branch-tree"].config),
+        "pat",
+    ),
+    DeviceType(
+        "github_repo",
+        github_repo_fakes,
+        github_repo_gene,
+        {
+            "repo_url": github_repo_fakes.REPO_URL,
+            "ref": "main",
+            "include_paths": ["docs/"],
+            "include_extensions": ["md"],
+            "pat": "repo-token",
+        },
         "pat",
     ),
 ]
@@ -378,3 +392,33 @@ def test_a_scheduled_run_of_a_device_source_queues_its_acquisition_job(deploymen
     [server_run, device_run] = deployment.runs(source_id)
     assert device_run[0] == "success" and device_run[1] is not None
     assert deployment.extracted_documents(source_id) == []
+
+
+@pytest.mark.parametrize("deployment", [TYPES[3]], ids=["github_repo"], indirect=True)
+def test_a_github_device_run_reuses_the_commit_times_the_source_stored(deployment):
+    """The device's fetch reads the stored extra a server run's fetch reads, so an unchanged blob keeps its time."""
+
+    source_id = _create_and_sync_on_the_server(deployment)
+    assert any("/commits?" in request for request in deployment.provider.requests)
+    stored_times = asyncio.run(_stored_commit_times(deployment.db, source_id))
+    _move_to_the_device(deployment, source_id)
+    deployment.provider.requests.clear()
+    deployment.extractor.fragment_calls.clear()
+
+    _sync_now_on_the_device(deployment, source_id)
+
+    # Every file kept its blob, so the device asked no commit time again.
+    assert not any("/commits?" in request for request in deployment.provider.requests)
+    assert asyncio.run(_stored_commit_times(deployment.db, source_id)) == stored_times
+    assert deployment.extracted_documents(source_id) == []
+
+
+async def _stored_commit_times(db: Database, source_id: str) -> dict[str, object]:
+    from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY
+
+    times = {}
+    for doc_id in await db.list_indexed_doc_ids(source_id):
+        unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        stored = await db.get_source_unit_input(unit.id)
+        times[doc_id] = stored.item.extra.get(LAST_COMMIT_AT_KEY)
+    return times

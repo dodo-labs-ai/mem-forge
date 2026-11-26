@@ -109,6 +109,9 @@ class _CapturingTransport:
     async def upload_input(self, package: AcquiredInputPackage) -> None:
         self.handed["inputs"].append(package.to_payload())
 
+    async def stored_extras(self, item_ids) -> dict:
+        return {}
+
     async def submit_answers(self, answers: AcquisitionAnswers) -> None:
         raise AssertionError("a run without requests has nothing to answer")
 

@@ -13,6 +13,8 @@ the server decides and keeps for such a run:
   execution owner.
 - :func:`acquisition_requests` answers a submitted manifest with what the
   server run will ask beyond discovery, by the server run's own rules.
+- :func:`stored_extras` gives the device's ``fetch`` what a server run's
+  ``fetch`` reads from the Source's stored inputs.
 - :func:`retain_acquired_input` keeps one acquired input for its attempt.
 - :func:`ready_acquisition` decides whether the attempt can be processed.
 - :func:`recorded_device_gene` and :func:`device_excluded_scope_gene_factory`
@@ -67,6 +69,7 @@ from memforge.pipeline.stored_document import (
     committed_source_item,
     document_content_item,
     stored_source_item,
+    stored_unit_input,
 )
 from memforge.pipeline.sync import STAGED_DERIVATION_STATUSES, select_failed_items
 from memforge.release import current_release
@@ -95,6 +98,7 @@ __all__ = [
     "ready_acquisition",
     "recorded_device_gene",
     "retain_acquired_input",
+    "stored_extras",
 ]
 
 ACQUIRED_INPUT_METADATA_KEY = "acquired_input"
@@ -323,6 +327,23 @@ async def _rediscovery_item(
         if exc.reason is StoredDocumentUnavailableReason.SOURCE_UNIT_MISSING:
             return failed_item
         return None
+
+
+async def stored_extras(db: Database, source_id: str, item_ids: Collection[str]) -> dict[str, dict[str, Any]]:
+    """The ``stored_extra`` a server run gives ``fetch`` for each item, by item id.
+
+    It is the ``extra`` the Source recorded with the stored input of the
+    item's current Unit (``ContentItem.stored_extra``); an item whose
+    Document the Source has not stored is left out, so the device's ``fetch``
+    reads it as a server run's ``fetch`` reads a new item.
+    """
+
+    extras: dict[str, dict[str, Any]] = {}
+    for item_id in dict.fromkeys(item_ids):
+        stored = await stored_unit_input(db, source_id=source_id, document_id=item_id)
+        if stored is not None:
+            extras[item_id] = dict(stored.item.extra)
+    return extras
 
 
 async def retain_acquired_input(

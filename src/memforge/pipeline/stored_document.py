@@ -178,6 +178,13 @@ async def stored_source_item(
     return await _unit_stored_item(db, source_unit_id=unit.id, document_id=document_id)
 
 
+async def stored_unit_input(db: RelationalStore, *, source_id: str, document_id: str) -> SourceUnitInput | None:
+    """The stored input of the Source's current Unit for one Document, ``None`` when it recorded none."""
+
+    unit = await db.find_source_unit_by_document_id(source_id, document_id, current_only=True)
+    return await db.get_source_unit_input(unit.id) if unit is not None else None
+
+
 async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, document_id: str) -> ContentItem:
     unit_input = await db.get_source_unit_input(source_unit_id)
     if unit_input is not None:
@@ -332,6 +339,16 @@ def _stored(document_store: DocumentStore, uri: str | None, media_type: str) -> 
         return bool(uri) and document_store.get_artifact(uri, media_type) is not None
     except FileNotFoundError:
         return False
+
+
+def committed_source_artifacts(committed: SourceProjection, *, document_id: str) -> tuple[StoredSourceArtifact, ...]:
+    """The projection input of every Artifact a Unit's committed revision cites.
+
+    Raises :class:`StoredDocumentUnavailable` for an Artifact the revision
+    cites that cannot be read back.
+    """
+
+    return _committed_artifacts(committed, lambda reason: StoredDocumentUnavailable(reason, document_id))
 
 
 def _committed_artifacts(committed: SourceProjection, unavailable) -> tuple[StoredSourceArtifact, ...]:

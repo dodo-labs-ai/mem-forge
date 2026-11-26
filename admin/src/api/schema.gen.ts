@@ -2031,6 +2031,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/acquisition/stored-extras": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Acquisition Stored Extras
+         * @description Give a device run's ``fetch`` the ``stored_extra`` a server run's ``fetch`` reads.
+         *
+         *     For each named item whose Document the Source has stored, the
+         *     ``extra`` recorded with its Unit's stored input, so a Gene that
+         *     reuses a fact it recorded for an unchanged provider revision does so
+         *     on the device as on the server.
+         */
+        post: operations["read_acquisition_stored_extras_api_v1_sources__source_id__acquisition_stored_extras_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/adapter/artifacts": {
         parameters: {
             query?: never;
@@ -2668,6 +2693,18 @@ export interface components {
             manifest: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * AcquisitionStoredExtrasRequest
+         * @description The items of a device run whose ``fetch`` reads what the Source stored for them.
+         */
+        AcquisitionStoredExtrasRequest: {
+            /** Item Ids */
+            item_ids: string[];
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
         };
         /** AddAliasRequest */
         AddAliasRequest: {
@@ -10787,6 +10824,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["AcquisitionManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_acquisition_stored_extras_api_v1_sources__source_id__acquisition_stored_extras_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcquisitionStoredExtrasRequest"];
             };
         };
         responses: {

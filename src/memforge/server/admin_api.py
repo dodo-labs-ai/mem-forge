@@ -231,6 +231,7 @@ from memforge.pipeline.device_acquisition import (
     document_acquisition_job_payload,
     ready_acquisition,
     retain_acquired_input,
+    stored_extras,
 )
 from memforge.scheduler import SyncScheduler
 from memforge.server.model_settings_api import (
@@ -3180,6 +3181,12 @@ class AcquiredInputRequest(AcquisitionAttemptRequest):
     """One acquired input of a device run, bound to its job attempt."""
 
     package: dict[str, Any]
+
+
+class AcquisitionStoredExtrasRequest(AcquisitionAttemptRequest):
+    """The items of a device run whose ``fetch`` reads what the Source stored for them."""
+
+    item_ids: list[str] = Field(max_length=SNAPSHOT_MANIFEST_MAX_ITEMS)
 
 
 class AcquisitionAnswersRequest(AcquisitionAttemptRequest):
@@ -10380,6 +10387,25 @@ def create_admin_app(
             "doc_id": package.item.item_id,
             "input_sha256": input_sha256,
         }
+
+    @source_router.post("/{source_id}/acquisition/stored-extras")
+    async def read_acquisition_stored_extras(
+        source_id: str,
+        req: AcquisitionStoredExtrasRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Give a device run's ``fetch`` the ``stored_extra`` a server run's ``fetch`` reads.
+
+        For each named item whose Document the Source has stored, the
+        ``extra`` recorded with its Unit's stored input, so a Gene that
+        reuses a fact it recorded for an unchanged provider revision does so
+        on the device as on the server.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        await _require_acquisition_lease(request, db, source=source, attempt=req)
+        return {"source_id": source_id, "stored_extras": await stored_extras(db, source_id, req.item_ids)}
 
     @source_router.post("/{source_id}/acquisition/answers")
     async def submit_acquisition_answers(

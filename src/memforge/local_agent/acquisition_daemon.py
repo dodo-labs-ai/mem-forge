@@ -10,7 +10,8 @@ server. The calls are the ones a server run makes, in this order:
 2. ``fetch`` of each discovered item, with its PDF export when the type
    exports PDFs and the artifacts it describes, each uploaded as an acquired
    input; an artifact that cannot be read is the item's failure, as it is in
-   a server run, and not the attempt's;
+   a server run, and not the attempt's. Each item ``fetch`` reads carries the
+   ``stored_extra`` a server run gives it, read from the server first;
 3. ``list_scope`` of each excluded scope the job carries;
 4. the manifest is submitted, and its response names what the server run
    will ask beyond discovery;
@@ -33,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol, TypeVar
@@ -85,6 +86,9 @@ class AcquisitionTransport(Protocol):
     async def upload_input(self, package: AcquiredInputPackage) -> None:
         """Upload one acquired input, before or after the manifest."""
 
+    async def stored_extras(self, item_ids: Sequence[str]) -> Mapping[str, Mapping[str, Any]]:
+        """The ``extra`` the Source stored with each named item, for the items it has stored."""
+
     async def submit_answers(self, answers: AcquisitionAnswers) -> None:
         """Submit the answers to what the manifest response asked."""
 
@@ -134,8 +138,7 @@ async def acquire_document_source(
             # The manifest names the items as discovery yielded them; ``fetch`` may change them.
             manifest = AcquisitionManifest(listing=listing, discovered=tuple(copy.deepcopy(discovered)))
             manifest.check_bound()
-            for item in discovered:
-                await acquirer.upload(item)
+            await acquirer.upload_each(discovered)
             excluded: list[ExcludedScopeListing] = []
             for entry in payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ():
                 scope_listing = await _list_excluded_scope(open_gene, entry)
@@ -143,9 +146,8 @@ async def acquire_document_source(
                     excluded.append(scope_listing)
             manifest = replace(manifest, excluded_listings=tuple(excluded))
         requests = await transport.submit_manifest(manifest)
-        answers = await _answer(gene, requests, acquirer)
-        for item in requests.fetch:
-            await acquirer.upload(item)
+        answers, found = await _answer(gene, requests)
+        await acquirer.upload_each([*found, *requests.fetch])
         if requests.awaits_answers:
             await transport.submit_answers(answers)
         return AcquisitionSummary(discovered=len(manifest.discovered), uploaded=acquirer.uploaded, failed=acquirer.failed)
@@ -185,12 +187,13 @@ async def _list_excluded_scope(open_gene: GeneOpener, entry: Mapping[str, Any]) 
     return ExcludedScopeListing(scope_key=scope_key, doc_ids=frozenset(listing.doc_ids))
 
 
-async def _answer(gene: DocumentGene, requests: AcquisitionRequests, acquirer: _Acquirer) -> AcquisitionAnswers:
-    """Answer ``confirm`` and ``rediscover``, and fetch each item ``rediscover`` still finds as itself.
+async def _answer(gene: DocumentGene, requests: AcquisitionRequests) -> tuple[AcquisitionAnswers, list[ContentItem]]:
+    """Answer ``confirm`` and ``rediscover``; return the answers and each item ``rediscover`` still finds as itself.
 
     An item ``confirm_absent`` leaves unanswered is answered ``exists``: the
     server run keeps every item it is not told is absent, and counts it as
-    present.
+    present. The server run fetches each item ``rediscover`` still finds, so
+    the device fetches it too.
     """
 
     absence: dict[str, AbsenceAnswer] = {}
@@ -203,6 +206,7 @@ async def _answer(gene: DocumentGene, requests: AcquisitionRequests, acquirer: _
             absence_failure = AcquisitionError.from_exception(exc)
     rediscovered: dict[str, ContentItem | None] = {}
     rediscover_failures: dict[str, AcquisitionError] = {}
+    found: list[ContentItem] = []
     for item in requests.rediscover:
         try:
             current = await gene.rediscover(item)
@@ -212,13 +216,14 @@ async def _answer(gene: DocumentGene, requests: AcquisitionRequests, acquirer: _
         # The answer is the item as rediscover returned it; fetch may change the item it reads.
         rediscovered[item.item_id] = copy.deepcopy(current)
         if current is not None and current.item_id == item.item_id:
-            await acquirer.upload(current)
-    return AcquisitionAnswers(
+            found.append(current)
+    answers = AcquisitionAnswers(
         absence=absence,
         absence_failure=absence_failure,
         rediscovered=rediscovered,
         rediscover_failures=rediscover_failures,
     )
+    return answers, found
 
 
 class _Acquirer:
@@ -239,7 +244,17 @@ class _Acquirer:
         self.uploaded = 0
         self.failed = 0
 
-    async def upload(self, item: ContentItem) -> None:
+    async def upload_each(self, items: Sequence[ContentItem]) -> None:
+        """Fetch and upload each item, with the ``stored_extra`` a server run's ``fetch`` reads."""
+
+        if not items:
+            return
+        extras = await self._transport.stored_extras([item.item_id for item in items])
+        for item in items:
+            item.stored_extra = dict(extras.get(item.item_id) or {})
+            await self._upload(item)
+
+    async def _upload(self, item: ContentItem) -> None:
         package = await self._acquire(item)
         await self._transport.upload_input(package)
         self.uploaded += 1

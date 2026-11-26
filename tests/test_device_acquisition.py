@@ -399,6 +399,10 @@ class _RouteTransport:
     async def upload_input(self, package: AcquiredInputPackage) -> None:
         await asyncio.to_thread(self._post, "inputs", {"package": package.to_payload()})
 
+    async def stored_extras(self, item_ids) -> dict:
+        answer = await asyncio.to_thread(self._post, "stored-extras", {"item_ids": list(item_ids)})
+        return answer["stored_extras"]
+
     async def submit_answers(self, answers: AcquisitionAnswers) -> None:
         await asyncio.to_thread(
             self._post, "answers", {"manifest_sha256": self.manifest_sha256, "answers": answers.to_payload()}
@@ -854,6 +858,9 @@ def test_the_device_fails_a_listing_above_the_bound_before_it_fetches_anything(w
         async def upload_input(self, package):
             raise AssertionError("nothing is uploaded")
 
+        async def stored_extras(self, item_ids):
+            raise AssertionError("nothing is fetched")
+
     with pytest.raises(AcquisitionManifestTooLarge) as raised:
         asyncio.run(
             acquire_document_source(
@@ -883,6 +890,9 @@ def test_the_device_makes_the_server_runs_calls_in_order_with_one_gene(wiki):
 
         async def upload_input(self, package):
             events.append(f"input:{package.item.item_id}")
+
+        async def stored_extras(self, item_ids):
+            return {}
 
         async def submit_answers(self, answers):
             events.append(f"answers:{sorted(answers.absence)}:{sorted(answers.rediscovered)}")
@@ -1100,6 +1110,9 @@ def test_the_daemon_lists_each_excluded_scope_with_an_instance_of_its_own_after_
 
         async def upload_input(self, package):
             events.append(f"input:{package.item.item_id}")
+
+        async def stored_extras(self, item_ids):
+            return {}
 
         async def submit_answers(self, answers):
             raise AssertionError("nothing was asked")
