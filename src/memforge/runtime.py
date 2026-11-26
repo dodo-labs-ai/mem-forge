@@ -34,6 +34,7 @@ from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_operation,
     snapshot_document_ids,
+    source_runs_on_device,
     source_with_sync_inputs,
 )
 from memforge.source_projection_config import (
@@ -1019,7 +1020,7 @@ async def run_source_sync(
     submitted. ``acquisition`` is what a device acquired for a document
     Source's run (ADR 0058): the run interprets it with the type's recorded
     Gene, from the time the device's job attempt was leased, and reaches
-    neither the provider nor its session.
+    neither the provider nor its session. A device Source runs only this way.
     """
     activity_id = source_activity.id if source_activity is not None else None
     owns_activity = False
@@ -1054,6 +1055,10 @@ async def run_source_sync(
         heartbeat_task = asyncio.create_task(heartbeat_activity())
     lifecycle_cycle_id = lifecycle_cycle_id or activity_id
     try:
+        if acquisition is None and source_runs_on_device(source):
+            # The server never reaches a device Source's provider: its runs
+            # interpret what its device acquired.
+            raise SourceSyncBoundaryError(f"device Source {source['id']} runs only on what its device acquired")
         runtime = runtime or await build_sync_runtime(db, config)
         secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
         source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)

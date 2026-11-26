@@ -794,10 +794,21 @@ export interface LocalAgentDeviceStatus {
   last_seen_at: string;
 }
 
+/** A Source whose acquisition runs on one of the caller's devices. */
+export interface LocalAgentDeviceSource {
+  id: string;
+  name: string;
+  type: string;
+  /** The configuration without secrets. */
+  config: Record<string, unknown>;
+}
+
 export interface LocalAgentDaemonStatusResponse {
   status: "online" | "offline";
   last_seen_at: string | null;
   devices: LocalAgentDeviceStatus[];
+  sources: LocalAgentDeviceSource[];
+  server: { version: string; acquisition_contracts: Record<string, number> };
   checked_at: string;
   stale_after_seconds: number;
 }

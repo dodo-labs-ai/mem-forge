@@ -19,6 +19,7 @@ from tests.device_report_fixture import device_report
 STATUS_PATH = "/api/cloud/local-agent/status"
 LEASE_PATH = "/api/cloud/local-agent/jobs/lease"
 PRINCIPAL_HEADER = "X-Test-Principal"
+SERVER = {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()}
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -41,7 +42,8 @@ def _lease(client: TestClient, principal: str, **device) -> None:
     assert response.status_code == 200, response.text
     assert response.json() == {
         "jobs": [],
-        "server": {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()},
+        "server": SERVER,
+        "released_source_ids": [],
     }
 
 
@@ -61,10 +63,14 @@ def test_self_hosted_status_observes_public_lease_heartbeat_for_only_its_princip
             "status",
             "last_seen_at",
             "devices",
+            "sources",
+            "server",
             "checked_at",
             "stale_after_seconds",
         }
         assert initial_body["devices"] == []
+        assert initial_body["sources"] == []
+        assert initial_body["server"] == SERVER
         assert initial_body["status"] == "offline"
         assert initial_body["last_seen_at"] is None
         assert initial_body["stale_after_seconds"] == 90
@@ -190,6 +196,8 @@ def test_self_hosted_status_expires_at_the_declared_stale_cutoff(
         "status": "offline",
         "last_seen_at": online.json()["last_seen_at"],
         "devices": [{**online.json()["devices"][0], "status": "offline"}],
+        "sources": [],
+        "server": SERVER,
         "checked_at": after_cutoff.isoformat(),
         "stale_after_seconds": 90,
     }

@@ -432,6 +432,31 @@ def wiki(monkeypatch) -> Wiki:
     return provider
 
 
+WIKI_TOKEN = "wiki-device-token"
+
+
+@pytest.fixture
+def held_wiki_token(monkeypatch) -> list[object]:
+    """This device holds the wiki Source's token in its keyring; returns the tokens each device Gene was opened with."""
+
+    import sys
+
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from tests.test_daemon_service import FakeKeyring
+
+    monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
+    DeviceCredentialStore(device_credentials_path()).set(SOURCE_ID, {"token": WIKI_TOKEN})
+    tokens: list[object] = []
+    opened = WikiGene.__init__
+
+    def init(self, config, source_id, *args, **kwargs):
+        tokens.append(config.get("token"))
+        opened(self, config, source_id, *args, **kwargs)
+
+    monkeypatch.setattr(WikiGene, "__init__", init)
+    return tokens
+
+
 @pytest.fixture
 def deployments(tmp_path, wiki):
     """A server deployment, and a device deployment whose daemon talks to its routes."""
@@ -1120,7 +1145,7 @@ def _routed_client(client):
     return tool_client
 
 
-def test_the_daemon_job_acquires_through_the_api_and_starts_the_run(deployments, wiki):
+def test_the_daemon_job_acquires_through_the_api_and_starts_the_run(deployments, wiki, held_wiki_token):
     import memforge.main as main
 
     server, device, client, lease = deployments
@@ -1130,8 +1155,10 @@ def test_the_daemon_job_acquires_through_the_api_and_starts_the_run(deployments,
     payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
     lease.lease(payload, leased_at=FIRST_RUN)
     job = {"job_id": "job-0", "attempt_count": 1, "operation": DOCUMENT_ACQUISITION_OPERATION, "payload": payload}
+    held_wiki_token.clear()
 
     result = main._run_cloud_document_acquisition_job(job, _routed_client(client))
+    device_tokens = list(held_wiki_token)
     asyncio.run(
         SourceSyncWorker(device.db, AppConfig(), runtime_provider=_RuntimeProvider(device), worker_id="worker-test").run_once()
     )
@@ -1140,9 +1167,29 @@ def test_the_daemon_job_acquires_through_the_api_and_starts_the_run(deployments,
     assert result["counts"] == {"discovered": 1, "uploaded": 1, "failed": 0}
     assert result["sync_started"] is True
     assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
+    # The device's Gene ran with the token this device holds; the job carried none.
+    assert "token" not in payload["config"]
+    assert device_tokens and set(device_tokens) == {WIKI_TOKEN}
 
 
-def test_the_daemon_job_stops_when_its_lease_is_lost(deployments, wiki):
+def test_a_daemon_job_for_a_source_this_device_holds_no_credentials_for_fails_without_a_retry(deployments, wiki):
+    import memforge.main as main
+
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    lease.lease(payload, leased_at=FIRST_RUN)
+    job = {"job_id": "job-0", "attempt_count": 1, "operation": DOCUMENT_ACQUISITION_OPERATION, "payload": payload}
+
+    result = main._run_cloud_document_acquisition_job(job, _routed_client(client))
+
+    assert result["retryable"] is False
+    assert f"memforge source credentials set {SOURCE_ID}" in result["error"]
+    assert wiki.calls == []
+
+
+def test_the_daemon_job_stops_when_its_lease_is_lost(deployments, wiki, held_wiki_token):
     import memforge.main as main
     from memforge.local_agent.runner import CloudJobLeaseLost
 
@@ -1158,7 +1205,7 @@ def test_the_daemon_job_stops_when_its_lease_is_lost(deployments, wiki):
         main._run_cloud_document_acquisition_job(job, _routed_client(client))
 
 
-def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wiki, tmp_path):
+def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wiki, tmp_path, held_wiki_token):
     import memforge.main as main
     from memforge.api_target import build_target
     from memforge.local_agent.runner import LocalAgentRunner

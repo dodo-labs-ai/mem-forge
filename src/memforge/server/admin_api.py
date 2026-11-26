@@ -304,6 +304,7 @@ from memforge.local_agent.document_acquisition import (
     AcquisitionAnswers,
     AcquisitionManifest,
     AcquisitionManifestTooLarge,
+    acquisition_job_config,
 )
 from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
@@ -317,11 +318,18 @@ from memforge.local_agent.snapshot_manifest import (
     snapshot_manifest_sha256,
     validate_excluded_listings_for_job,
 )
+from memforge.local_agent.credential_check import (
+    CREDENTIAL_CHECK_OPERATION,
+    credential_check_job_payload,
+    signs_in_with_browser_session,
+)
+from memforge.local_agent.device_lease import RELEASED_SOURCE_IDS_FIELD
 from memforge.local_agent.device_report import DeviceReport, declared_acquisition_contracts
 from memforge.local_agent.source_contract import (
     ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
+    SOURCE_EXECUTOR_DEVICE,
     LocalAgentLease,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -333,6 +341,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_snapshot_id,
     local_package_confirms_absence,
     local_package_requires_source_time,
+    source_runs_on_device,
     validate_local_agent_replay_package,
 )
 from memforge.storage.adapters.protocols import RelationalStore
@@ -369,9 +378,9 @@ async def _run_source_access_background(
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
 LOCAL_AGENT_STATUS_STALE_SECONDS = 90
+DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
     "github_repo_preview_tree": "github_repo",
-    "jira_auth": "jira",
     "local_markdown_pick_root": "local_markdown",
     "local_markdown_preview_tree": "local_markdown",
     "teams_auth": "teams",
@@ -1893,8 +1902,11 @@ class ConfigCheckResponse(BaseModel):
 
 
 class DiscoveryPreviewRequest(BaseModel):
+    """A configuration to preview; ``executor`` says where the Source it configures runs."""
+
     source_id: str | None = None
     config: dict[str, Any]
+    executor: Literal["server", "device"] = "server"
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -2643,12 +2655,30 @@ class LocalAgentDeviceStatus(BaseModel):
     last_seen_at: str
 
 
+class LocalAgentDeviceSource(BaseModel):
+    """A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets."""
+
+    id: str
+    name: str
+    type: str
+    config: dict[str, Any]
+
+
+class LocalAgentServerContracts(BaseModel):
+    """The server's MemForge version and the acquisition contract of each document type."""
+
+    version: str
+    acquisition_contracts: dict[str, int]
+
+
 class LocalAgentDaemonStatusResponse(BaseModel):
-    """The caller's devices, and whether any of them is online."""
+    """The caller's devices, whether any of them is online, the caller's device Sources and the server's contracts."""
 
     status: Literal["online", "offline"]
     last_seen_at: str | None
     devices: list[LocalAgentDeviceStatus]
+    sources: list[LocalAgentDeviceSource]
+    server: LocalAgentServerContracts
     checked_at: str
     stale_after_seconds: int
 
@@ -4082,7 +4112,7 @@ async def _cancel_running_jira_browser_sources_for_origin(
 ) -> None:
     origin = canonical_jira_origin(base_url)
     for source in await db.list_sources():
-        if source.get("type") != "jira":
+        if source.get("type") != "jira" or source_runs_on_device(source):
             continue
         config = source.get("config", {})
         if jira_auth_mode(config) != JIRA_AUTH_MODE_COOKIE:
@@ -7100,9 +7130,17 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Preview the documents a source config would discover without saving it."""
+        """Preview the documents a source config would discover without saving it.
+
+        Only the server's own connection can preview: a configuration that
+        runs on a device, or a device Source, answers 409
+        ``device_preview_unavailable``, because the server never reaches a
+        device Source's provider.
+        """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
+        if req.executor == SOURCE_EXECUTOR_DEVICE:
+            raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
 
         preview_config = dict(req.config)
         if req.source_id:
@@ -7113,6 +7151,8 @@ def create_admin_app(
             _require_local_agent_connection_management(request, existing)
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Preview source type does not match the existing source")
+            if source_runs_on_device(existing):
+                raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
             stored_config = decrypt_source_config_for_runtime(
                 existing["config"],
                 secret_fields=_source_secret_fields(name),
@@ -7271,6 +7311,7 @@ def create_admin_app(
             if (
                 s["type"] == "jira"
                 and auth_mode == JIRA_AUTH_MODE_COOKIE
+                and not source_runs_on_device(s)
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:
@@ -10904,6 +10945,9 @@ def create_admin_app(
             if requester != owner:
                 raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
             payload = await local_agent_sync_job_payload(db, source, payload)
+        elif req.operation == CREDENTIAL_CHECK_OPERATION:
+            source, owner = await _credential_check_source(request, db, source_id, req.source_type)
+            payload = credential_check_job_payload(source)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:
@@ -10951,18 +10995,60 @@ def create_admin_app(
         )
         return {"job_id": job_id, "status": "queued", "coalesced": False}
 
+    async def _credential_check_source(
+        request: Request, db: Database, source_id: str, source_type: str
+    ) -> tuple[dict[str, Any], str]:
+        """The Source a ``credential_check`` job checks, and the user whose device runs it.
+
+        A device Source's credential lives on its execution owner's device, so
+        only that owner checks it. A server Source's credential is checked on
+        the server, so a job for one only captures a browser session, which
+        any member who manages the Source may do from their own computer.
+        """
+
+        requester = resolve_request_principal(request)
+        if not source_id:
+            raise HTTPException(status_code=400, detail="credential_check_requires_source_id")
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+        _require_source_discoverability(request, source)
+        if source["type"] != source_type:
+            raise HTTPException(status_code=400, detail="local_agent_operation_source_type_mismatch")
+        if source_runs_on_device(source):
+            if execution_owner_user_id(source) != requester:
+                raise HTTPException(status_code=403, detail="credential_check_execution_owner_forbidden")
+        else:
+            if not signs_in_with_browser_session(source_type, source.get("config") or {}):
+                raise HTTPException(status_code=400, detail="credential_check_requires_browser_session")
+            if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
+                raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
+        return source, requester
+
     @local_agent_router.post("/jobs/lease")
     async def lease_local_agent_jobs(
         req: LocalAgentJobLeaseRequest,
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Lease the device its due jobs; the answer also names the server's version and acquisition contracts."""
+        """Lease the device its due jobs.
+
+        The answer also names the server's version and acquisition contracts,
+        and, among the Sources the device report names, those that are no
+        longer device Sources of the caller (deleted, moved to the server or
+        handed to another execution owner), whose credentials the device
+        deletes.
+        """
 
         requester = resolve_request_principal(request)
         device = _device_report(req.device)
         contracts = declared_acquisition_contracts()
-        server = {"version": installed_version(), "acquisition_contracts": contracts}
+        device_source_ids = {str(source["id"]) for source in await db.list_device_sources(requester)}
+        answer: dict[str, Any] = {
+            "jobs": [],
+            "server": {"version": installed_version(), "acquisition_contracts": contracts},
+            RELEASED_SOURCE_IDS_FIELD: sorted(device.source_ids - device_source_ids),
+        }
         deadline = time.monotonic() + req.wait_seconds
         while True:
             jobs = await db.lease_local_agent_jobs(
@@ -10973,9 +11059,9 @@ def create_admin_app(
                 lease_seconds=req.lease_seconds,
             )
             if jobs or req.wait_seconds <= 0 or time.monotonic() >= deadline:
-                return {"jobs": [_shape_local_agent_job(job) for job in jobs], "server": server}
+                return {**answer, "jobs": [_shape_local_agent_job(job) for job in jobs]}
             if await request.is_disconnected():
-                return {"jobs": [], "server": server}
+                return answer
             await asyncio.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
 
     @local_agent_router.post("/jobs/{job_id}/heartbeat")
@@ -11063,8 +11149,14 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Each of the caller's devices by its latest report, online while that report is recent."""
+        """Each of the caller's devices by its latest report, online while that report is recent.
 
+        It also names the caller's device Sources and the server's version
+        and acquisition contracts, from which a device tells, per Source,
+        whether it is ready, waits for a credential or waits for an update.
+        """
+
+        requester = resolve_request_principal(request)
         now = datetime.now(timezone.utc)
         devices = [
             {
@@ -11078,12 +11170,22 @@ def create_admin_app(
                 ),
                 "last_seen_at": device.last_seen_at.isoformat(),
             }
-            for device in await db.list_local_agent_devices(resolve_request_principal(request))
+            for device in await db.list_local_agent_devices(requester)
         ]
         return {
             "status": "online" if any(device["status"] == "online" for device in devices) else "offline",
             "last_seen_at": devices[0]["last_seen_at"] if devices else None,
             "devices": devices,
+            "sources": [
+                {
+                    "id": source["id"],
+                    "name": source["name"],
+                    "type": source["type"],
+                    "config": acquisition_job_config(str(source["type"]), source.get("config") or {}),
+                }
+                for source in await db.list_device_sources(requester)
+            ],
+            "server": {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()},
             "checked_at": now.isoformat(),
             "stale_after_seconds": LOCAL_AGENT_STATUS_STALE_SECONDS,
         }

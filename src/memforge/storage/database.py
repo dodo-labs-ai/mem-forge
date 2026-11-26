@@ -1323,6 +1323,7 @@ CREATE TABLE IF NOT EXISTS sources (
     access_state    TEXT NOT NULL DEFAULT 'active'
                     CHECK (access_state IN ('active', 'changing', 'orphaned_private')),
     execution_owner_user_id TEXT,
+    executor        TEXT NOT NULL DEFAULT 'server' CHECK (executor IN ('server', 'device')),
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
@@ -5167,6 +5168,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE local_agent_jobs ADD COLUMN acquisition_contract INTEGER",
         ],
     ),
+    (
+        136,
+        "Record where each Source's acquisition runs",
+        # A document Source's acquisition runs on the server or on its
+        # execution owner's device; the server reaches the provider only for
+        # the first.
+        [
+            """ALTER TABLE sources ADD COLUMN executor TEXT NOT NULL DEFAULT 'server'
+               CHECK (executor IN ('server', 'device'))""",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -7293,6 +7305,25 @@ class Database:
             )
             for row in rows
         ]
+
+    async def list_device_sources(self, execution_owner_user_id: str) -> list[dict[str, Any]]:
+        """The Sources whose acquisition runs on a device of this execution owner, by id."""
+
+        async with self.db.execute(
+            """SELECT * FROM sources
+               WHERE executor = 'device' AND execution_owner_user_id = ? AND status <> 'retired'
+               ORDER BY id""",
+            (execution_owner_user_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        sources: list[dict[str, Any]] = []
+        for row in rows:
+            source = dict(row)
+            source["config"] = json.loads(source["config"])
+            source["project_binding"] = json.loads(source["project_binding"]) if source.get("project_binding") else None
+            source["sync_schedule"] = _source_schedule_from_row(source)
+            sources.append(source)
+        return sources
 
     async def enqueue_due_local_agent_jobs(
         self,
@@ -16601,8 +16632,13 @@ class Database:
         execution_owner_user_id: str | None = None,
         projection_scope_transition: ProjectionScopeTransition | None = None,
         expected_open_transition_id: str | None = None,
+        executor: str | None = None,
     ) -> None:
         """Insert or update a source row.
+
+        `executor` is where the Source's acquisition runs, `server` or
+        `device`; `None` keeps the current one, and a new Source runs on the
+        server.
 
         `project_binding` is the structured rule the project resolver
         consults when memories are extracted from this source. `None`
@@ -16705,9 +16741,9 @@ class Database:
                     """INSERT INTO sources (
                        id, type, name, config, status, project_binding,
                        created_by_user_id, owner_user_id, access_policy,
-                       access_state, execution_owner_user_id
+                       access_state, execution_owner_user_id, executor
                    )
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?, COALESCE(?, 'server'))
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -16724,7 +16760,11 @@ class Database:
                    execution_owner_user_id=COALESCE(
                        sources.execution_owner_user_id,
                        excluded.execution_owner_user_id
-                   )""",
+                   ),
+                   executor=CASE
+                       WHEN ? IS NULL THEN sources.executor
+                       ELSE excluded.executor
+                   END""",
                     (
                         id,
                         type,
@@ -16737,7 +16777,9 @@ class Database:
                         access_policy,
                         access_state,
                         execution_owner_user_id,
+                        executor,
                         status,
+                        executor,
                     ),
                 )
                 if projection_scope_transition is not None or expected_open_transition_id is not None:

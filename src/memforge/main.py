@@ -69,8 +69,8 @@ from memforge.local_agent.document_identity import (
 )
 from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.setup_results import (
+    CredentialCheckResult,
     GitHubRepoPreviewTreeResult,
-    JiraAuthResult,
     LocalMarkdownPickRootResult,
     LocalMarkdownPreviewTreeResult,
     LocalSetupJobResult,
@@ -518,19 +518,32 @@ def _build_local_agent_runner(
 ):
     from memforge.local_agent.runner import LocalAgentRunner
 
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_lease import DeviceLeaseAnswers
+
     client = _local_agent_tool_client(ctx)
     device = _this_device_report
+    lease_answers = DeviceLeaseAnswers(
+        DeviceCredentialStore(device_credentials_path()), log=lambda message: click.echo(message, err=True)
+    )
+
+    def lease(limit: int = 1, wait_seconds: int = 0, lease_seconds: int = 60) -> dict[str, Any]:
+        answer = client.lease_local_agent_jobs(
+            device=device(),
+            limit=limit,
+            wait_seconds=wait_seconds,
+            lease_seconds=lease_seconds,
+        )
+        if not answer.get("error"):
+            lease_answers.observe(answer)
+        return answer
+
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
         cloud_job_handler=lambda job, report_progress=None: _run_cloud_local_agent_job(
             job, client, browser=browser, report_progress=report_progress
         ),
-        cloud_jobs_provider=lambda limit=1, wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
-            device=device(),
-            limit=limit,
-            wait_seconds=wait_seconds,
-            lease_seconds=lease_seconds,
-        ),
+        cloud_jobs_provider=lease,
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
             attempt_count=attempt_count,
@@ -1870,15 +1883,7 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         raise click.ClickException(str(exc)) from exc
     runtime = _local_agent_status_payload(ctx, verbose=verbose)
     try:
-        environment = manager.environment()
-        target = _build_cli_target(
-            api_url=environment["MEMFORGE_API_URL"],
-            edition=environment.get("MEMFORGE_EDITION"),
-        )
-        connection = ToolClient(
-            target=target,
-            api_token=environment.get("MEMFORGE_API_TOKEN"),
-        ).get_local_agent_status()
+        connection = _daemon_client(manager).get_local_agent_status()
     except (DaemonServiceError, click.ClickException) as exc:
         connection = {
             "status": "unconfigured",
@@ -1889,12 +1894,36 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         and runtime.get("status") == "running"
         and connection.get("status") == "online"
     )
-    return {
+    payload: dict[str, Any] = {
         "status": "healthy" if healthy else "unhealthy",
         "service": service,
         "runtime": runtime,
         "connection": connection,
     }
+    if not connection.get("error"):
+        payload["sources"] = _device_source_states(connection)
+    return payload
+
+
+def _daemon_client(manager) -> ToolClient:
+    """A client for the server the installed daemon serves, as the daemon's user."""
+    environment = manager.environment()
+    target = _build_cli_target(
+        api_url=environment["MEMFORGE_API_URL"],
+        edition=environment.get("MEMFORGE_EDITION"),
+    )
+    return ToolClient(target=target, api_token=environment.get("MEMFORGE_API_TOKEN"))
+
+
+def _device_source_states(status: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Each of the owner's device Sources: ready, waiting for an update or waiting for a credential on this device."""
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_sources import device_source_states
+
+    try:
+        return device_source_states(status, DeviceCredentialStore(device_credentials_path()))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @daemon_service.command("check")
@@ -2019,6 +2048,80 @@ def _wait_for_local_agent_online(
         if time.monotonic() >= deadline:
             return {**device, "fresh": False}
         time.sleep(0.5)
+
+
+@cli.command("upgrade")
+@click.pass_context
+def upgrade_command(ctx):
+    """Install exactly the MemForge version the server runs, and restart the daemon with it.
+
+    A device syncs its document Sources only while its acquisition contracts
+    equal the server's, so this also brings back a device that is ahead of
+    the server. MemForge is installed the way it was installed before.
+    """
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.service import DaemonServiceError
+    from memforge.local_agent.upgrade import UnknownInstallMethod, install_method
+    from memforge.release import installed_version
+
+    manager = _daemon_service_manager()
+    try:
+        environment = manager.environment()
+        client = _daemon_client(manager)
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"{exc} Run `memforge setup` first.") from exc
+    status = client.get_local_agent_status()
+    if status.get("error"):
+        _emit_tool_payload(ctx, status)
+        return
+    version = str((status.get("server") or {}).get("version") or "")
+    if not version:
+        raise click.ClickException("The server did not name its MemForge version.")
+    if version == installed_version():
+        _emit_tool_payload(ctx, {"ok": True, "version": version, "upgraded": False})
+        return
+    executable = _current_cli_executable()
+    try:
+        method = install_method(Path(executable))
+    except UnknownInstallMethod as exc:
+        raise click.ClickException(
+            f"{exc}. Install MemForge {version} the way you installed it, then run `memforge daemon restart`."
+        ) from exc
+    command = method.install_command(version)
+    installed = subprocess.run(command, check=False)
+    if installed.returncode != 0:
+        raise click.ClickException(f"`{' '.join(command)}` failed with exit status {installed.returncode}.")
+    device = DeviceIdentityStore(device_identity_path()).ensure()
+    try:
+        replacement = manager.replace(
+            executable=executable,
+            api_url=environment["MEMFORGE_API_URL"],
+            api_token=environment.get("MEMFORGE_API_TOKEN"),
+            edition=environment.get("MEMFORGE_EDITION"),
+        )
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    daemon_status = _wait_for_local_agent_online(
+        client,
+        device_id=device.device_id,
+        after_last_seen_at=(_reported_device(status, device.device_id) or {}).get("last_seen_at"),
+    )
+    if daemon_status.get("fresh") is not True or daemon_status.get("version") != version:
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                f"The daemon did not report MemForge {version}, and its service could not be restored: "
+                f"{rollback_error}"
+            ) from rollback_error
+        raise click.ClickException(
+            f"The daemon did not report MemForge {version} after the restart. Run `memforge daemon logs`."
+        )
+    try:
+        replacement.commit()
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"Could not commit the daemon restart: {exc}") from exc
+    _emit_tool_payload(ctx, {"ok": True, "version": version, "upgraded": True, "install_method": method.name})
 
 
 @cli.command("setup")
@@ -2477,6 +2580,55 @@ def api(ctx, port: int | None, host: str):
 def sources():
     """Manage configured data sources."""
     pass
+
+
+@cli.group("source")
+def source_group():
+    """Manage one Source on this device."""
+
+
+@source_group.group("credentials")
+def source_credentials():
+    """The provider credentials this device holds for a device Source."""
+
+
+@source_credentials.command("set")
+@click.argument("source_id")
+@click.pass_context
+def source_credentials_set(ctx, source_id: str):
+    """Store a device Source's secrets in this device's keyring, prompting for each secret field of its form."""
+    from memforge.local_agent.credential_check import signs_in_with_browser_session
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_sources import SIGN_IN_INSTRUCTION, credential_fields
+    from memforge.local_agent.service import DaemonServiceError
+
+    try:
+        status = _daemon_client(_daemon_service_manager()).get_local_agent_status()
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"{exc} Run `memforge setup` first.") from exc
+    if status.get("error"):
+        _emit_tool_payload(ctx, status)
+        return
+    source = next((entry for entry in status.get("sources") or () if entry.get("id") == source_id), None)
+    if source is None:
+        raise click.ClickException(
+            f"Source {source_id} is not one of your Sources that run on your computer. "
+            "Choose My computer under Where it runs in its Configure page first."
+        )
+    source_type = str(source["type"])
+    config = dict(source.get("config") or {})
+    if signs_in_with_browser_session(source_type, config):
+        raise click.ClickException(f"Source {source_id} signs in with a browser session. {SIGN_IN_INSTRUCTION}.")
+    secrets: dict[str, str] = {}
+    for field in credential_fields(source_type, config):
+        value = click.prompt(field.label, hide_input=True, default="" if not field.required else None)
+        if value:
+            secrets[field.key] = value
+    try:
+        DeviceCredentialStore(device_credentials_path()).set(source_id, secrets)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _emit_tool_payload(ctx, {"ok": True, "source_id": source_id, "fields": sorted(secrets)})
 
 
 @sources.command("list")
@@ -3458,7 +3610,7 @@ def _run_cloud_local_agent_job(
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
         "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
-        "jira_auth": lambda: _run_cloud_jira_auth_job(job, client, browser=browser),
+        "credential_check": lambda: _run_cloud_credential_check_job(job, client, browser=browser),
         "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser, report_progress=report_progress),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
@@ -3567,13 +3719,23 @@ def _run_cloud_document_acquisition_job(
 ) -> dict[str, Any]:
     """Acquire one document Source's run with its type's own Gene, then ask the server to process it.
 
-    A manifest above the bound every device manifest has fails the job with
-    the count, and does not retry: the same scope is as large next time.
+    The Gene runs with the credentials this device holds for the Source, and
+    a browser session is checked against the provider before anything is
+    read. A missing credential or a refused session fails the job without a
+    retry, because only the owner can renew it. A manifest above the bound
+    every device manifest has fails the job with the count, and does not
+    retry either: the same scope is as large next time.
     """
 
     from memforge.genes import gene_class
     from memforge.llm.structured import failure_retryable
     from memforge.local_agent.acquisition_daemon import acquire_document_source
+    from memforge.local_agent.device_credentials import (
+        DeviceCredentialStore,
+        check_browser_session,
+        device_credentials_path,
+    )
+    from memforge.local_agent.document_acquisition import CONFIG_PAYLOAD_FIELD
     from memforge.local_agent.runner import CloudJobLeaseLost
     from memforge.source_types import source_type_descriptor
 
@@ -3587,18 +3749,26 @@ def _run_cloud_document_acquisition_job(
     attempt_count = int(job["attempt_count"])
     gene_cls = gene_class(source_type)
     descriptor = source_type_descriptor(source_type)
+    credentials = DeviceCredentialStore(device_credentials_path())
+
+    def open_gene(config: Mapping[str, Any]) -> Any:
+        return gene_cls(config=credentials.gene_config(source_id, source_type, config), source_id=source_id)
+
+    async def acquire() -> Any:
+        await check_browser_session(
+            source_type,
+            credentials.gene_config(source_id, source_type, payload.get(CONFIG_PAYLOAD_FIELD) or {}),
+        )
+        return await acquire_document_source(
+            payload,
+            open_gene=open_gene,
+            transport=_ClientAcquisitionTransport(client, source_id=source_id, job_id=job_id, attempt_count=attempt_count),
+            exports_pdf=bool(descriptor and descriptor.exports_pdf),
+        )
+
     _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
     try:
-        summary = asyncio.run(
-            acquire_document_source(
-                payload,
-                open_gene=lambda config: gene_cls(config=dict(config), source_id=source_id),
-                transport=_ClientAcquisitionTransport(
-                    client, source_id=source_id, job_id=job_id, attempt_count=attempt_count
-                ),
-                exports_pdf=bool(descriptor and descriptor.exports_pdf),
-            )
-        )
+        summary = asyncio.run(acquire())
     except CloudJobLeaseLost:
         raise
     except Exception as exc:
@@ -3632,74 +3802,38 @@ def _setup_result(result: LocalSetupJobResult) -> dict[str, Any]:
     return result.model_dump()
 
 
-def _run_cloud_jira_auth_job(
+def _run_cloud_credential_check_job(
     job: dict[str, Any],
     client: ToolClient,
     *,
     browser: str | None,
 ) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
+    from memforge.genes import gene_class
+    from memforge.local_agent.credential_check import CREDENTIAL_CHECK_OPERATION, run_credential_check
+    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
+    source_type = str(payload.get("source_type") or "")
+    _source_id, scoped_client, error = _local_agent_job_source_client(
+        job, payload, operation=CREDENTIAL_CHECK_OPERATION, client=client
     )
     if error:
-        return _setup_result(JiraAuthResult(**error, retryable=False))
-
-    try:
-        from memforge.auth.jira_capture import capture_and_prevalidate
-
-        session_config = _jira_cloud_config_from_job_payload(payload)
-        captured = asyncio.run(
-            capture_and_prevalidate(
-                str(session_config["base_url"]),
-                browser=browser,
-                tls_config=session_config,
-                interactive=True,
-            )
+        return _setup_result(CredentialCheckResult(**error, retryable=False))
+    result = asyncio.run(
+        run_credential_check(
+            payload,
+            credentials=DeviceCredentialStore(device_credentials_path()),
+            open_gene=lambda source_id, config: gene_class(source_type)(config=dict(config), source_id=source_id),
+            upload_session=lambda provider, captured: scoped_client.upload_browser_session(
+                provider=provider,
+                base_url=captured.origin,
+                cookie_header=captured.cookie_header,
+                browser=captured.browser,
+            ),
+            browser=browser,
         )
-        uploaded_session = client.upload_jira_session(
-            base_url=captured.origin,
-            cookie_header=captured.cookie_header,
-            browser=captured.browser,
-        )
-        if _is_jira_principal_change(uploaded_session):
-            return _setup_result(
-                JiraAuthResult(
-                    operation=operation,
-                    source_id=source_id,
-                    **_principal_change_payload(uploaded_session),
-                    error_type="JiraPrincipalChangedError",
-                    retryable=False,
-                )
-            )
-        if uploaded_session.get("error"):
-            return _setup_result(
-                JiraAuthResult(
-                    operation=operation,
-                    source_id=source_id,
-                    error="Unable to store the renewed Jira browser session",
-                    error_type="JiraSessionUploadError",
-                    retryable=False,
-                )
-            )
-    except Exception as exc:
-        return _setup_result(
-            JiraAuthResult(
-                operation=operation,
-                source_id=source_id,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                retryable=False,
-            )
-        )
-
-    return _setup_result(
-        JiraAuthResult(operation=operation, source_id=source_id, authenticated=True, origin=captured.origin)
     )
+    return _setup_result(result)
 
 
 def _local_agent_lease_not_current(response: object) -> bool:

@@ -41,7 +41,19 @@ def _demo_provider() -> bs.BrowserSessionProvider:
         canonical_origin=lambda url: url.rstrip("/"),
         service_factory=_FakeService,
         uses_browser_session=lambda cfg: str(cfg.get("auth_mode") or "browser_cookie") == "browser_cookie",
+        capture_session=_capture_demo_session,
+        validate_session=_validate_demo_session,
     )
+
+
+async def _capture_demo_session(base_url, *, browser, tls_config) -> bs.CapturedBrowserSession:
+    return bs.CapturedBrowserSession(
+        origin=base_url.rstrip("/"), cookie_header="demo=1", browser=browser, principal={"name": "demo"}
+    )
+
+
+async def _validate_demo_session(origin, cookie_header, tls_config) -> dict:
+    return {"name": "demo"}
 
 
 def _db(tmp_path: Path) -> Database:

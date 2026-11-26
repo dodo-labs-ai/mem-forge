@@ -16,7 +16,7 @@ from memforge.genes.jira_gene import JiraGene
 from memforge.local_agent import folder_picker
 from memforge.local_agent.runner import CloudJobLeaseLost
 from memforge.local_agent.setup_results import (
-    JiraAuthResult,
+    CredentialCheckResult,
     LocalMarkdownPickRootResult,
     TeamsAuthCheckResult,
     TeamsAuthResult,
@@ -173,6 +173,14 @@ class FakeToolClient:
         self.calls.append(
             (
                 "upload_jira_session",
+                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
+            )
+        )
+        return self.response
+    def upload_browser_session(self, **kwargs):
+        self.calls.append(
+            (
+                "upload_browser_session",
                 {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
             )
         )
@@ -3093,7 +3101,7 @@ def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):
     assert FakeToolClient.calls == []
 
 
-def test_local_agent_cloud_jira_auth_opens_interactive_browser_and_uploads_session(monkeypatch):
+def test_a_server_sources_credential_check_opens_the_browser_and_stores_the_session_on_the_server(monkeypatch):
     from memforge.auth import jira_capture
 
     captured: dict[str, object] = {}
@@ -3131,14 +3139,16 @@ def test_local_agent_cloud_jira_auth_opens_interactive_browser_and_uploads_sessi
 
     payload = main._run_cloud_local_agent_job(
         {
-            "job_id": "laj-jira-auth",
+            "job_id": "laj-credential-check",
             "workspace_id": "team_alpha",
-            "operation": "jira_auth",
+            "operation": "credential_check",
             "source_type": "jira",
             "source_id": "src-jira",
             "payload": {
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
+                "source_id": "src-jira",
+                "source_type": "jira",
+                "executor": "server",
+                "config": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie"},
             },
         },
         _cloud_test_client(),
@@ -3147,19 +3157,16 @@ def test_local_agent_cloud_jira_auth_opens_interactive_browser_and_uploads_sessi
 
     assert (
         payload
-        == JiraAuthResult(
-            operation="jira_auth", source_id="src-jira", authenticated=True, origin="https://jira.example.test"
+        == CredentialCheckResult(
+            operation="credential_check", source_id="src-jira", authenticated=True, origin="https://jira.example.test"
         ).model_dump()
     )
     assert captured["base_url"] == "https://jira.example.test"
     assert captured["browser"] == "chrome"
     assert captured["interactive"] is True
-    assert captured["tls_config"] == {
-        "base_url": "https://jira.example.test",
-        "auth_mode": "browser_cookie",
-        "sync_mode": "cloud",
-    }
-    upload = next(call for name, call in FakeToolClient.calls if name == "upload_jira_session")
+    assert captured["tls_config"] == {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie"}
+    upload = next(call for name, call in FakeToolClient.calls if name == "upload_browser_session")
+    assert upload["provider"] == "jira"
     assert upload["workspace_id"] == "team_alpha"
     assert upload["cookie_header"] == "SESSION=interactive"
 

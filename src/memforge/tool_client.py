@@ -928,6 +928,16 @@ class ToolClient:
     def list_jira_origins(self) -> dict[str, Any]:
         return self._resource_json("GET", "/auth/jira-origins", None)
 
+    def upload_browser_session(
+        self, *, provider: str, base_url: str, cookie_header: str, browser: str | None = None
+    ) -> dict[str, Any]:
+        """Store a server Source's browser session of ``provider`` on the server, which checks it."""
+        return self._resource_json(
+            "POST",
+            f"/auth/{quote(provider, safe='')}-session",
+            {"base_url": base_url, "cookie_header": cookie_header, "browser": browser},
+        )
+
     def upload_jira_session(
         self, *, base_url: str, cookie_header: str, browser: str | None = None,
         confirm_principal_change: bool = False,

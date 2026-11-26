@@ -2,7 +2,8 @@
 
 A setup job is the admin UI asking the user's local daemon to do one
 interactive step while a Source is being set up: open the folder picker, list
-a repository tree, sign in to Jira or Teams, or list Teams conversations. The
+a repository tree, check a Source's credential or sign in to its site, sign
+in to Teams, or list Teams conversations. The
 daemon handler for the operation builds its result through the operation's
 model and completes the job with ``model.model_dump()``, so the model is the
 one owner of the shape and every field it declares is present, as null when
@@ -174,18 +175,25 @@ class LocalMarkdownPreviewTreeResult(LocalSetupJobResult):
     items: list[LocalMarkdownPreviewItem]
 
 
-# -- jira_auth --
+# -- credential_check --
 
 
-class JiraAuthResult(LocalSetupJobResult):
-    """A Jira browser session captured on the user's computer and stored for the Source.
+class CredentialCheckResult(LocalSetupJobResult):
+    """A Source's credential checked, and a browser session captured, on the user's computer.
 
-    On success ``authenticated`` is true and ``origin`` is the Jira site the
-    session belongs to. ``error`` is ``principal_changed`` when the user signed
-    in as a different Jira account than the one the stored session names;
-    ``old_principal_id`` and ``new_principal_id`` then name both accounts.
-    ``retryable`` is false for every failure, because renewing again needs the
-    user at the browser.
+    For a Source whose configuration signs in with a browser session, the
+    session is captured from the user's browser and checked against the
+    provider. A device Source keeps it in the device's keyring for the
+    session's origin; a server Source's session is stored on the server. For
+    a device Source that signs in with a token, the device's stored token is
+    checked by the type's ``authenticate``.
+
+    On success ``authenticated`` is true and ``origin`` is the site a captured
+    session belongs to. ``error`` is ``principal_changed`` when the user
+    signed in as a different account than the one the server's stored session
+    names; ``old_principal_id`` and ``new_principal_id`` then name both
+    accounts. ``retryable`` is false for every failure, because renewing a
+    credential needs the user.
     """
 
     source_id: str | None = None
@@ -278,8 +286,8 @@ class TeamsBrowseResult(LocalSetupJobResult):
 
 
 SETUP_RESULT_MODELS: dict[str, type[LocalSetupJobResult]] = {
+    "credential_check": CredentialCheckResult,
     "github_repo_preview_tree": GitHubRepoPreviewTreeResult,
-    "jira_auth": JiraAuthResult,
     "local_markdown_pick_root": LocalMarkdownPickRootResult,
     "local_markdown_preview_tree": LocalMarkdownPreviewTreeResult,
     "teams_auth": TeamsAuthResult,

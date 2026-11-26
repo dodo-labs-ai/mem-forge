@@ -1462,19 +1462,22 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
         asyncio.run(database.close())
 
 
-def test_jira_auth_job_uses_the_current_workspace(tmp_path):
+def test_credential_check_job_uses_the_current_workspace(tmp_path):
     database = _connect_database(tmp_path)
     try:
+        asyncio.run(
+            database.upsert_source(
+                id="src-jira",
+                type="jira",
+                name="Jira",
+                config_json='{"base_url":"https://jira.example.test","auth_mode":"browser_cookie","jql":"project = ACME"}',
+                access_policy="workspace",
+                owner_user_id="owner-a",
+                execution_owner_user_id="owner-a",
+            )
+        )
         app = _app(tmp_path, database, workspace_id="team_alpha")
-        body = {
-            "source_id": "src-jira",
-            "source_type": "jira",
-            "operation": "jira_auth",
-            "payload": {
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-            },
-        }
+        body = {"source_id": "src-jira", "source_type": "jira", "operation": "credential_check", "payload": {}}
         headers = {"x-test-user": "member-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
             accepted = client.post("/api/cloud/local-agent/jobs", headers=headers, json=body)
@@ -1488,7 +1491,13 @@ def test_jira_auth_job_uses_the_current_workspace(tmp_path):
         [job] = leased.json()["jobs"]
         assert job["workspace_id"] == "team_alpha"
         assert job["source_id"] == "src-jira"
-        assert job["operation"] == "jira_auth"
+        assert job["operation"] == "credential_check"
+        assert job["payload"] == {
+            "source_id": "src-jira",
+            "source_type": "jira",
+            "executor": "server",
+            "config": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "jql": "project = ACME"},
+        }
     finally:
         asyncio.run(database.close())
 

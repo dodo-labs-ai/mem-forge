@@ -513,7 +513,15 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
     assert current.json()["data"][0]["result"] == {}
     assert leased
 
-    assert set(offline.json()) == {"status", "last_seen_at", "devices", "checked_at", "stale_after_seconds"}
+    assert set(offline.json()) == {
+        "status",
+        "last_seen_at",
+        "devices",
+        "sources",
+        "server",
+        "checked_at",
+        "stale_after_seconds",
+    }
     assert offline.json()["status"] == "offline"
     assert offline.json()["last_seen_at"] is None
     assert online.json()["status"] == "online"

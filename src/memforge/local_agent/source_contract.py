@@ -411,6 +411,20 @@ def source_execution_descriptor(
     }
 
 
+SOURCE_EXECUTOR_SERVER = "server"
+SOURCE_EXECUTOR_DEVICE = "device"
+
+
+def source_runs_on_device(source: Mapping[str, Any]) -> bool:
+    """Whether the Source's acquisition runs on its execution owner's device (ADR 0058).
+
+    The server holds no credential for such a Source and never reaches its
+    provider; only the device does.
+    """
+
+    return source.get("executor") == SOURCE_EXECUTOR_DEVICE
+
+
 def execution_owner_user_id(source: Mapping[str, Any]) -> str | None:
     value = str(source.get("execution_owner_user_id") or "").strip()
     return value or None

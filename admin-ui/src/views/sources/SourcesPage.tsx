@@ -419,11 +419,8 @@ export function SourcesPage() {
       const created = await createLocalAgentJob({
         sourceId: source.id,
         sourceType: source.type,
-        operation: "jira_auth",
-        payload: {
-          base_url: baseUrl,
-          auth_mode: "browser_cookie",
-        },
+        operation: "credential_check",
+        payload: {},
       });
       const status = await pollLocalAgentSyncJob(created.job_id, {});
       if (status.status === "failed") throw new Error(jiraSignInJobErrorMessage(status));

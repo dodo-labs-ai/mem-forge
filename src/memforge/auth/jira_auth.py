@@ -23,10 +23,12 @@ from memforge.auth.browser_session import (
     BrowserSessionPrincipalChangedError,
     BrowserSessionProvider,
     BrowserSessionStore,
+    CapturedBrowserSession,
     register_provider,
 )
 from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 from memforge.genes.toolkit.config import require_https_base_url, tls_verify
+from memforge.local_agent.source_contract import source_runs_on_device
 from memforge.source_secrets import decrypt_secret, encrypt_secret
 
 logger = logging.getLogger(__name__)
@@ -128,7 +130,11 @@ def _principal_email(principal: dict[str, Any]) -> str | None:
 
 
 class JiraAuthSessionService:
-    """Owns shared Jira browser sessions keyed by provider and canonical origin."""
+    """Owns the server's shared Jira browser sessions, keyed by provider and canonical origin.
+
+    They serve server Sources only: a device Source's session lives on its
+    device, and the server never checks it.
+    """
 
     def __init__(
         self,
@@ -300,7 +306,7 @@ class JiraAuthSessionService:
     async def _source_ids_for_browser_session_origin(self, origin: str) -> list[str]:
         source_ids: list[str] = []
         for source in await self.db.list_sources():
-            if source.get("type") != "jira":
+            if source.get("type") != "jira" or source_runs_on_device(source):
                 continue
             source_config = source.get("config", {})
             if jira_auth_mode(source_config) != JIRA_AUTH_MODE_COOKIE:
@@ -400,6 +406,22 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _capture_jira_session(
+    base_url: str, *, browser: str | None, tls_config: dict[str, Any] | None
+) -> CapturedBrowserSession:
+    """Capture a Jira session from the user's browser, opening it for sign-in when no silent session is usable."""
+
+    from memforge.auth.jira_capture import capture_and_prevalidate
+
+    captured = await capture_and_prevalidate(base_url, browser=browser, tls_config=tls_config, interactive=True)
+    return CapturedBrowserSession(
+        origin=captured.origin,
+        cookie_header=captured.cookie_header,
+        browser=captured.browser,
+        principal=captured.principal,
+    )
+
+
 # Register Jira as a browser-session provider so the generic CLI / sync layer can
 # manage its sessions without any Jira-specific branching.
 register_provider(
@@ -411,5 +433,9 @@ register_provider(
         canonical_origin=canonical_jira_origin,
         service_factory=lambda db: JiraAuthSessionService(db),
         uses_browser_session=lambda config: jira_auth_mode(config) == JIRA_AUTH_MODE_COOKIE,
+        capture_session=_capture_jira_session,
+        validate_session=lambda origin, cookie_header, tls_config: validate_jira_cookie_session(
+            origin, cookie_header, tls_config
+        ),
     )
 )
