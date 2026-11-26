@@ -53,7 +53,7 @@ _CONNECTION = {"base_url": BASE_URL, "pat": "token", "exclude_labels": ["draft"]
 
 
 def _page(page_id: str) -> dict:
-    """The page as a read by identifier answers it: its header, ancestors, storage body and no attachments."""
+    """The page as a read by identifier answers it: header, ancestors, storage and export bodies, no attachments."""
     space, parent, labels, changed_at = PAGES[page_id]
     ancestors = []
     while parent is not None:
@@ -62,7 +62,15 @@ def _page(page_id: str) -> dict:
     return {
         **_page_header(page_id),
         "ancestors": ancestors,
-        "body": {"storage": {"value": f"<h1>Page {page_id}</h1><p>The {space} rules of page {page_id}.</p>"}},
+        "body": {
+            "storage": {"value": f"<h1>Page {page_id}</h1><p>The {space} rules of page {page_id}.</p>"},
+            "export_view": {
+                "value": (
+                    f"<p>The {space} rules of page {page_id}.</p>"
+                    f'<img src="/wiki/download/attachments/{page_id}/chart.png">'
+                )
+            },
+        },
         "children": {"attachment": _results([], 0)},
     }
 
@@ -103,6 +111,8 @@ class _Provider:
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url}")
+        if request.url.path.startswith("/wiki/download/attachments/"):
+            return httpx.Response(200, content=b"chart " + request.url.path.encode(), headers={"content-type": "image/png"})
         path = request.url.path.removeprefix("/wiki/rest/api")
         params = request.url.params
         if path == "/space":

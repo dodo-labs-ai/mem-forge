@@ -376,7 +376,7 @@ async def test_stored_input_whose_raw_object_is_not_its_own_has_no_stored_raw_co
 class ConfluenceGene(FakeGene):
     """Places a child page under its parent only from the item metadata fetched with it."""
 
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         return None
 
     @classmethod

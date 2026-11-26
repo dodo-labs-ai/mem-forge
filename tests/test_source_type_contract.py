@@ -81,10 +81,16 @@ def test_a_document_type_must_declare_a_positive_acquisition_contract(contract) 
     _refused(FakeGene, "must declare a positive integer acquisition_contract", acquisition_contract=contract)
 
 
+@pytest.mark.parametrize("executors", [frozenset(), frozenset({"server", "laptop"})], ids=["none", "unknown"])
+def test_a_document_type_declares_executors_from_server_and_device(executors) -> None:
+    _refused(FakeGene, "executors must be a non-empty subset", executors=executors)
+
+
 def test_every_built_in_document_type_declares_an_acquisition_contract() -> None:
     for descriptor in registered_source_types():
         if descriptor.family is CollectionFamilyKind.DOCUMENT:
-            assert descriptor.acquisition_contract == 1, descriptor.source_type
+            assert isinstance(descriptor.acquisition_contract, int), descriptor.source_type
+            assert descriptor.acquisition_contract >= 1, descriptor.source_type
         else:
             assert descriptor.acquisition_contract is None, descriptor.source_type
 

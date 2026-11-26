@@ -17,6 +17,8 @@ you need from its module::
   submitted for a Source, from the run's manifest or the Source's inbox.
 - :mod:`memforge.genes.toolkit.paging` walks a paged provider listing to its
   end, by offset or by cursor, and raises when the pages do not fit together.
+- :mod:`memforge.genes.toolkit.pdf` holds a PDF export's material and renders
+  it on the server, reaching nothing but the material.
 - :mod:`memforge.genes.toolkit.github_api` reads a GitHub repository: its
   default branch, a commit, its complete tree even when GitHub truncates it,
   and when a file last changed, under GitHub's rate-limit rule.

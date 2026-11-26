@@ -32,11 +32,8 @@ from memforge.auth.browser_session import (
 from memforge.local_agent.device_credentials import DeviceCredentialStore
 from memforge.local_agent.document_acquisition import acquisition_job_config
 from memforge.local_agent.setup_results import CredentialCheckResult
-from memforge.local_agent.source_contract import (
-    SOURCE_EXECUTOR_DEVICE,
-    SOURCE_EXECUTOR_SERVER,
-    source_runs_on_device,
-)
+from memforge.local_agent.source_contract import source_executor
+from memforge.source_types import SOURCE_EXECUTOR_DEVICE
 
 __all__ = [
     "CREDENTIAL_CHECK_OPERATION",
@@ -72,7 +69,7 @@ def credential_check_job_payload(source: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source_id": str(source["id"]),
         "source_type": source_type,
-        "executor": SOURCE_EXECUTOR_DEVICE if source_runs_on_device(source) else SOURCE_EXECUTOR_SERVER,
+        "executor": source_executor(source),
         "config": acquisition_job_config(source_type, dict(source.get("config") or {})),
     }
 

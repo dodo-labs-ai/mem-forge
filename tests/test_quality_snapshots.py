@@ -129,7 +129,9 @@ async def _document_projections(source_type: str, revision: int) -> dict[str, tu
                     body = b"".join([chunk async for chunk in download.chunks])
                 assert len(body) == artifact.declared_size_bytes
             if gene_exports_pdf(gene):
-                assert await gene.fetch_pdf(item), f"{source_type} exports a PDF; add export.pdf to {item.item_id}"
+                assert await gene.fetch_pdf_material(item), (
+                    f"{source_type} exports PDFs; add pdf_material to {item.item_id}"
+                )
             read[item.item_id] = (item, raw, normalized)
     finally:
         await gene.close()

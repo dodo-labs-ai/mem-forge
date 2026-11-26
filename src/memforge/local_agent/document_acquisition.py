@@ -42,6 +42,7 @@ from types import MappingProxyType
 from typing import Any
 
 from memforge.genes.recorded import AcquisitionFailed
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.llm.structured import failure_retryable
 from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS, ExcludedScopeListing
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION
@@ -478,22 +479,24 @@ class AcquiredInputPackage:
 
     ``item`` is the item as ``fetch`` left it, or as ``fetch`` was asked for
     it when ``failure`` holds the error ``fetch`` raised. ``body`` and
-    ``content_type`` are the bytes ``fetch`` returned. ``pdf`` is the item's
-    PDF export when its type exports PDFs, or ``pdf_failure`` the error that
-    export raised. ``artifacts`` are the bodies ``fetch`` described, in its
+    ``content_type`` are the bytes ``fetch`` returned. ``pdf_material`` is
+    what the item's PDF export renders from when its type exports PDFs, or
+    ``pdf_failure`` the error reading it raised; the server renders the PDF. ``artifacts`` are the bodies ``fetch`` described, in its
     order, each uploaded before the package that names it or failed.
     """
 
     item: ContentItem
     body: bytes = b""
     content_type: str = ""
-    pdf: bytes | None = None
+    pdf_material: PdfMaterial | None = None
     pdf_failure: AcquisitionError | None = None
     artifacts: tuple[AcquiredArtifact, ...] = ()
     failure: AcquisitionError | None = None
 
     def __post_init__(self) -> None:
-        if self.failure is not None and (self.body or self.pdf is not None or self.pdf_failure or self.artifacts):
+        if self.failure is not None and (
+            self.body or self.pdf_material is not None or self.pdf_failure or self.artifacts
+        ):
             raise ValueError("a failed fetch acquired nothing")
 
     def to_payload(self) -> dict[str, object]:
@@ -501,7 +504,7 @@ class AcquiredInputPackage:
             "item": self.item.to_payload(),
             "body": base64.b64encode(self.body).decode("ascii"),
             "content_type": self.content_type,
-            "pdf": base64.b64encode(self.pdf).decode("ascii") if self.pdf is not None else None,
+            "pdf_material": self.pdf_material.to_payload() if self.pdf_material is not None else None,
             "pdf_failure": self.pdf_failure.to_payload() if self.pdf_failure is not None else None,
             "artifacts": [artifact.to_payload() for artifact in self.artifacts],
             "failure": self.failure.to_payload() if self.failure is not None else None,
@@ -509,12 +512,12 @@ class AcquiredInputPackage:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> AcquiredInputPackage:
-        pdf = payload.get("pdf")
+        pdf_material = payload.get("pdf_material")
         return cls(
             item=ContentItem.from_payload(dict(payload["item"])),
             body=base64.b64decode(str(payload.get("body") or "")),
             content_type=str(payload.get("content_type") or ""),
-            pdf=base64.b64decode(str(pdf)) if pdf is not None else None,
+            pdf_material=PdfMaterial.from_payload(pdf_material) if pdf_material is not None else None,
             pdf_failure=_error(payload.get("pdf_failure")),
             artifacts=tuple(AcquiredArtifact.from_payload(artifact) for artifact in payload.get("artifacts") or ()),
             failure=_error(payload.get("failure")),

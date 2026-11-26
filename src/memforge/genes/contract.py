@@ -50,7 +50,7 @@ from memforge.models import (
     ScopeListingKind,
     comparison_string,
 )
-from memforge.source_types import SourceTypeDescriptor, registered_source_types
+from memforge.source_types import SOURCE_EXECUTORS, SourceTypeDescriptor, registered_source_types
 
 __all__ = ["SourceTypeContractError", "validate_registered_source_types", "validate_source_type"]
 
@@ -142,6 +142,10 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
     contract = descriptor.acquisition_contract
     if isinstance(contract, bool) or not isinstance(contract, int) or contract < 1:
         raise SourceTypeContractError(f"{name}: a document type must declare a positive integer acquisition_contract")
+    if not descriptor.executors or not descriptor.executors <= SOURCE_EXECUTORS:
+        raise SourceTypeContractError(
+            f"{name}: a document type's executors must be a non-empty subset of {sorted(SOURCE_EXECUTORS)}"
+        )
     kinds = getattr(gene_cls, "listing_kinds", None)
     if not isinstance(kinds, frozenset) or not all(isinstance(kind, ScopeListingKind) for kind in kinds):
         raise SourceTypeContractError(

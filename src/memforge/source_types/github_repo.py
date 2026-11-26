@@ -66,7 +66,7 @@ DESCRIPTOR = SourceTypeDescriptor(
         replay_adapter="memforge.local_agent.replay_adapter:GitHubRepoReplayAdapter",
         accepts_artifact_inputs=True,
     ),
-    acquisition_contract=1,
+    acquisition_contract=2,
     config=SourceConfigPolicy(
         validate_input=_validate_input,
         validate=_validate_config,

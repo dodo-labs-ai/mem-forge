@@ -4,7 +4,6 @@ import asyncio
 import heapq
 import json
 import time
-from pathlib import Path
 
 import httpx
 import pytest
@@ -12,12 +11,9 @@ from bs4 import BeautifulSoup
 
 from memforge.genes import confluence_pdf
 from memforge.genes.atlassian_auth import AtlassianRequestLimiter
-from memforge.genes.confluence_pdf import (
-    default_pdf_renderer,
-    default_weasyprint_renderer,
-    export_confluence_page_pdf,
-)
+from memforge.genes.confluence_pdf import fetch_confluence_pdf_material
 from memforge.genes.toolkit.http import ConnectorHttpClient
+from memforge.genes.toolkit.pdf import PdfImage, PdfMaterial, render_pdf_material
 
 COMPLETE_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
 
@@ -90,43 +86,67 @@ class ResponseStream:
         return False
 
 
-@pytest.mark.asyncio
-async def test_export_confluence_page_pdf_downloads_assets_and_rewrites_html(tmp_path):
-    client = RecordingClient()
-    captured_html: dict[str, str] = {}
-
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
-    pdf = await export_confluence_page_pdf(
+async def _material(client, *, title: str = "Architecture") -> PdfMaterial | None:
+    return await fetch_confluence_pdf_material(
         client=client,
         base_url="https://wiki.example.test",
         api_prefix="/wiki",
         page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
+        title=title,
     )
 
-    assert pdf == b"%PDF-local"
-    assert "file://" in captured_html["body"]
-    assert "/wiki/download/attachments/123/chart.png" not in captured_html["body"]
+
+async def _rendered_document(material: PdfMaterial) -> str:
+    """The HTML document the server's renderer is given for the material."""
+
+    captured: dict[str, str] = {}
+
+    async def render_html(document: str, _fetch) -> bytes:
+        captured["document"] = document
+        return COMPLETE_PDF
+
+    assert await render_pdf_material(material, render_html=render_html) == COMPLETE_PDF
+    return captured["document"]
+
+
+def _page_with(html: str):
+    async def get(url: str, **_kwargs):
+        if url == "/wiki/rest/api/content/123":
+            return JsonResponse({"body": {"export_view": {"value": html}}})
+        raise AssertionError(f"unexpected URL: {url}")
+
+    return get
+
+
+@pytest.mark.asyncio
+async def test_the_material_holds_the_export_html_and_its_same_origin_images():
+    client = RecordingClient()
+
+    material = await _material(client)
+
+    assert material == PdfMaterial(
+        title="Architecture",
+        html='<p><img src="/wiki/download/attachments/123/chart.png"></p>',
+        images={"/wiki/download/attachments/123/chart.png": PdfImage(b"png-bytes", "image/png")},
+    )
     assert client.calls[0] == (
         "/wiki/rest/api/content/123",
         {"params": {"expand": "body.export_view,body.view"}},
     )
     assert client.calls[1][0] == "https://wiki.example.test/wiki/download/attachments/123/chart.png"
+    document = await _rendered_document(material)
+    assert "/wiki/download/attachments/123/chart.png" not in document
+    assert BeautifulSoup(document, "html.parser").find("img")["src"] == "memforge-material:/image/0"
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_rewrites_lazy_image_sources(tmp_path):
+async def test_a_lazy_image_is_read_from_its_lazy_source():
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
+    client.get_page = client.get
 
-    async def get_with_lazy_image(url: str, **kwargs):
-        client.calls.append((url, kwargs))
+    async def get(url: str, **kwargs):
         if url == "/wiki/rest/api/content/123":
+            client.calls.append((url, kwargs))
             return JsonResponse(
                 {
                     "body": {
@@ -136,39 +156,26 @@ async def test_export_confluence_page_pdf_rewrites_lazy_image_sources(tmp_path):
                     }
                 }
             )
-        if url == "https://wiki.example.test/wiki/download/attachments/123/lazy.png":
-            return BytesResponse(b"lazy-png-bytes")
-        raise AssertionError(f"unexpected URL: {url}")
+        return await client.get_page(url, **kwargs)
 
-    client.get = get_with_lazy_image
+    client.get = get
 
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
+    material = await _material(client)
 
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf == b"%PDF-local"
-    soup = BeautifulSoup(captured_html["body"], "html.parser")
-    assert soup.find("img")["src"].startswith("file://")
-    assert "/wiki/download/attachments/123/lazy.png" not in captured_html["body"]
+    assert dict(material.images) == {
+        "/wiki/download/attachments/123/lazy.png": PdfImage(b"lazy-png-bytes", "image/png")
+    }
+    img = BeautifulSoup(await _rendered_document(material), "html.parser").find("img")
+    assert img["src"] == "memforge-material:/image/0"
+    assert img.get("data-image-src") is None
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_prefers_attachment_over_data_placeholder(tmp_path):
+async def test_a_lazy_source_wins_over_a_data_placeholder():
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
+    client.get_page = client.get
 
-    async def get_with_placeholder_image(url: str, **kwargs):
-        client.calls.append((url, kwargs))
+    async def get(url: str, **kwargs):
         if url == "/wiki/rest/api/content/123":
             return JsonResponse(
                 {
@@ -182,101 +189,60 @@ async def test_export_confluence_page_pdf_prefers_attachment_over_data_placehold
                     }
                 }
             )
-        if url == "https://wiki.example.test/wiki/download/attachments/123/lazy.png":
-            return BytesResponse(b"lazy-png-bytes")
-        raise AssertionError(f"unexpected URL: {url}")
+        return await client.get_page(url, **kwargs)
 
-    client.get = get_with_placeholder_image
+    client.get = get
 
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
+    material = await _material(client)
 
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf == b"%PDF-local"
-    soup = BeautifulSoup(captured_html["body"], "html.parser")
-    img = soup.find("img")
-    assert img["src"].startswith("file://")
-    assert img["data-image-src"].startswith("file://")
-    assert "data:image/gif;base64,placeholder" not in captured_html["body"]
+    assert list(material.images) == ["/wiki/download/attachments/123/lazy.png"]
+    document = await _rendered_document(material)
+    assert BeautifulSoup(document, "html.parser").find("img")["src"] == "memforge-material:/image/0"
+    assert "data:image/gif;base64,placeholder" not in document
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_blanks_unrewritten_image_sources(tmp_path):
+async def test_active_content_and_foreign_images_are_neither_read_nor_rendered():
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
-
-    async def get_with_unsafe_images(url: str, **kwargs):
-        client.calls.append((url, kwargs))
-        if url == "/wiki/rest/api/content/123":
-            return JsonResponse(
-                {
-                    "body": {
-                        "export_view": {
-                            "value": (
-                                '<p><img src="file:///etc/passwd" srcset="file:///etc/shadow 1x">'
-                                '<img src="http://internal.service/secret.png">'
-                                '<img src="data:image/png;base64,placeholder">'
-                                '<iframe src="file:///etc/passwd"></iframe>'
-                                '<object data="http://internal.service/object"></object>'
-                                '<style>@import url("http://internal.service/style.css");</style>'
-                                '<picture><source srcset="http://internal.service/picture.png"></picture>'
-                                '<video poster="http://internal.service/poster.png"></video>'
-                                '<svg><image href="http://internal.service/svg.png"/></svg>'
-                                '<span style="background:url(http://internal.service/bg.png)" '
-                                "onclick=\"fetch('http://internal.service/click')\">text</span>"
-                                '<input type="image" src="http://internal.service/input.png">'
-                                '<bgsound src="http://internal.service/sound.wav">'
-                                '<script>fetch("http://internal.service/script")</script></p>'
-                            )
-                        }
-                    }
-                }
-            )
-        raise AssertionError(f"unexpected URL: {url}")
-
-    client.get = get_with_unsafe_images
-
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
+    client.get = _page_with(
+        '<p><img src="file:///etc/passwd" srcset="file:///etc/shadow 1x">'
+        '<img src="http://internal.service/secret.png">'
+        '<img src="data:image/png;base64,placeholder">'
+        '<iframe src="file:///etc/passwd"></iframe>'
+        '<object data="http://internal.service/object"></object>'
+        '<style>@import url("http://internal.service/style.css");</style>'
+        '<picture><source srcset="http://internal.service/picture.png"></picture>'
+        '<video poster="http://internal.service/poster.png"></video>'
+        '<svg><image href="http://internal.service/svg.png"/></svg>'
+        '<span style="background:url(http://internal.service/bg.png)" '
+        "onclick=\"fetch('http://internal.service/click')\">text</span>"
+        '<input type="image" src="http://internal.service/input.png">'
+        '<bgsound src="http://internal.service/sound.wav">'
+        '<script>fetch("http://internal.service/script")</script></p>'
     )
 
-    assert pdf == b"%PDF-local"
-    assert len(client.calls) == 1
-    assert "file:///etc/passwd" not in captured_html["body"]
-    assert "file:///etc/shadow" not in captured_html["body"]
-    assert "http://internal.service/secret.png" not in captured_html["body"]
-    assert "http://internal.service/object" not in captured_html["body"]
-    assert "http://internal.service/script" not in captured_html["body"]
-    assert "http://internal.service/style.css" not in captured_html["body"]
-    assert "http://internal.service/picture.png" not in captured_html["body"]
-    assert "http://internal.service/poster.png" not in captured_html["body"]
-    assert "http://internal.service/svg.png" not in captured_html["body"]
-    assert "http://internal.service/bg.png" not in captured_html["body"]
-    assert "http://internal.service/click" not in captured_html["body"]
-    assert "http://internal.service/input.png" not in captured_html["body"]
-    assert "http://internal.service/sound.wav" not in captured_html["body"]
-    assert "data:image/png;base64,placeholder" not in captured_html["body"]
-    soup = BeautifulSoup(captured_html["body"], "html.parser")
+    material = await _material(client)
+
+    assert dict(material.images) == {}
+    document = await _rendered_document(material)
+    for reference in (
+        "file:///etc/passwd",
+        "file:///etc/shadow",
+        "http://internal.service/secret.png",
+        "http://internal.service/object",
+        "http://internal.service/script",
+        "http://internal.service/style.css",
+        "http://internal.service/picture.png",
+        "http://internal.service/poster.png",
+        "http://internal.service/svg.png",
+        "http://internal.service/bg.png",
+        "http://internal.service/click",
+        "http://internal.service/input.png",
+        "http://internal.service/sound.wav",
+        "data:image/png;base64,placeholder",
+    ):
+        assert reference not in document
+    soup = BeautifulSoup(document, "html.parser")
     assert [img.get("src") for img in soup.find_all("img")] == ["", "", ""]
     assert not soup.body.find_all(
         ["iframe", "object", "script", "style", "picture", "source", "video", "svg", "bgsound"]
@@ -286,60 +252,24 @@ async def test_export_confluence_page_pdf_blanks_unrewritten_image_sources(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_rejects_plain_http_same_host_asset(tmp_path):
+async def test_a_plain_http_image_on_the_same_host_is_not_read():
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
+    client.get = _page_with('<p><img src="http://wiki.example.test/wiki/download/attachments/123/chart.png"></p>')
 
-    async def get_with_plain_http_image(url: str, **kwargs):
-        client.calls.append((url, kwargs))
-        if url == "/wiki/rest/api/content/123":
-            return JsonResponse(
-                {
-                    "body": {
-                        "export_view": {
-                            "value": '<p><img src="http://wiki.example.test/wiki/download/attachments/123/chart.png"></p>'
-                        }
-                    }
-                }
-            )
-        raise AssertionError(f"unexpected URL: {url}")
+    material = await _material(client)
 
-    client.get = get_with_plain_http_image
-
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf == b"%PDF-local"
-    assert len(client.calls) == 1
-    assert "http://wiki.example.test" not in captured_html["body"]
-    assert BeautifulSoup(captured_html["body"], "html.parser").find("img")["src"] == ""
+    assert dict(material.images) == {}
+    document = await _rendered_document(material)
+    assert "http://wiki.example.test" not in document
+    assert BeautifulSoup(document, "html.parser").find("img")["src"] == ""
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_path, monkeypatch):
+async def test_an_oversized_image_stops_streaming_and_is_left_out(monkeypatch):
     monkeypatch.setattr("memforge.genes.confluence_pdf.MAX_IMAGE_BYTES", 5)
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
     chunks_yielded = 0
-
-    async def get_page_only(url: str, **kwargs):
-        client.calls.append((url, kwargs))
-        if url == "/wiki/rest/api/content/123":
-            return JsonResponse(
-                {"body": {"export_view": {"value": '<p><img src="/wiki/download/attachments/123/huge.png"></p>'}}}
-            )
-        raise AssertionError(f"unexpected buffered URL: {url}")
+    client.get = _page_with('<p><img src="/wiki/download/attachments/123/huge.png"></p>')
 
     class OversizedImageResponse:
         headers = {"content-type": "image/png"}
@@ -355,12 +285,6 @@ async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_p
 
     class OversizedImageStream:
         async def __aenter__(self):
-            client.calls.append(
-                (
-                    "https://wiki.example.test/wiki/download/attachments/123/huge.png",
-                    {"stream": True},
-                )
-            )
             return OversizedImageResponse()
 
         async def __aexit__(self, _exc_type, _exc, _tb):
@@ -371,52 +295,24 @@ async def test_export_confluence_page_pdf_stops_streaming_oversized_images(tmp_p
         assert url == "https://wiki.example.test/wiki/download/attachments/123/huge.png"
         return OversizedImageStream()
 
-    client.get = get_page_only
     client.stream = stream
 
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
+    material = await _material(client)
 
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf == b"%PDF-local"
     assert chunks_yielded == 2
-    assert BeautifulSoup(captured_html["body"], "html.parser").find("img")["src"] == ""
-    assert not list((tmp_path / "assets").iterdir())
+    assert dict(material.images) == {}
+    assert BeautifulSoup(await _rendered_document(material), "html.parser").find("img")["src"] == ""
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_downloads_images_with_bounded_concurrency(tmp_path, monkeypatch):
+async def test_images_are_read_with_bounded_concurrency(monkeypatch):
     monkeypatch.setattr("memforge.genes.confluence_pdf.IMAGE_DOWNLOAD_CONCURRENCY", 2)
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
     active_streams = 0
     max_active_streams = 0
-
-    async def get_page_only(url: str, **kwargs):
-        client.calls.append((url, kwargs))
-        if url == "/wiki/rest/api/content/123":
-            return JsonResponse(
-                {
-                    "body": {
-                        "export_view": {
-                            "value": "".join(
-                                f'<img src="/wiki/download/attachments/123/image-{index}.png">' for index in range(4)
-                            )
-                        }
-                    }
-                }
-            )
-        raise AssertionError(f"unexpected buffered URL: {url}")
+    client.get = _page_with(
+        "".join(f'<img src="/wiki/download/attachments/123/image-{index}.png">' for index in range(4))
+    )
 
     class SlowImageResponse:
         headers = {"content-type": "image/png"}
@@ -450,120 +346,44 @@ async def test_export_confluence_page_pdf_downloads_images_with_bounded_concurre
         assert method == "GET"
         return SlowImageStream(url)
 
-    client.get = get_page_only
     client.stream = stream
 
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
+    material = await _material(client)
 
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf == b"%PDF-local"
     assert max_active_streams == 2
-    assert captured_html["body"].count("file://") == 4
+    assert len(material.images) == 4
+    assert (await _rendered_document(material)).count("memforge-material:/image/") == 4
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_escapes_page_title(tmp_path):
+async def test_the_rendered_page_escapes_its_title():
+    material = await _material(RecordingClient(), title="Architecture </h1><script>alert(1)</script>&")
+
+    document = await _rendered_document(material)
+
+    assert "Architecture &lt;/h1&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;" in document
+    assert "</h1><script>alert(1)</script>" not in document
+
+
+@pytest.mark.asyncio
+async def test_a_page_without_exportable_html_has_no_material():
     client = RecordingClient()
-    captured_html: dict[str, str] = {}
+    client.get = _page_with("   ")
 
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
-    await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture </h1><script>alert(1)</script>&",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert "Architecture &lt;/h1&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;" in captured_html["body"]
-    assert "</h1><script>alert(1)</script>" not in captured_html["body"]
+    assert await _material(client) is None
 
 
 @pytest.mark.asyncio
-async def test_export_confluence_page_pdf_returns_none_when_renderer_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr("memforge.genes.confluence_pdf.default_pdf_renderer", lambda: None)
+async def test_an_error_reading_the_export_html_propagates():
     client = RecordingClient()
 
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=None,
-        work_dir=tmp_path,
-    )
+    async def refuse(url: str, **_kwargs):
+        raise httpx.ConnectError("refused")
 
-    assert pdf is None
+    client.get = refuse
 
-
-def test_default_pdf_renderer_uses_weasyprint(monkeypatch):
-    async def fake_weasyprint(_html_path: Path) -> bytes:
-        return COMPLETE_PDF
-
-    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: fake_weasyprint)
-
-    assert default_pdf_renderer() is fake_weasyprint
-
-
-def test_default_pdf_renderer_returns_none_when_weasyprint_missing(monkeypatch):
-    monkeypatch.setattr(confluence_pdf, "default_weasyprint_renderer", lambda: None)
-
-    assert default_pdf_renderer() is None
-
-
-@pytest.mark.asyncio
-async def test_default_weasyprint_renderer_renders_complete_pdf(tmp_path):
-    html_path = tmp_path / "page.html"
-    html_path.write_text("<!doctype html><html><body><h1>Architecture</h1><p>Readable content.</p></body></html>")
-
-    renderer = default_weasyprint_renderer()
-    if renderer is None:
-        pytest.skip("WeasyPrint renderer is not available in this environment")
-
-    pdf = await renderer(html_path)
-
-    assert pdf is not None
-    assert pdf.startswith(b"%PDF-")
-    assert b"%%EOF" in pdf[-2048:]
-
-
-@pytest.mark.asyncio
-async def test_export_confluence_page_pdf_times_out_slow_render(tmp_path, monkeypatch):
-    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS", 0.01)
-    client = RecordingClient()
-
-    async def render_pdf(_html_path: Path) -> bytes:
-        await asyncio.sleep(1)
-        return b"%PDF-local"
-
-    pdf = await export_confluence_page_pdf(
-        client=client,
-        base_url="https://wiki.example.test",
-        api_prefix="/wiki",
-        page_id="123",
-        title="Architecture",
-        render_pdf=render_pdf,
-        work_dir=tmp_path,
-    )
-
-    assert pdf is None
+    with pytest.raises(httpx.ConnectError):
+        await _material(client)
 
 
 # ---------------------------------------------------------------------------
@@ -589,8 +409,18 @@ def _image_page(image_count: int) -> dict:
     return {"body": {"export_view": {"value": images}}}
 
 
+async def _material_over(client: ConnectorHttpClient) -> PdfMaterial | None:
+    return await fetch_confluence_pdf_material(
+        client=client,
+        base_url="https://wiki.example.test",
+        api_prefix="/wiki",
+        page_id="123",
+        title="Architecture",
+    )
+
+
 @pytest.mark.asyncio
-async def test_a_page_with_many_images_exports_without_pacing_its_images_at_the_origin(tmp_path):
+async def test_a_page_with_many_images_reads_them_without_pacing_them_at_the_origin():
     image_count = 64
     clock = _FakeClock()
     limiter = AtlassianRequestLimiter(min_interval_seconds=2.0, clock=clock)
@@ -609,12 +439,6 @@ async def test_a_page_with_many_images_exports_without_pacing_its_images_at_the_
             return httpx.Response(200, json=_image_page(image_count))
         return httpx.Response(200, content=request.url.path.encode(), headers={"content-type": "image/png"})
 
-    captured_html: dict[str, str] = {}
-
-    async def render_pdf(html_path: Path) -> bytes:
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
     started_at = clock.now
     async with ConnectorHttpClient(
         product_name="Confluence",
@@ -625,27 +449,18 @@ async def test_a_page_with_many_images_exports_without_pacing_its_images_at_the_
         sleep=clock.sleep,
         transport=httpx.MockTransport(handle),
     ) as client:
-        pdf = await export_confluence_page_pdf(
-            client=client,
-            base_url="https://wiki.example.test",
-            api_prefix="/wiki",
-            page_id="123",
-            title="Architecture",
-            render_pdf=render_pdf,
-            work_dir=tmp_path,
-        )
+        material = await _material_over(client)
 
-    assert pdf == b"%PDF-local"
-    assert captured_html["body"].count("file://") == image_count
+    assert len(material.images) == image_count
     # Only the page read went through the 2 s origin limiter; paced the same
-    # way, 64 images would need 128 s, more than the whole export budget.
+    # way, 64 images would need 128 s, more than the whole image budget.
     assert limited_runs == 1
-    assert image_count * 2.0 > confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS
-    assert clock.now - started_at < confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS
+    assert image_count * 2.0 > confluence_pdf.PDF_IMAGE_BUDGET_SECONDS
+    assert clock.now - started_at < confluence_pdf.PDF_IMAGE_BUDGET_SECONDS
 
 
 @pytest.mark.asyncio
-async def test_an_image_download_is_retried_with_its_own_short_policy(tmp_path):
+async def test_an_image_download_is_retried_with_its_own_short_policy():
     image_answers = [httpx.Response(503), httpx.ConnectError("reset"), httpx.Response(200, content=b"png")]
     image_requests = 0
     waits: list[float] = []
@@ -663,10 +478,6 @@ async def test_an_image_download_is_retried_with_its_own_short_policy(tmp_path):
     async def record_wait(seconds: float) -> None:
         waits.append(seconds)
 
-    async def render_pdf(html_path: Path) -> bytes:
-        assert html_path.read_text(encoding="utf-8").count("file://") == 1
-        return b"%PDF-local"
-
     async with ConnectorHttpClient(
         product_name="Confluence",
         base_url="https://wiki.example.test",
@@ -675,17 +486,9 @@ async def test_an_image_download_is_retried_with_its_own_short_policy(tmp_path):
         sleep=record_wait,
         transport=httpx.MockTransport(handle),
     ) as client:
-        pdf = await export_confluence_page_pdf(
-            client=client,
-            base_url="https://wiki.example.test",
-            api_prefix="/wiki",
-            page_id="123",
-            title="Architecture",
-            render_pdf=render_pdf,
-            work_dir=tmp_path,
-        )
+        material = await _material_over(client)
 
-    assert pdf == b"%PDF-local"
+    assert [image.body for image in material.images.values()] == [b"png"]
     assert image_requests == confluence_pdf.IMAGE_RETRY.attempts == 3
     assert waits == [confluence_pdf.IMAGE_RETRY.backoff_seconds, confluence_pdf.IMAGE_RETRY.transport_wait_seconds]
 
@@ -732,29 +535,24 @@ class _VirtualClock:
             self._arm(loop)
 
 
-async def _export_on_virtual_clock(tmp_path, answer_image) -> tuple[bytes | None, float, int]:
-    """Export a page of 64 images whose downloads ``answer_image(request, clock)`` answers.
+async def _read_on_virtual_clock(answer_image) -> tuple[PdfMaterial | None, float, int]:
+    """Read a page of 64 images whose downloads ``answer_image(request, clock)`` answers.
 
-    Returns the PDF, the export budget left when the renderer started, and the
-    number of image requests.
+    Returns the material, the time the images took from when the export HTML
+    arrived, and the number of image requests.
     """
     clock = _VirtualClock()
     image_requests = 0
+    html_read_at: list[float] = []
 
     async def handle(request: httpx.Request) -> httpx.Response:
         nonlocal image_requests
         if request.url.path == "/wiki/rest/api/content/123":
+            html_read_at.append(clock())
             return httpx.Response(200, json=_image_page(64))
         image_requests += 1
         return await answer_image(request, clock)
 
-    left_at_render: list[float] = []
-
-    async def render_pdf(_html_path: Path) -> bytes:
-        left_at_render.append(started_at + confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS - clock())
-        return b"%PDF-local"
-
-    started_at = clock()
     async with ConnectorHttpClient(
         product_name="Confluence",
         base_url="https://wiki.example.test",
@@ -764,48 +562,39 @@ async def _export_on_virtual_clock(tmp_path, answer_image) -> tuple[bytes | None
         clock=clock,
         transport=httpx.MockTransport(handle),
     ) as client:
-        pdf = await export_confluence_page_pdf(
-            client=client,
-            base_url="https://wiki.example.test",
-            api_prefix="/wiki",
-            page_id="123",
-            title="Architecture",
-            render_pdf=render_pdf,
-            work_dir=tmp_path,
-        )
-    return pdf, left_at_render[0], image_requests
+        material = await _material_over(client)
+    return material, clock() - html_read_at[0], image_requests
 
 
 @pytest.mark.asyncio
-async def test_images_that_keep_asking_to_wait_leave_the_renderer_its_reserve(tmp_path):
+async def test_images_that_keep_asking_to_wait_stay_within_the_image_budget():
     async def rate_limited(_request: httpx.Request, _clock: _VirtualClock) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": "10"})
 
-    pdf, left, image_requests = await _export_on_virtual_clock(tmp_path, rate_limited)
+    material, took, image_requests = await _read_on_virtual_clock(rate_limited)
 
-    assert pdf == b"%PDF-local"
-    assert left >= confluence_pdf.PDF_RENDER_RESERVE_SECONDS
+    assert dict(material.images) == {}
+    assert took <= confluence_pdf.PDF_IMAGE_BUDGET_SECONDS
     # Some images were tried and retried; the rest were never started.
     assert 0 < image_requests < 64 * confluence_pdf.IMAGE_RETRY.attempts
 
 
 @pytest.mark.asyncio
-async def test_images_that_hang_until_their_timeout_leave_the_renderer_its_reserve(tmp_path):
+async def test_images_that_hang_until_their_timeout_stay_within_the_image_budget():
     async def hanging(request: httpx.Request, clock: _VirtualClock) -> httpx.Response:
         await clock.sleep(confluence_pdf.IMAGE_FETCH_TIMEOUT_SECONDS)
         raise httpx.ReadTimeout("timed out", request=request)
 
-    pdf, left, image_requests = await _export_on_virtual_clock(tmp_path, hanging)
+    material, took, image_requests = await _read_on_virtual_clock(hanging)
 
-    assert pdf == b"%PDF-local"
-    assert left >= confluence_pdf.PDF_RENDER_RESERVE_SECONDS
+    assert dict(material.images) == {}
+    assert took <= confluence_pdf.PDF_IMAGE_BUDGET_SECONDS
     assert 0 < image_requests < 64
 
 
 @pytest.mark.asyncio
-async def test_a_download_still_running_at_the_image_deadline_is_cancelled(tmp_path, monkeypatch):
-    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_EXPORT_TIMEOUT_SECONDS", 0.4)
-    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_RENDER_RESERVE_SECONDS", 0.3)
+async def test_a_download_still_running_at_the_image_deadline_is_cancelled(monkeypatch):
+    monkeypatch.setattr("memforge.genes.confluence_pdf.PDF_IMAGE_BUDGET_SECONDS", 0.1)
     monkeypatch.setattr("memforge.genes.confluence_pdf.IMAGE_FETCH_TIMEOUT_SECONDS", 0.01)
 
     class TrickleForever(httpx.AsyncByteStream):
@@ -819,14 +608,6 @@ async def test_a_download_still_running_at_the_image_deadline_is_cancelled(tmp_p
             return httpx.Response(200, json=_image_page(1))
         return httpx.Response(200, stream=TrickleForever(), headers={"content-type": "image/png"})
 
-    captured_html: dict[str, str] = {}
-    left_at_render: list[float] = []
-
-    async def render_pdf(html_path: Path) -> bytes:
-        left_at_render.append(started_at + 0.4 - time.monotonic())
-        captured_html["body"] = html_path.read_text(encoding="utf-8")
-        return b"%PDF-local"
-
     started_at = time.monotonic()
     async with ConnectorHttpClient(
         product_name="Confluence",
@@ -835,24 +616,15 @@ async def test_a_download_still_running_at_the_image_deadline_is_cancelled(tmp_p
         follow_redirects=True,
         transport=httpx.MockTransport(handle),
     ) as client:
-        pdf = await export_confluence_page_pdf(
-            client=client,
-            base_url="https://wiki.example.test",
-            api_prefix="/wiki",
-            page_id="123",
-            title="Architecture",
-            render_pdf=render_pdf,
-            work_dir=tmp_path,
-        )
+        material = await _material_over(client)
 
-    assert pdf == b"%PDF-local"
-    assert BeautifulSoup(captured_html["body"], "html.parser").find("img")["src"] == ""
-    # The cut came at the image deadline, 0.1 s in, leaving about the 0.3 s reserve.
-    assert left_at_render[0] > 0.2
+    assert dict(material.images) == {}
+    # The cut came at the image deadline, 0.1 s in.
+    assert time.monotonic() - started_at < 0.3
 
 
 @pytest.mark.asyncio
-async def test_cancelling_the_export_cancels_its_image_downloads(tmp_path):
+async def test_cancelling_the_read_cancels_its_image_downloads():
     requested: list[str] = []
     first_downloads = asyncio.Event()
 
@@ -864,9 +636,6 @@ async def test_cancelling_the_export_cancels_its_image_downloads(tmp_path):
         await asyncio.sleep(0.3)
         return httpx.Response(200, content=b"png", headers={"content-type": "image/png"})
 
-    async def render_pdf(html_path: Path) -> bytes:
-        return b"%PDF-local"
-
     async with ConnectorHttpClient(
         product_name="Confluence",
         base_url="https://wiki.example.test",
@@ -874,21 +643,11 @@ async def test_cancelling_the_export_cancels_its_image_downloads(tmp_path):
         follow_redirects=True,
         transport=httpx.MockTransport(handle),
     ) as client:
-        export = asyncio.ensure_future(
-            export_confluence_page_pdf(
-                client=client,
-                base_url="https://wiki.example.test",
-                api_prefix="/wiki",
-                page_id="123",
-                title="Architecture",
-                render_pdf=render_pdf,
-                work_dir=tmp_path,
-            )
-        )
+        read = asyncio.ensure_future(_material_over(client))
         await first_downloads.wait()
-        export.cancel()
+        read.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await export
+            await read
         requested_at_cancel = len(requested)
         await asyncio.sleep(0.5)
 

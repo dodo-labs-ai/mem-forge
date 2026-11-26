@@ -81,6 +81,6 @@ DESCRIPTOR = SourceTypeDescriptor(
     canonical_scope=_canonical_scope,
     project_native=adapter.project_native,
     evidence_profiles={"page_content": MARKDOWN_STRUCTURAL_PROFILE},
-    acquisition_contract=1,
+    acquisition_contract=2,
     config=SourceConfigPolicy(complete=_complete_config, validate=_validate_config),
 )

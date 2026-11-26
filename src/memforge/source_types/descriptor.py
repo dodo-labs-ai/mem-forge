@@ -93,6 +93,16 @@ class ConversationProviderReference:
         return self.factory_function()(job_config)
 
 
+SOURCE_EXECUTOR_SERVER = "server"
+"""The executor that reaches a document Source's provider from the server."""
+
+SOURCE_EXECUTOR_DEVICE = "device"
+"""The executor that reaches a document Source's provider from its execution owner's device (ADR 0058)."""
+
+SOURCE_EXECUTORS = frozenset({SOURCE_EXECUTOR_SERVER, SOURCE_EXECUTOR_DEVICE})
+"""Every executor a document Source can have; a document type runs on both unless it declares fewer."""
+
+
 @dataclass(frozen=True)
 class SourceTypeDescriptor:
     """Every per-type fact shared sync, projection, configuration and store code reads.
@@ -114,7 +124,11 @@ class SourceTypeDescriptor:
     document type's acquisition contract: an integer that changes whenever
     what the Gene's acquisition returns changes in a way its interpretation
     depends on, so a device acquires a type's runs only while its contract
-    equals the server's (ADR 0058). ``config`` checks and prepares the
+    equals the server's (ADR 0058). ``executors`` is the set of executors
+    a document type's acquisition can run on, from :data:`SOURCE_EXECUTORS`;
+    a type whose items exist only on the owner's machine declares the device
+    alone. Configure offers the choice from it; a conversation type's
+    collection is its ``local_agent`` and leaves it unread. ``config`` checks and prepares the
     Source's configuration. ``conversation_provider`` opens a conversation
     type's provider on the device.
     """
@@ -134,6 +148,7 @@ class SourceTypeDescriptor:
     local_agent: LocalAgentCollection | None = None
     exports_pdf: bool = False
     acquisition_contract: int | None = None
+    executors: frozenset[str] = SOURCE_EXECUTORS
     config: SourceConfigPolicy = field(default_factory=SourceConfigPolicy)
     conversation_provider: ConversationProviderReference | None = None
 

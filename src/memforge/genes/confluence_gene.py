@@ -26,8 +26,9 @@ from memforge.genes.document_gene import DocumentGene
 from memforge.genes.toolkit.config import bearer_headers, bool_config, list_config, require_https_base_url, tls_verify
 from memforge.genes.toolkit.http import ConnectorHttpClient
 from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.genes.confluence_artifacts import resolve_current_confluence_artifacts
-from memforge.genes.confluence_pdf import export_confluence_page_pdf
+from memforge.genes.confluence_pdf import fetch_confluence_pdf_material
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 from memforge.models import (
     AbsenceAnswer,
@@ -923,21 +924,16 @@ class ConfluenceGene(DocumentGene):
             raise RuntimeError(f"Confluence {context} response has an invalid next link")
         return results
 
-    async def fetch_pdf(self, item: ContentItem) -> bytes | None:
-        """Render Confluence export HTML to a local PDF."""
+    async def fetch_pdf_material(self, item: ContentItem) -> PdfMaterial | None:
+        """The page's export HTML and its same-origin images, which the server renders to a PDF."""
         page_id = item.extra.get("page_id", item.item_id.removeprefix(_PAGE_DOC_ID_PREFIX))
-
-        try:
-            return await export_confluence_page_pdf(
-                client=self._client,
-                base_url=self._base_url,
-                api_prefix=self._api_prefix,
-                page_id=page_id,
-                title=item.title,
-            )
-        except Exception as e:
-            logger.warning("PDF export failed for %s: %s", item.title, e)
-            return None
+        return await fetch_confluence_pdf_material(
+            client=self._client,
+            base_url=self._base_url,
+            api_prefix=self._api_prefix,
+            page_id=page_id,
+            title=item.title,
+        )
 
     def requires_pdf_artifact(
         self,

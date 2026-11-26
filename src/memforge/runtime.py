@@ -76,6 +76,7 @@ from memforge.release import current_release
 from memforge.source_item_failures import REMOVAL_STAGE, FailedItemRetry
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
     SOURCE_SYNC_CANCELLED_BY_USER,
     SourceActivityConflict,
     SourceActivityKind,
@@ -2127,7 +2128,7 @@ class SyncService:
         self.progress.pop(source_id, None)
         await self.db.cancel_pending_source_sync_run(
             source_id=source_id,
-            error_message="cancelled_by_source_change",
+            error_message=SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
         )
 
     async def stop_source(self, source_id: str) -> SourceSyncRun | None:

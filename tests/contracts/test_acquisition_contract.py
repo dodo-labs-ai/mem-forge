@@ -120,8 +120,7 @@ async def _no_wait(_seconds: float) -> None:
 async def acquired_digest(source_type: str, config_name: str) -> str:
     """The digest of everything a full device acquisition of one configuration hands the server.
 
-    The PDF export is left out: the rendered PDF is not deterministic, and
-    the PDF material a device hands the server joins this digest with it.
+    It includes the PDF material of a type that exports PDFs.
     """
 
     config = _acquisition_configs(source_type)[config_name]
@@ -139,7 +138,7 @@ async def acquired_digest(source_type: str, config_name: str) -> str:
             {"config": dict(config), "since": None},
             open_gene=lambda _config: gene,
             transport=transport,
-            exports_pdf=False,
+            exports_pdf=source_type_descriptor(source_type).exports_pdf,
             sleep=_no_wait,
         )
     encoded = json.dumps(transport.handed, sort_keys=True, ensure_ascii=False, default=str)

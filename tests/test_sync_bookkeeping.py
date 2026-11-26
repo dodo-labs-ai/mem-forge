@@ -31,6 +31,7 @@ from memforge.llm.structured import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.github_repo_gene import github_renamed_from
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import (
@@ -4019,12 +4020,15 @@ class PdfBackfillGene(BlockingFetchGene):
             data_shape="document",
         )
 
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
+        return PdfMaterial(title=item.title, html=f"<p>{item.title}</p>")
+
+    async def render_pdf(self, material):
         return b"%PDF-1.4\n" + (b"x" * 128)
 
 
 class MissingPdfGene(PdfBackfillGene):
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         return None
 
 
@@ -4041,7 +4045,7 @@ class AuthoritativeEmptyRequiredPdfGene(PdfBackfillGene):
     async def normalize(self, raw):
         return NormalizedContent(item=raw.item, markdown_body="")
 
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         raise AssertionError("authoritative empty evidence must not request a PDF")
 
 
@@ -4059,7 +4063,7 @@ class IncrementalAuthoritativeEmptyRequiredPdfGene(AuthoritativeEmptyRequiredPdf
 
 
 class UnexpectedPdfExportGene(PdfBackfillGene):
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         raise AssertionError("unchanged document with a stored PDF must not export again")
 
 
@@ -4168,7 +4172,7 @@ class LargeConfluenceGene(UpdatingDocumentGene):
     async def fetch(self, item):
         return _confluence_raw_content(item, self.markdown)
 
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         return None
 
     @classmethod

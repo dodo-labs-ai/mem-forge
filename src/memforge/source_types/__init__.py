@@ -15,6 +15,9 @@ import importlib
 
 from memforge.source_types.config import SourceConfigPolicy
 from memforge.source_types.descriptor import (
+    SOURCE_EXECUTOR_DEVICE,
+    SOURCE_EXECUTOR_SERVER,
+    SOURCE_EXECUTORS,
     ConversationProviderReference,
     LocalAgentCollection,
     SourceTypeDescriptor,
@@ -22,6 +25,9 @@ from memforge.source_types.descriptor import (
 )
 
 __all__ = [
+    "SOURCE_EXECUTORS",
+    "SOURCE_EXECUTOR_DEVICE",
+    "SOURCE_EXECUTOR_SERVER",
     "ConversationProviderReference",
     "LocalAgentCollection",
     "SourceConfigPolicy",

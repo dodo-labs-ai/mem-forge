@@ -69,6 +69,6 @@ DESCRIPTOR = SourceTypeDescriptor(
     project_native=adapter.project_native,
     evidence_profiles=adapter.CURRENT_OBSERVATION_PROFILES,
     record_schemas=adapter.CANONICAL_RECORD_SCHEMAS,
-    acquisition_contract=1,
+    acquisition_contract=2,
     config=SourceConfigPolicy(validate=_validate_config, credentials_changed=_credentials_changed),
 )

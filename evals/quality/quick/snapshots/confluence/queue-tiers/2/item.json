@@ -21,5 +21,7 @@
     "file": "raw.html",
     "content_type": "text/html"
   },
-  "pdf": "export.pdf"
+  "pdf_material": {
+    "html": "export.html"
+  }
 }

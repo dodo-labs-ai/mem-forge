@@ -624,6 +624,24 @@ def _fail_deferred_commits_nothing_can_unblock(
             result["deferred_lifecycle"] = None
 
 
+def _answered_by_acquisition_record(exc: BaseException) -> bool:
+    """Whether the error, or an error it was raised from, is one the run's acquisition record answered with.
+
+    Such an error stands for the provider's own: a Document step may raise
+    its error from it, as the PDF export does, and asking the record again
+    gives the same answer.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, AcquisitionFailed):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
 def _retained_document_error(exc: BaseException) -> str:
     """Project an exception into bounded state without retaining its traceback."""
 
@@ -1492,7 +1510,8 @@ class GeneSyncOrchestrator:
                             # with gives the same answer when asked again: the
                             # device already tried the provider again.
                             retry_document = (
-                                not isinstance(exc, (MemoryExtractionFailure, AcquisitionFailed))
+                                not isinstance(exc, MemoryExtractionFailure)
+                                and not _answered_by_acquisition_record(exc)
                                 and explicitly_retryable
                             )
                             if not explicitly_retryable:
@@ -3191,20 +3210,21 @@ class GeneSyncOrchestrator:
             if (reuse_content_artifacts or stored_document is not None) and stored_input is not None
             else None
         )
-        should_fetch_pdf = (
+        should_export_pdf = (
             stored_document is None
             and not raw.authoritative_empty
             and exports_pdf
             and (force_reprocess or requires_pdf_uri or not pdf_uri)
         )
-        if should_fetch_pdf:
+        if should_export_pdf:
             try:
-                pdf_bytes = await gene.fetch_pdf(item)
+                pdf_material = await gene.fetch_pdf_material(item)
             except Exception as e:
                 if requires_pdf_uri:
                     raise RuntimeError(f"{product_name} PDF export failed for {item.title}: {e}") from e
                 logger.warning("PDF export failed for %s: %s", item.title, e)
-                pdf_bytes = None
+                pdf_material = None
+            pdf_bytes = await gene.render_pdf(pdf_material) if pdf_material is not None else None
             if pdf_bytes and len(pdf_bytes) > 100:
                 pdf_uri = self.doc_store.store_raw(
                     source_id=source_id,

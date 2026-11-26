@@ -257,13 +257,20 @@ from memforge.source_projection_config import (
     source_access_context,
 )
 from memforge.source_types import (
+    SOURCE_EXECUTOR_DEVICE,
+    SOURCE_EXECUTOR_SERVER,
     LocalAgentCollection,
     SourceConfigPolicy,
     load_reference,
     source_type_descriptor,
 )
 from memforge.source_types.form import check_config, effective_value
-from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
+from memforge.source_activity import (
+    SourceAcquisitionLeased,
+    SourceActivityConflict,
+    SourceActivityKind,
+    SourceSyncRunActive,
+)
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -329,7 +336,6 @@ from memforge.local_agent.source_contract import (
     ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
-    SOURCE_EXECUTOR_DEVICE,
     LocalAgentLease,
     execution_owner_user_id,
     is_local_agent_backed_source,
@@ -341,6 +347,7 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_snapshot_id,
     local_package_confirms_absence,
     local_package_requires_source_time,
+    source_executor,
     source_runs_on_device,
     validate_local_agent_replay_package,
 )
@@ -1843,6 +1850,12 @@ class GeneMetadataResponse(BaseModel):
     auth_method: str
     data_shape: str
     execution_kinds: list[SourceExecutionKind]
+    executors: list[Literal["server", "device"]] | None = Field(
+        description=(
+            "Where a document Source of the type can run, which Configure offers as Where it runs; "
+            "null for a conversation type."
+        ),
+    )
 
 
 class ConfigConditionResponse(BaseModel):
@@ -2354,6 +2367,34 @@ class SourceUpdatedResponse(BaseModel):
     id: str
 
 
+class SourceExecutorChangeRequest(BaseModel):
+    """Where a document Source's acquisition runs from now on (ADR 0058)."""
+
+    executor: Literal["server", "device"] = Field(
+        description="server: the server reaches the provider; device: the changer's own device does.",
+    )
+    secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The secret fields of the type's form, which the server holds from now on. Required to move to "
+            "the server, as the form requires them; refused otherwise."
+        ),
+    )
+
+
+class SourceExecutorChangeResponse(BaseModel):
+    """The Source's executor after the change, and the queued sync jobs it cancelled."""
+
+    id: str
+    executor: Literal["server", "device"]
+    execution_owner_user_id: str | None = Field(
+        description="Whose device runs the Source; the person who moved it to the device.",
+    )
+    cancelled_job_ids: list[str] = Field(
+        description="The Source's queued sync jobs, which were planned for the previous executor.",
+    )
+
+
 class SourcePinResponse(BaseModel):
     """Whether the Source is now pinned in the caller's Source List."""
 
@@ -2835,6 +2876,26 @@ def _source_sync_running_http_error(source_id: str, run_id: str) -> HTTPExceptio
             ),
         },
     )
+
+
+def _source_acquisition_leased_http_error(source_id: str, job_id: str) -> HTTPException:
+    """The answer to a Source change that waits for the device that holds the Source's acquisition job."""
+
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "source_sync_running",
+            "local_agent_job_id": job_id,
+            "message": (
+                "A device is reading this Source for its sync. Stop it with "
+                f"POST /api/v1/sources/{source_id}/sync/stop, wait for it to end, and save again."
+            ),
+        },
+    )
+
+
+def _executor_change_refused(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"code": "executor_change_invalid", "message": message})
 
 
 async def _stop_source_sync(
@@ -3415,7 +3476,9 @@ async def _plan_config_change(
     source_type = str(source["type"])
     try:
         incoming_config = _complete_source_config(source_type, dict(requested), source_id, source["config"])
-        _validate_source_config(source_type, incoming_config, existing_config=source["config"])
+        _validate_source_config(
+            source_type, incoming_config, existing_config=source["config"], executor=source_executor(source)
+        )
         config = prepare_source_config_for_storage(
             incoming_config,
             existing_config=source["config"],
@@ -3948,6 +4011,15 @@ def _config_policy(source_type: str) -> SourceConfigPolicy:
     return descriptor.config if descriptor is not None else SourceConfigPolicy()
 
 
+def _type_executors(source_type: str) -> list[str] | None:
+    """The executors a document type declares, in a stable order; ``None`` for a conversation type."""
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
+        return None
+    return sorted(descriptor.executors, key=[SOURCE_EXECUTOR_SERVER, SOURCE_EXECUTOR_DEVICE].index)
+
+
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
     fields = set(source_secret_fields(source_type, GENE_REGISTRY))
     fields.update(_config_policy(source_type).extra_secret_fields)
@@ -4045,8 +4117,13 @@ def _validate_source_config(
     source_type: str,
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
+    *,
+    executor: str = SOURCE_EXECUTOR_SERVER,
 ) -> None:
     """Check a configuration the way a save does, normalizing it in place.
+
+    ``executor`` is where the Source runs: a device Source's secrets are its
+    device's, so the form check neither requires nor accepts them.
 
     The steps run in this order (``SourceConfigPolicy``): the type's
     ``validate_input`` on the configuration as given, the TLS CA bundle check,
@@ -4069,7 +4146,13 @@ def _validate_source_config(
             if callable(normalizer):
                 normalizer(config)
             descriptor = source_type_descriptor(source_type)
-            issues = check_config(gene_cls.config_schema(), config, existing_config, descriptor)
+            issues = check_config(
+                gene_cls.config_schema(),
+                config,
+                existing_config,
+                descriptor,
+                server_holds_secrets=executor == SOURCE_EXECUTOR_SERVER,
+            )
             if issues:
                 raise SourceConfigInvalid(issues)
         _require_secret_origin(source_type, config)
@@ -7017,6 +7100,7 @@ def create_admin_app(
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
+                executors=_type_executors(g.name),
             )
             for g in genes
         ]
@@ -7104,6 +7188,7 @@ def create_admin_app(
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
         existing_config: dict[str, Any] | None = None
+        executor = SOURCE_EXECUTOR_SERVER
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -7113,13 +7198,14 @@ def create_admin_app(
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Config-check source type does not match the existing source")
             existing_config = existing["config"]
+            executor = source_executor(existing)
 
         submitted = copy.deepcopy(req.config)
         config = copy.deepcopy(req.config)
         issues: tuple[FieldIssue, ...] = ()
         try:
             config = _complete_source_config(name, config, req.source_id or "config-check", existing_config)
-            _validate_source_config(name, config, existing_config=existing_config)
+            _validate_source_config(name, config, existing_config=existing_config, executor=executor)
         except SourceConfigInvalid as exc:
             issues = exc.issues
 
@@ -8705,6 +8791,99 @@ def create_admin_app(
                 "refusal": _scope_change_refusal(exc.detail),
             }
         return {"outcome": _scope_change_outcome(change), "open_transition": open_transition, "removes": removes}
+
+    @source_router.put("/{source_id}/executor", response_model=SourceExecutorChangeResponse)
+    async def change_source_executor(
+        request: Request,
+        source_id: str,
+        req: SourceExecutorChangeRequest,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Change where a document Source's acquisition runs, keeping everything the Source holds.
+
+        The executor is not part of the scope: the change opens no scope
+        transition and keeps the Source's Documents, Units, Memories, cursor,
+        failure ledger and an open transition, so its next run is an
+        ordinary incremental run. The executor must be one the type declares.
+
+        - To ``device``: the server's copies of the Source's secrets are
+          deleted, and the person who changes it becomes its execution owner,
+          whose device then holds the credentials.
+        - To ``server``: ``secrets`` must hold what the type's form requires.
+
+        Like a scope change, it cancels the Source's pending run and queued
+        sync jobs, and answers 409 ``source_sync_running`` while a run is
+        running or a device holds the Source's acquisition job.
+        """
+
+        existing = await db.get_source(source_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
+        source_type = str(existing["type"])
+        descriptor = source_type_descriptor(source_type)
+        if descriptor is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
+            raise _executor_change_refused("Only a document source can change where it runs.")
+        if req.executor not in descriptor.executors:
+            raise _executor_change_refused(
+                f"A {source_type} source runs on: {', '.join(sorted(descriptor.executors))}."
+            )
+        if is_local_agent_backed_source(existing):
+            raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+        secret_fields = _source_secret_fields(source_type)
+        moving_to_server = req.executor == SOURCE_EXECUTOR_SERVER and source_runs_on_device(existing)
+        if req.secrets and not moving_to_server:
+            raise _executor_change_refused("Secrets are sent only when a source moves to the server.")
+        if unknown := sorted(set(req.secrets) - set(secret_fields)):
+            raise _executor_change_refused(f"Not a secret of a {source_type} source: {', '.join(unknown)}.")
+        if req.executor == source_executor(existing):
+            return {
+                "id": source_id,
+                "executor": req.executor,
+                "execution_owner_user_id": execution_owner_user_id(existing),
+                "cancelled_job_ids": [],
+            }
+
+        owner_id: str | None = None
+        if req.executor == SOURCE_EXECUTOR_DEVICE:
+            config = acquisition_job_config(source_type, existing["config"])
+            owner_id = resolve_request_principal(request)
+        else:
+            config = {**existing["config"], **req.secrets}
+            try:
+                _validate_source_config(
+                    source_type, config, existing_config=existing["config"], executor=SOURCE_EXECUTOR_SERVER
+                )
+                config = prepare_source_config_for_storage(
+                    config, existing_config=existing["config"], secret_fields=secret_fields
+                )
+            except SourceConfigInvalid as exc:
+                raise _config_invalid_response(exc) from exc
+            except (SecretConfigurationError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        await sync_service.cancel_source(source_id)
+        try:
+            cancelled = await db.change_source_executor(
+                source_id,
+                executor=req.executor,
+                config_json=json.dumps(config),
+                execution_owner_user_id=owner_id,
+            )
+        except SourceSyncRunActive as exc:
+            raise _source_sync_running_http_error(source_id, exc.run_id) from exc
+        except SourceAcquisitionLeased as exc:
+            raise _source_acquisition_leased_http_error(source_id, exc.job_id) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Source not found") from exc
+        changed = await db.get_source(source_id)
+        return {
+            "id": source_id,
+            "executor": req.executor,
+            "execution_owner_user_id": execution_owner_user_id(changed or existing),
+            "cancelled_job_ids": cancelled,
+        }
 
     @source_router.put("/{source_id}", response_model=SourceUpdatedResponse)
     async def update_source(

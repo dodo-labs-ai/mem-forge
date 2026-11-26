@@ -108,16 +108,22 @@ def check_config(
     config: Mapping[str, Any],
     existing_config: Mapping[str, Any],
     descriptor: SourceTypeDescriptor,
+    *,
+    server_holds_secrets: bool = True,
 ) -> list[FieldIssue]:
     """Every way ``config`` breaks its form description, in field order; empty when it passes.
 
     ``config`` is the configuration the save would store, after the Gene's
     ``normalize_config``. ``existing_config`` is the stored configuration,
-    read only for whether a secret is already stored. The check refuses:
+    read only for whether a secret is already stored.
+    ``server_holds_secrets`` is false for a Source that runs on its owner's
+    device, whose credentials the device holds (ADR 0058). The check refuses:
 
     - a visible required field without a value: a non-secret field reads its
       effective value, so a declared default satisfies it, and a secret reads
-      the submitted or stored secret;
+      the submitted or stored secret; a secret the server does not hold is
+      never required;
+    - a secret the server does not hold, submitted with a value;
     - a visible ``tag_list`` or ``multi_select`` value that is neither a list
       nor a comma string;
     - a visible ``select`` value, or an item of a visible ``multi_select``
@@ -133,10 +139,23 @@ def check_config(
     fields = {field.key: field for field in schema.fields}
     issues: list[FieldIssue] = []
     for field in schema.fields:
-        issue = _field_issue(field, fields, config, existing_config, descriptor, product_name)
+        if field.field_type == ConfigFieldType.SECRET and not server_holds_secrets:
+            issue = _device_secret_issue(field, config, product_name)
+        else:
+            issue = _field_issue(field, fields, config, existing_config, descriptor, product_name)
         if issue is not None:
             issues.append(issue)
     return issues
+
+
+def _device_secret_issue(field: ConfigField, config: Mapping[str, Any], product_name: str) -> FieldIssue | None:
+    """A secret of a Source its device holds credentials for is never sent to the server."""
+
+    value = config.get(field.key)
+    if isinstance(value, str) and value.strip():
+        name = _issue_name(product_name, field.label)
+        return FieldIssue(field.key, f"{name} is stored on the device that runs this source, not on the server")
+    return None
 
 
 def _issue_name(product_name: str, label: str) -> str:

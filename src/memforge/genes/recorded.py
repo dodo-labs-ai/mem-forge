@@ -3,10 +3,11 @@
 A document Gene is two parts (see :mod:`memforge.genes.document_gene`):
 
 - **Acquisition** reaches the provider: ``authenticate``, ``discover``,
-  ``list_scope``, ``confirm_absent``, ``rediscover``, ``fetch``, ``fetch_pdf``
-  and ``open_source_artifact``.
+  ``list_scope``, ``confirm_absent``, ``rediscover``, ``fetch``,
+  ``fetch_pdf_material`` and ``open_source_artifact``.
 - **Interpretation** reads only what acquisition returned: ``normalize``,
-  ``raw_from_stored_input``, ``requires_pdf_artifact``, ``project_native`` and
+  ``render_pdf``, ``raw_from_stored_input``, ``requires_pdf_artifact``,
+  ``project_native`` and
   the readings, together with the class-level answers such as ``lists_scope``
   and ``rediscovers_documents``.
 
@@ -38,6 +39,7 @@ from datetime import datetime
 from typing import Protocol, TypeVar
 
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.models import AbsenceAnswer, ContentItem, RawContent, ScopeListing
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 
@@ -109,8 +111,9 @@ class AcquiredInput:
     """What acquisition read for one item: the input its Unit stores when the item commits.
 
     ``item`` is the item as ``fetch`` left it. ``body`` and ``content_type``
-    are the bytes ``fetch`` returned, ``pdf`` the item's PDF export when its
-    type exports one, or ``pdf_failure`` the error that export raised, and
+    are the bytes ``fetch`` returned, ``pdf_material`` what the item's PDF
+    export renders from when its type exports one (``None`` when the item had
+    nothing to export), or ``pdf_failure`` the error reading it raised, and
     ``artifacts`` the bodies ``fetch`` described, each opened through
     :meth:`AcquisitionRecord.open_artifact`.
     """
@@ -118,7 +121,7 @@ class AcquiredInput:
     item: ContentItem
     body: bytes
     content_type: str
-    pdf: bytes | None = None
+    pdf_material: PdfMaterial | None = None
     artifacts: tuple[RawSourceArtifact, ...] = ()
     pdf_failure: AcquisitionFailed | None = None
 
@@ -218,11 +221,11 @@ def recorded_gene_class(gene_cls: type[G]) -> type[G]:
             raw = self.raw_from_stored_input(item, acquired.body, acquired.content_type)
             return replace(raw, artifacts=acquired.artifacts)
 
-        async def fetch_pdf(self, item: ContentItem) -> bytes | None:
+        async def fetch_pdf_material(self, item: ContentItem) -> PdfMaterial | None:
             acquired = await self._opened().acquired(item.item_id)
             if acquired.pdf_failure is not None:
                 raise acquired.pdf_failure
-            return acquired.pdf
+            return acquired.pdf_material
 
         @asynccontextmanager
         async def open_source_artifact(self, artifact: RawSourceArtifact) -> AsyncIterator[SourceArtifactDownload]:

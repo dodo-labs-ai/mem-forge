@@ -24,6 +24,7 @@ from PIL import Image
 import memforge.server.admin_api as admin_api
 from memforge.config import AppConfig
 from memforge.genes.notion_gene import NotionGene
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.local_agent.acquisition_daemon import acquire_document_source
 from memforge.local_agent.document_acquisition import (
     ACQUISITION_ATTEMPT_PAYLOAD_FIELD,
@@ -63,6 +64,7 @@ from memforge.source_derivation import SourceUnitDerivationContext, source_deriv
 from memforge.source_item_failures import FailedItemRetry, SourceItemFailure
 from memforge.source_projection import ProjectionScopeTransition
 from memforge.source_projection_config import canonical_projection_scope, projection_scope_fingerprint
+from memforge.source_types import source_type_descriptor
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
@@ -528,7 +530,7 @@ def _acquire_and_process(
             payload,
             open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
             transport=transport,
-            exports_pdf=False,
+            exports_pdf=source_type_descriptor("wiki").exports_pdf,
             sleep=_no_pause,
         )
     )
@@ -1576,3 +1578,91 @@ def test_the_manifest_response_asks_for_the_documents_of_staged_derivations(depl
     # Recovery may end the staged derivation, and a requested run then fetches its Document again.
     requests = AcquisitionRequests.from_payload(response.json()["requests"])
     assert [item.item_id for item in requests.fetch] == ["wiki-s"]
+
+
+@pytest.fixture
+def exporting_wiki(monkeypatch, wiki) -> list[str]:
+    """The wiki type exports a PDF of each page, which a stored input must hold; returns the titles rendered.
+
+    The export material is the page's HTML. Rendering is the server's: it
+    reads only the material.
+    """
+
+    from memforge import source_types
+
+    rendered: list[str] = []
+
+    async def fetch_pdf_material(self, item):
+        wiki = self._wiki("fetch_pdf_material")
+        page_id = str(item.extra["page_id"])
+        if page_id in wiki.refused_exports:
+            raise WikiUnavailable(f"the wiki could not export page {page_id}")
+        return PdfMaterial(title=item.title, html=f"<p>{wiki.pages[page_id].body}</p>")
+
+    async def render_pdf(self, material):
+        rendered.append(material.title)
+        return b"%PDF-1.4\n" + material.html.encode() + b"\n" + b"x" * 128 + b"\n%%EOF"
+
+    def requires_pdf_artifact(self, *, item, stored_input, existing_hash, new_hash):
+        return stored_input is None or existing_hash != new_hash or not stored_input.pdf_content_uri
+
+    wiki.refused_exports = set()
+    monkeypatch.setattr(WikiGene, "fetch_pdf_material", fetch_pdf_material, raising=False)
+    monkeypatch.setattr(WikiGene, "render_pdf", render_pdf, raising=False)
+    monkeypatch.setattr(WikiGene, "requires_pdf_artifact", requires_pdf_artifact, raising=False)
+    monkeypatch.delitem(source_types._DESCRIPTORS, "wiki")
+    register_test_source_type(
+        monkeypatch, "wiki", WikiGene, unit_noun="page", scope_fields=("root_pages",), exports_pdf=True
+    )
+    return rendered
+
+
+def _stored_pdfs(side: _Side) -> dict[str, bytes]:
+    async def read() -> dict[str, bytes]:
+        pdfs = {}
+        for doc_id in sorted(await side.db.list_indexed_doc_ids(SOURCE_ID)):
+            unit = await side.db.find_source_unit_by_document_id(SOURCE_ID, doc_id, current_only=True)
+            stored = await side.db.get_source_unit_input(unit.id)
+            pdfs[doc_id] = await asyncio.to_thread(side.doc_store.read_artifact, stored.pdf_content_uri)
+        return pdfs
+
+    return asyncio.run(read())
+
+
+def test_the_device_reads_the_pdf_material_and_the_server_renders_it(deployments, wiki, exporting_wiki):
+    server, device, client, lease = deployments
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+
+    _server_run(server, FIRST_RUN)
+    wiki.calls.clear()
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+
+    assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
+    assert _stored_pdfs(device) == _stored_pdfs(server)
+    assert _stored_pdfs(device)["wiki-a"].startswith(b"%PDF-1.4\n<p>body of a</p>")
+    # Each page's material is read once on the device and rendered on each side's server.
+    assert wiki.calls.count("fetch_pdf_material") == 2
+    assert exporting_wiki == ["Page a", "Page b", "Page a", "Page b"]
+
+
+def test_a_pdf_read_the_device_gave_up_on_fails_its_document_without_a_retry_on_the_server(
+    deployments, wiki, exporting_wiki
+):
+    server, device, client, lease = deployments
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    wiki.refused_exports = {"a"}
+
+    _server_run(server, FIRST_RUN)
+    wiki.calls.clear()
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+
+    assert asyncio.run(_end_state(device)) == asyncio.run(_end_state(server))
+    assert sorted(asyncio.run(device.held())) == ["wiki-b"]
+    _stage, _error_class, message, _retryable = asyncio.run(device.ledger())["wiki-a"]
+    assert message == "Wiki PDF export failed for Page a: the wiki could not export page a"
+    # The device asked the provider again; its run fails the page on the recorded answer once.
+    assert wiki.calls.count("fetch_pdf_material") == 4
+    assert server.retry_sleeps == [2, 4]
+    assert device.retry_sleeps == []

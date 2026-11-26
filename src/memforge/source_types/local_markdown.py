@@ -8,7 +8,7 @@ from typing import Any
 from memforge.source_adapters import local_markdown as adapter
 from memforge.source_adapters.contracts import FILE_ALTERNATIVE_EVIDENCE_PROFILES, MARKDOWN_STRUCTURAL_PROFILE
 from memforge.source_types.config import LocalInbox, SourceConfigPolicy
-from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
+from memforge.source_types.descriptor import SOURCE_EXECUTOR_DEVICE, LocalAgentCollection, SourceTypeDescriptor
 
 
 def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -39,6 +39,8 @@ DESCRIPTOR = SourceTypeDescriptor(
         package_submitter="memforge.local_adapter:submit_local_markdown_request",
         replay_adapter="memforge.local_agent.replay_adapter:LocalMarkdownReplayAdapter",
     ),
-    acquisition_contract=1,
+    acquisition_contract=2,
+    # Its files exist only on the owner's machine.
+    executors=frozenset({SOURCE_EXECUTOR_DEVICE}),
     config=SourceConfigPolicy(complete=_complete_config, store=_store_config),
 )

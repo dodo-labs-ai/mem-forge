@@ -8,7 +8,8 @@ product uses it.
 
 - A document type's snapshot is the stored input of one Unit revision: the
   item its Gene discovered, the raw bytes and their content type, the PDF
-  export when the type exports one, and the artifacts. A set is an
+  material when the type exports PDFs (its export HTML and images, which the
+  server renders), and the artifacts. A set is an
   acquisition record store (:class:`SnapshotRecordStore`) behind the type's
   recorded Gene (:func:`memforge.genes.recorded.recorded_gene_class`), which
   answers only acquisition from it. Normalization, ``project_native``,
@@ -75,6 +76,7 @@ from memforge.conversations.port import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.recorded import AcquiredInput, AcquisitionRecordMismatch
+from memforge.genes.toolkit.pdf import PdfImage, PdfMaterial
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 from memforge.source_artifacts import RawSourceArtifact, SourceArtifactDownload
 from memforge.source_time import parse_source_time
@@ -302,7 +304,7 @@ class DocumentSnapshot:
     item: ContentItem
     body: bytes
     content_type: str
-    pdf: bytes | None
+    pdf_material: PdfMaterial | None
     artifacts: tuple[SnapshotArtifact, ...]
     directory: Path
 
@@ -316,7 +318,7 @@ def read_document_snapshot(revision_dir: Path) -> DocumentSnapshot:
         raw = spec["raw"]
         raw_path = _contained(revision_dir, raw["file"])
         content_type = str(raw["content_type"])
-        pdf = _contained(revision_dir, spec["pdf"]).read_bytes() if spec.get("pdf") else None
+        pdf_material = _pdf_material(revision_dir, item.title, spec["pdf_material"]) if spec.get("pdf_material") else None
         artifacts = []
         for entry in spec.get("artifacts") or ():
             path = _contained(revision_dir, entry["file"])
@@ -341,9 +343,24 @@ def read_document_snapshot(revision_dir: Path) -> DocumentSnapshot:
         item=item,
         body=raw_path.read_bytes(),
         content_type=content_type,
-        pdf=pdf,
+        pdf_material=pdf_material,
         artifacts=tuple(artifacts),
         directory=revision_dir,
+    )
+
+
+def _pdf_material(revision_dir: Path, title: str, spec: Mapping[str, Any]) -> PdfMaterial:
+    """The PDF material a snapshot names: its export HTML file and each image's file, by the URL the HTML names."""
+
+    return PdfMaterial(
+        title=title,
+        html=_contained(revision_dir, spec["html"]).read_text(encoding="utf-8"),
+        images={
+            str(url): PdfImage(
+                body=_contained(revision_dir, image["file"]).read_bytes(), content_type=str(image["content_type"])
+            )
+            for url, image in dict(spec.get("images") or {}).items()
+        },
     )
 
 
@@ -545,7 +562,7 @@ class SnapshotRecord:
             item=snapshot.item,
             body=snapshot.body,
             content_type=snapshot.content_type,
-            pdf=snapshot.pdf,
+            pdf_material=snapshot.pdf_material,
             artifacts=tuple(artifact.descriptor for artifact in snapshot.artifacts),
         )
 

@@ -503,7 +503,7 @@ class DeviceAcquisitionRecord:
             item=package.item,
             body=package.body,
             content_type=package.content_type,
-            pdf=package.pdf,
+            pdf_material=package.pdf_material,
             artifacts=tuple(acquired.artifact for acquired in package.artifacts),
             pdf_failure=package.pdf_failure.raised() if package.pdf_failure is not None else None,
         )

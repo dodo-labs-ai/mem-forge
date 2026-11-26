@@ -1,20 +1,17 @@
-"""Local Confluence HTML-to-PDF export for PAT-authenticated pages.
+"""Acquire a Confluence page's PDF material: its export HTML and the same-origin images it names.
 
-The export reads the page's export HTML through the Gene's
-``ConnectorHttpClient``, downloads the page's same-origin images, and renders
-the result locally. Images and rendering share one budget of
-``PDF_EXPORT_TIMEOUT_SECONDS``; an export that outlasts it produces no PDF,
-which fails the Document.
-
-The images get the budget less ``PDF_RENDER_RESERVE_SECONDS``, so the
-renderer always starts with the reserve left, whatever the images do:
+The page is read like any other Confluence request, through the Gene's
+``ConnectorHttpClient`` with its limiter and retries; an error reading it
+propagates. Its images are then read within the image budget of
+``PDF_IMAGE_BUDGET_SECONDS``, and the server renders the material
+(:mod:`memforge.genes.toolkit.pdf`):
 
 - A download starts only when its ``IMAGE_FETCH_TIMEOUT_SECONDS`` fits before
   the image deadline, and a retry only when its wait and that timeout fit.
 - At the image deadline every unfinished download is cancelled, which also
   bounds a body that trickles in under its per-read timeout.
-- An image that does not arrive is left blank, and the page renders without
-  it.
+- An image that does not arrive is left out of the material, and the page
+  renders without it.
 
 Image downloads go past the Atlassian origin limiter: a page may carry up to
 ``MAX_IMAGE_ASSETS`` images, and pacing them at the origin's interval (2 s for
@@ -29,60 +26,36 @@ clock; both are monotonic in production.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import html as html_lib
 import logging
-import os
-import sys
-import tempfile
-from collections.abc import Awaitable, Callable
-from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup
-
 from memforge.genes.toolkit.http import ConnectorHttpClient, RetryPolicy
+from memforge.genes.toolkit.pdf import PdfImage, PdfMaterial, exportable_soup, preferred_image_source
 
 logger = logging.getLogger(__name__)
 
-RenderPdf = Callable[[Path], Awaitable[bytes | None]]
 MAX_IMAGE_ASSETS = 200
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 25 * 1024 * 1024
-MAX_PDF_BYTES = 100 * 1024 * 1024
 IMAGE_FETCH_TIMEOUT_SECONDS = 10.0
 IMAGE_STREAM_CHUNK_BYTES = 64 * 1024
 IMAGE_DOWNLOAD_CONCURRENCY = 4
-PDF_EXPORT_TIMEOUT_SECONDS = 120.0
-# Rendering is never left less than this. No measurement of WeasyPrint on real
-# pages bounds it more tightly, and images had no bound of their own before
-# (one 10 s attempt each, four at a time, inside the shared budget), so half
-# of the budget is kept for the renderer.
-PDF_RENDER_RESERVE_SECONDS = PDF_EXPORT_TIMEOUT_SECONDS / 2
+PDF_IMAGE_BUDGET_SECONDS = 60.0
+"""How long reading one page's images may take, from when its export HTML arrived."""
 # An image is worth less than the page it illustrates: a few quick attempts,
-# and a long Retry-After costs an image rather than the export budget.
+# and a long Retry-After costs an image rather than the image budget.
 IMAGE_RETRY = RetryPolicy(attempts=3, backoff_seconds=1.0, max_wait_seconds=10.0)
 
 
-async def export_confluence_page_pdf(
+async def fetch_confluence_pdf_material(
     *,
     client: ConnectorHttpClient,
     base_url: str,
     api_prefix: str,
     page_id: str,
     title: str,
-    render_pdf: RenderPdf | None = None,
-    work_dir: Path | None = None,
-) -> bytes | None:
-    """Render a Confluence page's REST export HTML to a local PDF.
-
-    The page itself is read like any other Confluence request, through the
-    client's limiter and retries; its images are not (module docstring).
-    """
-    renderer = render_pdf if render_pdf is not None else default_pdf_renderer()
-    if renderer is None:
-        logger.warning("PDF renderer not found; skipping PDF export for %s", title)
-        return None
+) -> PdfMaterial | None:
+    """The page's export HTML and the images it names, or ``None`` when the page has no exportable HTML."""
 
     resp = await client.get(
         f"{api_prefix}/rest/api/content/{page_id}",
@@ -98,150 +71,29 @@ async def export_confluence_page_pdf(
     if not html.strip():
         logger.warning("Confluence page %s has no exportable HTML", page_id)
         return None
-
-    if work_dir is None:
-        with tempfile.TemporaryDirectory(prefix="memforge-confluence-pdf-") as tmp:
-            return await _render_with_timeout(
-                client=client,
-                html=html,
-                title=title,
-                base_url=base_url,
-                api_prefix=api_prefix,
-                renderer=renderer,
-                work_dir=Path(tmp),
-            )
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    return await _render_with_timeout(
-        client=client,
-        html=html,
-        title=title,
-        base_url=base_url,
-        api_prefix=api_prefix,
-        renderer=renderer,
-        work_dir=work_dir,
-    )
-
-
-async def _render_with_timeout(
-    *,
-    client: ConnectorHttpClient,
-    html: str,
-    title: str,
-    base_url: str,
-    api_prefix: str,
-    renderer: RenderPdf,
-    work_dir: Path,
-) -> bytes | None:
-    images_deadline = client.clock() + PDF_EXPORT_TIMEOUT_SECONDS - PDF_RENDER_RESERVE_SECONDS
-    try:
-        return await asyncio.wait_for(
-            _render_with_assets(
-                client=client,
-                html=html,
-                title=title,
-                base_url=base_url,
-                api_prefix=api_prefix,
-                renderer=renderer,
-                work_dir=work_dir,
-                images_deadline=images_deadline,
-            ),
-            timeout=PDF_EXPORT_TIMEOUT_SECONDS,
-        )
-    except TimeoutError:
-        logger.warning("Confluence PDF export timed out for %s", title)
-        return None
-
-
-def default_pdf_renderer() -> RenderPdf | None:
-    return default_weasyprint_renderer()
-
-
-def default_weasyprint_renderer() -> RenderPdf | None:
-    _prepare_weasyprint_library_path()
-    try:
-        from weasyprint import HTML
-    except Exception as exc:
-        logger.warning("WeasyPrint renderer not available: %s", exc)
-        return None
-
-    async def render(html_path: Path) -> bytes | None:
-        def render_sync() -> bytes:
-            return HTML(filename=str(html_path), base_url=html_path.parent.as_uri()).write_pdf()
-
-        try:
-            pdf_bytes = await asyncio.to_thread(render_sync)
-        except Exception as exc:
-            logger.warning("WeasyPrint PDF rendering failed for %s: %s", html_path, exc)
-            return None
-        if len(pdf_bytes) > MAX_PDF_BYTES:
-            logger.warning("WeasyPrint PDF rendering exceeded size limit for %s", html_path)
-            return None
-        if _looks_like_complete_pdf(pdf_bytes):
-            return pdf_bytes
-        logger.warning("WeasyPrint PDF rendering produced an incomplete PDF for %s", html_path)
-        return None
-
-    return render
-
-
-def _prepare_weasyprint_library_path() -> None:
-    if sys.platform != "darwin":
-        return
-    candidates = ["/opt/homebrew/lib", "/usr/local/lib"]
-    existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
-    paths = [path for path in existing.split(":") if path]
-    for candidate in candidates:
-        if Path(candidate).exists() and candidate not in paths:
-            paths.append(candidate)
-    if paths:
-        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(paths)
-
-
-def _looks_like_complete_pdf(pdf_bytes: bytes) -> bool:
-    return pdf_bytes.startswith(b"%PDF-") and b"%%EOF" in pdf_bytes[-2048:]
-
-
-async def _render_with_assets(
-    *,
-    client: ConnectorHttpClient,
-    html: str,
-    title: str,
-    base_url: str,
-    api_prefix: str,
-    renderer: RenderPdf,
-    work_dir: Path,
-    images_deadline: float,
-) -> bytes | None:
-    assets_dir = work_dir / "assets"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    html = await _rewrite_image_sources(
+    images = await _read_images(
         client=client,
         html=html,
         base_url=base_url,
         api_prefix=api_prefix,
-        assets_dir=assets_dir,
-        deadline=images_deadline,
+        deadline=client.clock() + PDF_IMAGE_BUDGET_SECONDS,
     )
-    html_path = work_dir / "page.html"
-    html_path.write_text(_wrap_html(title, html), encoding="utf-8")
-    return await renderer(html_path)
+    return PdfMaterial(title=title, html=html, images=images)
 
 
-async def _rewrite_image_sources(
+async def _read_images(
     *,
     client: ConnectorHttpClient,
     html: str,
     base_url: str,
     api_prefix: str,
-    assets_dir: Path,
     deadline: float,
-) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    _remove_active_content(soup)
+) -> dict[str, PdfImage]:
+    """Each same-origin HTTPS image the exportable HTML names that arrives by ``deadline``, by the URL it names."""
+
     image_sources: list[str] = []
-    for img in soup.find_all("img"):
-        src = _preferred_image_source(img)
+    for img in exportable_soup(html).find_all("img"):
+        src = preferred_image_source(img)
         if src and src not in image_sources:
             image_sources.append(src)
 
@@ -252,53 +104,30 @@ async def _rewrite_image_sources(
     budget = _AssetBudget(MAX_TOTAL_IMAGE_BYTES)
     semaphore = asyncio.Semaphore(IMAGE_DOWNLOAD_CONCURRENCY)
 
-    async def download(src: str) -> tuple[str, str, tuple[bytes, str] | None]:
+    async def download(src: str) -> tuple[str, PdfImage | None]:
         url = _same_origin_https_asset_url(src, base_url, api_prefix)
         if url is None:
-            return src, "", None
+            return src, None
         async with semaphore:
             if client.clock() + IMAGE_FETCH_TIMEOUT_SECONDS > deadline:
-                return src, url, None
+                return src, None
             image = await _download_image_asset(client=client, url=url, budget=budget, deadline=deadline)
-        return src, url, image
+        return src, image
 
-    replacements: dict[str, str] = {}
     downloads = await _finished_by(
         [asyncio.ensure_future(download(src)) for src in image_sources], deadline - client.clock()
     )
-    skipped = len(image_sources) - sum(1 for _src, _url, image in downloads if image is not None)
-    if skipped:
-        logger.warning("Rendering Confluence page without %d of its %d images", skipped, len(image_sources))
-    for src, url, image in downloads:
-        if image is None:
-            continue
-        content, content_type = image
-        asset_path = assets_dir / _asset_filename(url, content_type)
-        asset_path.write_bytes(content)
-        replacements[src] = asset_path.as_uri()
-
-    for img in soup.find_all("img"):
-        src = _preferred_image_source(img)
-        replacement = replacements.get(src or "")
-        if not replacement:
-            img["src"] = ""
-            if img.get("srcset"):
-                del img["srcset"]
-            if img.get("data-image-src"):
-                del img["data-image-src"]
-            continue
-        img["src"] = replacement
-        if img.get("srcset"):
-            del img["srcset"]
-        if img.get("data-image-src"):
-            img["data-image-src"] = replacement
-
-    return str(soup)
+    images = {src: image for src, image in downloads if image is not None}
+    if len(images) < len(image_sources):
+        logger.warning(
+            "Reading Confluence page without %d of its %d images", len(image_sources) - len(images), len(image_sources)
+        )
+    return images
 
 
 async def _download_image_asset(
     client: ConnectorHttpClient, url: str, budget: "_AssetBudget", deadline: float
-) -> tuple[bytes, str] | None:
+) -> PdfImage | None:
     reserved_bytes = 0
     committed = False
     content = bytearray()
@@ -331,7 +160,7 @@ async def _download_image_asset(
                 content.extend(chunk)
             content_type = resp.headers.get("content-type", "")
         committed = True
-        return bytes(content), content_type
+        return PdfImage(body=bytes(content), content_type=content_type or "application/octet-stream")
     except Exception as exc:
         logger.warning("Failed to download Confluence image %s: %s", url, exc)
         return None
@@ -343,8 +172,8 @@ async def _download_image_asset(
 async def _finished_by(tasks: list[asyncio.Future], seconds: float) -> list:
     """The results of the tasks done within ``seconds``.
 
-    The rest are cancelled, also when the export itself is cancelled while
-    waiting, so no download outlives the export.
+    The rest are cancelled, also when the read itself is cancelled while
+    waiting, so no download outlives it.
     """
     if not tasks:
         return []
@@ -384,49 +213,6 @@ def _content_length(value: str | None) -> int | None:
         return None
 
 
-def _remove_active_content(soup: BeautifulSoup) -> None:
-    blocked_tags = [
-        "script",
-        "iframe",
-        "object",
-        "embed",
-        "link",
-        "style",
-        "meta",
-        "base",
-        "picture",
-        "source",
-        "video",
-        "audio",
-        "track",
-        "bgsound",
-        "svg",
-    ]
-    blocked_attrs = {
-        "style",
-        "srcset",
-        "poster",
-        "background",
-        "xlink:href",
-        "data",
-        "formaction",
-        "action",
-        "ping",
-        "srcdoc",
-    }
-    for tag in soup.find_all(blocked_tags):
-        tag.decompose()
-    for tag in soup.find_all(True):
-        for attr in list(tag.attrs):
-            attr_name = attr.lower()
-            if attr_name.startswith("on") or attr_name in blocked_attrs:
-                del tag.attrs[attr]
-            elif attr_name == "src" and tag.name != "img":
-                del tag.attrs[attr]
-            elif attr_name == "href" and tag.name != "a":
-                del tag.attrs[attr]
-
-
 def _same_origin_https_asset_url(src: str, base_url: str, api_prefix: str) -> str | None:
     parsed_src = urlparse(src)
     if parsed_src.scheme and parsed_src.scheme.lower() not in {"http", "https"}:
@@ -442,51 +228,3 @@ def _same_origin_https_asset_url(src: str, base_url: str, api_prefix: str) -> st
     if parsed_url.netloc != parsed_base.netloc:
         return None
     return url
-
-
-def _preferred_image_source(img) -> str | None:
-    src = img.get("src")
-    data_src = img.get("data-image-src")
-    if data_src and not str(data_src).startswith("data:"):
-        return str(data_src)
-    if src:
-        return str(src)
-    return None
-
-
-def _asset_filename(url: str, content_type: str) -> str:
-    path = urlparse(url).path.lower()
-    extension = ".bin"
-    if "png" in content_type or path.endswith(".png"):
-        extension = ".png"
-    elif "jpeg" in content_type or "jpg" in content_type or path.endswith((".jpg", ".jpeg")):
-        extension = ".jpg"
-    elif "gif" in content_type or path.endswith(".gif"):
-        extension = ".gif"
-    elif "svg" in content_type or path.endswith(".svg"):
-        extension = ".svg"
-    return f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}{extension}"
-
-
-def _wrap_html(title: str, body: str) -> str:
-    escaped_title = html_lib.escape(title, quote=True)
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{escaped_title}</title>
-<style>
-@page {{ size: A4; margin: 16mm 14mm; }}
-body {{ font-family: Arial, Helvetica, sans-serif; font-size: 11px; line-height: 1.4; color: #172b4d; }}
-h1, h2, h3 {{ page-break-after: avoid; color: #172b4d; }}
-table {{ border-collapse: collapse; width: 100%; margin: 8px 0; page-break-inside: auto; }}
-th, td {{ border: 1px solid #dfe1e6; padding: 4px 6px; vertical-align: top; }}
-img {{ max-width: 100%; height: auto; page-break-inside: avoid; }}
-pre, code {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
-</style>
-</head>
-<body>
-<h1>{escaped_title}</h1>
-{body}
-</body>
-</html>"""

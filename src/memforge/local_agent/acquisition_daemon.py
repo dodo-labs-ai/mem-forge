@@ -40,6 +40,7 @@ from typing import Any, Protocol, TypeVar
 
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.local_agent.document_acquisition import (
     CONFIG_PAYLOAD_FIELD,
     REPROCESS_PAYLOAD_FIELD,
@@ -252,18 +253,18 @@ class _Acquirer:
             raw = await self._again(lambda: self._gene.fetch(item))
         except Exception as exc:
             return AcquiredInputPackage(item=item, failure=AcquisitionError.from_exception(exc))
-        pdf: bytes | None = None
+        pdf_material: PdfMaterial | None = None
         pdf_failure: AcquisitionError | None = None
         if self._exports_pdf and not raw.authoritative_empty:
             try:
-                pdf = await self._again(lambda: self._gene.fetch_pdf(item))
+                pdf_material = await self._again(lambda: self._gene.fetch_pdf_material(item))
             except Exception as exc:
                 pdf_failure = AcquisitionError.from_exception(exc)
         return AcquiredInputPackage(
             item=item,
             body=raw.body,
             content_type=raw.content_type,
-            pdf=pdf,
+            pdf_material=pdf_material,
             pdf_failure=pdf_failure,
             artifacts=await self._acquire_artifacts(item, raw.artifacts),
         )

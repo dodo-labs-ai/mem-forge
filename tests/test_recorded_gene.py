@@ -233,7 +233,7 @@ def test_the_recorded_gene_replaces_acquisition_only() -> None:
         "confirm_absent",
         "rediscover",
         "fetch",
-        "fetch_pdf",
+        "fetch_pdf_material",
         "open_source_artifact",
     }
 

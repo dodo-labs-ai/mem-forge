@@ -59,7 +59,9 @@ from memforge.storage.recovery_points import (
     installed_release,
 )
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
     SOURCE_SYNC_CANCELLED_BY_USER,
+    SourceAcquisitionLeased,
     SourceActivityConflict,
     SourceActivityKind,
     SourceActivityLease,
@@ -7331,6 +7333,86 @@ class Database:
         ) as cursor:
             rows = await cursor.fetchall()
         return [_source_from_row(row) for row in rows]
+
+    async def change_source_executor(
+        self,
+        source_id: str,
+        *,
+        executor: str,
+        config_json: str,
+        execution_owner_user_id: str | None = None,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Move where the Source's acquisition runs, keeping everything it holds; return the jobs it cancelled.
+
+        The executor is not part of the Source's scope: the change opens no
+        scope transition, and leaves its Documents, Units, Memories, cursor,
+        failure ledger and an open transition as they are. ``config_json`` is
+        the configuration with the credentials the new executor's server side
+        holds. ``execution_owner_user_id`` becomes the Source's execution
+        owner; ``None`` keeps the current one.
+
+        The change waits for the Source's sync: it raises
+        :class:`SourceSyncRunActive` while a run is pending or running, and
+        :class:`SourceAcquisitionLeased` while a daemon holds one of its
+        ``document_acquisition`` jobs. The Source's queued sync jobs fail as
+        cancelled by the change, because each was planned for the previous
+        executor. Raises ``LookupError`` for an unknown Source.
+        """
+
+        changed_at = _utc_iso(now)
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
+        async with self._write_lock:
+            try:
+                source_lock = await self.db.execute("UPDATE sources SET status = status WHERE id = ?", (source_id,))
+                if not source_lock.rowcount:
+                    raise LookupError("source_not_found")
+                async with self.db.execute(
+                    """SELECT run_id FROM source_sync_runs
+                       WHERE source_id = ? AND status IN ('pending', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    active_run = await cursor.fetchone()
+                if active_run is not None:
+                    raise SourceSyncRunActive(
+                        f"source sync run already active: {active_run['run_id']}", run_id=str(active_run["run_id"])
+                    )
+                async with self.db.execute(
+                    """SELECT job_id FROM local_agent_jobs
+                       WHERE source_id = ? AND operation = ? AND status = 'leased'
+                       ORDER BY created_at, job_id LIMIT 1""",
+                    (source_id, DOCUMENT_ACQUISITION_OPERATION),
+                ) as cursor:
+                    leased_job = await cursor.fetchone()
+                if leased_job is not None:
+                    raise SourceAcquisitionLeased(
+                        f"source acquisition job is leased: {leased_job['job_id']}", job_id=str(leased_job["job_id"])
+                    )
+                queued = f"source_id = ? AND operation IN ({placeholders}) AND status = 'queued'"
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {queued} ORDER BY created_at, job_id",
+                    (source_id, *operations),
+                ) as cursor:
+                    cancelled = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {queued}""",
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, changed_at, changed_at, source_id, *operations),
+                )
+                await self.db.execute(
+                    """UPDATE sources SET executor = ?, config = ?,
+                           execution_owner_user_id = COALESCE(?, execution_owner_user_id)
+                       WHERE id = ?""",
+                    (executor, config_json, execution_owner_user_id, source_id),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return cancelled
 
     async def enqueue_due_local_agent_jobs(
         self,

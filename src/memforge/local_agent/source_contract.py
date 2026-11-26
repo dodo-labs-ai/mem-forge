@@ -12,7 +12,12 @@ from typing import Any
 
 from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
 from memforge.local_agent.snapshot_manifest import UPSERT
-from memforge.source_types import registered_source_types, source_type_descriptor
+from memforge.source_types import (
+    SOURCE_EXECUTOR_DEVICE,
+    SOURCE_EXECUTOR_SERVER,
+    registered_source_types,
+    source_type_descriptor,
+)
 
 
 DOCUMENT_ACQUISITION_OPERATION = "document_acquisition"
@@ -411,8 +416,10 @@ def source_execution_descriptor(
     }
 
 
-SOURCE_EXECUTOR_SERVER = "server"
-SOURCE_EXECUTOR_DEVICE = "device"
+def source_executor(source: Mapping[str, Any]) -> str:
+    """Where the Source's acquisition runs: ``server`` or ``device`` (ADR 0058)."""
+
+    return SOURCE_EXECUTOR_DEVICE if source_runs_on_device(source) else SOURCE_EXECUTOR_SERVER
 
 
 def source_runs_on_device(source: Mapping[str, Any]) -> bool:

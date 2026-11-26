@@ -94,9 +94,10 @@ Acquisition and interpretation
 
 The methods that reach the provider are the Gene's *acquisition*:
 ``authenticate``, ``discover``, ``list_scope``, ``confirm_absent``,
-``rediscover``, ``fetch``, ``fetch_pdf`` and ``open_source_artifact``.
-Everything else, ``normalize``, ``raw_from_stored_input`` and the type's
-``project_native`` above all, is *interpretation*: it reads only what
+``rediscover``, ``fetch``, ``fetch_pdf_material`` and
+``open_source_artifact``. Everything else, ``normalize``, ``render_pdf``,
+``raw_from_stored_input`` and the type's ``project_native`` above all, is
+*interpretation*: it runs on the server and reads only what
 acquisition returned and never reaches the provider. Keep every provider
 request inside an acquisition method, and keep what interpretation needs in
 the item, the raw content or the artifacts ``fetch`` returns. The recorded

@@ -492,6 +492,10 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     assert genes["teams"]["execution_kinds"] == ["local_agent"]
     assert genes["local_markdown"]["execution_kinds"] == ["local_agent"]
     assert "agent_session" not in genes
+    assert genes["confluence"]["executors"] == ["server", "device"]
+    assert genes["notion"]["executors"] == ["server", "device"]
+    assert genes["local_markdown"]["executors"] == ["device"]
+    assert genes["teams"]["executors"] is None
 
 
 def test_gene_execution_kinds_define_ordinary_sync_capability():
