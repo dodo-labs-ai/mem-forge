@@ -964,7 +964,9 @@ def test_setup_preserves_previous_target_when_health_validation_fails(monkeypatc
     assert manager.installs == []
 
 
-def test_setup_rolls_back_service_and_target_when_fresh_heartbeat_never_arrives(monkeypatch, tmp_path):
+def test_setup_rolls_back_service_target_and_device_name_when_fresh_heartbeat_never_arrives(monkeypatch, tmp_path):
+    identities = DeviceIdentityStore(device_identity.device_identity_path())
+    named = identities.ensure("Work laptop")
     config_path = tmp_path / "cli.toml"
     original = (
         'active = "old"\n\n[targets.old]\n'
@@ -998,7 +1000,7 @@ def test_setup_rolls_back_service_and_target_when_fresh_heartbeat_never_arrives(
     monkeypatch.setattr(main, "ToolClient", FakeToolClient)
     result = CliRunner().invoke(
         cli,
-        ["setup", "--api-url", "https://new.example.com"],
+        ["setup", "--api-url", "https://new.example.com", "--device-name", "Desk"],
         input="new-token\nnew-token\n",
         env={"MEMFORGE_CLI_CONFIG": str(config_path)},
     )
@@ -1007,6 +1009,7 @@ def test_setup_rolls_back_service_and_target_when_fresh_heartbeat_never_arrives(
     assert manager.replacements[0].rolled_back is True
     assert manager.replacements[0].committed is False
     assert config_path.read_text(encoding="utf-8") == original
+    assert identities.load() == named
 
 
 def test_setup_rolls_back_service_when_target_commit_fails(monkeypatch, tmp_path):
@@ -1109,6 +1112,7 @@ def test_daemon_status_uses_the_daemons_stored_target_for_server_connection(monk
 
     class FakeToolClient:
         def __init__(self, *, target, api_token):
+            self.target = target
             captured.update(
                 {
                     "api_url": target.origin,
@@ -1152,8 +1156,8 @@ def test_daemon_check_exits_nonzero_when_server_heartbeat_is_offline(monkeypatch
     )
 
     class OfflineToolClient:
-        def __init__(self, **kwargs):
-            pass
+        def __init__(self, *, target, api_token):
+            self.target = target
 
         def get_local_agent_status(self):
             return {"status": "offline", "last_seen_at": None, "stale_after_seconds": 90}

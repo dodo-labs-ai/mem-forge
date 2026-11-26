@@ -170,3 +170,33 @@ def test_upgrade_names_the_installed_version_when_the_previous_one_cannot_be_ins
     assert result.exit_code == 1
     assert f"MemForge {SERVER_VERSION} stays installed" in result.output
     assert manager.replacements[0].rolled_back is True
+
+
+def test_upgrade_names_the_installed_version_when_the_service_cannot_be_restored(upgrade, monkeypatch) -> None:
+    from memforge.local_agent.service import DaemonServiceError
+
+    run, manager, installs = upgrade
+    _Server.reported_version = "0.0.1"
+    monkeypatch.setattr(
+        main,
+        "_wait_for_local_agent_online",
+        lambda client, **kwargs: {**client.get_local_agent_status()["devices"][0], "fresh": True},
+    )
+    replace = manager.replace
+
+    def unrestorable(**kwargs):
+        replacement = replace(**kwargs)
+
+        def rollback():
+            raise DaemonServiceError("launchctl bootstrap failed")
+
+        replacement.rollback = rollback
+        return replacement
+
+    manager.replace = unrestorable
+
+    result = run()
+
+    assert result.exit_code == 1
+    assert f"MemForge {installed_version()} was installed again" in result.output
+    assert "its service could not be restored: launchctl bootstrap failed" in result.output

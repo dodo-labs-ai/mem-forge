@@ -7162,7 +7162,16 @@ class Database:
         completed_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(completed_at)
         async with self._write_lock:
-            counted_attempts = await self._counted_local_agent_attempts(job_id, attempt_count)
+            async with self.db.execute(
+                """SELECT uncounted_attempt_count FROM local_agent_jobs
+                   WHERE job_id = ? AND status = 'leased' AND lease_owner_user_id = ? AND attempt_count = ?""",
+                (job_id, user_id, attempt_count),
+            ) as cursor:
+                leased = await cursor.fetchone()
+            if leased is None:
+                return False
+            # Only the attempts that count toward the job's retry budget decide whether it retries.
+            counted_attempts = attempt_count - int(leased["uncounted_attempt_count"])
             stored_status = local_agent_completion_status(
                 status,
                 retryable=retryable,
@@ -7229,16 +7238,6 @@ class Database:
                 await self.db.rollback()
                 raise
         return job_ids
-
-    async def _counted_local_agent_attempts(self, job_id: str, attempt_count: int) -> int:
-        """The attempts up to ``attempt_count`` that count toward the job's retry budget."""
-
-        async with self.db.execute(
-            "SELECT uncounted_attempt_count FROM local_agent_jobs WHERE job_id = ?",
-            (job_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return attempt_count - int(row["uncounted_attempt_count"] or 0) if row else attempt_count
 
     async def requeue_local_agent_job_uncounted(
         self,

@@ -16,9 +16,9 @@ from memforge.source_types import registered_source_types, source_type_descripto
 
 
 DOCUMENT_ACQUISITION_OPERATION = "document_acquisition"
+"""The local-agent operation that acquires a document Source on its owner's device with the type's own Gene."""
 ACQUISITION_CONTRACT_CHANGED = "acquisition_contract_changed"
 """Why a device run's submission was refused: the server's acquisition contract for the type changed."""
-"""The local-agent operation that acquires a document Source on its owner's device with the type's own Gene."""
 LOCAL_AGENT_SYNC_OPERATIONS = frozenset(
     {
         DOCUMENT_ACQUISITION_OPERATION,

@@ -4,8 +4,9 @@ Besides the jobs, every lease answer names:
 
 - ``released_source_ids``: the Sources the device report named that are no
   longer device Sources of this owner, because they were deleted, moved to
-  the server or handed to another execution owner. The device deletes their
-  credentials from its keyring.
+  the server or handed to another execution owner. The device deletes the
+  credentials it holds for them on the server it leases from, and nothing it
+  holds for another server.
 - ``server``: the server's MemForge version and the acquisition contract of
   each document type. A device whose contracts differ takes none of their
   jobs; the daemon says so in one log line when its contracts stop matching

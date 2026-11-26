@@ -201,3 +201,21 @@ def test_self_hosted_status_expires_at_the_declared_stale_cutoff(
         "checked_at": after_cutoff.isoformat(),
         "stale_after_seconds": 90,
     }
+
+
+def test_a_lease_or_heartbeat_without_a_device_report_names_the_update(tmp_path: Path) -> None:
+    app = admin_api.create_admin_app(config=_config(tmp_path), principal_resolver=_principal)
+
+    with TestClient(app) as client:
+        lease = client.post(LEASE_PATH, json={"limit": 1, "lease_seconds": 60, "wait_seconds": 0})
+        heartbeat = client.post(
+            "/api/cloud/local-agent/jobs/job-1/heartbeat", json={"attempt_count": 1, "lease_seconds": 60}
+        )
+        status = client.get(STATUS_PATH)
+
+    for answer in (lease, heartbeat):
+        assert answer.status_code == 422, answer.text
+        detail = answer.json()["detail"]
+        assert detail["error"] == "device_report_required"
+        assert f"Install MemForge {installed_version()}" in detail["message"]
+    assert status.json()["devices"] == []

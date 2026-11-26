@@ -9,8 +9,15 @@ holds its credentials. A Source whose type keeps no secret, or whose
 configuration signs in with a browser session, is held with no fields, which
 marks this device as the one that acquires it.
 
-A browser session lives in the keyring per provider and origin, because one
-sign-in serves every Source of that site. The index names the session each
+A device can serve more than one MemForge server, each with its own Sources,
+so everything it holds belongs to the server it holds it for: the index keeps
+one entry per server's API origin, and every keyring account starts with that
+origin. A store is opened for one server (:func:`device_credentials`); the
+daemon reports, and releases on that server's word, only what it holds for the
+server it leases from.
+
+A browser session lives in the keyring per server, provider and origin,
+because one sign-in serves every Source of that site. The index names the session each
 Source signs in with, so the session is deleted together with the last Source
 that uses it. The device's Gene reads a Source's secrets and session from
 here (:meth:`DeviceCredentialStore.gene_config`), and the session is checked
@@ -24,6 +31,7 @@ processes, so each change holds an exclusive lock on a file beside it.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from collections.abc import Iterator, Mapping
@@ -34,10 +42,6 @@ from typing import Any
 
 from memforge.local_agent.service import DaemonServicePaths, SecretStore
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - the daemon service runs on macOS and Linux
-    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "DEVICE_CREDENTIALS_KEYRING_SERVICE",
@@ -46,6 +50,7 @@ __all__ = [
     "DeviceCredentialsMissing",
     "check_browser_session",
     "credentials_command",
+    "device_credentials",
     "device_credentials_path",
 ]
 
@@ -59,6 +64,12 @@ def device_credentials_path() -> Path:
     """Where this installation keeps its credential index: beside the daemon service configuration."""
 
     return DaemonServicePaths.for_home(Path.home()).config.with_name(DEVICE_CREDENTIALS_FILENAME)
+
+
+def device_credentials(server: str) -> DeviceCredentialStore:
+    """What this installation holds for the server at the API origin ``server``."""
+
+    return DeviceCredentialStore(device_credentials_path(), server=server)
 
 
 def credentials_command(source_id: str) -> str:
@@ -91,10 +102,11 @@ class _HeldSource:
 
 
 class DeviceCredentialStore:
-    """The device's per-Source provider credentials: values in the keyring, their names in the index."""
+    """The provider credentials the device holds for one server's Sources: values in the keyring, names in the index."""
 
-    def __init__(self, path: Path, *, keyring_store: SecretStore | None = None) -> None:
+    def __init__(self, path: Path, *, server: str, keyring_store: SecretStore | None = None) -> None:
         self.path = path
+        self.server = server
         self._keyring = keyring_store
 
     @property
@@ -105,53 +117,66 @@ class DeviceCredentialStore:
             self._keyring = keyring
         return self._keyring
 
-    @staticmethod
-    def _account(source_id: str, field: str) -> str:
-        return f"{source_id}/{field}"
+    def _account(self, source_id: str, field: str) -> str:
+        return f"{self.server}#{source_id}/{field}"
 
-    @staticmethod
-    def _session_account(provider: str, origin: str) -> str:
-        return f"{provider}:{origin}"
+    def _session_account(self, provider: str, origin: str) -> str:
+        return f"{self.server}#{provider}:{origin}"
 
     @contextmanager
     def _changing(self) -> Iterator[dict[str, _HeldSource]]:
-        """The index, held exclusively while the caller changes it, then written back."""
+        """This server's Sources in the index, held exclusively while the caller changes them, then written back."""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = os.open(self.path.with_name(f".{self.path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            if fcntl is not None:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            index = self._index()
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            servers = self._servers()
+            index = servers.setdefault(self.server, {})
             yield index
-            self._write_index(index)
+            if not index:
+                del servers[self.server]
+            self._write_servers(servers)
         finally:
             os.close(handle)
 
     def _index(self) -> dict[str, _HeldSource]:
+        return self._servers().get(self.server, {})
+
+    def _servers(self) -> dict[str, dict[str, _HeldSource]]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"Could not read the device credential index: {self.path}") from exc
-        sources = payload.get("sources") if isinstance(payload, dict) else None
-        if payload.get("version") != DEVICE_CREDENTIALS_VERSION or not isinstance(sources, dict):
+        servers = payload.get("servers") if isinstance(payload, dict) else None
+        if payload.get("version") != DEVICE_CREDENTIALS_VERSION or not isinstance(servers, dict):
             raise ValueError(f"Invalid device credential index: {self.path}")
-        index: dict[str, _HeldSource] = {}
-        for source_id, held in sources.items():
-            if not isinstance(held, dict) or not isinstance(held.get("fields"), list):
+        index: dict[str, dict[str, _HeldSource]] = {}
+        for server, sources in servers.items():
+            if not isinstance(sources, dict):
                 raise ValueError(f"Invalid device credential index: {self.path}")
-            session = held.get("session")
-            index[str(source_id)] = _HeldSource(
-                fields=tuple(str(field) for field in held["fields"]),
-                session=str(session) if session is not None else None,
-            )
+            held_sources: dict[str, _HeldSource] = {}
+            for source_id, held in sources.items():
+                if not isinstance(held, dict) or not isinstance(held.get("fields"), list):
+                    raise ValueError(f"Invalid device credential index: {self.path}")
+                session = held.get("session")
+                held_sources[str(source_id)] = _HeldSource(
+                    fields=tuple(str(field) for field in held["fields"]),
+                    session=str(session) if session is not None else None,
+                )
+            index[str(server)] = held_sources
         return index
 
-    def _write_index(self, index: Mapping[str, _HeldSource]) -> None:
+    def _write_servers(self, servers: Mapping[str, Mapping[str, _HeldSource]]) -> None:
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        body = {"version": DEVICE_CREDENTIALS_VERSION, "sources": {key: index[key].to_payload() for key in sorted(index)}}
+        body = {
+            "version": DEVICE_CREDENTIALS_VERSION,
+            "servers": {
+                server: {key: sources[key].to_payload() for key in sorted(sources)} for server, sources in servers.items()
+            },
+        }
         try:
             temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             temporary.chmod(0o600)
@@ -160,7 +185,7 @@ class DeviceCredentialStore:
             temporary.unlink(missing_ok=True)
 
     def source_ids(self) -> frozenset[str]:
-        """The Sources this device holds credentials for."""
+        """The Sources of this server this device holds credentials for."""
 
         return frozenset(self._index())
 

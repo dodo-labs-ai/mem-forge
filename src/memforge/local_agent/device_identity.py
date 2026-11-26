@@ -18,7 +18,7 @@ from pathlib import Path
 
 from memforge.local_agent.device_report import DEVICE_NAME_MAX_CHARS
 
-__all__ = ["DeviceIdentity", "DeviceIdentityStore", "device_identity_path"]
+__all__ = ["DeviceIdentity", "DeviceIdentityStore", "checked_device_name", "device_identity_path"]
 
 DEVICE_IDENTITY_FILENAME = "device.json"
 DEVICE_IDENTITY_VERSION = 1
@@ -36,6 +36,15 @@ def device_identity_path() -> Path:
 class DeviceIdentity:
     device_id: str
     name: str
+
+
+def checked_device_name(name: str | None) -> str:
+    """The device name the owner gave, stripped; empty when none. Raises ``ValueError`` when it is too long."""
+
+    wanted = (name or "").strip()
+    if len(wanted) > DEVICE_NAME_MAX_CHARS:
+        raise ValueError(f"A device name has at most {DEVICE_NAME_MAX_CHARS} characters")
+    return wanted
 
 
 def _host_name() -> str:
@@ -68,9 +77,7 @@ class DeviceIdentityStore:
         """The installation's identity, created on first use; ``name`` renames the device."""
 
         current = self.load()
-        wanted = (name or "").strip()
-        if len(wanted) > DEVICE_NAME_MAX_CHARS:
-            raise ValueError(f"A device name has at most {DEVICE_NAME_MAX_CHARS} characters")
+        wanted = checked_device_name(name)
         if current is not None and (not wanted or wanted == current.name):
             return current
         identity = DeviceIdentity(

@@ -433,6 +433,7 @@ def wiki(monkeypatch) -> Wiki:
 
 
 WIKI_TOKEN = "wiki-device-token"
+DAEMON_SERVER = "http://127.0.0.1:8765"
 
 
 @pytest.fixture
@@ -441,11 +442,11 @@ def held_wiki_token(monkeypatch) -> list[object]:
 
     import sys
 
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_credentials import device_credentials
     from tests.test_daemon_service import FakeKeyring
 
     monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
-    DeviceCredentialStore(device_credentials_path()).set(SOURCE_ID, {"token": WIKI_TOKEN})
+    device_credentials(DAEMON_SERVER).set(SOURCE_ID, {"token": WIKI_TOKEN})
     tokens: list[object] = []
     opened = WikiGene.__init__
 
@@ -1132,7 +1133,7 @@ def _routed_client(client):
     from memforge.api_target import build_target
     from memforge.tool_client import ToolClient
 
-    tool_client = ToolClient(target=build_target(origin="http://127.0.0.1:8765", edition="oss"), api_token=None)
+    tool_client = ToolClient(target=build_target(origin=DAEMON_SERVER, edition="oss"), api_token=None)
 
     def http_json(method: str, url: str, body: dict | None) -> dict:
         response = client.request(method, urlsplit(url).path, json=body)
@@ -1215,7 +1216,7 @@ def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wi
     count = SNAPSHOT_MANIFEST_MAX_ITEMS + 1
     for page_id in range(count):
         wiki.write(str(page_id), "body", FIRST_RUN)
-    client = ToolClient(target=build_target(origin="http://127.0.0.1:8765", edition="oss"), api_token=None)
+    client = ToolClient(target=build_target(origin=DAEMON_SERVER, edition="oss"), api_token=None)
     completed: list[tuple] = []
     runner = LocalAgentRunner(
         state_store=LocalAgentStateStore(tmp_path / "state.json"),

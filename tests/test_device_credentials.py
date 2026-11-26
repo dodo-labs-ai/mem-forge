@@ -23,10 +23,14 @@ from memforge.local_agent.device_report import DeviceReport, declared_acquisitio
 from memforge.release import installed_version
 from tests.test_daemon_service import FakeKeyring
 
+# The server the installed daemon service serves in these tests (FakeServiceManager's environment).
+SERVER = "https://stored.example"
+OTHER_SERVER = "https://other.example"
+
 
 def test_secrets_live_in_the_keyring_per_source_and_field_and_the_index_names_only_fields(tmp_path) -> None:
     keyring = FakeKeyring()
-    store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
+    store = DeviceCredentialStore(tmp_path / "device-credentials.json", server=SERVER, keyring_store=keyring)
 
     store.set("src-wiki", {"token": "wiki-token-secret"})
     store.set("src-notes", {})
@@ -35,18 +39,18 @@ def test_secrets_live_in_the_keyring_per_source_and_field_and_the_index_names_on
     assert store.get("src-wiki") == {"token": "wiki-token-secret"}
     assert store.get("src-notes") == {}
     assert store.get("src-other") is None
-    assert keyring.values == {(DEVICE_CREDENTIALS_KEYRING_SERVICE, "src-wiki/token"): "wiki-token-secret"}
+    assert keyring.values == {(DEVICE_CREDENTIALS_KEYRING_SERVICE, f"{SERVER}#src-wiki/token"): "wiki-token-secret"}
     assert "wiki-token-secret" not in (tmp_path / "device-credentials.json").read_text(encoding="utf-8")
 
 
 def test_setting_a_sources_credentials_again_replaces_them_and_deleting_forgets_them(tmp_path) -> None:
     keyring = FakeKeyring()
-    store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
+    store = DeviceCredentialStore(tmp_path / "device-credentials.json", server=SERVER, keyring_store=keyring)
     store.set("src-wiki", {"token": "old", "cookie": "session"})
 
     store.set("src-wiki", {"token": "new"})
     assert store.get("src-wiki") == {"token": "new"}
-    assert keyring.values == {(DEVICE_CREDENTIALS_KEYRING_SERVICE, "src-wiki/token"): "new"}
+    assert keyring.values == {(DEVICE_CREDENTIALS_KEYRING_SERVICE, f"{SERVER}#src-wiki/token"): "new"}
 
     store.delete("src-wiki")
     assert store.source_ids() == frozenset()
@@ -55,7 +59,7 @@ def test_setting_a_sources_credentials_again_replaces_them_and_deleting_forgets_
 
 def test_an_origins_session_is_deleted_with_the_last_held_source_that_signs_in_with_it(tmp_path) -> None:
     keyring = FakeKeyring()
-    store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
+    store = DeviceCredentialStore(tmp_path / "device-credentials.json", server=SERVER, keyring_store=keyring)
     store.hold_session("src-issues", "jira", "https://jira.example.test", "SESSION=one")
     store.hold_session("src-bugs", "jira", "https://jira.example.test", "SESSION=two")
 
@@ -76,17 +80,54 @@ def test_concurrent_changes_to_the_index_each_keep_their_source(tmp_path) -> Non
     source_ids = [f"src-{number}" for number in range(24)]
 
     def hold(source_id: str) -> None:
-        DeviceCredentialStore(path, keyring_store=keyring).set(source_id, {"token": source_id})
+        DeviceCredentialStore(path, server=SERVER, keyring_store=keyring).set(source_id, {"token": source_id})
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(hold, source_ids))
 
-    assert DeviceCredentialStore(path, keyring_store=keyring).source_ids() == frozenset(source_ids)
+    assert DeviceCredentialStore(path, server=SERVER, keyring_store=keyring).source_ids() == frozenset(source_ids)
+
+
+def test_what_the_device_holds_for_one_server_is_apart_from_another_servers(tmp_path) -> None:
+    keyring = FakeKeyring()
+    path = tmp_path / "device-credentials.json"
+    first = DeviceCredentialStore(path, server=SERVER, keyring_store=keyring)
+    second = DeviceCredentialStore(path, server=OTHER_SERVER, keyring_store=keyring)
+    first.set("src-wiki", {"token": "first-token"})
+    first.hold_session("src-issues", "jira", "https://jira.example.test", "SESSION=first")
+    second.set("src-wiki", {"token": "second-token"})
+    second.hold_session("src-bugs", "jira", "https://jira.example.test", "SESSION=second")
+
+    second.delete("src-wiki")
+    second.delete("src-bugs")
+
+    assert second.source_ids() == frozenset()
+    assert first.source_ids() == frozenset({"src-wiki", "src-issues"})
+    assert first.get("src-wiki") == {"token": "first-token"}
+    assert first.session("jira", "https://jira.example.test") == "SESSION=first"
+
+
+def test_a_daemon_leasing_from_another_server_keeps_the_first_servers_credentials(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
+    device_credentials.device_credentials(SERVER).set("src-wiki", {"token": "first-token"})
+    other = device_credentials.device_credentials(OTHER_SERVER)
+    report = DeviceReport.from_payload(main._this_device_report(OTHER_SERVER))
+    assert report.source_ids == frozenset()
+
+    # The other server releases every Source the report named, and none of the first server's.
+    DeviceLeaseAnswers(other, log=lambda message: None).observe(
+        {"jobs": [], "released_source_ids": sorted(report.source_ids) + ["src-wiki"]}
+    )
+
+    assert device_credentials.device_credentials(SERVER).get("src-wiki") == {"token": "first-token"}
+    assert DeviceReport.from_payload(main._this_device_report(SERVER)).source_ids == frozenset({"src-wiki"})
 
 
 def test_a_secret_missing_from_the_keyring_is_an_error(tmp_path) -> None:
     keyring = FakeKeyring()
-    store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
+    store = DeviceCredentialStore(tmp_path / "device-credentials.json", server=SERVER, keyring_store=keyring)
     store.set("src-wiki", {"token": "secret"})
     keyring.values.clear()
 
@@ -95,11 +136,11 @@ def test_a_secret_missing_from_the_keyring_is_an_error(tmp_path) -> None:
 
 
 def test_the_daemons_report_names_this_device_its_version_contracts_and_held_sources() -> None:
-    store = DeviceCredentialStore(device_credentials.device_credentials_path(), keyring_store=FakeKeyring())
+    store = DeviceCredentialStore(device_credentials.device_credentials_path(), server=SERVER, keyring_store=FakeKeyring())
     store.set("src-wiki", {"token": "secret"})
 
-    first = DeviceReport.from_payload(main._this_device_report())
-    second = DeviceReport.from_payload(main._this_device_report())
+    first = DeviceReport.from_payload(main._this_device_report(SERVER))
+    second = DeviceReport.from_payload(main._this_device_report(SERVER))
 
     identity = DeviceIdentityStore(device_identity.device_identity_path()).load()
     assert identity is not None
@@ -108,7 +149,7 @@ def test_the_daemons_report_names_this_device_its_version_contracts_and_held_sou
     assert first.version == installed_version()
     assert dict(first.acquisition_contracts) == declared_acquisition_contracts()
     assert first.source_ids == frozenset({"src-wiki"})
-    assert "secret" not in json.dumps(main._this_device_report())
+    assert "secret" not in json.dumps(main._this_device_report(SERVER))
 
 
 # -- What the device runs a Source's Gene with --
@@ -130,7 +171,7 @@ def keyring(monkeypatch) -> FakeKeyring:
 
 
 def _store() -> DeviceCredentialStore:
-    return DeviceCredentialStore(device_credentials.device_credentials_path())
+    return device_credentials.device_credentials(SERVER)
 
 
 def test_the_device_gene_runs_with_the_sources_secrets_and_its_origins_browser_session(keyring) -> None:
@@ -201,7 +242,7 @@ def test_the_device_deletes_released_credentials_and_logs_only_when_contract_agr
     answers.observe(answer(ours))
 
     assert store.source_ids() == frozenset({"src-kept"})
-    assert (DEVICE_CREDENTIALS_KEYRING_SERVICE, "src-moved/pat") not in keyring.values
+    assert (DEVICE_CREDENTIALS_KEYRING_SERVICE, f"{SERVER}#src-moved/pat") not in keyring.values
     assert len(logged) == 3
     assert "src-moved" in logged[0]
     assert "9.9.9" in logged[1] and "memforge upgrade" in logged[1]
@@ -309,7 +350,7 @@ class _StatusClient:
     status: dict = {}
 
     def __init__(self, *, target, api_token):
-        pass
+        self.target = target
 
     def get_local_agent_status(self):
         return self.status

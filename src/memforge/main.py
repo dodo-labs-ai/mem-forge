@@ -500,14 +500,18 @@ def _acquire_local_agent_daemon_lock(lock_path: Path | None = None) -> _LocalAge
     return _LocalAgentDaemonLock(path, fd)
 
 
-def _this_device_report() -> dict[str, Any]:
-    """This installation's device report, as of now: the Sources it holds credentials for can change at any time."""
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+def _this_device_report(server: str) -> dict[str, Any]:
+    """This installation's device report to the server at API origin ``server``, as of now.
+
+    It names the Sources this device holds credentials for on that server,
+    which can change at any time.
+    """
+    from memforge.local_agent.device_credentials import device_credentials
     from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.device_report import this_device_report
 
     identity = DeviceIdentityStore(device_identity_path()).ensure()
-    source_ids = DeviceCredentialStore(device_credentials_path()).source_ids()
+    source_ids = device_credentials(server).source_ids()
     return this_device_report(identity.device_id, identity.name, source_ids).to_payload()
 
 
@@ -518,14 +522,16 @@ def _build_local_agent_runner(
 ):
     from memforge.local_agent.runner import LocalAgentRunner
 
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_credentials import device_credentials
     from memforge.local_agent.device_lease import DeviceLeaseAnswers
 
     client = _local_agent_tool_client(ctx)
-    device = _this_device_report
-    lease_answers = DeviceLeaseAnswers(
-        DeviceCredentialStore(device_credentials_path()), log=lambda message: click.echo(message, err=True)
-    )
+    server = client.target.origin
+
+    def device() -> dict[str, Any]:
+        return _this_device_report(server)
+
+    lease_answers = DeviceLeaseAnswers(device_credentials(server), log=lambda message: click.echo(message, err=True))
 
     def lease(limit: int = 1, wait_seconds: int = 0, lease_seconds: int = 60) -> dict[str, Any]:
         answer = client.lease_local_agent_jobs(
@@ -1883,7 +1889,8 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         raise click.ClickException(str(exc)) from exc
     runtime = _local_agent_status_payload(ctx, verbose=verbose)
     try:
-        connection = _daemon_client(manager).get_local_agent_status()
+        daemon_client = _daemon_client(manager)
+        connection = daemon_client.get_local_agent_status()
     except (DaemonServiceError, click.ClickException) as exc:
         connection = {
             "status": "unconfigured",
@@ -1901,7 +1908,7 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         "connection": connection,
     }
     if not connection.get("error"):
-        payload["sources"] = _device_source_states(connection)
+        payload["sources"] = _device_source_states(connection, daemon_client.target.origin)
     return payload
 
 
@@ -1915,13 +1922,13 @@ def _daemon_client(manager) -> ToolClient:
     return ToolClient(target=target, api_token=environment.get("MEMFORGE_API_TOKEN"))
 
 
-def _device_source_states(status: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Each of the owner's device Sources: ready, waiting for an update or waiting for a credential on this device."""
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+def _device_source_states(status: Mapping[str, Any], server: str) -> list[dict[str, Any]]:
+    """Each of the owner's device Sources on ``server``: ready, waiting for an update or for a credential on this device."""
+    from memforge.local_agent.device_credentials import device_credentials
     from memforge.local_agent.device_sources import device_source_states
 
     try:
-        return device_source_states(status, DeviceCredentialStore(device_credentials_path()))
+        return device_source_states(status, device_credentials(server))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -2110,22 +2117,23 @@ def upgrade_command(ctx):
     if daemon_status.get("fresh") is not True or daemon_status.get("version") != version:
         restore_command = method.install_command(previous_version)
         reinstalled = subprocess.run(restore_command, check=False)
+        if reinstalled.returncode == 0:
+            reinstall_outcome = f"MemForge {previous_version} was installed again"
+        else:
+            reinstall_outcome = (
+                f"`{' '.join(restore_command)}` failed with exit status {reinstalled.returncode}, "
+                f"so MemForge {version} stays installed"
+            )
         try:
             replacement.rollback()
         except DaemonServiceError as rollback_error:
             raise click.ClickException(
-                f"The daemon did not report MemForge {version}, and its service could not be restored: "
-                f"{rollback_error}"
+                f"The daemon did not report MemForge {version} after the restart; {reinstall_outcome}, "
+                f"and its service could not be restored: {rollback_error}"
             ) from rollback_error
-        if reinstalled.returncode != 0:
-            raise click.ClickException(
-                f"The daemon did not report MemForge {version} after the restart, and `{' '.join(restore_command)}` "
-                f"failed with exit status {reinstalled.returncode}, so MemForge {version} stays installed. "
-                "Run `memforge daemon logs`."
-            )
         raise click.ClickException(
-            f"The daemon did not report MemForge {version} after the restart, so MemForge {previous_version} "
-            "was installed again and its service restored. Run `memforge daemon logs`."
+            f"The daemon did not report MemForge {version} after the restart; {reinstall_outcome}, "
+            "and its service was restored. Run `memforge daemon logs`."
         )
     try:
         replacement.commit()
@@ -2143,9 +2151,13 @@ def upgrade_command(ctx):
 @click.option("--device-name", default=None, help="Name of this computer in MemForge. Defaults to its host name.")
 @click.pass_context
 def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str, device_name: str | None):
-    """Configure a target, name this device and install the local daemon user service."""
+    """Configure a target, name this device and install the local daemon user service.
+
+    The device takes its new name once the setup is committed; a setup that
+    is rolled back leaves the device as it was named.
+    """
     from memforge.api_target import Edition
-    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_identity import DeviceIdentityStore, checked_device_name, device_identity_path
     from memforge.local_agent.service import DaemonServiceError
 
     cli_config_path = _cli_config_path()
@@ -2185,8 +2197,10 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
     if health.get("error"):
         _emit_tool_payload(ctx, health)
         return
+    identities = DeviceIdentityStore(device_identity_path())
     try:
-        device = DeviceIdentityStore(device_identity_path()).ensure(device_name)
+        new_device_name = checked_device_name(device_name)
+        device = identities.ensure()
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     try:
@@ -2261,6 +2275,7 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
         if recovery_errors:
             detail += "; " + "; ".join(recovery_errors)
         raise click.ClickException(detail) from commit_error
+    identities.ensure(new_device_name)
     payload: dict[str, Any] = {
         "ok": True,
         "target": {
@@ -2608,12 +2623,13 @@ def source_credentials():
 def source_credentials_set(ctx, source_id: str):
     """Store a device Source's secrets in this device's keyring, prompting for each secret field of its form."""
     from memforge.local_agent.credential_check import signs_in_with_browser_session
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_credentials import device_credentials
     from memforge.local_agent.device_sources import SIGN_IN_INSTRUCTION, credential_fields
     from memforge.local_agent.service import DaemonServiceError
 
     try:
-        status = _daemon_client(_daemon_service_manager()).get_local_agent_status()
+        daemon_client = _daemon_client(_daemon_service_manager())
+        status = daemon_client.get_local_agent_status()
     except DaemonServiceError as exc:
         raise click.ClickException(f"{exc} Run `memforge setup` first.") from exc
     if status.get("error"):
@@ -2635,7 +2651,7 @@ def source_credentials_set(ctx, source_id: str):
         if value:
             secrets[field.key] = value
     try:
-        DeviceCredentialStore(device_credentials_path()).set(source_id, secrets)
+        device_credentials(daemon_client.target.origin).set(source_id, secrets)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     _emit_tool_payload(ctx, {"ok": True, "source_id": source_id, "fields": sorted(secrets)})
@@ -3740,11 +3756,7 @@ def _run_cloud_document_acquisition_job(
     from memforge.genes import gene_class
     from memforge.llm.structured import failure_retryable
     from memforge.local_agent.acquisition_daemon import acquire_document_source
-    from memforge.local_agent.device_credentials import (
-        DeviceCredentialStore,
-        check_browser_session,
-        device_credentials_path,
-    )
+    from memforge.local_agent.device_credentials import check_browser_session, device_credentials
     from memforge.local_agent.document_acquisition import CONFIG_PAYLOAD_FIELD
     from memforge.local_agent.runner import CloudJobLeaseLost
     from memforge.source_types import source_type_descriptor
@@ -3759,7 +3771,7 @@ def _run_cloud_document_acquisition_job(
     attempt_count = int(job["attempt_count"])
     gene_cls = gene_class(source_type)
     descriptor = source_type_descriptor(source_type)
-    credentials = DeviceCredentialStore(device_credentials_path())
+    credentials = device_credentials(client.target.origin)
 
     def open_gene(config: Mapping[str, Any]) -> Any:
         return gene_cls(config=credentials.gene_config(source_id, source_type, config), source_id=source_id)
@@ -3820,7 +3832,7 @@ def _run_cloud_credential_check_job(
 ) -> dict[str, Any]:
     from memforge.genes import gene_class
     from memforge.local_agent.credential_check import CREDENTIAL_CHECK_OPERATION, run_credential_check
-    from memforge.local_agent.device_credentials import DeviceCredentialStore, device_credentials_path
+    from memforge.local_agent.device_credentials import device_credentials
 
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     source_type = str(payload.get("source_type") or "")
@@ -3832,7 +3844,7 @@ def _run_cloud_credential_check_job(
     result = asyncio.run(
         run_credential_check(
             payload,
-            credentials=DeviceCredentialStore(device_credentials_path()),
+            credentials=device_credentials(client.target.origin),
             open_gene=lambda source_id, config: gene_class(source_type)(config=dict(config), source_id=source_id),
             upload_session=lambda provider, captured: scoped_client.upload_browser_session(
                 provider=provider,

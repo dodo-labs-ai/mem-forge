@@ -742,9 +742,28 @@ async def _require_current_acquisition_contract(
     raise HTTPException(status_code=409, detail=ACQUISITION_CONTRACT_CHANGED)
 
 
-def _device_report(payload: Mapping[str, Any]) -> DeviceReport:
-    """The device report a lease or job heartbeat carries; 422 when it is malformed."""
+DEVICE_REPORT_REQUIRED = "device_report_required"
 
+
+def _device_report(payload: Mapping[str, Any] | None) -> DeviceReport:
+    """The device report a lease or job heartbeat carries; 422 when it is missing or malformed.
+
+    A daemon that sends none predates the device report and takes no job
+    until its device installs the server's MemForge version, which the
+    answer names.
+    """
+
+    if payload is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": DEVICE_REPORT_REQUIRED,
+                "message": (
+                    "This MemForge daemon sends no device report, so it takes no jobs. "
+                    f"Install MemForge {installed_version()} on this device and restart its daemon."
+                ),
+            },
+        )
     try:
         return DeviceReport.from_payload(payload)
     except (TypeError, ValueError) as exc:
@@ -2592,14 +2611,14 @@ class LocalAgentJobLeaseRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=20)
     lease_seconds: int = Field(default=60, ge=1, le=3600)
     wait_seconds: int = Field(default=0, ge=0, le=25)
-    device: dict[str, Any]
+    device: dict[str, Any] | None = None
 
 
 class LocalAgentJobHeartbeatRequest(BaseModel):
     attempt_count: int = Field(ge=1)
     lease_seconds: int = Field(default=60, ge=1, le=3600)
     progress: dict[str, Any] | None = None
-    device: dict[str, Any]
+    device: dict[str, Any] | None = None
 
 
 class LocalAgentJobCompleteRequest(BaseModel):
@@ -11122,7 +11141,9 @@ def create_admin_app(
                 raise HTTPException(status_code=404, detail="local_agent_job_not_found")
         else:
             completed = await db.get_local_agent_job(job_id)
-            status = str((completed or {}).get("status") or "")
+            if completed is None:
+                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+            status = str(completed["status"])
         return {"ok": True, "job_id": job_id, "status": status}
 
     @local_agent_router.get("/jobs/current", response_model=LocalAgentJobListResponse)
