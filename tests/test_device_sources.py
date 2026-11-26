@@ -62,11 +62,12 @@ def _source(
     executor: str | None,
     owner: str = OWNER,
     config: dict | None = None,
+    source_type: str = "jira",
 ) -> None:
     asyncio.run(
         database.upsert_source(
             id=source_id,
-            type="jira",
+            type=source_type,
             name=source_id,
             config_json=json.dumps(config or JIRA_TOKEN_CONFIG),
             access_policy="workspace",
@@ -140,6 +141,23 @@ def test_the_server_does_not_preview_a_device_configuration_or_a_device_source(t
 
     assert (new.status_code, new.json()["detail"]) == (409, "device_preview_unavailable")
     assert (existing.status_code, existing.json()["detail"]) == (409, "device_preview_unavailable")
+
+
+def test_the_server_does_not_browse_a_device_sources_repository(tmp_path, database) -> None:
+    _source(
+        database,
+        "src-device-repo",
+        executor="device",
+        source_type="github_repo",
+        config={"repo_url": "https://github.example.com/acme/handbook", "connection_mode": "cloud_pull"},
+    )
+
+    with TestClient(_app(tmp_path, database)) as client:
+        answer = client.post(
+            "/api/v1/genes/github_repo/browse-tree", json={"source_id": "src-device-repo", "config": {}, "limit": 50}
+        )
+
+    assert (answer.status_code, answer.json()["detail"]) == (409, "device_preview_unavailable")
 
 
 def test_the_server_never_runs_a_device_source_without_its_devices_acquisition(database) -> None:

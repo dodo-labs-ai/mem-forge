@@ -2077,7 +2077,8 @@ def upgrade_command(ctx):
     version = str((status.get("server") or {}).get("version") or "")
     if not version:
         raise click.ClickException("The server did not name its MemForge version.")
-    if version == installed_version():
+    previous_version = installed_version()
+    if version == previous_version:
         _emit_tool_payload(ctx, {"ok": True, "version": version, "upgraded": False})
         return
     executable = _current_cli_executable()
@@ -2107,6 +2108,8 @@ def upgrade_command(ctx):
         after_last_seen_at=(_reported_device(status, device.device_id) or {}).get("last_seen_at"),
     )
     if daemon_status.get("fresh") is not True or daemon_status.get("version") != version:
+        restore_command = method.install_command(previous_version)
+        reinstalled = subprocess.run(restore_command, check=False)
         try:
             replacement.rollback()
         except DaemonServiceError as rollback_error:
@@ -2114,8 +2117,15 @@ def upgrade_command(ctx):
                 f"The daemon did not report MemForge {version}, and its service could not be restored: "
                 f"{rollback_error}"
             ) from rollback_error
+        if reinstalled.returncode != 0:
+            raise click.ClickException(
+                f"The daemon did not report MemForge {version} after the restart, and `{' '.join(restore_command)}` "
+                f"failed with exit status {reinstalled.returncode}, so MemForge {version} stays installed. "
+                "Run `memforge daemon logs`."
+            )
         raise click.ClickException(
-            f"The daemon did not report MemForge {version} after the restart. Run `memforge daemon logs`."
+            f"The daemon did not report MemForge {version} after the restart, so MemForge {previous_version} "
+            "was installed again and its service restored. Run `memforge daemon logs`."
         )
     try:
         replacement.commit()

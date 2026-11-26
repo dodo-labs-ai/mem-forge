@@ -140,4 +140,33 @@ def test_upgrade_restores_the_service_when_the_daemon_does_not_report_the_new_ve
 
     assert result.exit_code == 1
     assert f"did not report MemForge {SERVER_VERSION}" in result.output
+    assert f"MemForge {installed_version()} was installed again" in result.output
+    assert installs == [
+        ["pipx", "install", "--force", f"memforge-ai=={SERVER_VERSION}"],
+        ["pipx", "install", "--force", f"memforge-ai=={installed_version()}"],
+    ]
+    assert manager.replacements[0].rolled_back is True
+
+
+def test_upgrade_names_the_installed_version_when_the_previous_one_cannot_be_installed_again(
+    upgrade, monkeypatch
+) -> None:
+    run, manager, installs = upgrade
+    _Server.reported_version = "0.0.1"
+    monkeypatch.setattr(
+        main,
+        "_wait_for_local_agent_online",
+        lambda client, **kwargs: {**client.get_local_agent_status()["devices"][0], "fresh": True},
+    )
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda command, check=False: installs.append(command)
+        or subprocess.CompletedProcess(command, 0 if len(installs) == 1 else 1),
+    )
+
+    result = run()
+
+    assert result.exit_code == 1
+    assert f"MemForge {SERVER_VERSION} stays installed" in result.output
     assert manager.replacements[0].rolled_back is True

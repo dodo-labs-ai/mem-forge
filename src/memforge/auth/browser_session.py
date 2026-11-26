@@ -130,6 +130,8 @@ class BrowserSessionProvider:
     source_type: str
     label: str
     cookie_config_key: str
+    principal_changed_code: str
+    """The code the server answers when an uploaded session belongs to another account than the one it holds."""
     canonical_origin: Callable[[str], str]
     service_factory: Callable[[BrowserSessionStore], BrowserSessionService]
     uses_browser_session: Callable[[dict], bool]

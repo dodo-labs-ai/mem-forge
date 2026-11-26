@@ -53,6 +53,37 @@ def test_setting_a_sources_credentials_again_replaces_them_and_deleting_forgets_
     assert keyring.values == {}
 
 
+def test_an_origins_session_is_deleted_with_the_last_held_source_that_signs_in_with_it(tmp_path) -> None:
+    keyring = FakeKeyring()
+    store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
+    store.hold_session("src-issues", "jira", "https://jira.example.test", "SESSION=one")
+    store.hold_session("src-bugs", "jira", "https://jira.example.test", "SESSION=two")
+
+    store.delete("src-issues")
+    assert store.session("jira", "https://jira.example.test") == "SESSION=two"
+
+    store.delete("src-bugs")
+    assert store.session("jira", "https://jira.example.test") is None
+    assert keyring.values == {}
+    assert "SESSION" not in (tmp_path / "device-credentials.json").read_text(encoding="utf-8")
+
+
+def test_concurrent_changes_to_the_index_each_keep_their_source(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    keyring = FakeKeyring()
+    path = tmp_path / "device-credentials.json"
+    source_ids = [f"src-{number}" for number in range(24)]
+
+    def hold(source_id: str) -> None:
+        DeviceCredentialStore(path, keyring_store=keyring).set(source_id, {"token": source_id})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(hold, source_ids))
+
+    assert DeviceCredentialStore(path, keyring_store=keyring).source_ids() == frozenset(source_ids)
+
+
 def test_a_secret_missing_from_the_keyring_is_an_error(tmp_path) -> None:
     keyring = FakeKeyring()
     store = DeviceCredentialStore(tmp_path / "device-credentials.json", keyring_store=keyring)
@@ -105,8 +136,7 @@ def _store() -> DeviceCredentialStore:
 def test_the_device_gene_runs_with_the_sources_secrets_and_its_origins_browser_session(keyring) -> None:
     store = _store()
     store.set("src-token", {"pat": "device-pat"})
-    store.set("src-cookie", {})
-    store.set_session("jira", JIRA_ORIGIN, "SESSION=device")
+    store.hold_session("src-cookie", "jira", JIRA_ORIGIN, "SESSION=device")
 
     assert store.gene_config("src-token", "jira", JIRA_TOKEN_CONFIG) == {**JIRA_TOKEN_CONFIG, "pat": "device-pat"}
     assert store.gene_config("src-cookie", "jira", JIRA_COOKIE_CONFIG) == {

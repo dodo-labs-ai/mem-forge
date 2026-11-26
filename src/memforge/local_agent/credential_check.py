@@ -7,7 +7,8 @@ server builds the job from the Source and hands it to the requester's daemon:
   captured from the user's browser, through the type's browser-session
   provider, which also checks it against the provider. A **device Source**
   keeps the session in the device's keyring for the session's origin, and the
-  device then holds the Source, so its device report names it. A **server
+  device then holds the Source with that session, so its device report names
+  it. A **server
   Source** has the session stored on the server, which serves server Sources
   only.
 - A device Source that signs in with a token has the token the device holds
@@ -52,7 +53,7 @@ SessionUploader = Callable[[str, CapturedBrowserSession], Mapping[str, Any]]
 """Stores a server Source's captured session on the server: ``(provider, session) -> answer``.
 
 The server answers a session of another account than the one it holds with
-the code ``<provider>_principal_changed``.
+the provider's ``principal_changed_code``.
 """
 
 
@@ -116,12 +117,10 @@ async def run_credential_check(
                 str(config.get("base_url") or ""), browser=browser, tls_config=config
             )
             if on_device:
-                credentials.set_session(provider.provider, captured.origin, captured.cookie_header)
-                if credentials.get(source_id) is None:
-                    credentials.set(source_id, {})
+                credentials.hold_session(source_id, provider.provider, captured.origin, captured.cookie_header)
             else:
                 uploaded = upload_session(provider.provider, captured)
-                if uploaded.get("code") == f"{provider.provider}_{PRINCIPAL_CHANGED_ERROR}":
+                if uploaded.get("code") == provider.principal_changed_code:
                     principal = uploaded.get("detail") if isinstance(uploaded.get("detail"), Mapping) else {}
                     return failed(
                         PRINCIPAL_CHANGED_ERROR,

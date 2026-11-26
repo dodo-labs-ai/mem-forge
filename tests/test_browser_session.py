@@ -38,6 +38,7 @@ def _demo_provider() -> bs.BrowserSessionProvider:
         source_type="demo",
         label="Demo",
         cookie_config_key="demo_cookie",
+        principal_changed_code="demo_principal_changed",
         canonical_origin=lambda url: url.rstrip("/"),
         service_factory=_FakeService,
         uses_browser_session=lambda cfg: str(cfg.get("auth_mode") or "browser_cookie") == "browser_cookie",

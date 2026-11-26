@@ -793,6 +793,14 @@ def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _source_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(row)
+    source["config"] = json.loads(source["config"])
+    source["project_binding"] = json.loads(source["project_binding"]) if source.get("project_binding") else None
+    source["sync_schedule"] = _source_schedule_from_row(source)
+    return source
+
+
 def _source_sync_run_from_row(
     row: Mapping[str, Any],
     *,
@@ -7307,7 +7315,14 @@ class Database:
         ]
 
     async def list_device_sources(self, execution_owner_user_id: str) -> list[dict[str, Any]]:
-        """The Sources whose acquisition runs on a device of this execution owner, by id."""
+        """The Sources whose acquisition runs on a device of this execution owner, by id.
+
+        The list covers every Source the owner's daemon serves, which is the
+        scope the lease selects jobs from. A device deletes the credentials of
+        each Source its report names that is missing here, so a store that
+        serves one daemon across several workspaces returns the owner's device
+        Sources of all of them.
+        """
 
         async with self.db.execute(
             """SELECT * FROM sources
@@ -7316,14 +7331,7 @@ class Database:
             (execution_owner_user_id,),
         ) as cursor:
             rows = await cursor.fetchall()
-        sources: list[dict[str, Any]] = []
-        for row in rows:
-            source = dict(row)
-            source["config"] = json.loads(source["config"])
-            source["project_binding"] = json.loads(source["project_binding"]) if source.get("project_binding") else None
-            source["sync_schedule"] = _source_schedule_from_row(source)
-            sources.append(source)
-        return sources
+        return [_source_from_row(row) for row in rows]
 
     async def enqueue_due_local_agent_jobs(
         self,
@@ -16818,13 +16826,7 @@ class Database:
     async def get_source(self, source_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)) as cursor:
             row = await cursor.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["config"] = json.loads(d["config"])
-            d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
-            d["sync_schedule"] = _source_schedule_from_row(d)
-            return d
+            return _source_from_row(row) if row else None
 
     async def create_source_access_transition(
         self,
@@ -17345,11 +17347,7 @@ class Database:
             "SELECT * FROM sources WHERE status <> 'retired' ORDER BY created_at"
         ) as cursor:
             async for row in cursor:
-                d = dict(row)
-                d["config"] = json.loads(d["config"])
-                d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
-                d["sync_schedule"] = _source_schedule_from_row(d)
-                results.append(d)
+                results.append(_source_from_row(row))
         return results
 
     async def list_searchable_source_ids_for_user(

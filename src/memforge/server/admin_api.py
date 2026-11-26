@@ -7219,7 +7219,9 @@ def create_admin_app(
         The tree is read with the Source's own client and TLS. A tree GitHub
         truncates is walked folder by folder within
         ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
-        400, and its paths are typed instead.
+        400, and its paths are typed instead. A device Source answers 409
+        ``device_preview_unavailable``, because the server never reaches a
+        device Source's provider.
         """
         gene = None
         try:
@@ -7232,6 +7234,8 @@ def create_admin_app(
                 _require_local_agent_connection_management(request, existing)
                 if existing["type"] != "github_repo":
                     raise ValueError("Repository browse source type does not match the existing source")
+                if source_runs_on_device(existing):
+                    raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
                 stored_config = decrypt_source_config_for_runtime(
                     existing["config"],
                     secret_fields=_source_secret_fields("github_repo"),
@@ -10946,7 +10950,8 @@ def create_admin_app(
                 raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
             payload = await local_agent_sync_job_payload(db, source, payload)
         elif req.operation == CREDENTIAL_CHECK_OPERATION:
-            source, owner = await _credential_check_source(request, db, source_id, req.source_type)
+            source = await _credential_check_source(request, db, source_id, req.source_type)
+            owner = requester
             payload = credential_check_job_payload(source)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
@@ -10997,8 +11002,8 @@ def create_admin_app(
 
     async def _credential_check_source(
         request: Request, db: Database, source_id: str, source_type: str
-    ) -> tuple[dict[str, Any], str]:
-        """The Source a ``credential_check`` job checks, and the user whose device runs it.
+    ) -> dict[str, Any]:
+        """The Source a ``credential_check`` job checks; the requester's own device runs the job.
 
         A device Source's credential lives on its execution owner's device, so
         only that owner checks it. A server Source's credential is checked on
@@ -11023,7 +11028,7 @@ def create_admin_app(
                 raise HTTPException(status_code=400, detail="credential_check_requires_browser_session")
             if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
                 raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
-        return source, requester
+        return source
 
     @local_agent_router.post("/jobs/lease")
     async def lease_local_agent_jobs(

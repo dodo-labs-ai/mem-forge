@@ -430,12 +430,11 @@ register_provider(
         source_type="jira",
         label="Jira",
         cookie_config_key="jira_cookie",
+        principal_changed_code=JIRA_PRINCIPAL_CHANGED_CODE,
         canonical_origin=canonical_jira_origin,
         service_factory=lambda db: JiraAuthSessionService(db),
         uses_browser_session=lambda config: jira_auth_mode(config) == JIRA_AUTH_MODE_COOKIE,
         capture_session=_capture_jira_session,
-        validate_session=lambda origin, cookie_header, tls_config: validate_jira_cookie_session(
-            origin, cookie_header, tls_config
-        ),
+        validate_session=validate_jira_cookie_session,
     )
 )

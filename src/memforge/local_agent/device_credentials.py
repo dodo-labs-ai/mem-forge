@@ -10,21 +10,34 @@ configuration signs in with a browser session, is held with no fields, which
 marks this device as the one that acquires it.
 
 A browser session lives in the keyring per provider and origin, because one
-sign-in serves every Source of that site. The device's Gene reads a Source's
-secrets and session from here (:meth:`DeviceCredentialStore.gene_config`),
-and the session is checked against the provider before each run
-(:func:`check_browser_session`), on the device, never on the server.
+sign-in serves every Source of that site. The index names the session each
+Source signs in with, so the session is deleted together with the last Source
+that uses it. The device's Gene reads a Source's secrets and session from
+here (:meth:`DeviceCredentialStore.gene_config`), and the session is checked
+against the provider before each run (:func:`check_browser_session`), on the
+device, never on the server.
+
+The daemon's lease loop, its ``credential_check`` jobs and the ``memforge
+source credentials set`` command change the index from separate threads and
+processes, so each change holds an exclusive lock on a file beside it.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from memforge.local_agent.service import DaemonServicePaths, SecretStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the daemon service runs on macOS and Linux
+    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "DEVICE_CREDENTIALS_KEYRING_SERVICE",
@@ -63,6 +76,20 @@ class DeviceCredentialsMissing(RuntimeError):
     retryable = False
 
 
+@dataclass(frozen=True, slots=True)
+class _HeldSource:
+    """What the index records for one Source: its secret fields and the browser session it signs in with."""
+
+    fields: tuple[str, ...] = ()
+    session: str | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"fields": sorted(self.fields)}
+        if self.session is not None:
+            payload["session"] = self.session
+        return payload
+
+
 class DeviceCredentialStore:
     """The device's per-Source provider credentials: values in the keyring, their names in the index."""
 
@@ -82,7 +109,26 @@ class DeviceCredentialStore:
     def _account(source_id: str, field: str) -> str:
         return f"{source_id}/{field}"
 
-    def _index(self) -> dict[str, list[str]]:
+    @staticmethod
+    def _session_account(provider: str, origin: str) -> str:
+        return f"{provider}:{origin}"
+
+    @contextmanager
+    def _changing(self) -> Iterator[dict[str, _HeldSource]]:
+        """The index, held exclusively while the caller changes it, then written back."""
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(self.path.with_name(f".{self.path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            index = self._index()
+            yield index
+            self._write_index(index)
+        finally:
+            os.close(handle)
+
+    def _index(self) -> dict[str, _HeldSource]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -92,12 +138,20 @@ class DeviceCredentialStore:
         sources = payload.get("sources") if isinstance(payload, dict) else None
         if payload.get("version") != DEVICE_CREDENTIALS_VERSION or not isinstance(sources, dict):
             raise ValueError(f"Invalid device credential index: {self.path}")
-        return {str(source_id): [str(field) for field in fields] for source_id, fields in sources.items()}
+        index: dict[str, _HeldSource] = {}
+        for source_id, held in sources.items():
+            if not isinstance(held, dict) or not isinstance(held.get("fields"), list):
+                raise ValueError(f"Invalid device credential index: {self.path}")
+            session = held.get("session")
+            index[str(source_id)] = _HeldSource(
+                fields=tuple(str(field) for field in held["fields"]),
+                session=str(session) if session is not None else None,
+            )
+        return index
 
-    def _write_index(self, index: Mapping[str, list[str]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _write_index(self, index: Mapping[str, _HeldSource]) -> None:
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        body = {"version": DEVICE_CREDENTIALS_VERSION, "sources": {key: sorted(index[key]) for key in sorted(index)}}
+        body = {"version": DEVICE_CREDENTIALS_VERSION, "sources": {key: index[key].to_payload() for key in sorted(index)}}
         try:
             temporary.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             temporary.chmod(0o600)
@@ -111,24 +165,35 @@ class DeviceCredentialStore:
         return frozenset(self._index())
 
     def set(self, source_id: str, secrets: Mapping[str, str]) -> None:
-        """Hold exactly ``secrets`` for the Source, replacing what it held before."""
+        """Hold exactly ``secrets`` for the Source, replacing what it held before, its session included."""
 
-        index = self._index()
-        for field, value in secrets.items():
-            self.keyring.set_password(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field), value)
-        for field in set(index.get(source_id, ())) - set(secrets):
-            self._delete_secret(source_id, field)
-        index[source_id] = sorted(secrets)
-        self._write_index(index)
+        with self._changing() as index:
+            previous = index.get(source_id, _HeldSource())
+            for field, value in secrets.items():
+                self.keyring.set_password(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field), value)
+            for field in set(previous.fields) - set(secrets):
+                self._delete_secret(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field))
+            index[source_id] = _HeldSource(fields=tuple(secrets))
+            self._release_unused_session(index, previous.session)
+
+    def hold_session(self, source_id: str, provider: str, origin: str, cookie_header: str) -> None:
+        """Keep the provider's session for ``origin`` and record that the Source signs in with it."""
+
+        session = self._session_account(provider, origin)
+        with self._changing() as index:
+            previous = index.get(source_id, _HeldSource())
+            self.keyring.set_password(DEVICE_SESSIONS_KEYRING_SERVICE, session, cookie_header)
+            index[source_id] = _HeldSource(fields=previous.fields, session=session)
+            self._release_unused_session(index, previous.session)
 
     def get(self, source_id: str) -> dict[str, str] | None:
         """The Source's secrets by field, or ``None`` when this device holds none for it."""
 
-        fields = self._index().get(source_id)
-        if fields is None:
+        held = self._index().get(source_id)
+        if held is None:
             return None
         secrets: dict[str, str] = {}
-        for field in fields:
+        for field in held.fields:
             value = self.keyring.get_password(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field))
             if value is None:
                 raise ValueError(f"The keyring no longer holds {field} of Source {source_id}")
@@ -136,16 +201,21 @@ class DeviceCredentialStore:
         return secrets
 
     def delete(self, source_id: str) -> None:
-        """Forget the Source's credentials on this device."""
+        """Forget the Source's credentials on this device, and its session once no held Source uses it."""
 
-        index = self._index()
-        for field in index.pop(source_id, ()):
-            self._delete_secret(source_id, field)
-        self._write_index(index)
+        with self._changing() as index:
+            held = index.pop(source_id, _HeldSource())
+            for field in held.fields:
+                self._delete_secret(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field))
+            self._release_unused_session(index, held.session)
 
-    def _delete_secret(self, source_id: str, field: str) -> None:
+    def _release_unused_session(self, index: Mapping[str, _HeldSource], session: str | None) -> None:
+        if session is not None and all(held.session != session for held in index.values()):
+            self._delete_secret(DEVICE_SESSIONS_KEYRING_SERVICE, session)
+
+    def _delete_secret(self, service: str, account: str) -> None:
         try:
-            self.keyring.delete_password(DEVICE_CREDENTIALS_KEYRING_SERVICE, self._account(source_id, field))
+            self.keyring.delete_password(service, account)
         except Exception as exc:
             if exc.__class__.__name__ != "PasswordDeleteError":
                 raise
@@ -153,10 +223,7 @@ class DeviceCredentialStore:
     def session(self, provider: str, origin: str) -> str | None:
         """The browser session this device holds for the provider's origin."""
 
-        return self.keyring.get_password(DEVICE_SESSIONS_KEYRING_SERVICE, f"{provider}:{origin}")
-
-    def set_session(self, provider: str, origin: str, cookie_header: str) -> None:
-        self.keyring.set_password(DEVICE_SESSIONS_KEYRING_SERVICE, f"{provider}:{origin}", cookie_header)
+        return self.keyring.get_password(DEVICE_SESSIONS_KEYRING_SERVICE, self._session_account(provider, origin))
 
     def gene_config(self, source_id: str, source_type: str, config: Mapping[str, Any]) -> dict[str, Any]:
         """The configuration the device runs the Source's Gene with: the job's, plus what this device holds.
