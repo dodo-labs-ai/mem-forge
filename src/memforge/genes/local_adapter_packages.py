@@ -85,40 +85,6 @@ def read_package_body(gene: Any, item: ContentItem, *, source_label: str) -> byt
     return Path(str(package_path)).read_bytes()
 
 
-def source_artifacts_from_package(package: dict[str, Any]) -> tuple[RawSourceArtifact, ...]:
-    """Reconstruct validated descriptors for service-owned binary inputs."""
-
-    raw_artifacts = package.get("source_artifacts")
-    if raw_artifacts is None:
-        return ()
-    if not isinstance(raw_artifacts, list):
-        raise SourceArtifactContractError("local source package Artifacts must be a list")
-    artifacts: list[RawSourceArtifact] = []
-    for raw in raw_artifacts:
-        if not isinstance(raw, dict):
-            raise SourceArtifactContractError("local source package Artifact is invalid")
-        uri = str(raw.get("uri") or "").strip()
-        sha256 = str(raw.get("sha256") or "").strip()
-        if not uri or len(sha256) != 64:
-            raise SourceArtifactContractError("local source package Artifact bytes are not attested")
-        artifacts.append(
-            RawSourceArtifact(
-                provider_key=str(raw.get("provider_key") or ""),
-                parent_observation_type=str(raw.get("parent_observation_type") or ""),
-                parent_provider_key=str(raw.get("parent_provider_key") or ""),
-                provider_revision=str(raw.get("provider_revision") or ""),
-                filename=str(raw.get("filename") or ""),
-                media_type=str(raw.get("media_type") or ""),
-                declared_size_bytes=raw.get("size_bytes"),
-                locator={
-                    "input_uri": uri,
-                    "content_sha256": sha256,
-                },
-            )
-        )
-    return tuple(artifacts)
-
-
 @asynccontextmanager
 async def open_packaged_source_artifact(gene: Any, artifact: RawSourceArtifact):
     """Stream one service-owned local input through the shared Artifact path."""

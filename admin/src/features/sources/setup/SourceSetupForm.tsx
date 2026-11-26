@@ -29,7 +29,6 @@ import { checkSetupKind } from "./model/checkSetup";
 import {
   comparisonString,
   defaultValues,
-  effectiveValue,
   formSchema,
   missingRequired,
   reconcileHiddenChoices,
@@ -463,19 +462,10 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   /**
    * config-check's facts, which state the whole configuration and so show once: on the
    * last content group, the Check setup step, or on the last group when the type has no
-   * content group; and on an edit page the fixed execution choice of this group.
+   * content group.
    */
   function groupFacts(step: SetupStep): Property[] {
-    const facts: Property[] =
-      step.key === factsGroup ? (configCheck.result?.facts ?? []).map((fact) => ({ label: fact.label, value: fact.value })) : [];
-    if (!source) return facts;
-    for (const field of schema.fields) {
-      if (!field.fixed_after_create || field.group !== step.key) continue;
-      const value = comparisonString(effectiveValue(field, state));
-      const label = field.choices.find((choice) => comparisonString(choice.value) === value)?.label ?? String(effectiveValue(field, state) ?? "");
-      facts.push({ label: field.label, value: label, hint: "Fixed when the source was created." });
-    }
-    return facts;
+    return step.key === factsGroup ? (configCheck.result?.facts ?? []).map((fact) => ({ label: fact.label, value: fact.value })) : [];
   }
 
   return (

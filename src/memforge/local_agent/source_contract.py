@@ -60,12 +60,6 @@ A collection under this contract or a later one does not reuse a retained file
 package without a source time, so the agent uploads that file once more with
 its time (design ``source-sync-to-memory.md`` 0.9).
 """
-LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION = 3
-"""The first contract under which an agent confirms by identifier what its query manifest leaves out.
-
-The manifest response then names the items to confirm, and the agent posts
-its answers before it asks for processing.
-"""
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
 
 
@@ -116,11 +110,12 @@ _TEAMS_CONVERSATION_ID_RE = re.compile(r"^19:[^\s@]+@[^\s@]+$")
 def jira_config_with_auth_mode(config: Mapping[str, Any]) -> dict[str, Any] | None:
     """A stored Jira configuration that names its authentication method, or ``None`` when it already does.
 
-    The named method is the one a configuration without it authenticates
-    with: local sync uses the shared browser session; otherwise a configuration
-    with no ``auth_mode`` key uses its token when it holds one (``pat`` or
-    ``pat_encrypted``), and a blank ``auth_mode`` or no token means the
-    browser session.
+    The named method is the one a configuration without it authenticated
+    with when it was stored: Jira's local agent sync (``sync_mode``
+    ``local_agent``) used the shared browser session; otherwise a
+    configuration with no ``auth_mode`` key uses its token when it holds one
+    (``pat`` or ``pat_encrypted``), and a blank ``auth_mode`` or no token
+    means the browser session.
     """
 
     configured = config.get("auth_mode")
@@ -134,10 +129,6 @@ def jira_config_with_auth_mode(config: Mapping[str, Any]) -> dict[str, Any] | No
 
 class SourceSyncRunReceiptError(ValueError):
     """Raised when a successful local sync cannot identify its durable server run."""
-
-
-class GitHubProviderConnectionError(ConnectionError):
-    """Raised when GitHub CLI cannot reach the configured GitHub host."""
 
 
 def source_processing_receipt(sync_result: object) -> dict[str, str]:
@@ -346,14 +337,6 @@ def local_package_requires_source_time(
     return adapter.package_source_time
 
 
-def local_package_confirms_absence(package_contract_version: int | None) -> bool:
-    """Whether an agent collecting under this package contract confirms unlisted items by identifier."""
-
-    return package_contract_version is not None and (
-        package_contract_version >= LOCAL_PACKAGE_CONFIRMATION_CONTRACT_VERSION
-    )
-
-
 def _source_config(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
@@ -408,14 +391,12 @@ def source_execution_descriptor(source: Mapping[str, Any]) -> dict[str, Any]:
     by the device executor (ADR 0058) or a type's local-agent operation, and
     ``server`` otherwise.
     """
-    source_type = str(source.get("type") or "")
     operation = source_collection_operation(source)
-    descriptor = source_type_descriptor(source_type.strip().lower())
-    collection = descriptor.local_agent if descriptor is not None else None
     return {
         "kind": "local_agent" if operation is not None else "server",
         "operation": operation,
-        "immutable_config_fields": list(collection.immutable_execution_fields if collection else ()),
+        # Deprecated (admin-ui-v1): V1 setup reads it; always empty, removed with V1.
+        "immutable_config_fields": [],
     }
 
 
@@ -484,13 +465,8 @@ LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD = "excluded_scopes"
 
 Each entry is ``{"scope_key": ..., "config": ...}``: the scope's fingerprint,
 which the device's manifest names its listing by, and the job configuration
-that lists that scope. A device collector removes both transition fields
-before it configures its Gene.
+that lists that scope.
 """
-LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS = frozenset(
-    {LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD, LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD}
-)
-"""The job payload fields about the open scope transition, which never reach a device Gene's configuration."""
 
 
 async def local_agent_sync_job_payload(
@@ -502,12 +478,9 @@ async def local_agent_sync_job_payload(
 
     Every place that enqueues a local-agent sync job builds its payload here:
     the saved collection configuration, the request's control fields, and,
-    while a document scope transition is open, that transition. Once the
-    transition's previous run left no listed Document that is not yet a member,
-    the next run can complete it, so the payload also carries the configuration
-    of every distinct scope the transition excludes, for the device to list
-    (:data:`LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD`). Only a query listing
-    needs them; an existence listing completes from the new listing alone.
+    while a document scope transition is open, that transition. A package
+    snapshot is an existence listing, so the run completes a transition from
+    the new listing alone.
     """
 
     from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
@@ -534,72 +507,7 @@ async def local_agent_sync_job_payload(
         "previous_scope": dict(transition.previous_scope),
         "target_scope": dict(transition.target_scope),
     }
-    excluded_scopes = await _excluded_scope_job_configs(db, source_type, config, transition)
-    if excluded_scopes:
-        payload[LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD] = excluded_scopes
     return payload
-
-
-async def _excluded_scope_job_configs(
-    db: Any,
-    source_type: str,
-    config: Mapping[str, Any],
-    transition: Any,
-) -> list[dict[str, Any]]:
-    """The job configuration of each scope the transition excludes, once its next run can complete it.
-
-    The next run can complete it when the transition's latest run reached the
-    step that lists the excluded scopes (``excluded_scopes_due``), or when
-    that run, bound to a device snapshot, listed only Documents that are
-    already members. Before any such run, and while a listed Document waits
-    for anything but the removals completion makes, none is carried.
-    """
-
-    from memforge.genes.family import CollectionFamilyKind
-    from memforge.models import ScopeListingKind
-    from memforge.source_projection_config import (
-        ExcludedScopesUnavailable,
-        excluded_projection_scopes,
-        excluded_scope_config,
-        projection_scope_fingerprint,
-    )
-
-    descriptor = source_type_descriptor(source_type)
-    if descriptor is None or descriptor.local_agent is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
-        return []
-    if descriptor.gene_class().snapshot_listing_kind() is not ScopeListingKind.QUERY:
-        return []
-    if not transition.excluded_scopes_due and not await _previous_run_left_none_waiting(db, transition):
-        return []
-    try:
-        scopes = await excluded_projection_scopes(db, transition, source_type=source_type, config=config)
-    except ExcludedScopesUnavailable:
-        return []
-    return [
-        {
-            "scope_key": projection_scope_fingerprint(scope),
-            "config": local_agent_job_config(source_type, excluded_scope_config(source_type, config, scope)),
-        }
-        for scope in scopes
-    ]
-
-
-async def _previous_run_left_none_waiting(db: Any, transition: Any) -> bool:
-    """Whether the transition's latest run, bound to a device snapshot, listed only Documents that are members."""
-
-    if transition.run_id is None:
-        return False
-    run = await db.get_source_sync_run(transition.run_id)
-    if run is None or run.input_snapshot_id is None:
-        return False
-    listed = snapshot_document_ids(
-        await db.list_source_sync_inputs(
-            source_id=transition.source_id,
-            workspace_id=run.workspace_id,
-            input_snapshot_id=run.input_snapshot_id,
-        )
-    )
-    return not listed - set(await db.list_projection_scope_transition_member_doc_ids(transition.id))
 
 
 def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
@@ -607,8 +515,8 @@ def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
 
     It is the configuration the job hands the device: the fields of the
     type's local-agent collection for a Source that collects through it (a
-    conversation Source, or a Jira, GitHub repository or local Markdown
-    Source on its package path), and otherwise, for a document Source the
+    conversation Source, or a local Markdown Source on its package path), and
+    otherwise, for a document Source the
     device acquires with its type's own Gene (ADR 0058), every field but the
     secrets.
     """

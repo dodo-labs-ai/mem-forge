@@ -258,8 +258,7 @@ def test_config_check_type_mismatch_is_refused(client):
         # A new Source reads the declared default, a personal access token.
         ({}, {}, [{"key": "pat", "message": "Jira Personal Access Token is required"}]),
         ({"pat": "jira-pat-secret"}, {}, []),
-        # Local sync offers only a browser session.
-        ({"sync_mode": "local_agent"}, {"auth_mode": "browser_cookie"}, []),
+        ({"auth_mode": "browser_cookie"}, {}, []),
     ],
 )
 def test_jira_config_check_reports_the_auth_mode_save_stores(client, submitted, derived, issues):

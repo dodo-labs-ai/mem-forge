@@ -779,28 +779,6 @@ def test_limited_jira_changelog_carries_unreturned_prior_histories() -> None:
     assert limited.deltas[0].removed_observation_ids == ()
 
 
-def test_incomplete_local_agent_jira_changelog_forces_partial_coverage() -> None:
-    item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
-    raw, normalized = _inputs(
-        item,
-        {
-            "package_kind": "jira_document",
-            "raw_payload": _jira_payload(histories=[{"id": "1"}], changelog_total=2),
-        },
-    )
-
-    projection = project_source_item(
-        source_id="src-j",
-        source_type="jira",
-        run_id="run-j-local-changelog-partial",
-        item=item,
-        raw=raw,
-        normalized=normalized,
-    )
-
-    assert projection.coverage is ProjectionCoverage.PARTIAL_PROJECTION
-
-
 def test_jira_projection_types_changelog_semantics_for_generic_quality_policy() -> None:
     item = _item(item_id="jira-PAY-12", extra={"issue_key": "PAY-12"})
     raw, normalized = _inputs(

@@ -10,11 +10,6 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-from memforge.local_agent.snapshot_manifest import (
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    SnapshotConfirmationAnswer,
-)
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 import memforge.pipeline.collection_family as collection_family_module
 from memforge.pipeline.collection_family import SnapshotBinding
@@ -174,27 +169,10 @@ class Workspace:
         force_full_sync: bool = False,
         retry: FailedItemRetry = FailedItemRetry.ALL,
         manifest: set[int] | None = None,
-        answers: dict[int, SnapshotConfirmationAnswer] | None = None,
-        confirmation_failure: str | None = None,
-        excluded_listings: tuple[ExcludedScopeListing, ...] = (),
         extractor=None,
         excluded_scope_gene=None,
     ):
-        """Sync as a person requests it; ``manifest`` binds the run to a device snapshot listing those issues.
-
-        ``answers`` are the device's answers for the issues the manifest left
-        out; ``confirmation_failure`` is the cause it gave instead.
-        ``excluded_listings`` are what the device listed in the excluded scopes.
-        """
-        confirmations = tuple(
-            SnapshotConfirmation(
-                f"jira-{number}",
-                str(FIRST_ISSUE_ID + number),
-                SnapshotConfirmationAnswer.FAILED if confirmation_failure else answer,
-                confirmation_failure,
-            )
-            for number, answer in sorted((answers or {}).items())
-        )
+        """Sync as a person requests it; ``manifest`` binds the run to a device snapshot listing those issues."""
         return await self.orchestrator(extractor).sync_gene(
             gene=gene,
             source_name="Jira",
@@ -202,9 +180,7 @@ class Workspace:
             force_full_sync=force_full_sync,
             failed_item_retry=retry,
             input_snapshot=(
-                SnapshotBinding(
-                    "snapshot-1", frozenset(f"jira-{number}" for number in manifest), confirmations, excluded_listings
-                )
+                SnapshotBinding("snapshot-1", frozenset(f"jira-{number}" for number in manifest))
                 if manifest is not None
                 else None
             ),
@@ -462,15 +438,6 @@ class DeviceManifest(JiraProject):
         raise AssertionError("a device-collected Source is listed by its snapshot manifest")
 
 
-class DeviceJira(DeviceManifest):
-    """Jira read through the local agent: its manifest is the query result, confirmed on the device."""
-
-    listing_kinds = frozenset({ScopeListingKind.QUERY})
-
-    async def confirm_absent(self, items):
-        raise AssertionError("only the device confirms a device query listing")
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("listing_kind", [ScopeListingKind.EXISTENCE, ScopeListingKind.QUERY])
 @pytest.mark.parametrize("stage", ["fetch", "normalize", "projection", "derivation", "lifecycle"])
@@ -617,126 +584,6 @@ async def test_a_device_existence_manifest_removes_unlisted_units_and_settles_un
     assert workspace.tombstoned() == ["jira-1"]
     assert await workspace.held() == {"jira-0"}
     assert await workspace.ledger() == {}
-    assert state.unlisted_present_count is None
-
-
-@pytest.mark.asyncio
-async def test_a_device_query_manifest_without_confirmations_removes_nothing(workspace):
-    device = DeviceJira(existing={0, 1})
-    assert (await workspace.sync(device, manifest={0, 1})).last_sync_status == "success"
-    workspace.engine.events.clear()
-
-    device.move_on(existing={0, 1}, in_query={0})
-    state = await workspace.sync(device, manifest={0})
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == []
-    assert await workspace.held() == {"jira-0", "jira-1"}
-    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
-    assert await workspace.recorded_skip_reason() == "absence_confirmation_missing"
-    assert state.unlisted_present_count is None
-
-
-@pytest.mark.asyncio
-async def test_a_device_query_manifest_listing_everything_needs_no_confirmation(workspace):
-    device = DeviceJira(existing={0, 1})
-    await workspace.sync(device, manifest={0, 1})
-
-    state = await workspace.sync(device, manifest={0, 1})
-
-    assert state.absence_check_skipped_reason is None
-
-
-ABSENT = SnapshotConfirmationAnswer.ABSENT
-EXISTS = SnapshotConfirmationAnswer.EXISTS
-HIDDEN = SnapshotConfirmationAnswer.HIDDEN
-
-
-@pytest.mark.asyncio
-async def test_a_device_query_manifest_removes_only_the_issues_the_device_answered_absent(workspace):
-    device = DeviceJira(existing={0, 1, 2, 3, 4})
-    await workspace.sync(device, manifest={0, 1, 2, 3, 4})
-    workspace.engine.events.clear()
-
-    # jira-1 was deleted, jira-2 left the JQL, jira-3 is hidden from the
-    # device's session, and the device was not asked about jira-4.
-    device.move_on(existing={0, 2, 3, 4}, in_query={0})
-    state = await workspace.sync(device, manifest={0}, answers={1: ABSENT, 2: EXISTS, 3: HIDDEN})
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == ["jira-1"]
-    assert await workspace.held() == {"jira-0", "jira-2", "jira-3", "jira-4"}
-    assert state.absence_check_skipped_reason is None
-    assert state.unlisted_present_count == 2
-    assert await workspace.recorded_unlisted_present_count() == 2
-
-
-@pytest.mark.asyncio
-async def test_a_device_answer_settles_or_keeps_the_failed_issues_its_manifest_left_out(workspace):
-    device = DeviceJira(existing={0, 1, 2, 3})
-    device.broken[2] = ("fetch", ValueError("issue unreadable"))
-    device.broken[3] = ("fetch", ValueError("issue unreadable"))
-    assert (await workspace.sync(device, manifest={0, 1, 2, 3})).last_sync_status == "partial"
-    assert set(await workspace.ledger()) == {"jira-2", "jira-3"}
-    workspace.engine.events.clear()
-
-    # jira-2 was deleted; jira-1 and jira-3 left the JQL but still exist.
-    device.move_on(existing={0, 1, 3}, in_query={0})
-    state = await workspace.sync(device, manifest={0}, answers={1: EXISTS, 2: ABSENT, 3: EXISTS})
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == []
-    assert set(await workspace.ledger()) == {"jira-3"}
-    assert "jira-3" not in device.fetched
-    assert state.unlisted_present_count == 1
-
-    # The issue that still exists is retried once a manifest lists it again.
-    device.broken.clear()
-    device.move_on(existing={0, 1, 3}, in_query={0, 3})
-    state = await workspace.sync(device, manifest={0, 3}, answers={1: EXISTS}, retry=SCHEDULED)
-
-    assert state.last_sync_status == "success"
-    assert "jira-3" in device.fetched
-    assert await workspace.ledger() == {}
-    assert await workspace.held() == {"jira-0", "jira-1", "jira-3"}
-
-
-@pytest.mark.asyncio
-async def test_a_confirm_set_too_large_to_issue_removes_nothing(workspace):
-    device = DeviceJira(existing={0, 1, 2})
-    await workspace.sync(device, manifest={0, 1, 2})
-    workspace.engine.events.clear()
-
-    # The server issued no confirmations because the set was larger than a
-    # manifest, so the device answered nothing.
-    device.move_on(existing={0}, in_query={0})
-    state = await workspace.sync(device, manifest={0}, answers={})
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == []
-    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
-    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
-    assert await workspace.recorded_skip_reason() == "absence_confirmation_missing"
-
-
-@pytest.mark.asyncio
-async def test_a_failed_device_confirmation_removes_and_settles_nothing(workspace):
-    device = DeviceJira(existing={0, 1, 2})
-    device.broken[2] = ("fetch", ValueError("issue unreadable"))
-    await workspace.sync(device, manifest={0, 1, 2})
-    workspace.engine.events.clear()
-
-    device.move_on(existing={0}, in_query={0})
-    state = await workspace.sync(
-        device, manifest={0}, answers={1: None, 2: None}, confirmation_failure="HTTP 401 from Jira"
-    )
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == []
-    assert await workspace.held() == {"jira-0", "jira-1"}
-    assert set(await workspace.ledger()) == {"jira-2"}
-    assert state.absence_check_skipped_reason == "absence_confirmation_failed"
-    assert await workspace.recorded_skip_reason() == "absence_confirmation_failed"
     assert state.unlisted_present_count is None
 
 

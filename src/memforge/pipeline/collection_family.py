@@ -32,11 +32,6 @@ from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
 from memforge.genes.recorded import AcquisitionRecordMismatch
-from memforge.local_agent.snapshot_manifest import (
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    SnapshotConfirmationAnswer,
-)
 from memforge.local_agent.source_contract import local_agent_sync_operation
 from memforge.models import (
     AbsenceAnswer,
@@ -63,7 +58,6 @@ from memforge.source_projection import (
 from memforge.source_projection_config import (
     ExcludedScopesUnavailable,
     excluded_projection_scopes,
-    projection_scope_fingerprint,
 )
 
 if TYPE_CHECKING:
@@ -105,17 +99,11 @@ class SnapshotBinding:
     """The complete input snapshot a device submitted for one document sync run.
 
     ``doc_ids`` are the Documents its manifest names: everything the scope
-    holds, as the device read it. ``confirmations`` are the unlisted items the
-    server asked the device to confirm with a query manifest, with the
-    device's answers; a manifest issued none, as from an agent that does not
-    confirm, has none. ``excluded_listings`` are what the device listed in
-    each scope an open transition excludes, when its job carried them.
+    holds, as the device read it.
     """
 
     snapshot_id: str
     doc_ids: frozenset[str]
-    confirmations: tuple[SnapshotConfirmation, ...] = ()
-    excluded_listings: tuple[ExcludedScopeListing, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,7 +377,6 @@ class DocumentFamily(CollectionFamily):
         super().__init__(gene, db=db, doc_store=doc_store, source_id=source_id)
         self.scope_listing: ScopeListing | None = None
         self._listing_skipped_reason: AbsenceCheckSkippedReason | None = None
-        self._unlisted_ledger_doc_ids: frozenset[str] = frozenset()
         self._excluded_scope_gene: ExcludedScopeGeneFactory | None = None
         self._transition: ProjectionScopeTransition | None = None
         self._transition_outstanding: str | None = None
@@ -443,25 +430,15 @@ class DocumentFamily(CollectionFamily):
 
         - Existence listing: every unlisted row is settled, whatever the retry
           rules say, including a row whose Document never became a Unit.
-        - Query listing read from the provider: an unlisted row is retried
-          through ``rediscover``, which settles it when the item is gone or has
-          left the query. A Source that cannot rediscover keeps it untried.
-        - Query listing from a device: an unlisted row the device answered
-          ``absent`` for is settled. Every other unlisted row is kept untried
-          until a manifest lists it again: one that still exists or is hidden
-          has left the query, and one without an answer is unproven.
+        - Query listing: an unlisted row is retried through ``rediscover``,
+          which settles it when the item is gone or has left the query. A
+          Source that cannot rediscover keeps it untried.
 
         A listed row, and every row of a run without a listing, follows the
         retry rules.
         """
 
-        listing = self.scope_listing
-        if listing is not None and listing.kind is ScopeListingKind.QUERY and self.input_snapshot is not None:
-            unlisted = frozenset(ledger_doc_ids) - listing.doc_ids
-            self._unlisted_ledger_doc_ids = unlisted
-            settled = unlisted & self._device_absent() if self._device_confirmation_failed() is None else frozenset()
-            return LedgerPartition(settled=settled, untried=unlisted - settled)
-        return listing_partition(listing, ledger_doc_ids, rediscovering=rediscovering)
+        return listing_partition(self.scope_listing, ledger_doc_ids, rediscovering=rediscovering)
 
     async def _requires_full_discovery(self) -> bool:
         if not gene_exports_pdf(self.gene):
@@ -542,9 +519,7 @@ class DocumentFamily(CollectionFamily):
         - Existence listing: every other unlisted Document is absent.
         - Query listing: each other unlisted Document is read by identifier,
           and only one the provider answers ``absent`` for is absent. A
-          confirmation that fails removes nothing and records why. A device
-          reads them itself and answers with its manifest
-          (:meth:`_device_absence`).
+          confirmation that fails removes nothing and records why.
         """
 
         if reprocessing:
@@ -567,8 +542,6 @@ class DocumentFamily(CollectionFamily):
         unlisted -= held
         if listing.kind is ScopeListingKind.EXISTENCE:
             return AbsenceOutcome(removals=_absent(unlisted, evidence="scope listing"))
-        if self.input_snapshot is not None:
-            return self._device_absence(unlisted)
         if not unlisted:
             return AbsenceOutcome()
         try:
@@ -584,82 +557,6 @@ class DocumentFamily(CollectionFamily):
         return AbsenceOutcome(
             removals=_absent(absent, evidence="scope listing"),
             unlisted_present_count=len(unlisted) - len(absent),
-        )
-
-    def _device_absence(self, unlisted: set[str]) -> AbsenceOutcome:
-        """What a device's answers to its query manifest show absent.
-
-        Only a held Document the device answered ``absent`` for is absent;
-        one it answered ``exists`` or ``hidden`` for is kept and counted, and
-        one it was not asked about is kept. When the device's confirmation
-        failed, or the manifest left Documents unlisted and the device
-        answered nothing, as an agent that does not confirm or a set too
-        large to issue, nothing is removed and the run records why.
-        """
-
-        failure = self._device_confirmation_failed()
-        if failure is not None:
-            logger.warning("The device could not confirm the unlisted Documents of %s: %s", self.source_id, failure)
-            return AbsenceOutcome(skipped_reason="absence_confirmation_failed")
-        if not unlisted and not self._unlisted_ledger_doc_ids:
-            return AbsenceOutcome()
-        answers = self._device_answers()
-        if not answers:
-            logger.warning(
-                "Device listing of %s left %d held and %d failed Documents unlisted, and the device "
-                "confirmed none of them; nothing is removed",
-                self.source_id,
-                len(unlisted),
-                len(self._unlisted_ledger_doc_ids),
-            )
-            return AbsenceOutcome(skipped_reason="absence_confirmation_missing")
-        unanswered = unlisted - set(answers)
-        if unanswered:
-            logger.warning(
-                "The device was not asked about %d unlisted Documents of %s; they are kept",
-                len(unanswered),
-                self.source_id,
-            )
-        absent = unlisted & self._device_absent()
-        present = sum(
-            1
-            for doc_id in unlisted
-            if answers.get(doc_id) in {SnapshotConfirmationAnswer.EXISTS, SnapshotConfirmationAnswer.HIDDEN}
-        )
-        logger.info(
-            "Device listing of %s left %d held Documents unlisted; the device answered %d absent",
-            self.source_id,
-            len(unlisted),
-            len(absent),
-        )
-        return AbsenceOutcome(removals=_absent(absent, evidence="device confirmation"), unlisted_present_count=present)
-
-    def _device_answers(self) -> dict[str, SnapshotConfirmationAnswer]:
-        """The device's answer for each Document it was asked to confirm."""
-
-        assert self.input_snapshot is not None
-        return {
-            item.doc_id: item.answer for item in self.input_snapshot.confirmations if item.answer is not None
-        }
-
-    def _device_absent(self) -> frozenset[str]:
-        """The Documents the device answered ``absent`` for."""
-
-        return frozenset(
-            doc_id for doc_id, answer in self._device_answers().items() if answer is SnapshotConfirmationAnswer.ABSENT
-        )
-
-    def _device_confirmation_failed(self) -> str | None:
-        """The cause the device gave when its confirmation failed, or ``None``."""
-
-        assert self.input_snapshot is not None
-        return next(
-            (
-                item.cause
-                for item in self.input_snapshot.confirmations
-                if item.answer is SnapshotConfirmationAnswer.FAILED
-            ),
-            None,
         )
 
     async def _transition_removals(
@@ -744,30 +641,18 @@ class DocumentFamily(CollectionFamily):
           excluded scope is rejected as a configuration, it cannot say what
           it held, so every unlisted Document follows the ordinary rule.
 
-        A device lists the excluded scopes in its manifest and answers the
-        ordinary rule's confirmations itself (:meth:`_device_absence`).
         Raises ``_TransitionStaysOpen`` when an excluded scope cannot be
-        listed for any other reason, or the device's manifest lacks it.
+        listed for any other reason.
         """
 
         if listing.kind is ScopeListingKind.EXISTENCE:
             return AbsenceOutcome(removals=_removed_from_scope(unlisted))
         self.excluded_scopes_due = True
-        if self.input_snapshot is not None:
-            excluded = await self._device_excluded_listings(transition)
-        else:
-            excluded = await self._list_excluded_scopes(transition)
+        excluded = await self._list_excluded_scopes(transition)
         removed = unlisted & excluded if excluded is not None else set()
         rest = unlisted - removed
         rest -= await self._held_by_renames(rest, uncommitted)
         removals = _removed_from_scope(removed)
-        if self.input_snapshot is not None:
-            confirmed = self._device_absence(rest)
-            return AbsenceOutcome(
-                removals={**removals, **(confirmed.removals or {})},
-                skipped_reason=confirmed.skipped_reason,
-                unlisted_present_count=confirmed.unlisted_present_count,
-            )
         if not rest:
             return AbsenceOutcome(removals=removals)
         try:
@@ -814,33 +699,6 @@ class DocumentFamily(CollectionFamily):
                 logger.warning("Listing an excluded scope of %s failed: %s", self.source_id, exc)
                 raise _TransitionStaysOpen("listing a scope the change excluded failed") from exc
             listed |= excluded_listing.doc_ids
-        return listed
-
-    async def _device_excluded_listings(self, transition: ProjectionScopeTransition) -> set[str] | None:
-        """Every Document the device listed in the transition's excluded scopes, from its manifest.
-
-        ``None`` when the device reported an excluded scope rejected as a
-        configuration. Raises ``_TransitionStaysOpen`` when the manifest lacks
-        the listing of an excluded scope, as when the job carried none: the
-        next job carries them once this run left no listed Document waiting.
-        """
-
-        assert self.input_snapshot is not None
-        listings = {listing.scope_key: listing for listing in self.input_snapshot.excluded_listings}
-        listed: set[str] = set()
-        for scope in await self._excluded_scopes(transition):
-            listing = listings.get(projection_scope_fingerprint(scope))
-            if listing is None:
-                raise _TransitionStaysOpen("the device has not listed every scope the change excluded")
-            if listing.rejection is not None:
-                logger.warning(
-                    "The device reported an excluded scope of %s rejected (%s); every unlisted Document follows "
-                    "the ordinary rule",
-                    self.source_id,
-                    listing.rejection,
-                )
-                return None
-            listed |= listing.doc_ids
         return listed
 
     async def _excluded_scopes(self, transition: ProjectionScopeTransition) -> list[dict[str, object]]:

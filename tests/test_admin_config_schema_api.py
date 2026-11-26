@@ -36,12 +36,7 @@ def test_the_response_carries_labelled_choices_and_conditions(client):
     fields = _fields(_schema(client, "jira"))
 
     assert fields["auth_mode"]["choices"] == [
-        {
-            "value": "pat",
-            "label": "Personal access token",
-            "help_text": "",
-            "visible_when": [{"field": "sync_mode", "values": ["cloud"]}],
-        },
+        {"value": "pat", "label": "Personal access token", "help_text": "", "visible_when": []},
         {"value": "browser_cookie", "label": "Browser session", "help_text": "", "visible_when": []},
     ]
     assert fields["auth_mode"]["default"] == "pat"
@@ -74,16 +69,15 @@ def test_widgets_are_named_on_their_fields(client):
     assert _fields(_schema(client, "jira"))["base_url"]["widget"] is None
 
 
-def test_scope_and_fixed_after_create_come_from_the_descriptor(client):
+def test_scope_comes_from_the_descriptor(client):
     jira = _fields(_schema(client, "jira"))
     repo = _fields(_schema(client, "github_repo"))
 
     assert jira["projects"]["scope"] is True
     assert jira["base_url"]["scope"] is False
-    assert jira["sync_mode"]["fixed_after_create"] is True
-    assert jira["auth_mode"]["fixed_after_create"] is False
-    assert repo["connection_mode"]["fixed_after_create"] is True
     assert repo["include_paths"]["scope"] is True
+    # Where a Source runs is its executor, not a configuration field.
+    assert "sync_mode" not in jira and "connection_mode" not in repo
 
 
 def test_project_field_is_sent(client):

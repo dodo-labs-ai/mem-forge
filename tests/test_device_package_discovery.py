@@ -1,8 +1,7 @@
 """Device-collected connectors discover submitted packages through the shared toolkit.
 
-Local Markdown, GitHub repository local push and Jira local agent read the
-same manifest and inbox, and a package without its own time carries the time
-it was submitted.
+Local Markdown reads its manifest and inbox through the toolkit, and a
+package without its own time carries the time it was submitted.
 """
 
 from __future__ import annotations
@@ -16,14 +15,11 @@ from pathlib import Path
 import pytest
 
 from memforge.genes.document_gene import DocumentGene
-from memforge.genes.github_repo_gene import GitHubRepoGene
-from memforge.genes.jira_gene import JiraGene
 from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.models import ContentItem
 from memforge.pipeline.sync import _same_provider_revision
 
 SUBMITTED_AT = datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc)
-REPO_URL = "https://github.example.test/payroll/architecture"
 
 
 @dataclass(frozen=True)
@@ -44,23 +40,6 @@ CONNECTORS = [
         package_fields={"vault_id": "notes", "relative_path": "ideas.md", "content_type": "text/markdown"},
         gene=lambda config: LocalMarkdownGene(config, "src-local"),
         inbox_key="documents_dir",
-    ),
-    Connector(
-        name="github_repo",
-        package_kind="github_repo_document",
-        package_fields={"repo_url": REPO_URL, "repo_ref": "main", "relative_path": "README.md"},
-        gene=lambda config: GitHubRepoGene({"connection_mode": "local_push", "repo_url": REPO_URL, **config}, "src-repo"),
-        inbox_key="documents_dir",
-    ),
-    Connector(
-        name="jira",
-        package_kind="jira_document",
-        package_fields={"issue_key": "PAY-1", "content_type": "application/json"},
-        gene=lambda config: JiraGene(
-            {"base_url": "https://jira.example.test", "sync_mode": "local_agent", **config},
-            "src-jira",
-        ),
-        inbox_key="local_agent_documents_dir",
     ),
 ]
 

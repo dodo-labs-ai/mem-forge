@@ -25,7 +25,7 @@ from memforge.genes.teams_client import AuthenticationError
 from memforge.local_agent.credential_check import CREDENTIAL_CHECK_OPERATION
 from memforge.local_agent.setup_results import SETUP_RESULT_MODELS, CredentialCheckResult, LocalMarkdownPickRootResult
 from memforge.server.admin_api import LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES
-from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client, _fake_github_remote_run
+from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client
 from tests.test_source_authority_api import _app, _connect_database
 
 BROWSE_DATA = {
@@ -73,20 +73,6 @@ def test_the_live_document_publishes_every_setup_result_model(tmp_path):
     assert schemas["TeamsBrowseResult"]["properties"]["teams"]["anyOf"][0]["items"] == {
         "$ref": "#/components/schemas/TeamsTeamOption"
     }
-
-
-def test_github_repo_preview_tree_result(monkeypatch):
-    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
-
-    result = _run(
-        "github_repo_preview_tree",
-        {"repo_url": "https://github.example.com/acme/architecture", "ref": "main", "limit": 2},
-        source_id="src-gh",
-    )
-
-    _assert_described("github_repo_preview_tree", result)
-    assert result["counts"] == {"included": 3, "ignored": 2}
-    assert len(result["items"]) == 2
 
 
 def test_local_markdown_preview_tree_result(tmp_path: Path):

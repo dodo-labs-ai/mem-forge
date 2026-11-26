@@ -88,8 +88,6 @@ def test_local_agent_sync_operations_are_exported_from_the_domain_contract() -> 
     assert LOCAL_AGENT_SYNC_OPERATIONS == frozenset(
         {
             "document_acquisition",
-            "github_repo_sync",
-            "jira_sync",
             "local_markdown_sync",
             "teams_sync",
         }
@@ -100,10 +98,10 @@ def test_local_agent_attempt_identity_and_retry_status_are_deterministic() -> No
     assert local_agent_sync_snapshot_id("job-1", 2) == "job-1:attempt:2"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=4) == "queued"
     assert local_agent_completion_status("failed", retryable=True, attempt_count=5) == "failed"
-    assert local_agent_collection_attempt_id("jira", "job-1", 2, "job-1:attempt:2") == "job-1:attempt:2"
+    assert local_agent_collection_attempt_id("local_markdown", "job-1", 2, "job-1:attempt:2") == "job-1:attempt:2"
     assert local_agent_collection_attempt_id("teams", "job-1", 2) == "job-1:attempt:2"
     with pytest.raises(ValueError, match="does not match"):
-        local_agent_collection_attempt_id("jira", "job-1", 2, "spoofed")
+        local_agent_collection_attempt_id("local_markdown", "job-1", 2, "spoofed")
     with pytest.raises(ValueError, match="not collected by a local agent"):
         local_agent_collection_attempt_id("unregistered", "job-1", 2)
 
@@ -125,15 +123,10 @@ class _NoTransitions:
 
 
 def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
-    jira_source = {
-        "id": "src-jira",
-        "type": "jira",
-        "config": {
-            "base_url": "https://jira.example.test",
-            "query_mode": "advanced",
-            "jql": "project = PAY",
-            "jql_filter": "updated >= -90d",
-        },
+    markdown_source = {
+        "id": "src-notes",
+        "type": "local_markdown",
+        "config": {"root": "/notes", "vault_id": "notes", "include": ["**/*.md"], "exclude": ["drafts/**"]},
     }
     teams_source = {
         "id": "src-teams",
@@ -145,21 +138,20 @@ def test_local_agent_job_payload_preserves_complete_collection_scope() -> None:
         },
     }
 
-    jira = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), jira_source))
+    markdown = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), markdown_source))
     teams = asyncio.run(local_agent_sync_job_payload(_NoTransitions(), teams_source))
 
-    assert jira["query_mode"] == "advanced"
-    assert jira["jql_filter"] == "updated >= -90d"
+    assert (markdown["include"], markdown["exclude"]) == (["**/*.md"], ["drafts/**"])
     assert teams["initial_history_days"] == 45
     assert teams["rolling_retention_days"] is None
     assert "max_age_days" not in teams
     assert "max_block_messages" not in teams
-    assert jira["source_config_revision"] == local_agent_source_config_revision(jira_source)
+    assert markdown["source_config_revision"] == local_agent_source_config_revision(markdown_source)
     assert teams["source_config_revision"] == local_agent_source_config_revision(teams_source)
 
 
 def test_local_replay_adapter_registry_has_no_provider_fallback() -> None:
-    assert registered_local_source_types() == frozenset({"github_repo", "jira", "local_markdown"})
+    assert registered_local_source_types() == frozenset({"local_markdown"})
     with pytest.raises(
         ValueError,
         match="local source replay adapter is not registered: unknown",
@@ -174,55 +166,16 @@ def test_local_agent_input_identity_uses_document_and_content_identity() -> None
     assert first != local_agent_input_sha256("doc-b", "content-v1")
 
 
-@pytest.mark.parametrize(
-    ("source_type", "package", "missing_payload_field"),
-    [
-        (
-            "github_repo",
-            {
-                "package_kind": "github_repo_document",
-                "doc_id": "doc-a",
-                "version": content_hash("# Repository"),
-                "markdown": "# Repository",
-            },
-            "markdown",
-        ),
-        (
-            "jira",
-            {
-                "package_kind": "jira_document",
-                "doc_id": "doc-a",
-                "version": "version-a",
-                "raw_hash": "version-a",
-                "issue_key": "PAY-1",
-                "raw_payload": _valid_jira_raw(),
-            },
-            "raw_payload",
-        ),
-        (
-            "local_markdown",
-            {
-                "package_kind": "local_markdown_document",
-                "doc_id": "doc-a",
-                "version": content_hash("# Local"),
-                "markdown": "# Local",
-            },
-            "markdown",
-        ),
-    ],
-)
-def test_replay_package_identity_validation_covers_every_local_source_type(
-    source_type: str,
-    package: dict[str, object],
-    missing_payload_field: str,
-) -> None:
-    if source_type == "jira":
-        semantic_hash = _canonical_payload_hash(package["raw_payload"])
-        package["semantic_hash"] = semantic_hash
-        if source_type == "jira":
-            package["version"] = semantic_hash
-    else:
-        semantic_hash = content_hash(str(package["markdown"]))
+def test_replay_package_identity_validation_covers_every_local_source_type() -> None:
+    source_type = "local_markdown"
+    missing_payload_field = "markdown"
+    package: dict[str, object] = {
+        "package_kind": "local_markdown_document",
+        "doc_id": "doc-a",
+        "version": content_hash("# Local"),
+        "markdown": "# Local",
+    }
+    semantic_hash = content_hash(str(package["markdown"]))
     body = json.dumps(package).encode()
     package_hash = hashlib.sha256(body).hexdigest()
     expected_version = str(package["version"])
@@ -269,36 +222,9 @@ def test_replay_package_identity_validation_covers_every_local_source_type(
         )
 
 
-def test_jira_replay_rejects_comment_without_stable_provider_id() -> None:
-    raw_payload = _valid_jira_raw(comments=[{"body": "Decision"}])
-    semantic_hash = _canonical_payload_hash(raw_payload)
-    package = {
-        "package_kind": "jira_document",
-        "doc_id": "doc-jira",
-        "version": semantic_hash,
-        "raw_hash": semantic_hash,
-        "semantic_hash": semantic_hash,
-        "issue_key": "PAY-1",
-        "raw_payload": raw_payload,
-    }
-    body = json.dumps(package).encode()
-
-    with pytest.raises(ValueError, match="source_lifecycle_local_replay_artifact_invalid"):
-        validate_local_agent_replay_package(
-            "jira",
-            body,
-            expected_doc_id="doc-jira",
-            expected_version=semantic_hash,
-            expected_input_sha256=local_agent_semantic_input_sha256("doc-jira", semantic_hash),
-            expected_package_sha256=hashlib.sha256(body).hexdigest(),
-        )
-
-
-@pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
-def test_replay_package_rejects_markdown_that_no_longer_matches_content_version(
-    source_type: str,
-) -> None:
-    package_kind = "github_repo_document" if source_type == "github_repo" else "local_markdown_document"
+def test_replay_package_rejects_markdown_that_no_longer_matches_content_version() -> None:
+    source_type = "local_markdown"
+    package_kind = "local_markdown_document"
     version = content_hash("original")
     body = json.dumps(
         {
@@ -320,54 +246,6 @@ def test_replay_package_rejects_markdown_that_no_longer_matches_content_version(
                 content_hash("original"),
             ),
             expected_package_sha256=hashlib.sha256(body).hexdigest(),
-        )
-
-
-def test_replay_package_rejects_tampered_payload_and_package_bytes() -> None:
-    raw_payload = _valid_jira_raw(summary="Original")
-    semantic_hash = _canonical_payload_hash(raw_payload)
-    package = {
-        "package_kind": "jira_document",
-        "doc_id": "doc-a",
-        "version": semantic_hash,
-        "raw_hash": semantic_hash,
-        "semantic_hash": semantic_hash,
-        "issue_key": "PAY-1",
-        "raw_payload": raw_payload,
-    }
-    body = json.dumps(package, sort_keys=True).encode()
-    package_hash = hashlib.sha256(body).hexdigest()
-
-    validate_local_agent_replay_package(
-        "jira",
-        body,
-        expected_doc_id="doc-a",
-        expected_version=semantic_hash,
-        expected_input_sha256=local_agent_semantic_input_sha256("doc-a", semantic_hash),
-        expected_package_sha256=package_hash,
-    )
-
-    tampered = json.dumps(
-        {
-            **package,
-            "raw_payload": {
-                "key": "PAY-1",
-                "fields": {"summary": "Tampered"},
-            },
-        },
-        sort_keys=True,
-    ).encode()
-    with pytest.raises(ValueError, match="source_lifecycle_local_replay_artifact_invalid"):
-        validate_local_agent_replay_package(
-            "jira",
-            tampered,
-            expected_doc_id="doc-a",
-            expected_version=semantic_hash,
-            expected_input_sha256=local_agent_semantic_input_sha256(
-                "doc-a",
-                semantic_hash,
-            ),
-            expected_package_sha256=package_hash,
         )
 
 
@@ -404,15 +282,9 @@ def test_local_package_validation_fails_closed_without_byte_attestation() -> Non
     ("source_type", "config", "expected_operation"),
     [
         ("teams", {}, "teams_sync"),
-        ("jira", {"sync_mode": "local_agent"}, "jira_sync"),
-        ("jira", {"sync_mode": "cloud"}, None),
         ("local_markdown", {}, "local_markdown_sync"),
-        (
-            "github_repo",
-            {"connection_mode": "local_push"},
-            "github_repo_sync",
-        ),
-        ("github_repo", {"connection_mode": "cloud_pull"}, None),
+        ("jira", {}, None),
+        ("github_repo", {}, None),
         ("confluence", {}, None),
     ],
 )
@@ -429,31 +301,19 @@ def test_local_agent_sync_operation_classifies_execution_mode(
     ("source_type", "config", "expected"),
     [
         (
-            "jira",
-            {"sync_mode": "local_agent"},
-            {
-                "kind": "local_agent",
-                "operation": "jira_sync",
-                "immutable_config_fields": ["sync_mode"],
-            },
+            "local_markdown",
+            {"root": "/notes"},
+            {"kind": "local_agent", "operation": "local_markdown_sync", "immutable_config_fields": []},
         ),
         (
-            "github_repo",
-            {"connection_mode": "cloud_pull"},
-            {
-                "kind": "server",
-                "operation": None,
-                "immutable_config_fields": ["connection_mode"],
-            },
+            "jira",
+            {"base_url": "https://jira.example.test"},
+            {"kind": "server", "operation": None, "immutable_config_fields": []},
         ),
         (
             "confluence",
             {},
-            {
-                "kind": "server",
-                "operation": None,
-                "immutable_config_fields": [],
-            },
+            {"kind": "server", "operation": None, "immutable_config_fields": []},
         ),
     ],
 )
@@ -477,8 +337,8 @@ def test_a_device_source_is_collected_by_device_acquisition() -> None:
 
 def test_local_agent_source_contract_accepts_serialized_config() -> None:
     source = {
-        "type": "jira",
-        "config": json.dumps({"sync_mode": "local_agent"}),
+        "type": "local_markdown",
+        "config": json.dumps({"root": "/notes"}),
     }
 
     assert is_local_agent_backed_source(source) is True
@@ -500,41 +360,16 @@ def test_execution_owner_normalizes_missing_and_blank_values() -> None:
     ("source_type", "config", "expected"),
     [
         (
-            "github_repo",
+            "local_markdown",
             {
-                "connection_mode": "local_push",
-                "repo_url": "https://github.example.test/org/repo",
-                "ref": "main",
-                "repo_path": "/Users/me/repo",
-                "include_paths": ["docs/"],
-                "exclude_paths": ["docs/archived/"],
+                "root": "/notes",
+                "vault_id": "notes",
+                "include": ["**/*.md"],
+                "exclude": ["drafts/**"],
                 "documents_dir": "/server/private",
                 "api_token": "secret",
             },
-            {
-                "repo_url": "https://github.example.test/org/repo",
-                "ref": "main",
-                "include_paths": ["docs/"],
-                "exclude_paths": ["docs/archived/"],
-            },
-        ),
-        (
-            "jira",
-            {
-                "sync_mode": "local_agent",
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-                "projects": ["PAY"],
-                "local_agent_documents_dir": "/server/private",
-                "pat": "secret",
-                "client_secret": "secret",
-            },
-            {
-                "sync_mode": "local_agent",
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-                "projects": ["PAY"],
-            },
+            {"root": "/notes", "vault_id": "notes", "include": ["**/*.md"], "exclude": ["drafts/**"]},
         ),
         (
             "teams",

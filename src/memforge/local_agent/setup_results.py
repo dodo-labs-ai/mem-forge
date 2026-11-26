@@ -51,72 +51,6 @@ class LocalSetupJobResult(BaseModel):
     heartbeat_errors: list[str] | None = None
 
 
-# -- github_repo_preview_tree --
-
-
-class GitHubSymlinkHop(BaseModel):
-    """One symbolic link followed on the way to a file's content."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str
-    blob_sha: str
-    target_path: str
-
-
-class GitHubRepoPreviewItem(BaseModel):
-    """One repository file the Source would read.
-
-    ``relative_path`` is the path the Source names the file by. When it is a
-    symbolic link, ``symlink_chain`` lists the links followed and
-    ``resolved_relative_path`` is the file whose content is read.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    relative_path: str
-    blob_sha: str
-    bytes: int
-    file_mode: str
-    logical_file_mode: str
-    symlink_chain: list[GitHubSymlinkHop]
-    resolved_relative_path: str | None
-    content_type: str
-
-
-class GitHubRepoPreviewCounts(BaseModel):
-    """Files the configured paths and extensions include, and files they leave out."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    included: int
-    ignored: int
-
-
-class GitHubRepoPreviewTreeResult(LocalSetupJobResult):
-    """A remote repository's tree as the daemon's Git access reads it.
-
-    The daemon lists the whole tree at ``commit_sha`` of ``ref`` with the
-    configured include and exclude paths cleared, so the folder picker can
-    offer every folder. ``items`` holds at most the requested number of files,
-    and ``counts`` counts all of them. ``extension_counts`` counts the
-    included files by extension.
-    """
-
-    source_id: str
-    profile: str
-    repo_url: str
-    ref: str
-    commit_sha: str
-    root_tree_sha: str
-    include_paths: list[str]
-    exclude_paths: list[str]
-    include_extensions: list[str]
-    counts: GitHubRepoPreviewCounts
-    extension_counts: dict[str, int]
-    items: list[GitHubRepoPreviewItem]
-
-
 # -- local_markdown_pick_root --
 
 
@@ -287,7 +221,6 @@ class TeamsBrowseResult(LocalSetupJobResult):
 
 SETUP_RESULT_MODELS: dict[str, type[LocalSetupJobResult]] = {
     "credential_check": CredentialCheckResult,
-    "github_repo_preview_tree": GitHubRepoPreviewTreeResult,
     "local_markdown_pick_root": LocalMarkdownPickRootResult,
     "local_markdown_preview_tree": LocalMarkdownPreviewTreeResult,
     "teams_auth": TeamsAuthResult,

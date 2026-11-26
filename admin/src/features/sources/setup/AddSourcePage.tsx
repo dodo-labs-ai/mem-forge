@@ -52,8 +52,8 @@ export function AddSourcePage() {
                 </span>
                 <span className="flex-1 text-sm text-muted-foreground">{type.description}</span>
                 <span className="flex flex-wrap items-center gap-2">
-                  <Badge variant="outline">{runBadge(type.execution_kinds)}</Badge>
-                  {canRunOnLocalSync(type.execution_kinds) ? (
+                  <Badge variant="outline">{runBadge(type)}</Badge>
+                  {canRunOnLocalSync(type) ? (
                     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
                       <span
                         aria-hidden

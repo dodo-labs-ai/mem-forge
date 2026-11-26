@@ -640,21 +640,6 @@ async def test_a_device_existence_manifest_settles_a_failed_document_it_does_not
 
 
 @pytest.mark.asyncio
-async def test_a_device_query_manifest_keeps_untried_a_failed_document_it_does_not_list(db):
-    harness = await _gone_before_it_committed(db, BreakableProvider())
-
-    state = await _device_sync(harness)
-
-    # Only the device can confirm by identifier whether PAY-1 left the query
-    # or is gone, and it has not.
-    assert state.last_sync_status == "success"
-    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
-    assert state.unlisted_present_count is None
-    assert "PAY-1" not in harness.provider.fetches
-    assert set(await _ledger(db)) == {"PAY-1"}
-
-
-@pytest.mark.asyncio
 async def test_a_document_leaves_the_ledger_when_it_commits_even_if_the_run_then_stops(db, monkeypatch):
     harness = await breakable(db)
     _change(harness, "PAY-1")

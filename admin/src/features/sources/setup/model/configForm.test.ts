@@ -9,7 +9,6 @@ import {
   missingRequired,
   reconcileHiddenChoices,
   serializeConfig,
-  visibleChoices,
   visibleFields,
   type ConfigFormState,
   type ConfigSchema,
@@ -72,30 +71,9 @@ describe("config form", () => {
     expect(missingRequired(schema, state).map((candidate) => candidate.key)).toContain("pat");
   });
 
-  test("Jira hides the PAT option for local sync and resets auth to browser session", () => {
-    const schema = sourceTypeSchema("jira");
-    let state: ConfigFormState = { values: { sync_mode: "cloud", auth_mode: "pat" } };
-    expect(visibleChoices(schema, field(schema, "auth_mode"), state).map((choice) => choice.value)).toEqual(["pat", "browser_cookie"]);
-    expect(visibleKeys(schema, state)).toContain("pat");
-
-    state = change(schema, state, "sync_mode", "local_agent");
-
-    expect(visibleChoices(schema, field(schema, "auth_mode"), state).map((choice) => choice.value)).toEqual(["browser_cookie"]);
-    expect(state.values.auth_mode).toBe("browser_cookie");
-    expect(visibleKeys(schema, state)).not.toContain("pat");
-  });
-
-  test("Jira local sync moves the default PAT to browser session", () => {
-    const schema = sourceTypeSchema("jira");
-    const state = change(schema, { values: defaultValues(schema) }, "sync_mode", "local_agent");
-
-    expect(state.values.auth_mode).toBe("browser_cookie");
-    expect(visibleKeys(schema, state)).not.toContain("pat");
-  });
-
   test("a stored Jira browser session keeps its method", () => {
     const schema = sourceTypeSchema("jira");
-    const stored = { base_url: "https://jira.example.com", sync_mode: "cloud", auth_mode: "browser_cookie", projects: ["PAY"] };
+    const stored = { base_url: "https://jira.example.com", auth_mode: "browser_cookie", projects: ["PAY"] };
     const state: ConfigFormState = { values: defaultValues(schema, stored), stored };
 
     expect(effectiveValue(field(schema, "auth_mode"), state)).toBe("browser_cookie");
@@ -204,20 +182,20 @@ describe("config form", () => {
     const schema: ConfigSchema = {
       groups: [{ key: "scope", label: "Scope", order: 0, description: "", purpose: "content", panels: [] }],
       fields: [
-        { ...field(sourceTypeSchema("jira"), "sync_mode"), group: "scope" },
+        { ...field(sourceTypeSchema("jira"), "auth_mode"), group: "scope" },
         {
           ...field(sourceTypeSchema("jira"), "issue_types"),
           visible_when: [],
           group: "scope",
           choices: [
             { value: "Epic", label: "Epic", help_text: "", visible_when: [] },
-            { value: "Bug", label: "Bug", help_text: "", visible_when: [{ field: "sync_mode", values: ["cloud"] }] },
+            { value: "Bug", label: "Bug", help_text: "", visible_when: [{ field: "auth_mode", values: ["pat"] }] },
           ],
         },
       ],
     };
 
-    const state = change(schema, { values: { issue_types: ["Epic", "Bug"] } }, "sync_mode", "local_agent");
+    const state = change(schema, { values: { auth_mode: "pat", issue_types: ["Epic", "Bug"] } }, "auth_mode", "browser_cookie");
 
     expect(state.values.issue_types).toEqual(["Epic"]);
   });

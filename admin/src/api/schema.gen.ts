@@ -779,7 +779,7 @@ export interface paths {
          * @description The form description of a source type, which the admin UI draws without per-type code.
          *
          *     Besides what the Gene declares, each field says whether it is a scope
-         *     field and whether it is fixed after create, from the type's descriptor.
+         *     field, from the type's descriptor.
          */
         get: operations["get_gene_config_schema_api_v1_genes__name__config_schema_get"];
         put?: never;
@@ -2096,31 +2096,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit Local Source Confirmations
-         * @description Store a device's answers for the items its manifest response asked it to confirm.
-         *
-         *     The answers bind to the job attempt and the digest of the manifest. An
-         *     identical replay is accepted; an item the manifest did not ask about,
-         *     another digest or attempt, and answers that differ from the stored
-         *     ones are refused with 409.
-         */
-        post: operations["submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/sources/{source_id}/adapter/packages": {
         parameters: {
             query?: never;
@@ -2135,8 +2110,8 @@ export interface paths {
          * @description Receive one local-source package pushed by the local daemon/adapter.
          *
          *     The service owns the inbox layout and package format. Local clients
-         *     send raw file text or structured source payloads; source genes perform
-         *     canonical markdown normalization during sync.
+         *     send raw file text; source genes perform canonical markdown
+         *     normalization during sync.
          */
         post: operations["push_local_source_package_api_v1_sources__source_id__adapter_packages_post"];
         delete?: never;
@@ -3141,12 +3116,6 @@ export interface components {
             /** Field Type */
             field_type: string;
             /**
-             * Fixed After Create
-             * @description Chooses the executor; a stored Source keeps it.
-             * @default false
-             */
-            fixed_after_create: boolean;
-            /**
              * Group
              * @default general
              */
@@ -3765,96 +3734,6 @@ export interface components {
             /** Name */
             name: string;
         };
-        /**
-         * GitHubRepoPreviewCounts
-         * @description Files the configured paths and extensions include, and files they leave out.
-         */
-        GitHubRepoPreviewCounts: {
-            /** Ignored */
-            ignored: number;
-            /** Included */
-            included: number;
-        };
-        /**
-         * GitHubRepoPreviewItem
-         * @description One repository file the Source would read.
-         *
-         *     ``relative_path`` is the path the Source names the file by. When it is a
-         *     symbolic link, ``symlink_chain`` lists the links followed and
-         *     ``resolved_relative_path`` is the file whose content is read.
-         */
-        GitHubRepoPreviewItem: {
-            /** Blob Sha */
-            blob_sha: string;
-            /** Bytes */
-            bytes: number;
-            /** Content Type */
-            content_type: string;
-            /** File Mode */
-            file_mode: string;
-            /** Logical File Mode */
-            logical_file_mode: string;
-            /** Relative Path */
-            relative_path: string;
-            /** Resolved Relative Path */
-            resolved_relative_path: string | null;
-            /** Symlink Chain */
-            symlink_chain: components["schemas"]["GitHubSymlinkHop"][];
-        };
-        /**
-         * GitHubRepoPreviewTreeResult
-         * @description A remote repository's tree as the daemon's Git access reads it.
-         *
-         *     The daemon lists the whole tree at ``commit_sha`` of ``ref`` with the
-         *     configured include and exclude paths cleared, so the folder picker can
-         *     offer every folder. ``items`` holds at most the requested number of files,
-         *     and ``counts`` counts all of them. ``extension_counts`` counts the
-         *     included files by extension.
-         */
-        GitHubRepoPreviewTreeResult: {
-            /** Commit Sha */
-            commit_sha: string;
-            counts: components["schemas"]["GitHubRepoPreviewCounts"];
-            /**
-             * Error
-             * @default null
-             */
-            error: string | null;
-            /**
-             * Error Type
-             * @default null
-             */
-            error_type: string | null;
-            /** Exclude Paths */
-            exclude_paths: string[];
-            /** Extension Counts */
-            extension_counts: {
-                [key: string]: number;
-            };
-            /**
-             * Heartbeat Errors
-             * @default null
-             */
-            heartbeat_errors: string[] | null;
-            /** Include Extensions */
-            include_extensions: string[];
-            /** Include Paths */
-            include_paths: string[];
-            /** Items */
-            items: components["schemas"]["GitHubRepoPreviewItem"][];
-            /** Operation */
-            operation: string;
-            /** Profile */
-            profile: string;
-            /** Ref */
-            ref: string;
-            /** Repo Url */
-            repo_url: string;
-            /** Root Tree Sha */
-            root_tree_sha: string;
-            /** Source Id */
-            source_id: string;
-        };
         /** GitHubRepoTreeItemResponse */
         GitHubRepoTreeItemResponse: {
             /** Path */
@@ -3897,18 +3776,6 @@ export interface components {
             source_type: "github_repo";
             /** Truncated */
             truncated: boolean;
-        };
-        /**
-         * GitHubSymlinkHop
-         * @description One symbolic link followed on the way to a file's content.
-         */
-        GitHubSymlinkHop: {
-            /** Blob Sha */
-            blob_sha: string;
-            /** Path */
-            path: string;
-            /** Target Path */
-            target_path: string;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -4368,61 +4235,6 @@ export interface components {
             vault_id: string;
         };
         /**
-         * LocalSourceConfirmationAnswerRequest
-         * @description The device's answer for one item its manifest response asked it to confirm.
-         */
-        LocalSourceConfirmationAnswerRequest: {
-            /**
-             * Answer
-             * @enum {string}
-             */
-            answer: "absent" | "exists" | "hidden";
-            /** Doc Id */
-            doc_id: string;
-            /** Provider Key */
-            provider_key: string;
-        };
-        /**
-         * LocalSourceConfirmationsRequest
-         * @description A device's answers for the items its query manifest left out, bound to that manifest.
-         *
-         *     ``manifest_sha256`` is the digest the manifest response returned, and the
-         *     job attempt is the one that submitted the manifest. The request answers
-         *     every item the response named in ``confirm``, or, when the device could
-         *     not confirm them, gives ``failure_cause`` and no answers.
-         */
-        LocalSourceConfirmationsRequest: {
-            /** Answers */
-            answers?: components["schemas"]["LocalSourceConfirmationAnswerRequest"][];
-            /** Failure Cause */
-            failure_cause?: string | null;
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count: number;
-            /** Local Agent Job Id */
-            local_agent_job_id: string;
-            /** Manifest Sha256 */
-            manifest_sha256: string;
-            /** Sync Snapshot Id */
-            sync_snapshot_id: string;
-        };
-        /**
-         * LocalSourceExcludedListingRequest
-         * @description What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
-         *
-         *     ``scope_key`` is the key the job named the scope by. A listing holds the
-         *     Document ids the scope lists, up to the manifest's item bound. A
-         *     definitive rejection, such as a JQL the provider refuses, gives its cause
-         *     in ``rejection`` and lists nothing.
-         */
-        LocalSourceExcludedListingRequest: {
-            /** Doc Ids */
-            doc_ids?: string[];
-            /** Rejection */
-            rejection?: string | null;
-            /** Scope Key */
-            scope_key: string;
-        };
-        /**
          * LocalSourceManifestItemRequest
          * @description One item of a device manifest: the item as the device read it.
          */
@@ -4445,8 +4257,7 @@ export interface components {
          *     ``complete_snapshot`` coverage and every item an ``upsert``.
          *     ``package_contract_version`` is the package contract the local agent
          *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-         *     the numbered contract sends none. ``excluded_listings`` answers the
-         *     excluded scopes the job carried, one entry per scope at most.
+         *     the numbered contract sends none.
          */
         LocalSourceManifestRequest: {
             /**
@@ -4454,8 +4265,6 @@ export interface components {
              * @constant
              */
             coverage: "complete_snapshot";
-            /** Excluded Listings */
-            excluded_listings?: components["schemas"]["LocalSourceExcludedListingRequest"][];
             /** Items */
             items: components["schemas"]["LocalSourceManifestItemRequest"][];
             /** Local Agent Attempt Count */
@@ -4471,29 +4280,16 @@ export interface components {
          * LocalSourcePackageRequest
          * @description One raw local-source package pushed by the local daemon/adapter.
          *
-         *     File-like sources use ``markdown_body`` as raw file text for the declared
-         *     ``content_type``. Structured sources such as Jira use ``raw_payload`` and
-         *     defer canonical markdown rendering to the source gene.
-         *     ``source_updated_at`` is a file-like source's own time for this content
-         *     (an offset-aware ISO time); structured sources carry their times in
-         *     ``raw_payload``.
+         *     ``markdown_body`` is the raw file text for the declared ``content_type``;
+         *     the source gene normalizes it during sync. ``source_updated_at`` is the
+         *     file's own time for this content (an offset-aware ISO time).
          */
         LocalSourcePackageRequest: {
-            /** Artifact Input Hashes */
-            artifact_input_hashes?: string[];
-            /** Artifact Source Unit Key */
-            artifact_source_unit_key?: string | null;
-            /** Base Url */
-            base_url?: string | null;
-            /** Blob Sha */
-            blob_sha?: string | null;
             /**
              * Content Type
              * @default text/markdown
              */
             content_type: string;
-            /** Issue Key */
-            issue_key?: string | null;
             /** Local Agent Attempt Count */
             local_agent_attempt_count?: number | null;
             /** Local Agent Job Id */
@@ -4503,34 +4299,16 @@ export interface components {
              * @default
              */
             markdown_body: string;
-            /** Provider Revision */
-            provider_revision?: string | null;
             /** Raw Hash */
             raw_hash?: string | null;
-            /** Raw Payload */
-            raw_payload?: {
-                [key: string]: unknown;
-            };
             /** Relative Path */
             relative_path?: string | null;
-            /** Repo Ref */
-            repo_ref?: string | null;
-            /** Repo Url */
-            repo_url?: string | null;
-            /** Resolved Relative Path */
-            resolved_relative_path?: string | null;
             /** Source Updated At */
             source_updated_at?: string | null;
-            /** Source Url */
-            source_url?: string | null;
             /** Submitted At */
             submitted_at?: string | null;
             /** Submitted By */
             submitted_by?: string | null;
-            /** Symlink Chain */
-            symlink_chain?: {
-                [key: string]: string;
-            }[];
             /** Sync Snapshot Id */
             sync_snapshot_id?: string | null;
             /** Title */
@@ -6425,7 +6203,11 @@ export interface components {
         SourceExecutionResponse: {
             /** @description Present for a Source whose acquisition runs on its execution owner's device. */
             device?: components["schemas"]["SourceExecutionDeviceResponse"] | null;
-            /** Immutable Config Fields */
+            /**
+             * Immutable Config Fields
+             * @deprecated
+             * @default []
+             */
             immutable_config_fields: string[];
             /**
              * Kind
@@ -6774,7 +6556,7 @@ export interface components {
         SourceScopeChangeRefusalResponse: {
             /**
              * Code
-             * @description scope_change_requires_listing, transition_requires_listing, source_provider_namespace_immutable or source_execution_mode_immutable.
+             * @description scope_change_requires_listing, transition_requires_listing or source_provider_namespace_immutable.
              */
             code: string;
             /** Message */
@@ -10935,41 +10717,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LocalSourceManifestRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourceConfirmationsRequest"];
             };
         };
         responses: {

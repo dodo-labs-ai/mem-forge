@@ -59,7 +59,6 @@ export function ConfigGroupFields({ schema, group, state, sourceType, sourceId, 
         onBlur={onBlur ? () => onBlur(field.key) : undefined}
         error={issues[field.key]}
         note={notes[field.key]}
-        readOnly={sourceId !== undefined && field.fixed_after_create}
         secretConfigured={state.stored?.[`${field.key}_configured`] === true}
         sourceType={sourceType}
         sourceId={sourceId}

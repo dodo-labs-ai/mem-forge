@@ -37,8 +37,7 @@
       "description": "Repository files from GitHub or GitHub Enterprise, scoped by folders and file types",
       "display_name": "GitHub Repository",
       "execution_kinds": [
-        "server",
-        "local_agent"
+        "server"
       ],
       "executors": [
         "server",
@@ -53,8 +52,7 @@
       "description": "Tickets, decisions, and work items",
       "display_name": "Jira",
       "execution_kinds": [
-        "server",
-        "local_agent"
+        "server"
       ],
       "executors": [
         "server",
@@ -112,7 +110,6 @@
           "choices": [],
           "default": "",
           "field_type": "url",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Paste a Confluence root, space, or page URL",
           "key": "base_url",
@@ -143,7 +140,6 @@
           ],
           "default": "space",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Sync one page tree or a whole space",
           "key": "sync_mode",
@@ -164,7 +160,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Space keys to sync",
           "key": "spaces",
@@ -189,7 +184,6 @@
           "choices": [],
           "default": "",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Only sync pages under this root page",
           "key": "page_tree_root",
@@ -214,7 +208,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Pages with these labels will be skipped",
           "key": "exclude_labels",
@@ -232,7 +225,6 @@
           "choices": [],
           "default": "true",
           "field_type": "boolean",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "",
           "key": "include_children",
@@ -257,7 +249,6 @@
           "choices": [],
           "default": "",
           "field_type": "secret",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Stored encrypted in MemForge and sent as a bearer token",
           "key": "pat",
@@ -311,7 +302,6 @@
           ],
           "default": "github_pat",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Use a GitHub personal access token for Enterprise GitHub Pages, or no auth for public pages.",
           "key": "auth_mode",
@@ -332,7 +322,6 @@
           "choices": [],
           "default": "",
           "field_type": "secret",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Stored encrypted and sent as a bearer token when PAT mode is selected.",
           "key": "pat",
@@ -376,7 +365,6 @@
           ],
           "default": "single_page",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Choose one page, all pages under a path, or an explicit URL list.",
           "key": "sync_mode",
@@ -398,7 +386,6 @@
           "choices": [],
           "default": "",
           "field_type": "url",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Published GitHub Pages URL for one documentation page.",
           "key": "page_url",
@@ -423,7 +410,6 @@
           "choices": [],
           "default": "",
           "field_type": "url",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Only published pages under this URL path are discovered.",
           "key": "root_url",
@@ -448,7 +434,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Comma-separated documentation page URLs.",
           "key": "pages",
@@ -473,7 +458,6 @@
           "choices": [],
           "default": "5",
           "field_type": "integer",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Maximum same-site link depth when sitemap discovery is unavailable.",
           "key": "max_depth",
@@ -498,7 +482,6 @@
           "choices": [],
           "default": "200",
           "field_type": "integer",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Stop with an error if discovery reaches this many pages.",
           "key": "max_pages",
@@ -524,7 +507,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Regex patterns for page URLs to exclude.",
           "key": "exclude_url_patterns",
@@ -550,7 +532,6 @@
           "choices": [],
           "default": "false",
           "field_type": "boolean",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Allow a validated sitemap urlset to retire pages that are no longer listed. Leave disabled unless the site guarantees that its sitemap is exhaustive.",
           "key": "sitemap_authoritative",
@@ -588,44 +569,9 @@
       "fields": [
         {
           "advanced": false,
-          "choices": [
-            {
-              "help_text": "",
-              "label": "Cloud access",
-              "value": "cloud_pull",
-              "visible_when": []
-            },
-            {
-              "help_text": "",
-              "label": "Local sync",
-              "value": "local_push",
-              "visible_when": []
-            }
-          ],
-          "default": "cloud_pull",
-          "field_type": "select",
-          "fixed_after_create": true,
-          "group": "connection",
-          "help_text": "Use Public internet when MemForge Cloud can reach the repo. Use Internal network / VPN when only your machine can reach it.",
-          "key": "connection_mode",
-          "label": "Repository Access",
-          "options": [
-            "cloud_pull",
-            "local_push"
-          ],
-          "order": 0,
-          "placeholder": "",
-          "required": true,
-          "scope": false,
-          "visible_when": [],
-          "widget": null
-        },
-        {
-          "advanced": false,
           "choices": [],
           "default": "",
           "field_type": "url",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "GitHub or GitHub Enterprise repository URL.",
           "key": "repo_url",
@@ -643,9 +589,8 @@
           "choices": [],
           "default": "",
           "field_type": "secret",
-          "fixed_after_create": false,
           "group": "connection",
-          "help_text": "Optional token for private repositories when using cloud pull. Leave blank for public repositories or local push.",
+          "help_text": "Optional token for private repositories. Leave blank for public repositories.",
           "key": "pat",
           "label": "Personal Access Token",
           "options": [],
@@ -653,14 +598,7 @@
           "placeholder": "",
           "required": false,
           "scope": false,
-          "visible_when": [
-            {
-              "field": "connection_mode",
-              "values": [
-                "cloud_pull"
-              ]
-            }
-          ],
+          "visible_when": [],
           "widget": null
         },
         {
@@ -668,7 +606,6 @@
           "choices": [],
           "default": "main",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Git ref to sync. Leave as main unless the repository uses another branch.",
           "key": "ref",
@@ -686,7 +623,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Repo-relative folders or files to sync. Empty means the whole repository, filtered by extension.",
           "key": "include_paths",
@@ -704,7 +640,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Repository-relative folders or files to leave out. Exclusions override selected paths.",
           "key": "exclude_paths",
@@ -722,7 +657,6 @@
           "choices": [],
           "default": "md, markdown, txt, adoc, rst",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Text-like extensions to sync. Binary assets are skipped unless explicitly allowed.",
           "key": "include_extensions",
@@ -740,7 +674,6 @@
           "choices": [],
           "default": "500",
           "field_type": "integer",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Stop with an error if the selected scope contains more files.",
           "key": "max_files",
@@ -781,7 +714,6 @@
           "choices": [],
           "default": "",
           "field_type": "url",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "",
           "key": "base_url",
@@ -799,50 +731,9 @@
           "choices": [
             {
               "help_text": "",
-              "label": "Cloud",
-              "value": "cloud",
-              "visible_when": []
-            },
-            {
-              "help_text": "",
-              "label": "Local sync",
-              "value": "local_agent",
-              "visible_when": []
-            }
-          ],
-          "default": "cloud",
-          "field_type": "select",
-          "fixed_after_create": true,
-          "group": "connection",
-          "help_text": "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync from the machine where the daemon is running, useful for VPN-only Jira.",
-          "key": "sync_mode",
-          "label": "Sync Location",
-          "options": [
-            "cloud",
-            "local_agent"
-          ],
-          "order": 1,
-          "placeholder": "",
-          "required": false,
-          "scope": false,
-          "visible_when": [],
-          "widget": null
-        },
-        {
-          "advanced": false,
-          "choices": [
-            {
-              "help_text": "",
               "label": "Personal access token",
               "value": "pat",
-              "visible_when": [
-                {
-                  "field": "sync_mode",
-                  "values": [
-                    "cloud"
-                  ]
-                }
-              ]
+              "visible_when": []
             },
             {
               "help_text": "",
@@ -853,9 +744,8 @@
           ],
           "default": "pat",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "connection",
-          "help_text": "A personal access token, from Jira Data Center or Server, is sent as a bearer token and needs no local daemon. Browser session is for deployments where a personal access token is not available: the local CLI adapter (`memforge adapter auth jira refresh --base-url ...`) captures cookies from your signed-in browser. Local sync always uses a browser session.",
+          "help_text": "A personal access token, from Jira Data Center or Server, is sent as a bearer token. Browser session is for deployments where a personal access token is not available: the local CLI adapter (`memforge adapter auth jira refresh --base-url ...`) captures cookies from your signed-in browser.",
           "key": "auth_mode",
           "label": "Authentication Method",
           "options": [
@@ -887,7 +777,6 @@
           ],
           "default": "simple",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Simple builds the query from projects and issue types. Advanced uses a full JQL you provide (authoritative).",
           "key": "query_mode",
@@ -908,7 +797,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Comma-separated Jira project keys (simple mode)",
           "key": "projects",
@@ -933,7 +821,6 @@
           "choices": [],
           "default": "",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Full JQL used as-is in advanced mode. MemForge adds an incremental updated-since filter before your ORDER BY.",
           "key": "jql",
@@ -958,7 +845,6 @@
           "choices": [],
           "default": "",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Additional JQL filter to refine results (simple mode)",
           "key": "jql_filter",
@@ -1020,7 +906,6 @@
           ],
           "default": "Epic,Story,Bug,Task",
           "field_type": "multi_select",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "",
           "key": "issue_types",
@@ -1052,7 +937,6 @@
           "choices": [],
           "default": "true",
           "field_type": "boolean",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "",
           "key": "include_comments",
@@ -1070,7 +954,6 @@
           "choices": [],
           "default": "",
           "field_type": "secret",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Stored encrypted and sent as a bearer token when PAT mode is selected",
           "key": "pat",
@@ -1130,7 +1013,6 @@
           "choices": [],
           "default": "",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Folder path on the machine running the local daemon.",
           "key": "root",
@@ -1148,7 +1030,6 @@
           "choices": [],
           "default": "",
           "field_type": "string",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Optional human-readable label shown in source metadata.",
           "key": "display_label",
@@ -1166,7 +1047,6 @@
           "choices": [],
           "default": "*.md,**/*.md,*.markdown,**/*.markdown,*.txt,**/*.txt,*.json,**/*.json,*.html,**/*.html,*.htm,**/*.htm",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Glob patterns relative to the folder path.",
           "key": "include",
@@ -1184,7 +1064,6 @@
           "choices": [],
           "default": ".obsidian/**,.trash/**,.git/**,**/.git/**",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Glob patterns to skip.",
           "key": "exclude",
@@ -1225,7 +1104,6 @@
           "choices": [],
           "default": "",
           "field_type": "secret",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "",
           "key": "token",
@@ -1243,7 +1121,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "content",
           "help_text": "",
           "key": "root_pages",
@@ -1261,7 +1138,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "content",
           "help_text": "",
           "key": "databases",
@@ -1321,7 +1197,6 @@
           ],
           "default": "emea",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "connection",
           "help_text": "Teams API regional endpoint",
           "key": "region",
@@ -1343,7 +1218,6 @@
           "choices": [],
           "default": "",
           "field_type": "tag_list",
-          "fixed_after_create": false,
           "group": "scope",
           "help_text": "Direct Teams conversation IDs selected through Browse Teams",
           "key": "conversation_ids",
@@ -1361,7 +1235,6 @@
           "choices": [],
           "default": "14",
           "field_type": "integer",
-          "fixed_after_create": false,
           "group": "sync",
           "help_text": "How far back to collect, and to follow edits, deletions and replies",
           "key": "initial_history_days",
@@ -1404,7 +1277,6 @@
           ],
           "default": "forever",
           "field_type": "select",
-          "fixed_after_create": false,
           "group": "sync",
           "help_text": "Explicitly remove MemForge support older than the selected period",
           "key": "rolling_retention_days",

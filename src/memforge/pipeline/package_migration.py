@@ -135,7 +135,7 @@ def _rebuild_github_repo(
 ) -> _Rebuilt:
     """The file as ``GitHubRepoGene`` discovers and fetches it, at the configured repository and ref."""
 
-    from memforge.genes.github_repo_gene import CONNECTION_MODE_CLOUD_PULL, LAST_COMMIT_AT_KEY, title_from_path
+    from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY, title_from_path
 
     relative_path = str(package.get("relative_path") or "").strip()
     markdown = package.get("markdown")
@@ -153,7 +153,6 @@ def _rebuild_github_repo(
     content_type = str(package.get("content_type") or "text/markdown")
     symlink_chain = package.get("symlink_chain")
     extra: dict[str, Any] = {
-        "connection_mode": CONNECTION_MODE_CLOUD_PULL,
         "file_identity_contract": "repository_path",
         "repo_url": repo["repo_url"],
         "repo_host": repo["host"],

@@ -487,8 +487,10 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     genes = {gene["name"]: gene for gene in response.json()}
     assert genes["confluence"]["execution_kinds"] == ["server"]
     assert genes["github_pages"]["execution_kinds"] == ["server"]
-    assert genes["jira"]["execution_kinds"] == ["server", "local_agent"]
-    assert genes["github_repo"]["execution_kinds"] == ["server", "local_agent"]
+    # Where a document type runs is its executors; no local-agent package path remains for these.
+    assert genes["jira"]["execution_kinds"] == ["server"]
+    assert genes["github_repo"]["execution_kinds"] == ["server"]
+    assert genes["jira"]["executors"] == genes["github_repo"]["executors"] == ["server", "device"]
     assert genes["teams"]["execution_kinds"] == ["local_agent"]
     assert genes["local_markdown"]["execution_kinds"] == ["local_agent"]
     assert "agent_session" not in genes

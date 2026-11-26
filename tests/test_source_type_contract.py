@@ -23,7 +23,7 @@ from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION, LOCAL_AGENT_SYNC_OPERATIONS
-from memforge.genes import github_pages_gene, github_repo_gene, jira_gene
+from memforge.genes import github_pages_gene, jira_gene
 from memforge.models import (
     ConfigCondition,
     ConfigField,
@@ -608,10 +608,8 @@ MODE_READERS = {
     ("confluence", "sync_mode"): lambda config: canonical_projection_scope("confluence", config)["sync_mode"],
     ("github_pages", "auth_mode"): github_pages_gene._auth_mode,
     ("github_pages", "sync_mode"): github_pages_gene.sync_mode_for_config,
-    ("github_repo", "connection_mode"): github_repo_gene._connection_mode,
     ("jira", "auth_mode"): jira_gene._auth_mode,
     ("jira", "query_mode"): lambda config: canonical_projection_scope("jira", config)["query_mode"],
-    ("jira", "sync_mode"): lambda config: "local_agent" if jira_gene._read_by_local_agent(config) else "cloud",
 }
 
 # The least each built-in type needs before its hooks run.

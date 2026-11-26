@@ -13,18 +13,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
 
-from memforge.github_repo_utils import build_github_repo_doc_id
-from memforge.local_agent.document_identity import (
-    build_jira_doc_id,
-    build_local_markdown_doc_id,
-)
+from memforge.local_agent.document_identity import build_local_markdown_doc_id
 from memforge.local_agent.source_contract import (
     local_agent_semantic_input_sha256,
     local_file_package_semantic_hash,
-)
-from memforge.source_artifacts import (
-    SourceArtifactContractError,
-    source_artifact_semantic_refs,
 )
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, source_time_iso
 from memforge.source_types import registered_source_types, source_type_descriptor
@@ -32,17 +24,6 @@ from memforge.source_types import registered_source_types, source_type_descripto
 
 INVALID_REPLAY_ARTIFACT = "source_lifecycle_local_replay_artifact_invalid"
 MISSING_REPLAY_ATTESTATION = "source_lifecycle_local_replay_attestation_required"
-
-
-def _semantic_json_hash(value: Mapping[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            dict(value),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
 
 
 class LocalSourceReplayAdapter(ABC):
@@ -137,50 +118,6 @@ class _MarkdownPackageAdapter(LocalSourceReplayAdapter):
         pass
 
 
-class GitHubRepoReplayAdapter(_MarkdownPackageAdapter):
-    source_type = "github_repo"
-    package_kind = "github_repo_document"
-
-    def derive_document_id(
-        self,
-        *,
-        source_id: str,
-        package: Mapping[str, Any],
-    ) -> str:
-        return build_github_repo_doc_id(
-            source_id=source_id,
-            repo_url=str(package.get("repo_url") or ""),
-            repo_ref=str(package.get("repo_ref") or ""),
-            relative_path=str(package.get("relative_path") or ""),
-        )
-
-    def _content_hash(self, package: Mapping[str, Any]) -> str:
-        markdown = package.get("markdown")
-        if not isinstance(markdown, str):
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        source_artifacts = package.get("source_artifacts")
-        if not source_artifacts:
-            return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-        try:
-            artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
-        except SourceArtifactContractError:
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        return _semantic_json_hash(
-            {
-                "markdown": markdown,
-                "source_artifacts": artifact_semantic_refs,
-            }
-        )
-
-    def _version_matches(
-        self,
-        package: Mapping[str, Any],
-        package_version: str,
-        content_hash: str,
-    ) -> bool:
-        return package_version == str(package.get("blob_sha") or package.get("raw_hash") or content_hash).strip()
-
-
 class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
     source_type = "local_markdown"
     package_kind = "local_markdown_document"
@@ -204,62 +141,6 @@ class LocalMarkdownReplayAdapter(_MarkdownPackageAdapter):
         content_hash: str,
     ) -> bool:
         return package_version == content_hash
-
-
-class JiraReplayAdapter(LocalSourceReplayAdapter):
-    source_type = "jira"
-    package_kind = "jira_document"
-
-    def derive_document_id(
-        self,
-        *,
-        source_id: str,
-        package: Mapping[str, Any],
-    ) -> str:
-        return build_jira_doc_id(
-            source_id=source_id,
-            issue_key=str(package.get("issue_key") or ""),
-        )
-
-    def _validate_semantics(
-        self,
-        package: Mapping[str, Any],
-        package_version: str,
-    ) -> str:
-        raw_payload = package.get("raw_payload")
-        if not isinstance(raw_payload, Mapping) or not raw_payload:
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        from memforge.local_agent.jira_contract import validate_jira_observation_identities
-
-        try:
-            validate_jira_observation_identities(raw_payload)
-        except ValueError as exc:
-            raise ValueError(INVALID_REPLAY_ARTIFACT) from exc
-        issue_key = str(package.get("issue_key") or "").strip().upper()
-        source_artifacts = package.get("source_artifacts")
-        if source_artifacts:
-            try:
-                artifact_semantic_refs = source_artifact_semantic_refs(source_artifacts)
-            except SourceArtifactContractError:
-                raise ValueError(INVALID_REPLAY_ARTIFACT)
-            semantic_hash = _semantic_json_hash(
-                {
-                    "raw_payload": raw_payload,
-                    "source_artifacts": artifact_semantic_refs,
-                }
-            )
-        else:
-            semantic_hash = _semantic_json_hash(raw_payload)
-        if (
-            not issue_key
-            or str(raw_payload.get("key") or "").strip().upper() != issue_key
-            or not isinstance(raw_payload.get("fields"), Mapping)
-            or not str(package.get("raw_hash") or "").strip()
-            or str(package.get("semantic_hash") or "").strip() != semantic_hash
-            or package_version != semantic_hash
-        ):
-            raise ValueError(INVALID_REPLAY_ARTIFACT)
-        return semantic_hash
 
 
 def get_local_source_replay_adapter(source_type: str) -> LocalSourceReplayAdapter:

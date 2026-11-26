@@ -166,7 +166,6 @@ from memforge.models import (
     AbsenceCheckSkippedReason,
     ConfigCondition,
     ConfigGroupPurpose,
-    ScopeListingKind,
     ConfigFieldType,
     Entity,
     Memory,
@@ -250,7 +249,6 @@ from memforge.source_secrets import (
 from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStale,
-    provider_item_key,
 )
 from memforge.source_projection_config import (
     canonical_scope_transition,
@@ -322,9 +320,6 @@ from memforge.local_agent.snapshot_manifest import (
     COMPLETE_SNAPSHOT,
     SNAPSHOT_MANIFEST_MAX_ITEMS,
     UPSERT,
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    SnapshotConfirmationAnswer,
     SnapshotManifestItem,
     plan_snapshot_manifest,
     snapshot_manifest_sha256,
@@ -350,7 +345,6 @@ from memforge.local_agent.source_contract import (
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
-    local_package_confirms_absence,
     local_package_requires_source_time,
     source_executor,
     source_collection_operation,
@@ -392,7 +386,6 @@ SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
 DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
-    "github_repo_preview_tree": "github_repo",
     "local_markdown_pick_root": "local_markdown",
     "local_markdown_preview_tree": "local_markdown",
     "teams_auth": "teams",
@@ -1895,7 +1888,6 @@ class ConfigFieldResponse(BaseModel):
     widget: str | None = None
     advanced: bool = False
     scope: bool = Field(default=False, description="Changing it changes which items the Source holds.")
-    fixed_after_create: bool = Field(default=False, description="Chooses the executor; a stored Source keeps it.")
     # Deprecated (admin-ui-v1): V1 setup reads bare option values; removed with V1.
     options: list[str] = Field(default=[], deprecated=True, description="The values of `choices`.")
 
@@ -2228,7 +2220,8 @@ class SourceExecutionDeviceResponse(BaseModel):
 class SourceExecutionResponse(BaseModel):
     kind: Literal["server", "local_agent"]
     operation: str | None
-    immutable_config_fields: list[str]
+    # Deprecated (admin-ui-v1): V1 setup reads it; always empty, removed with V1.
+    immutable_config_fields: list[str] = Field(default=[], deprecated=True)
     device: SourceExecutionDeviceResponse | None = Field(
         default=None,
         description="Present for a Source whose acquisition runs on its execution owner's device.",
@@ -2842,8 +2835,7 @@ class SourceScopeChangeRefusalResponse(BaseModel):
 
     code: str = Field(
         description=(
-            "scope_change_requires_listing, transition_requires_listing, "
-            "source_provider_namespace_immutable or source_execution_mode_immutable."
+            "scope_change_requires_listing, transition_requires_listing or source_provider_namespace_immutable."
         ),
     )
     mode: str | None = Field(default=None, description="The configured mode that cannot list its scope.")
@@ -3005,85 +2997,23 @@ def _source_paused_http_error() -> HTTPException:
 class LocalSourcePackageRequest(BaseModel):
     """One raw local-source package pushed by the local daemon/adapter.
 
-    File-like sources use ``markdown_body`` as raw file text for the declared
-    ``content_type``. Structured sources such as Jira use ``raw_payload`` and
-    defer canonical markdown rendering to the source gene.
-    ``source_updated_at`` is a file-like source's own time for this content
-    (an offset-aware ISO time); structured sources carry their times in
-    ``raw_payload``.
+    ``markdown_body`` is the raw file text for the declared ``content_type``;
+    the source gene normalizes it during sync. ``source_updated_at`` is the
+    file's own time for this content (an offset-aware ISO time).
     """
 
     vault_id: str | None = None
     relative_path: str | None = None
     markdown_body: str = ""
-    raw_payload: dict[str, Any] = Field(default_factory=dict)
     content_type: str = "text/markdown"
-    base_url: str | None = None
-    repo_url: str | None = None
-    repo_ref: str | None = None
-    blob_sha: str | None = None
-    symlink_chain: list[dict[str, str]] = Field(default_factory=list)
-    resolved_relative_path: str | None = None
-    issue_key: str | None = None
-    source_url: str | None = None
     title: str | None = None
     raw_hash: str | None = None
     source_updated_at: str | None = None
-    provider_revision: str | None = None
     sync_snapshot_id: str | None = None
     local_agent_job_id: str | None = None
     local_agent_attempt_count: int | None = Field(default=None, ge=1)
-    artifact_source_unit_key: str | None = None
-    artifact_input_hashes: list[str] = Field(default_factory=list)
     submitted_by: str | None = None
     submitted_at: str | None = None
-
-
-async def _resolve_local_source_artifact_inputs(
-    db: Database,
-    *,
-    source_id: str,
-    workspace_id: str,
-    input_hashes: list[str],
-    expected_source_unit_key: str,
-) -> list[dict[str, Any]]:
-    """Resolve only attested raw inputs owned by this Source Unit."""
-
-    requested = tuple(dict.fromkeys(str(value).strip() for value in input_hashes if str(value).strip()))
-    if not requested:
-        return []
-    if any(len(value) != 64 for value in requested):
-        raise ValueError("local source Artifact input hash is invalid")
-    inputs = await db.get_source_sync_inputs_by_raw_hashes(
-        source_id=source_id,
-        workspace_id=workspace_id,
-        raw_sha256s=requested,
-    )
-    by_hash = {item.raw_sha256: item for item in inputs}
-    if set(by_hash) != set(requested):
-        raise ValueError("local source Artifact input was not found for this source")
-    resolved: list[dict[str, Any]] = []
-    for input_hash in requested:
-        source_input = by_hash[input_hash]
-        metadata = source_input.metadata.get("local_source_artifact")
-        if not isinstance(metadata, Mapping):
-            raise ValueError("local source Artifact input metadata is invalid")
-        if str(metadata.get("source_unit_key") or "") != expected_source_unit_key:
-            raise ValueError("local source Artifact input belongs to another Source Unit")
-        resolved.append(
-            {
-                "provider_key": str(metadata.get("provider_key") or ""),
-                "parent_observation_type": str(metadata.get("parent_observation_type") or ""),
-                "parent_provider_key": str(metadata.get("parent_provider_key") or ""),
-                "provider_revision": str(metadata.get("provider_revision") or ""),
-                "filename": str(metadata.get("filename") or ""),
-                "media_type": str(metadata.get("media_type") or ""),
-                "size_bytes": int(metadata.get("size_bytes") or 0),
-                "sha256": str(metadata.get("content_sha256") or ""),
-                "uri": source_input.raw_uri,
-            }
-        )
-    return resolved
 
 
 class LocalSourceManifestItemRequest(BaseModel):
@@ -3097,26 +3027,6 @@ class LocalSourceManifestItemRequest(BaseModel):
 LOCAL_SOURCE_MANIFEST_MAX_ITEMS = SNAPSHOT_MANIFEST_MAX_ITEMS
 
 
-class LocalSourceExcludedListingRequest(BaseModel):
-    """What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
-
-    ``scope_key`` is the key the job named the scope by. A listing holds the
-    Document ids the scope lists, up to the manifest's item bound. A
-    definitive rejection, such as a JQL the provider refuses, gives its cause
-    in ``rejection`` and lists nothing.
-    """
-
-    scope_key: str = Field(min_length=1, max_length=128)
-    doc_ids: list[str] = Field(default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
-    rejection: str | None = Field(default=None, min_length=1, max_length=2_000)
-
-    @model_validator(mode="after")
-    def _listed_or_rejected(self) -> "LocalSourceExcludedListingRequest":
-        if self.rejection is not None and self.doc_ids:
-            raise ValueError("a rejected excluded scope lists nothing")
-        return self
-
-
 class LocalSourceManifestRequest(BaseModel):
     """One complete local collection, planned against the retained packages.
 
@@ -3124,8 +3034,7 @@ class LocalSourceManifestRequest(BaseModel):
     ``complete_snapshot`` coverage and every item an ``upsert``.
     ``package_contract_version`` is the package contract the local agent
     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-    the numbered contract sends none. ``excluded_listings`` answers the
-    excluded scopes the job carried, one entry per scope at most.
+    the numbered contract sends none.
     """
 
     items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
@@ -3134,34 +3043,6 @@ class LocalSourceManifestRequest(BaseModel):
     local_agent_job_id: str
     local_agent_attempt_count: int = Field(ge=1)
     package_contract_version: int | None = Field(default=None, ge=1)
-    excluded_listings: list[LocalSourceExcludedListingRequest] = Field(default_factory=list, max_length=100)
-
-
-class LocalSourceConfirmationAnswerRequest(BaseModel):
-    """The device's answer for one item its manifest response asked it to confirm."""
-
-    doc_id: str = Field(min_length=1, max_length=512)
-    provider_key: str = Field(min_length=1, max_length=512)
-    answer: Literal["absent", "exists", "hidden"]
-
-
-class LocalSourceConfirmationsRequest(BaseModel):
-    """A device's answers for the items its query manifest left out, bound to that manifest.
-
-    ``manifest_sha256`` is the digest the manifest response returned, and the
-    job attempt is the one that submitted the manifest. The request answers
-    every item the response named in ``confirm``, or, when the device could
-    not confirm them, gives ``failure_cause`` and no answers.
-    """
-
-    sync_snapshot_id: str
-    local_agent_job_id: str
-    local_agent_attempt_count: int = Field(ge=1)
-    manifest_sha256: str = Field(min_length=64, max_length=64)
-    answers: list[LocalSourceConfirmationAnswerRequest] = Field(
-        default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS
-    )
-    failure_cause: str | None = Field(default=None, min_length=1, max_length=2_000)
 
 
 class AcquisitionAttemptRequest(BaseModel):
@@ -3253,11 +3134,7 @@ async def _require_ready_snapshot_manifest(
     req: Any,
     lease_payload: Mapping[str, Any],
 ) -> None:
-    """Require the document snapshot manifest of this job attempt, materialized and answered.
-
-    Every declared item must be materialized, and every item the manifest
-    asked its device to confirm must be answered.
-    """
+    """Require the document snapshot manifest of this job attempt, every declared item materialized."""
 
     manifest_status = await db.get_source_sync_snapshot_manifest_status(
         source_id=source_id,
@@ -3274,8 +3151,6 @@ async def _require_ready_snapshot_manifest(
         raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
     if manifest_status["materialized_count"] != manifest_status["item_count"]:
         raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if manifest_status["awaiting_confirmations"]:
-        raise HTTPException(status_code=409, detail="source_snapshot_confirmations_pending")
     if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
         raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
@@ -3313,81 +3188,6 @@ def _is_document_source_type(source_type: str) -> bool:
 
     descriptor = source_type_descriptor(source_type)
     return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
-
-
-async def _snapshot_confirm_set(
-    db: Database,
-    *,
-    source: Mapping[str, Any],
-    workspace_id: str,
-    snapshot_id: str,
-    listed_doc_ids: frozenset[str],
-    excluded_listings: Sequence[ExcludedScopeListing],
-    package_contract_version: int | None,
-) -> tuple[SnapshotConfirmation, ...]:
-    """The items a device manifest asks its device to confirm by identifier.
-
-    Only a document Source whose device listing is a query asks, and only an
-    agent that confirms is asked. It asks about every Document with a current
-    Unit the manifest does not list, by the provider's key of the Unit's item
-    (without the incarnation a Unit that came back carries), and every
-    failed Document the manifest does not list that never became a Unit, by
-    the provider key of its stored item. A replay of a stored manifest returns
-    the set the manifest was issued, without asking again. When the manifest
-    lists the excluded scopes of a transition and none was rejected, an item
-    an excluded listing names is not asked about: completing the transition
-    removes it on that listing.
-
-    A set larger than a manifest is issued empty: the run then records
-    ``absence_confirmation_missing`` and removes nothing.
-    """
-
-    source_type = str(source.get("type") or "")
-    descriptor = source_type_descriptor(source_type)
-    if (
-        not local_package_confirms_absence(package_contract_version)
-        or descriptor is None
-        or descriptor.family is not CollectionFamilyKind.DOCUMENT
-    ):
-        return ()
-    gene_cls = cast(type[DocumentGene], descriptor.gene_class())
-    if gene_cls.snapshot_listing_kind() is not ScopeListingKind.QUERY:
-        return ()
-    source_id = str(source["id"])
-    stored = await db.get_source_sync_snapshot_manifest_status(
-        source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
-    )
-    if stored is not None:
-        issued = await db.list_source_sync_snapshot_confirmations(
-            source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
-        )
-        return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
-    held = await db.list_current_document_provider_keys(source_id)
-    if excluded_listings and all(listing.rejection is None for listing in excluded_listings):
-        listed_doc_ids = listed_doc_ids.union(*(listing.doc_ids for listing in excluded_listings))
-    unlisted_units = sorted(set(held) - listed_doc_ids)
-    unlisted_failures = sorted(
-        (
-            failure
-            for failure in await db.list_source_item_failures(source_id=source_id)
-            if failure.document_id not in listed_doc_ids and failure.document_id not in held
-        ),
-        key=lambda failure: failure.document_id,
-    )
-    if len(unlisted_units) + len(unlisted_failures) > LOCAL_SOURCE_MANIFEST_MAX_ITEMS:
-        logger.warning(
-            "Source %s has %d unlisted Documents, more than a manifest holds; none is issued for confirmation",
-            source_id,
-            len(unlisted_units) + len(unlisted_failures),
-        )
-        return ()
-    confirm = [SnapshotConfirmation(doc_id, provider_item_key(held[doc_id])) for doc_id in unlisted_units]
-    confirm.extend(
-        SnapshotConfirmation(failure.document_id, gene_cls.provider_key(failure.item))
-        for failure in unlisted_failures
-        if failure.item is not None
-    )
-    return tuple(sorted(confirm, key=lambda item: item.doc_id))
 
 
 @dataclass(frozen=True)
@@ -3558,8 +3358,6 @@ async def _plan_config_change(
         raise _config_invalid_response(exc) from exc
     except (SecretConfigurationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
-        raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
     if _provider_namespace_config(source_type, config) != _provider_namespace_config(source_type, source["config"]):
         raise HTTPException(status_code=409, detail="source_provider_namespace_immutable")
     current_scope = _sync_scope_config(source_type, source["config"])
@@ -7179,7 +6977,7 @@ def create_admin_app(
         """The form description of a source type, which the admin UI draws without per-type code.
 
         Besides what the Gene declares, each field says whether it is a scope
-        field and whether it is fixed after create, from the type's descriptor.
+        field, from the type's descriptor.
         """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
@@ -7187,7 +6985,6 @@ def create_admin_app(
         schema = GENE_REGISTRY[name].config_schema()
         descriptor = source_type_descriptor(name)
         scope_fields = set(descriptor.scope_fields)
-        fixed_fields = set(descriptor.local_agent.immutable_execution_fields) if descriptor.local_agent else set()
 
         def conditions(items: Iterable[ConfigCondition]) -> list[ConfigConditionResponse]:
             return [ConfigConditionResponse(field=c.field, values=list(c.values)) for c in items]
@@ -7228,7 +7025,6 @@ def create_admin_app(
                     widget=f.widget,
                     advanced=f.advanced,
                     scope=f.key in scope_fields,
-                    fixed_after_create=f.key in fixed_fields,
                     options=[o.value for o in f.choices],
                 )
                 for f in schema.fields
@@ -7423,8 +7219,6 @@ def create_admin_app(
                 )
                 config = {**stored_config, **config}
             _validate_source_config("github_repo", config)
-            if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
-                raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
             gene = cast(GitHubRepoGene, create_gene("github_repo", config, source_id="browse-github-repo"))
             await gene.authenticate()
             github = gene.github_api()
@@ -9695,10 +9489,7 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        collection = _local_agent_collection(source.get("type"))
-        package_inputs = (collection is not None and collection.accepts_artifact_inputs) or _is_conversation_source(
-            source
-        )
+        package_inputs = _is_conversation_source(source)
         if not package_inputs and not _is_document_source_type(str(source.get("type") or "")):
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
@@ -9788,8 +9579,8 @@ def create_admin_app(
         """Receive one local-source package pushed by the local daemon/adapter.
 
         The service owns the inbox layout and package format. Local clients
-        send raw file text or structured source payloads; source genes perform
-        canonical markdown normalization during sync.
+        send raw file text; source genes perform canonical markdown
+        normalization during sync.
         """
         source = await db.get_source(source_id)
         if not source:
@@ -9822,17 +9613,6 @@ def create_admin_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        try:
-            source_artifacts = await _resolve_local_source_artifact_inputs(
-                db,
-                source_id=source_id,
-                workspace_id=workspace_id,
-                input_hashes=req.artifact_input_hashes,
-                expected_source_unit_key=str(req.artifact_source_unit_key or "").strip(),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
         submit_package = load_reference(collection.package_submitter)
         try:
             result = await submit_package(
@@ -9843,7 +9623,6 @@ def create_admin_app(
                 source=source,
                 document_store=artifact_store,
                 sync_snapshot_id=input_snapshot_id,
-                source_artifacts=source_artifacts,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -10161,30 +9940,7 @@ def create_admin_app(
                     req.package_contract_version,
                 ),
             )
-            excluded_listings = tuple(
-                ExcludedScopeListing(
-                    scope_key=listing.scope_key, doc_ids=frozenset(listing.doc_ids), rejection=listing.rejection
-                )
-                for listing in req.excluded_listings
-            )
-            validate_excluded_listings_for_job(
-                excluded_listings,
-                (
-                    str(entry.get("scope_key") or "")
-                    for entry in lease_payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ()
-                    if isinstance(entry, Mapping)
-                ),
-            )
-            manifest_sha256 = snapshot_manifest_sha256(items, excluded_listings)
-            confirm = await _snapshot_confirm_set(
-                db,
-                source=source,
-                workspace_id=workspace_id,
-                snapshot_id=snapshot_id,
-                listed_doc_ids=frozenset(item.doc_id for item in items),
-                excluded_listings=excluded_listings,
-                package_contract_version=req.package_contract_version,
-            )
+            manifest_sha256 = snapshot_manifest_sha256(items)
             await db.attach_source_sync_inputs_to_snapshot(
                 source_id=source_id,
                 workspace_id=workspace_id,
@@ -10197,8 +9953,6 @@ def create_admin_app(
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
-                confirm=confirm,
-                excluded_listings=excluded_listings,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -10210,65 +9964,6 @@ def create_admin_app(
             "manifest_sha256": manifest_sha256,
             "reused_count": len(plan.reused_memberships),
             "required_doc_ids": list(plan.required_doc_ids),
-            "confirm": [{"doc_id": item.doc_id, "provider_key": item.provider_key} for item in confirm],
-        }
-
-    @source_router.post("/{source_id}/adapter/manifest/confirmations")
-    async def submit_local_source_confirmations(
-        source_id: str,
-        req: LocalSourceConfirmationsRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        workspace_id: str = Depends(get_workspace_id),
-    ):
-        """Store a device's answers for the items its manifest response asked it to confirm.
-
-        The answers bind to the job attempt and the digest of the manifest. An
-        identical replay is accepted; an item the manifest did not ask about,
-        another digest or attempt, and answers that differ from the stored
-        ones are refused with 409.
-        """
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
-        try:
-            snapshot_id = local_agent_collection_attempt_id(
-                source.get("type"),
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-            await db.write_source_sync_snapshot_confirmations(
-                source_id=source_id,
-                workspace_id=workspace_id,
-                snapshot_id=snapshot_id,
-                manifest_sha256=req.manifest_sha256,
-                local_agent_job_id=req.local_agent_job_id,
-                local_agent_attempt_count=req.local_agent_attempt_count,
-                answers=tuple(
-                    SnapshotConfirmation(
-                        item.doc_id, item.provider_key, SnapshotConfirmationAnswer(item.answer)
-                    )
-                    for item in req.answers
-                ),
-                failure_cause=req.failure_cause,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "source_id": source_id,
-            "snapshot_id": snapshot_id,
-            "answered_count": len(req.answers),
-            "failed": req.failure_cause is not None,
         }
 
     async def _acquisition_source(request: Request, db: Database, source_id: str) -> dict[str, Any]:

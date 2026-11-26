@@ -158,57 +158,6 @@ def test_update_source_schedule_puts_source_schedule_payload():
     ]
 
 
-def test_push_github_repo_document_posts_adapter_payload():
-    client = _RecordingClient({"package_id": "github_repo_document:hash"})
-
-    result = client.push_github_repo_document(
-        source_id="src-github",
-        repo_url="https://github.example.com/org/repo",
-        repo_ref="main",
-        relative_path="docs/design.md",
-        markdown_body="# Design",
-        title="Design",
-        raw_hash="raw-1",
-        blob_sha="blob-1",
-        symlink_chain=[{
-            "path": "docs/design.md",
-            "blob_sha": "link-1",
-            "target_path": "docs/current-design.md",
-        }],
-        resolved_relative_path="docs/current-design.md",
-        sync_snapshot_id="laj-sync-1",
-        submitted_by="codex",
-        submitted_at="2026-07-07T08:00:00Z",
-    )
-
-    assert result["package_id"] == "github_repo_document:hash"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-github/adapter/packages",
-            {
-                "repo_url": "https://github.example.com/org/repo",
-                "repo_ref": "main",
-                "relative_path": "docs/design.md",
-                "markdown_body": "# Design",
-                "content_type": "text/markdown",
-                "title": "Design",
-                "raw_hash": "raw-1",
-                "blob_sha": "blob-1",
-                "symlink_chain": [{
-                    "path": "docs/design.md",
-                    "blob_sha": "link-1",
-                    "target_path": "docs/current-design.md",
-                }],
-                "resolved_relative_path": "docs/current-design.md",
-                "sync_snapshot_id": "laj-sync-1",
-                "submitted_by": "codex",
-                "submitted_at": "2026-07-07T08:00:00Z",
-            },
-        )
-    ]
-
-
 def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
     client = _RecordingClient({"required_doc_ids": []})
 
@@ -238,79 +187,6 @@ def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
     ]
     # The agent confirms by identifier what a query manifest leaves out.
     assert LOCAL_PACKAGE_CONTRACT_VERSION == 3
-
-
-def test_submit_local_source_confirmations_posts_answers_bound_to_the_manifest():
-    client = _RecordingClient({"answered_count": 1})
-    binding = {
-        "manifest_sha256": "d" * 64,
-        "sync_snapshot_id": "job-1:attempt:2",
-        "local_agent_job_id": "job-1",
-        "local_agent_attempt_count": 2,
-    }
-
-    answered = client.submit_local_source_confirmations(
-        source_id="src-jira",
-        answers=[{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}],
-        **binding,
-    )
-    failed = client.submit_local_source_confirmations(
-        source_id="src-jira", failure_cause="RuntimeError: HTTP 401 from Jira", **binding
-    )
-
-    assert answered == {"answered_count": 1}
-    assert failed == {"answered_count": 1}
-    route = "/api/v1/sources/src-jira/adapter/manifest/confirmations"
-    assert client.calls == [
-        (
-            "POST",
-            route,
-            {**binding, "answers": [{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}]},
-        ),
-        ("POST", route, {**binding, "answers": [], "failure_cause": "RuntimeError: HTTP 401 from Jira"}),
-    ]
-
-
-def test_push_jira_package_posts_raw_payload_without_markdown_body():
-    client = _RecordingClient({"doc_id": "jira-doc"})
-
-    result = client.push_jira_package(
-        source_id="src-jira",
-        base_url="https://jira.example.test",
-        issue_key="PAY-1",
-        source_url="https://jira.example.test/browse/PAY-1",
-        raw_payload={"key": "PAY-1", "fields": {"summary": "Payroll task"}},
-        title="Payroll task",
-        raw_hash="raw-1",
-        provider_revision="2026-07-07T07:59:00Z",
-        sync_snapshot_id="laj-sync-2",
-        artifact_source_unit_key="PAY-1",
-        artifact_input_hashes=["b" * 64],
-        submitted_by="codex",
-        submitted_at="2026-07-07T08:00:00Z",
-    )
-
-    assert result["doc_id"] == "jira-doc"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-jira/adapter/packages",
-            {
-                "base_url": "https://jira.example.test",
-                "issue_key": "PAY-1",
-                "source_url": "https://jira.example.test/browse/PAY-1",
-                "raw_payload": {"key": "PAY-1", "fields": {"summary": "Payroll task"}},
-                "title": "Payroll task",
-                "raw_hash": "raw-1",
-                "provider_revision": "2026-07-07T07:59:00Z",
-                "sync_snapshot_id": "laj-sync-2",
-                "artifact_source_unit_key": "PAY-1",
-                "artifact_input_hashes": ["b" * 64],
-                "submitted_by": "codex",
-                "submitted_at": "2026-07-07T08:00:00Z",
-            },
-        )
-    ]
 
 
 def test_conversation_collection_calls_use_the_source_resource():

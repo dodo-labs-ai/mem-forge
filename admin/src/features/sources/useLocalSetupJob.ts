@@ -9,7 +9,6 @@ type SharedSetupJobOperation = "credential_check";
 
 /** The Source type each type's own setup operation belongs to, as the server's job route checks it. */
 const SETUP_JOB_SOURCE_TYPES: Readonly<Record<Exclude<SetupJobOperation, SharedSetupJobOperation>, string>> = {
-  github_repo_preview_tree: "github_repo",
   local_markdown_pick_root: "local_markdown",
   local_markdown_preview_tree: "local_markdown",
   teams_auth: "teams",
@@ -30,7 +29,6 @@ const MINUTE_MS = 60_000;
  */
 const SETUP_JOB_TIMEOUT_MS: Readonly<Record<SetupJobOperation, number>> = {
   credential_check: 60 * MINUTE_MS,
-  github_repo_preview_tree: 3 * MINUTE_MS,
   local_markdown_pick_root: 60 * MINUTE_MS,
   local_markdown_preview_tree: 3 * MINUTE_MS,
   teams_auth: 10 * MINUTE_MS,

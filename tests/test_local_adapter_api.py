@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,89 +12,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.github_repo_utils import build_github_repo_doc_id
 from memforge.local_agent.source_contract import LocalAgentLease, source_with_sync_inputs
-from memforge.local_adapter import submit_github_repo_document
 from memforge.models import ContentItem, require_attested_content
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
-from memforge.source_artifacts import SourceArtifactContractError
-
-
-class _EmptySourceInputDatabase:
-    async def list_source_sync_inputs(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        input_snapshot_id: str | None,
-    ):
-        assert workspace_id == "local"
-        return []
-
-
-class _BlockingDocumentStore:
-    def __init__(self) -> None:
-        self.started = threading.Event()
-        self.release = threading.Event()
-
-    def store_raw(
-        self,
-        source_id: str,
-        doc_id: str,
-        title: str,
-        content: bytes,
-        content_type: str,
-        extension: str | None = None,
-    ) -> str:
-        self.started.set()
-        assert self.release.wait(timeout=2)
-        return "object-store://workspace/documents/package"
-
-
-@pytest.mark.asyncio
-async def test_github_package_artifact_io_does_not_block_event_loop(tmp_path: Path) -> None:
-    store = _BlockingDocumentStore()
-    release_timer = threading.Timer(0.5, store.release.set)
-    release_timer.start()
-    loop = asyncio.get_running_loop()
-    started_at = loop.time()
-    try:
-        task = asyncio.create_task(
-            submit_github_repo_document(
-                db=_EmptySourceInputDatabase(),
-                workspace_id="local",
-                config=_config(tmp_path),
-                source={
-                    "id": "src-github",
-                    "type": "github_repo",
-                    "config": {
-                        "connection_mode": "local_push",
-                        "repo_url": "https://github.example.test/org/repo",
-                        "ref": "main",
-                        "include_paths": ["docs/"],
-                        "include_extensions": ["md"],
-                        "max_files": 500,
-                    },
-                },
-                repo_url="https://github.example.test/org/repo",
-                repo_ref="main",
-                relative_path="docs/guide.md",
-                markdown_body="# Guide",
-                document_store=store,
-                sync_snapshot_id="snapshot-1",
-            )
-        )
-        await asyncio.sleep(0.05)
-        assert loop.time() - started_at < 0.2
-        assert store.started.is_set()
-        assert not task.done()
-        store.release.set()
-        result = await task
-    finally:
-        store.release.set()
-        release_timer.cancel()
-    assert result["package_uri"] == "object-store://workspace/documents/package"
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -165,64 +85,6 @@ def _create_unmapped_local_markdown_source(
                 "vault_id": vault_id,
                 "display_label": "Engineering notes",
             },
-        },
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def _create_github_repo_source(
-    client: TestClient,
-    *,
-    name: str = "Gamma Architecture",
-    connection_mode: str = "local_push",
-    max_files: int = 500,
-    exclude_paths: list[str] | None = None,
-    include_extensions: list[str] | None = None,
-) -> dict:
-    response = client.post(
-        "/api/v1/sources",
-        json={
-            "type": "github_repo",
-            "name": name,
-            "access_policy": "private",
-            "config": {
-                "connection_mode": connection_mode,
-                "repo_url": "https://github.example.com/acme/architecture",
-                "ref": "main",
-                "include_paths": ["Payroll Processing/"],
-                "exclude_paths": exclude_paths or [],
-                "include_extensions": include_extensions or ["md"],
-                "max_files": max_files,
-            },
-            "project_binding": {"mode": "fixed", "project_key": "GAMMA"},
-        },
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def _create_jira_source(
-    client: TestClient,
-    *,
-    name: str = "Payroll Jira",
-    sync_mode: str = "local_agent",
-) -> dict:
-    response = client.post(
-        "/api/v1/sources",
-        json={
-            "type": "jira",
-            "name": name,
-            "access_policy": "private",
-            "config": {
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-                "sync_mode": sync_mode,
-                "projects": ["PAY"],
-                "issue_types": ["Task"],
-                "include_comments": True,
-            },
-            "project_binding": {"mode": "fixed", "project_key": "PAY"},
         },
     )
     assert response.status_code == 200, response.text
@@ -327,389 +189,6 @@ def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
         assert row is not None
         assert row["config"]["vault_id"] == "engineering"
         assert row["config"]["display_label"] == "Engineering docs"
-    finally:
-        asyncio.run(database.close())
-
-
-def test_create_github_repo_source_populates_inbox_path_for_local_push(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            created = _create_github_repo_source(client)
-            row = asyncio.run(database.get_source(created["id"]))
-        assert row is not None
-        assert row["type"] == "github_repo"
-        assert row["config"]["repo_url"] == "https://github.example.com/acme/architecture"
-        documents_dir = Path(row["config"]["documents_dir"])
-        assert documents_dir.exists()
-        expected_root = Path(cfg.storage.docs_path).parent / "local-adapter-submissions"
-        assert documents_dir.is_relative_to(expected_root)
-    finally:
-        asyncio.run(database.close())
-
-
-def test_jira_adapter_document_push_uses_one_canonical_artifact(tmp_path):
-    from memforge.genes.jira_gene import JiraGene
-    from memforge.local_adapter import build_jira_doc_id
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            created = _create_jira_source(client)
-            source_id = created["id"]
-            raw_payload = {
-                "id": "10001",
-                "key": "PAY-1",
-                "fields": {
-                    "summary": "Create daemon source support",
-                    "description": "Create daemon source support.",
-                    "status": {"name": "Open"},
-                    "issuetype": {"name": "Task"},
-                    "priority": {"name": "Medium"},
-                    "assignee": {"displayName": "Ada"},
-                    "labels": [],
-                    "resolution": None,
-                    "updated": "2026-07-10T08:00:00+00:00",
-                    "issuelinks": [],
-                    "subtasks": [],
-                },
-                "_comments": [],
-                "_comments_included": True,
-                "_comments_total": 0,
-                "changelog": {"startAt": 0, "histories": [], "total": 0},
-            }
-            initial_row = asyncio.run(database.get_source(source_id))
-            assert initial_row is not None
-            initial_documents_dir = Path(initial_row["config"]["local_agent_documents_dir"])
-            assert initial_documents_dir.exists()
-            manifest_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                json={
-                    "items": [
-                        {
-                            "doc_id": build_jira_doc_id(
-                                source_id=source_id,
-                                issue_key="PAY-1",
-                            ),
-                            "revision": "2026-07-10T08:00:00+00:00",
-                            "change_kind": "upsert",
-                        }
-                    ],
-                    "coverage": "complete_snapshot",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                },
-            )
-            premature_process = client.post(
-                f"/api/v1/sources/{source_id}/process",
-                json={"sync_snapshot_id": "test-local-agent-job:attempt:1"},
-            )
-            revision_mismatch = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "source_url": "https://jira.example.test/browse/PAY-1",
-                    "title": "Create daemon source support",
-                    "raw_payload": raw_payload,
-                    "provider_revision": "2026-07-10T09:00:00+00:00",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                },
-            )
-            undeclared = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-2",
-                    "source_url": "https://jira.example.test/browse/PAY-2",
-                    "title": "Undeclared issue",
-                    "raw_payload": {**raw_payload, "id": "10002", "key": "PAY-2"},
-                    "provider_revision": "2026-07-10T08:00:00+00:00",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                },
-            )
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "source_url": "https://jira.example.test/browse/PAY-1",
-                    "title": "Create daemon source support",
-                    "raw_payload": raw_payload,
-                    "provider_revision": "2026-07-10T08:00:00+00:00",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                    "submitted_at": "2026-07-10T08:00:00+00:00",
-                },
-            )
-            repeated_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "source_url": "https://jira.example.test/browse/PAY-1",
-                    "title": "Create daemon source support",
-                    "raw_payload": raw_payload,
-                    "provider_revision": "2026-07-10T08:00:00+00:00",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                    "submitted_at": "2026-07-10T08:05:00+00:00",
-                },
-            )
-            process_response = client.post(
-                f"/api/v1/sources/{source_id}/process",
-                json={
-                    "force_full_sync": False,
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                },
-            )
-
-        assert manifest_response.status_code == 200, manifest_response.text
-        assert premature_process.status_code == 409
-        assert premature_process.json()["detail"] == "source_snapshot_materialization_incomplete"
-        assert revision_mismatch.status_code == 409
-        assert "does not match manifest" in revision_mismatch.json()["detail"]
-        assert undeclared.status_code == 409
-        assert undeclared.json()["detail"] == "snapshot input was not declared by the manifest"
-        assert response.status_code == 200, response.text
-        assert repeated_response.status_code == 200, repeated_response.text
-        payload = response.json()
-        repeated_payload = repeated_response.json()
-        assert payload["issue_key"] == "PAY-1"
-        assert payload["package_uri"]
-        assert repeated_payload["package_uri"] == payload["package_uri"]
-        first_package = json.loads(Path(payload["package_uri"]).read_text(encoding="utf-8"))
-        assert first_package["submitted_at"] == "2026-07-10T08:00:00+00:00"
-        _run_artifact_cleanup(database, cfg)
-        package_artifacts = list(Path(cfg.storage.docs_path).rglob("*package*.json"))
-        assert package_artifacts == [Path(payload["package_uri"])]
-        row = asyncio.run(database.get_source(source_id))
-        assert row is not None
-        documents_dir = Path(row["config"]["local_agent_documents_dir"])
-        package_path = documents_dir / f"{payload['doc_id']}.json"
-        assert payload["package_path"] is None
-        assert not package_path.exists()
-        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
-        assert len(inputs) == 1
-        assert inputs[0].raw_uri == payload["package_uri"]
-        assert inputs[0].metadata["doc_id"] == payload["doc_id"]
-        assert inputs[0].metadata["manifest_entry"]["doc_id"] == payload["doc_id"]
-        assert inputs[0].metadata["manifest_entry"]["provider_revision"] == "2026-07-10T08:00:00+00:00"
-        snapshot_inputs = asyncio.run(
-            database.list_source_sync_inputs(
-                workspace_id="local",
-                source_id=source_id,
-                input_snapshot_id="test-local-agent-job:attempt:1",
-            )
-        )
-        assert [item.input_id for item in snapshot_inputs] == [inputs[0].input_id]
-        repeated_snapshot_inputs = asyncio.run(
-            database.list_source_sync_inputs(
-                workspace_id="local",
-                source_id=source_id,
-                input_snapshot_id="test-local-agent-job:attempt:1",
-            )
-        )
-        assert [item.input_id for item in repeated_snapshot_inputs] == [inputs[0].input_id]
-        assert process_response.status_code == 202, process_response.text
-        run = asyncio.run(database.get_source_sync_run(process_response.json()["run_id"]))
-        assert run is not None
-        assert run.input_snapshot_id == "test-local-agent-job:attempt:1"
-
-        projected = _project_source_inputs(database, row)
-        gene = JiraGene(projected["config"], source_id)
-        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
-
-        async def _read_package():
-            await gene.authenticate()
-            items = [item async for item in gene.discover(None)]
-            raw = await gene.fetch(items[0])
-            normalized = await gene.normalize(raw)
-            return items, normalized
-
-        items, normalized = asyncio.run(_read_package())
-        assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
-        assert "Create daemon source support." in normalized.markdown_body
-        assert normalized.source_semantics["status"] == "Open"
-        assert normalized.source_semantics["issue_key"] == "PAY-1"
-    finally:
-        asyncio.run(database.close())
-
-
-def test_jira_adapter_rejects_comment_without_stable_provider_id(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_jira_source(client)["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "raw_payload": {
-                        "key": "PAY-1",
-                        "fields": {"summary": "Issue"},
-                        "_comments": [{"body": "Decision"}],
-                    },
-                },
-            )
-
-        assert response.status_code == 400
-        assert "stable provider id" in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_jira_local_agent_mode_rejects_pat_auth(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            response = client.post(
-                "/api/v1/sources",
-                json={
-                    "type": "jira",
-                    "name": "Payroll Jira",
-                    "access_policy": "private",
-                    "config": {
-                        "base_url": "https://jira.example.test",
-                        "auth_mode": "pat",
-                        "sync_mode": "local_agent",
-                        "pat": "local-pat",
-                        "projects": ["PAY"],
-                    },
-                    "project_binding": {"mode": "fixed", "project_key": "PAY"},
-                },
-            )
-
-        assert response.status_code == 400, response.text
-        # The token option is offered only while Jira is read by the server.
-        assert response.json()["detail"]["fields"] == [
-            {"key": "auth_mode", "message": "Jira Authentication Method must be one of: Browser session"}
-        ]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_update_jira_local_agent_source_preserves_sync_mode_when_omitted(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            created = _create_jira_source(client)
-            source_id = created["id"]
-            before = asyncio.run(database.get_source(source_id))
-            assert before is not None
-            initial_documents_dir = before["config"]["local_agent_documents_dir"]
-            response = client.put(
-                f"/api/v1/sources/{source_id}",
-                json={
-                    "config": {
-                        "base_url": "https://jira.example.test",
-                        "auth_mode": "browser_cookie",
-                        "projects": ["PAY", "ENG"],
-                        "issue_types": ["Task"],
-                        "include_comments": True,
-                    }
-                },
-            )
-
-        assert response.status_code == 200, response.text
-        row = asyncio.run(database.get_source(source_id))
-        assert row is not None
-        assert row["config"]["sync_mode"] == "local_agent"
-        assert row["config"]["local_agent_documents_dir"] == initial_documents_dir
-    finally:
-        asyncio.run(database.close())
-
-
-def test_jira_local_agent_package_discovery_normalizes_naive_timestamps(tmp_path):
-    from datetime import datetime, timezone
-
-    from memforge.genes.jira_gene import JiraGene
-
-    documents_dir = tmp_path / "jira-inbox"
-    documents_dir.mkdir()
-    (documents_dir / "pay-1.json").write_text(
-        json.dumps(
-            {
-                "package_kind": "jira_document",
-                "doc_id": "jira-pay-1",
-                "issue_key": "PAY-1",
-                "title": "Naive timestamp package",
-                "source_url": "https://jira.example.test/browse/PAY-1",
-                "last_modified": "2026-07-07T12:00:00",
-                "raw_payload": {
-                    "key": "PAY-1",
-                    "fields": {
-                        "summary": "Naive timestamp package",
-                        "description": "PAY-1",
-                        "status": {"name": "Open"},
-                        "issuetype": {"name": "Task"},
-                        "issuelinks": [],
-                        "subtasks": [],
-                    },
-                    "_comments": [],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    gene = JiraGene(
-        {
-            "base_url": "https://jira.example.test",
-            "auth_mode": "browser_cookie",
-            "sync_mode": "local_agent",
-            "local_agent_documents_dir": str(documents_dir),
-        },
-        "src-jira",
-    )
-
-    async def _discover():
-        await gene.authenticate()
-        return [item async for item in gene.discover(datetime(2026, 7, 7, 11, 0, tzinfo=timezone.utc))]
-
-    items = asyncio.run(_discover())
-    assert [item.extra["issue_key"] for item in items] == ["PAY-1"]
-    assert items[0].last_modified.tzinfo is timezone.utc
-
-
-def test_jira_adapter_document_push_requires_local_agent_mode(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            created = _create_jira_source(client, sync_mode="cloud")
-            source_id = created["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "markdown_body": "# PAY-1",
-                },
-            )
-
-        assert response.status_code == 400, response.text
-        assert "sync_mode=local_agent" in response.json()["detail"]
     finally:
         asyncio.run(database.close())
 
@@ -1008,9 +487,7 @@ def test_normal_local_source_fetch_rejects_tampered_canonical_package(tmp_path):
         asyncio.run(database.close())
 
 
-@pytest.mark.parametrize("source_type", ["local_markdown", "github_repo"])
-def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type):
-    from memforge.genes.github_repo_gene import GitHubRepoGene
+def test_local_file_package_attests_explicit_empty_content(tmp_path):
     from memforge.genes.local_markdown_gene import LocalMarkdownGene
     from memforge.server.admin_api import create_admin_app
 
@@ -1023,23 +500,13 @@ def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type
             local_agent_lease_validator=_allow_local_agent_lease,
         )
         with LeaseAwareTestClient(app) as client:
-            if source_type == "local_markdown":
-                source_id = _create_local_markdown_source(client)["id"]
-                payload = {
-                    "vault_id": "engineering",
-                    "relative_path": "emptied.md",
-                    "markdown_body": "",
-                    "process_now": False,
-                }
-            else:
-                source_id = _create_github_repo_source(client)["id"]
-                payload = {
-                    "repo_url": ("https://github.example.com/acme/architecture"),
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/emptied.md",
-                    "markdown_body": "",
-                    "process_now": False,
-                }
+            source_id = _create_local_markdown_source(client)["id"]
+            payload = {
+                "vault_id": "engineering",
+                "relative_path": "emptied.md",
+                "markdown_body": "",
+                "process_now": False,
+            }
             response = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json=payload,
@@ -1047,11 +514,7 @@ def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type
         assert response.status_code == 200, response.text
         source = asyncio.run(database.get_source(source_id))
         projected = _project_source_inputs(database, source)
-        gene = (
-            LocalMarkdownGene(projected["config"], source_id)
-            if source_type == "local_markdown"
-            else GitHubRepoGene(projected["config"], source_id)
-        )
+        gene = LocalMarkdownGene(projected["config"], source_id)
         gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
 
         async def fetch_package():
@@ -1065,307 +528,6 @@ def test_local_file_package_attests_explicit_empty_content(tmp_path, source_type
         assert raw.authoritative_empty is True
         assert raw.empty_evidence
         assert normalized.markdown_body == ""
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_adapter_document_push_writes_package(tmp_path):
-    from memforge.genes.github_repo_gene import GitHubRepoGene
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            created = _create_github_repo_source(client)
-            source_id = created["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "title": "Payroll Processing",
-                    "markdown_body": "# Payroll Processing\n\nArchitecture notes.",
-                    "content_type": "text/markdown",
-                    "blob_sha": "blob-sha-1",
-                    "raw_hash": "raw-hash-1",
-                    "submitted_by": "github-adapter",
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        assert body["source_id"] == source_id
-        assert body["doc_id"] == build_github_repo_doc_id(
-            source_id=source_id,
-            repo_url="https://github.example.com/acme/architecture",
-            repo_ref="main",
-            relative_path="Payroll Processing/README.md",
-        )
-        assert body["package_uri"]
-        assert body["relative_path"] == "Payroll Processing/README.md"
-
-        assert body["package_path"] is None
-        package_path = Path(body["package_uri"])
-        package = json.loads(package_path.read_text())
-        assert package["package_kind"] == "github_repo_document"
-        assert package["repo_url"] == "https://github.example.com/acme/architecture"
-        assert package["repo_ref"] == "main"
-        assert package["relative_path"] == "Payroll Processing/README.md"
-        assert package["blob_sha"] == "blob-sha-1"
-        assert package["markdown"].startswith("# Payroll Processing")
-
-        row = asyncio.run(database.get_source(source_id))
-        assert row is not None
-        inputs = asyncio.run(database.list_source_sync_inputs(workspace_id="local", source_id=source_id))
-        assert len(inputs) == 1
-        assert inputs[0].raw_uri == body["package_uri"]
-        assert inputs[0].metadata["doc_id"] == body["doc_id"]
-        assert inputs[0].metadata["manifest_entry"]["doc_id"] == body["doc_id"]
-
-        projected = _project_source_inputs(database, row)
-        gene = GitHubRepoGene(projected["config"], source_id)
-        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
-
-        async def _read_package():
-            await gene.authenticate()
-            items = [item async for item in gene.discover(None)]
-            raw = await gene.fetch(items[0])
-            normalized = await gene.normalize(raw)
-            return items, normalized
-
-        items, normalized = asyncio.run(_read_package())
-        assert items[0].extra["package_uri"] == body["package_uri"]
-        assert normalized.markdown_body.startswith("# Payroll Processing")
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_symlink_push_preserves_logical_identity_and_audit_locator(tmp_path):
-    from memforge.genes.github_repo_gene import GitHubRepoGene
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client)["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Contributions\n\nUse reviewed changes.",
-                    "content_type": "text/markdown",
-                    "blob_sha": "b" * 40,
-                    "symlink_chain": [{
-                        "path": "Payroll Processing/README.md",
-                        "blob_sha": "a" * 40,
-                        "target_path": "docs/CONTRIBUTIONS.md",
-                    }],
-                    "resolved_relative_path": "docs/CONTRIBUTIONS.md",
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 200, response.text
-        body = response.json()
-        package = json.loads(Path(body["package_uri"]).read_text())
-        assert package["doc_id"] == build_github_repo_doc_id(
-            source_id=source_id,
-            repo_url="https://github.example.com/acme/architecture",
-            repo_ref="main",
-            relative_path="Payroll Processing/README.md",
-        )
-        assert package["blob_sha"] == "b" * 40
-        assert package["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
-        assert package["symlink_chain"] == [{
-            "path": "Payroll Processing/README.md",
-            "blob_sha": "a" * 40,
-            "target_path": "docs/CONTRIBUTIONS.md",
-        }]
-
-        source = asyncio.run(database.get_source(source_id))
-        projected = _project_source_inputs(database, source)
-        gene = GitHubRepoGene(projected["config"], source_id)
-        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
-
-        async def _normalize_package():
-            await gene.authenticate()
-            [item] = [item async for item in gene.discover(None)]
-            return await gene.normalize(await gene.fetch(item))
-
-        normalized = asyncio.run(_normalize_package())
-        assert normalized.source_semantics["relative_path"] == "Payroll Processing/README.md"
-        assert normalized.source_semantics["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
-        assert normalized.source_semantics["logical_file_mode"] == "120000"
-    finally:
-        asyncio.run(database.close())
-
-
-@pytest.mark.parametrize(
-    ("resolved_path", "exclude_paths", "message"),
-    [
-        ("/docs/CONTRIBUTIONS.md", [], "repository-relative"),
-        ("docs/CONTRIBUTIONS.md ", [], "repository-relative"),
-        ("docs/CONTRIBUTIONS.md", ["docs"], "explicitly excluded"),
-        ("assets/photo.png", [], "binary Artifacts"),
-        ("Payroll Processing/README.md", [], "cyclic"),
-    ],
-)
-def test_github_repo_symlink_push_rejects_unsafe_audit_locator(
-    tmp_path, resolved_path, exclude_paths, message,
-):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client, exclude_paths=exclude_paths)["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Contributions",
-                    "content_type": "text/markdown",
-                    "blob_sha": "b" * 40,
-                    "symlink_chain": [{
-                        "path": "Payroll Processing/README.md",
-                        "blob_sha": "a" * 40,
-                        "target_path": resolved_path,
-                    }],
-                    "resolved_relative_path": resolved_path,
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 400, response.text
-        assert message in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-@pytest.mark.parametrize(
-    ("symlink_chain", "resolved_relative_path"),
-    [
-        ([{"path": "Payroll Processing/README.md", "blob_sha": "a" * 40,
-           "target_path": "docs/a.md"}], None),
-        ([], "docs/a.md"),
-    ],
-)
-def test_github_repo_symlink_push_rejects_incomplete_audit_locator(
-    tmp_path, symlink_chain, resolved_relative_path,
-):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client)["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# A",
-                    "blob_sha": "b" * 40,
-                    "symlink_chain": symlink_chain,
-                    "resolved_relative_path": resolved_relative_path,
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 400, response.text
-        assert "identity is incomplete" in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_local_push_materializes_binary_artifact_input(tmp_path):
-    from memforge.genes.github_repo_gene import GitHubRepoGene
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    image_bytes = b"\x89PNG\r\n\x1a\nlocal-github-image"
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            local_agent_lease_validator=_allow_local_agent_lease,
-        )
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(
-                client,
-                include_extensions=["png"],
-            )["id"]
-            artifact_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/artifacts",
-                params={
-                    "source_unit_key": "Payroll Processing/architecture.png",
-                    "provider_key": "Payroll Processing/architecture.png",
-                    "provider_revision": "blob-image-sha",
-                    "parent_observation_type": "file_content",
-                    "parent_provider_key": "content",
-                    "filename": "architecture.png",
-                    "media_type": "image/png",
-                    "local_agent_job_id": "test-local-agent-job",
-                    "local_agent_attempt_count": 1,
-                },
-                content=image_bytes,
-                headers={"content-type": "image/png"},
-            )
-            assert artifact_response.status_code == 200, artifact_response.text
-            artifact_input_hash = artifact_response.json()["input_sha256"]
-            package_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/architecture.png",
-                    "markdown_body": "",
-                    "content_type": "image/png",
-                    "blob_sha": "blob-image-sha",
-                    "artifact_source_unit_key": "Payroll Processing/architecture.png",
-                    "artifact_input_hashes": [artifact_input_hash],
-                },
-            )
-        assert package_response.status_code == 200, package_response.text
-
-        source = asyncio.run(database.get_source(source_id))
-        assert source is not None
-        projected = _project_source_inputs(database, source)
-        gene = GitHubRepoGene(projected["config"], source_id)
-        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
-
-        async def _read_package():
-            await gene.authenticate()
-            item = [item async for item in gene.discover(None)][0]
-            raw = await gene.fetch(item)
-            async with gene.open_source_artifact(raw.artifacts[0]) as download:
-                observed = b"".join([chunk async for chunk in download.chunks])
-            return raw, observed
-
-        raw, observed = asyncio.run(_read_package())
-        assert raw.body
-        assert raw.authoritative_empty is True
-        assert len(raw.artifacts) == 1
-        assert raw.artifacts[0].provider_revision == "blob-image-sha"
-        assert observed == image_bytes
-
-        package = json.loads(Path(package_response.json()["package_uri"]).read_text())
-        artifact_path = Path(package["source_artifacts"][0]["uri"])
-        artifact_path.write_bytes(b"x" * len(image_bytes))
-        with pytest.raises(SourceArtifactContractError, match="byte hash"):
-            asyncio.run(_read_package())
     finally:
         asyncio.run(database.close())
 
@@ -1406,197 +568,7 @@ def test_local_markdown_rejects_implicit_binary_artifact_intake(tmp_path):
         asyncio.run(database.close())
 
 
-def test_jira_local_push_materializes_comment_image_artifact_input(tmp_path):
-    from memforge.genes.jira_gene import JiraGene
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    image_bytes = b"\x89PNG\r\n\x1a\njira-comment-image"
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            local_agent_lease_validator=_allow_local_agent_lease,
-        )
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_jira_source(client)["id"]
-            artifact_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/artifacts",
-                params={
-                    "source_unit_key": "PAY-1",
-                    "provider_key": "attachment-1",
-                    "provider_revision": "attachment-revision-1",
-                    "parent_observation_type": "comment",
-                    "parent_provider_key": "comment-1",
-                    "filename": "screenshot.png",
-                    "media_type": "image/png",
-                    "local_agent_job_id": "test-local-agent-job",
-                    "local_agent_attempt_count": 1,
-                },
-                content=image_bytes,
-                headers={"content-type": "image/png"},
-            )
-            assert artifact_response.status_code == 200, artifact_response.text
-            artifact_input_hash = artifact_response.json()["input_sha256"]
-            raw_payload = {
-                "id": "10001",
-                "key": "PAY-1",
-                "fields": {
-                    "summary": "Image in comment",
-                    "description": "",
-                    "status": {"name": "Open"},
-                    "issuetype": {"name": "Task"},
-                    "priority": {"name": "Medium"},
-                    "assignee": None,
-                    "labels": [],
-                    "resolution": None,
-                    "updated": "2026-07-10T08:00:00+00:00",
-                    "issuelinks": [],
-                    "subtasks": [],
-                    "attachment": [],
-                },
-                "_comments": [
-                    {
-                        "id": "comment-1",
-                        "body": "See screenshot.png",
-                    }
-                ],
-                "_comments_included": True,
-                "_comments_total": 1,
-                "changelog": {"startAt": 0, "histories": [], "total": 0},
-            }
-            package_response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "base_url": "https://jira.example.test",
-                    "issue_key": "PAY-1",
-                    "source_url": "https://jira.example.test/browse/PAY-1",
-                    "title": "Image in comment",
-                    "raw_payload": raw_payload,
-                    "provider_revision": "2026-07-10T08:00:00+00:00",
-                    "artifact_source_unit_key": "PAY-1",
-                    "artifact_input_hashes": [artifact_input_hash],
-                    "process_now": False,
-                },
-            )
-        assert package_response.status_code == 200, package_response.text
-
-        source = asyncio.run(database.get_source(source_id))
-        assert source is not None
-        projected = _project_source_inputs(database, source)
-        gene = JiraGene(projected["config"], source_id)
-        gene.bind_document_store(LocalDocumentStore(cfg.storage.docs_path))
-
-        async def _read_package():
-            await gene.authenticate()
-            item = [item async for item in gene.discover(None)][0]
-            raw = await gene.fetch(item)
-            async with gene.open_source_artifact(raw.artifacts[0]) as download:
-                observed = b"".join([chunk async for chunk in download.chunks])
-            return raw, observed
-
-        raw, observed = asyncio.run(_read_package())
-        assert len(raw.artifacts) == 1
-        assert raw.artifacts[0].parent_observation_type == "comment"
-        assert raw.artifacts[0].parent_provider_key == "comment-1"
-        assert observed == image_bytes
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_manifest_reuses_unchanged_input_without_another_package(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(
-            db=database,
-            config=cfg,
-            local_agent_lease_validator=_allow_local_agent_lease,
-        )
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client)["id"]
-            relative_path = "Payroll Processing/README.md"
-            doc_id = build_github_repo_doc_id(
-                source_id=source_id,
-                repo_url="https://github.example.com/acme/architecture",
-                repo_ref="main",
-                relative_path=relative_path,
-            )
-            initial_manifest = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                json={
-                    "items": [
-                        {"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}
-                    ],
-                    "coverage": "complete_snapshot",
-                    "sync_snapshot_id": "test-local-agent-job:attempt:1",
-                    "local_agent_job_id": "test-local-agent-job",
-                    "local_agent_attempt_count": 1,
-                },
-            )
-            first = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": relative_path,
-                    "markdown_body": "# Payroll Processing\n\nArchitecture notes.",
-                    "blob_sha": "blob-sha-1",
-                },
-            )
-            planned = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                json={
-                    "items": [{"doc_id": doc_id, "revision": "blob-sha-1", "change_kind": "upsert"}],
-                    "coverage": "complete_snapshot",
-                    "sync_snapshot_id": "test-local-agent-job-2:attempt:1",
-                    "local_agent_job_id": "test-local-agent-job-2",
-                    "local_agent_attempt_count": 1,
-                },
-            )
-
-        assert initial_manifest.status_code == 200, initial_manifest.text
-        assert initial_manifest.json()["required_doc_ids"] == [doc_id]
-        assert first.status_code == 200, first.text
-        assert planned.status_code == 200, planned.text
-        assert planned.json() == {
-            "source_id": source_id,
-            "snapshot_id": "test-local-agent-job-2:attempt:1",
-            "coverage": "complete_snapshot",
-            "manifest_count": 1,
-            "manifest_sha256": planned.json()["manifest_sha256"],
-            "reused_count": 1,
-            "required_doc_ids": [],
-            # A repository tree is an existence listing: nothing is confirmed.
-            "confirm": [],
-        }
-        [first_input] = asyncio.run(
-            database.list_source_sync_inputs(
-                workspace_id="local",
-                source_id=source_id,
-                input_snapshot_id="test-local-agent-job:attempt:1",
-            )
-        )
-        [reused_input] = asyncio.run(
-            database.list_source_sync_inputs(
-                workspace_id="local",
-                source_id=source_id,
-                input_snapshot_id="test-local-agent-job-2:attempt:1",
-            )
-        )
-        assert reused_input.input_id == first_input.input_id
-    finally:
-        asyncio.run(database.close())
-
-
-@pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
-def test_file_package_without_source_time_is_uploaded_once_more_under_the_source_time_contract(
-    tmp_path,
-    source_type,
-):
+def test_file_package_without_source_time_is_uploaded_once_more_under_the_source_time_contract(tmp_path):
     from memforge.local_agent.document_identity import build_local_markdown_doc_id
     from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
     from memforge.models import content_hash
@@ -1613,38 +585,20 @@ def test_file_package_without_source_time_is_uploaded_once_more_under_the_source
             local_agent_lease_validator=_allow_local_agent_lease,
         )
         with LeaseAwareTestClient(app) as client:
-            if source_type == "github_repo":
-                source_id = _create_github_repo_source(client)["id"]
-                relative_path = "Payroll Processing/README.md"
-                doc_id = build_github_repo_doc_id(
-                    source_id=source_id,
-                    repo_url="https://github.example.com/acme/architecture",
-                    repo_ref="main",
-                    relative_path=relative_path,
-                )
-                revision = "blob-sha-1"
-                package = {
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": relative_path,
-                    "markdown_body": markdown_body,
-                    "blob_sha": revision,
-                }
-            else:
-                source_id = _create_local_markdown_source(client)["id"]
-                relative_path = "payroll/README.md"
-                doc_id = build_local_markdown_doc_id(
-                    source_id=source_id,
-                    vault_id="engineering",
-                    relative_path=relative_path,
-                )
-                revision = content_hash(markdown_body)
-                package = {
-                    "vault_id": "engineering",
-                    "relative_path": relative_path,
-                    "markdown_body": markdown_body,
-                    "raw_hash": revision,
-                }
+            source_id = _create_local_markdown_source(client)["id"]
+            relative_path = "payroll/README.md"
+            doc_id = build_local_markdown_doc_id(
+                source_id=source_id,
+                vault_id="engineering",
+                relative_path=relative_path,
+            )
+            revision = content_hash(markdown_body)
+            package = {
+                "vault_id": "engineering",
+                "relative_path": relative_path,
+                "markdown_body": markdown_body,
+                "raw_hash": revision,
+            }
 
             def manifest(job_id: str, contract_version: int | None) -> dict:
                 body = {
@@ -1717,22 +671,19 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
             local_agent_lease_validator=_allow_local_agent_lease,
         )
         with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client)["id"]
-            relative_path = "Payroll Processing/README.md"
-            doc_id = build_github_repo_doc_id(
-                source_id=source_id,
-                repo_url="https://github.example.com/acme/architecture",
-                repo_ref="main",
-                relative_path=relative_path,
+            from memforge.local_agent.document_identity import build_local_markdown_doc_id
+
+            source_id = _create_local_markdown_source(client)["id"]
+            relative_path = "payroll/README.md"
+            doc_id = build_local_markdown_doc_id(
+                source_id=source_id, vault_id="engineering", relative_path=relative_path
             )
             first = client.post(
                 f"/api/v1/sources/{source_id}/adapter/packages",
                 json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
+                    "vault_id": "engineering",
                     "relative_path": relative_path,
                     "markdown_body": "# Payroll Processing",
-                    "blob_sha": "blob-sha-1",
                 },
             )
             changed = client.post(
@@ -1812,171 +763,6 @@ def test_local_source_manifest_requests_changed_body_and_accepts_complete_remova
             )
             is None
         )
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_adapter_document_push_requires_local_push_mode(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client, connection_mode="cloud_pull")["id"]
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Payroll Processing",
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 400
-        assert "Internal network / VPN" in response.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_adapter_document_push_rejects_out_of_scope_request(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(
-                client,
-                exclude_paths=["Payroll Processing/archived"],
-            )["id"]
-            wrong_ref = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "feature",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Payroll Processing",
-                    "process_now": False,
-                },
-            )
-            wrong_path = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Flexible Payroll/README.md",
-                    "markdown_body": "# Flexible Payroll",
-                    "process_now": False,
-                },
-            )
-            wrong_extension = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/diagram.png",
-                    "markdown_body": "png bytes",
-                    "process_now": False,
-                },
-            )
-            excluded_path = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/archived/README.md",
-                    "markdown_body": "# Archived",
-                    "process_now": False,
-                },
-            )
-        assert wrong_ref.status_code == 400
-        assert "configured ref" in wrong_ref.json()["detail"]
-        assert wrong_path.status_code == 400
-        assert "repository scope" in wrong_path.json()["detail"]
-        assert wrong_extension.status_code == 400
-        assert "include_extensions" in wrong_extension.json()["detail"]
-        assert excluded_path.status_code == 400
-        assert "repository scope" in excluded_path.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_adapter_document_push_enforces_max_files(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client, max_files=1)["id"]
-            first = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Payroll Processing",
-                    "process_now": False,
-                },
-            )
-            second = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/Second.md",
-                    "markdown_body": "# Second",
-                    "process_now": False,
-                },
-            )
-        assert first.status_code == 200, first.text
-        assert second.status_code == 400
-        assert "max_files" in second.json()["detail"]
-    finally:
-        asyncio.run(database.close())
-
-
-def test_github_repo_adapter_document_push_max_files_counts_current_scope_only(tmp_path):
-    from memforge.server.admin_api import create_admin_app
-
-    cfg = _config(tmp_path)
-    database = _connect_database(tmp_path)
-    try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
-        with LeaseAwareTestClient(app) as client:
-            source_id = _create_github_repo_source(client, max_files=1)["id"]
-            row = asyncio.run(database.get_source(source_id))
-            inbox = Path(row["config"]["documents_dir"])
-            inbox.mkdir(parents=True, exist_ok=True)
-            (inbox / "stale.json").write_text(
-                json.dumps(
-                    {
-                        "package_kind": "github_repo_document",
-                        "doc_id": "stale",
-                        "repo_url": "https://github.example.com/acme/architecture",
-                        "repo_ref": "main",
-                        "relative_path": "Flexible Payroll/README.md",
-                        "content_type": "text/markdown",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            response = client.post(
-                f"/api/v1/sources/{source_id}/adapter/packages",
-                json={
-                    "repo_url": "https://github.example.com/acme/architecture",
-                    "repo_ref": "main",
-                    "relative_path": "Payroll Processing/README.md",
-                    "markdown_body": "# Payroll Processing",
-                    "process_now": False,
-                },
-            )
-        assert response.status_code == 200, response.text
     finally:
         asyncio.run(database.close())
 
@@ -2542,7 +1328,7 @@ def test_a_retried_artifact_upload_survives_cleanup_of_the_failed_attempt(tmp_pa
         record = _FailOnceThenCleanUp(database, document_store)
         database.create_source_sync_input = record
         with LeaseAwareTestClient(app, raise_server_exceptions=False) as client:
-            source_id = _create_github_repo_source(client, include_extensions=["png"])["id"]
+            source_id = _create_teams_source(client)["id"]
             route = f"/api/v1/sources/{source_id}/adapter/artifacts"
             failed = client.post(route, params=params, content=image_bytes, headers={"content-type": "image/png"})
             [abandoned] = _cleanup_uris(database)
@@ -2566,12 +1352,10 @@ def test_a_retried_package_push_survives_cleanup_of_the_failed_attempt(tmp_path)
     database = _connect_database(tmp_path)
     document_store = LocalDocumentStore(cfg.storage.docs_path)
     package = {
-        "repo_url": "https://github.example.com/acme/architecture",
-        "repo_ref": "main",
-        "relative_path": "Payroll Processing/overview.md",
+        "vault_id": "engineering",
+        "relative_path": "payroll/overview.md",
         "markdown_body": "# Overview\n\nPayroll runs nightly.",
         "content_type": "text/markdown",
-        "blob_sha": "blob-overview-sha",
         # A retry of the same push carries the same payload, so its bytes are identical.
         "submitted_at": "2026-09-27T08:00:00+00:00",
         "submitted_by": "local-agent",
@@ -2584,7 +1368,7 @@ def test_a_retried_package_push_survives_cleanup_of_the_failed_attempt(tmp_path)
         record = _FailOnceThenCleanUp(database, document_store)
         database.create_source_sync_input = record
         with LeaseAwareTestClient(app, raise_server_exceptions=False) as client:
-            source_id = _create_github_repo_source(client)["id"]
+            source_id = _create_local_markdown_source(client)["id"]
             route = f"/api/v1/sources/{source_id}/adapter/packages"
             failed = client.post(route, json=package)
             [abandoned] = _cleanup_uris(database)

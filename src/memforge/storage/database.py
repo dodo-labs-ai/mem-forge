@@ -27,14 +27,6 @@ import aiosqlite
 
 from memforge.derivation_work import DerivationWork
 from memforge.local_agent.snapshot_manifest import (
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    excluded_listing_rows,
-    excluded_listings_from_rows,
-    snapshot_confirmation,
-    snapshot_confirmation_updates,
-    validate_snapshot_confirmation_submission,
-    validate_snapshot_manifest_extras,
     validate_snapshot_manifest_values,
 )
 from memforge.local_agent.device_report import DeviceReport, LocalAgentDevice
@@ -1945,36 +1937,6 @@ CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
     ON source_sync_snapshot_manifest_items(
         workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
     );
-
--- The unlisted items a snapshot asks its device to confirm, issued with the
--- manifest; answer is NULL until the device answers.
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_confirmations (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    doc_id              TEXT NOT NULL,
-    provider_key        TEXT NOT NULL,
-    answer              TEXT CHECK (answer IN ('absent', 'exists', 'hidden', 'failed')),
-    cause               TEXT,
-    answered_at         TEXT,
-    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
-);
-
--- One scope row per excluded scope a device listed (doc_id NULL; rejection
--- NULL when the scope was listed, its cause when the provider rejected it)
--- and one item row per Document the scope lists.
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_excluded_listings (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    scope_key           TEXT NOT NULL,
-    doc_id              TEXT,
-    rejection           TEXT,
-    CHECK (doc_id IS NULL OR rejection IS NULL)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_excluded_listings_snapshot
-    ON source_sync_snapshot_excluded_listings(workspace_id, source_id, snapshot_id, scope_key);
 
 -- One device run's acquisition of a document Source (ADR 0058): the manifest
 -- the device submitted (its listing, the items it discovered in order and the
@@ -5187,6 +5149,17 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         [
             """ALTER TABLE sources ADD COLUMN executor TEXT NOT NULL DEFAULT 'server'
                CHECK (executor IN ('server', 'device'))""",
+        ],
+    ),
+    (
+        137,
+        "Drop the device confirmations and excluded-scope listings of package snapshots",
+        # A device acquisition records its own listing, answers and excluded
+        # listings with its manifest; a package snapshot is an existence
+        # listing, which needs neither.
+        [
+            "DROP TABLE IF EXISTS source_sync_snapshot_confirmations",
+            "DROP TABLE IF EXISTS source_sync_snapshot_excluded_listings",
         ],
     ),
 ]
@@ -19999,20 +19972,14 @@ class Database:
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         source_config_revision: str,
-        confirm: Sequence[SnapshotConfirmation] = (),
-        excluded_listings: Sequence[ExcludedScopeListing] = (),
     ) -> None:
         """Persist one fenced manifest and attach its reusable immutable inputs.
 
         The manifest declares ``complete_snapshot`` coverage and every item an
-        ``upsert``; any other value is refused. ``confirm`` is the set of unlisted items the server asks the device to
-        confirm, issued unanswered in the manifest's transaction.
-        ``excluded_listings`` is what the device listed in each excluded scope
-        of an open transition. Both belong to the manifest: a replay must
-        carry the same ones, as it must carry the same items.
+        ``upsert``; any other value is refused. A replay must carry the same
+        items.
         """
         validate_snapshot_manifest_values(coverage, manifest_items)
-        validate_snapshot_manifest_extras(manifest_items, confirm, excluded_listings)
         normalized_snapshot_id = _non_empty_string(snapshot_id)
         if normalized_snapshot_id is None:
             raise ValueError("snapshot_id is required")
@@ -20111,16 +20078,6 @@ class Database:
                         ]
                     if existing_items != sorted(manifest_items):
                         raise SourceActivityConflict("source snapshot manifest changed")
-                    issued = await self._list_source_sync_snapshot_confirmations_unlocked(
-                        workspace_id, source_id, normalized_snapshot_id
-                    )
-                    listed = await self.list_source_sync_snapshot_excluded_listings(
-                        source_id=source_id, workspace_id=workspace_id, snapshot_id=normalized_snapshot_id
-                    )
-                    if [(item.doc_id, item.provider_key) for item in issued] != sorted(
-                        (item.doc_id, item.provider_key) for item in confirm
-                    ) or listed != tuple(sorted(excluded_listings, key=lambda listing: listing.scope_key)):
-                        raise SourceActivityConflict("source snapshot manifest changed")
                 else:
                     async with self.db.execute(
                         """SELECT doc_id FROM source_sync_snapshot_items
@@ -20166,24 +20123,6 @@ class Database:
                             for doc_id, revision, change_kind in manifest_items
                         ],
                     )
-                    await self.db.executemany(
-                        """INSERT INTO source_sync_snapshot_confirmations (
-                            workspace_id, source_id, snapshot_id, doc_id, provider_key
-                        ) VALUES (?, ?, ?, ?, ?)""",
-                        [
-                            (workspace_id, source_id, normalized_snapshot_id, item.doc_id, item.provider_key)
-                            for item in confirm
-                        ],
-                    )
-                    await self.db.executemany(
-                        """INSERT INTO source_sync_snapshot_excluded_listings (
-                            workspace_id, source_id, snapshot_id, scope_key, doc_id, rejection
-                        ) VALUES (?, ?, ?, ?, ?, ?)""",
-                        [
-                            (workspace_id, source_id, normalized_snapshot_id, *row)
-                            for row in excluded_listing_rows(excluded_listings)
-                        ],
-                    )
                 await self.db.executemany(
                     """INSERT INTO source_sync_snapshot_items (
                         workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
@@ -20217,8 +20156,7 @@ class Database:
     ) -> dict[str, Any] | None:
         """Return manifest coverage and whether the manifest is ready to process.
 
-        It is ready once every declared item is materialized and every issued
-        confirmation is answered; a manifest issued none awaits nothing.
+        It is ready once every declared item is materialized.
         """
         async with self.db.execute(
             """SELECT m.coverage, m.item_count, m.local_agent_job_id,
@@ -20226,12 +20164,7 @@ class Database:
                       (SELECT COUNT(*) FROM source_sync_snapshot_items si
                         WHERE si.workspace_id = m.workspace_id
                           AND si.source_id = m.source_id
-                          AND si.snapshot_id = m.snapshot_id) AS materialized_count,
-                      (SELECT COUNT(*) FROM source_sync_snapshot_confirmations c
-                        WHERE c.workspace_id = m.workspace_id
-                          AND c.source_id = m.source_id
-                          AND c.snapshot_id = m.snapshot_id
-                          AND c.answer IS NULL) AS unanswered_count
+                          AND si.snapshot_id = m.snapshot_id) AS materialized_count
                FROM source_sync_snapshot_manifests m
                WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?""",
             (workspace_id, source_id, snapshot_id),
@@ -20241,133 +20174,15 @@ class Database:
             return None
         materialized_count = int(row["materialized_count"] or 0)
         item_count = int(row["item_count"] or 0)
-        awaiting_confirmations = int(row["unanswered_count"] or 0) > 0
         return {
             "coverage": str(row["coverage"]),
             "item_count": item_count,
             "materialized_count": materialized_count,
-            "awaiting_confirmations": awaiting_confirmations,
-            "ready": materialized_count == item_count and not awaiting_confirmations,
+            "ready": materialized_count == item_count,
             "local_agent_job_id": str(row["local_agent_job_id"]),
             "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
             "source_config_revision": str(row["source_config_revision"]),
         }
-
-    async def write_source_sync_snapshot_confirmations(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        snapshot_id: str,
-        manifest_sha256: str,
-        local_agent_job_id: str,
-        local_agent_attempt_count: int,
-        answers: Sequence[SnapshotConfirmation] = (),
-        failure_cause: str | None = None,
-    ) -> None:
-        """Store a device's answers to the confirmations its snapshot was issued.
-
-        The submission is bound to the manifest's collection attempt and
-        digest. It answers every issued item with ``absent``, ``exists`` or
-        ``hidden``, or, when ``confirm_absent`` raised, gives
-        ``failure_cause``, which every issued item then carries as ``failed``.
-        Repeating the stored answers is accepted; an item that was not issued,
-        a submission for another digest or attempt, and answers that differ
-        from the stored ones are refused, and nothing is written.
-        """
-        validate_snapshot_confirmation_submission(answers, failure_cause)
-        async with self._write_lock:
-            try:
-                async with self.db.execute(
-                    """SELECT manifest_sha256, local_agent_job_id, local_agent_attempt_count
-                       FROM source_sync_snapshot_manifests
-                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-                    (workspace_id, source_id, snapshot_id),
-                ) as cursor:
-                    manifest = await cursor.fetchone()
-                issued = await self._list_source_sync_snapshot_confirmations_unlocked(
-                    workspace_id, source_id, snapshot_id
-                )
-                pending = snapshot_confirmation_updates(
-                    manifest=(
-                        (
-                            str(manifest["manifest_sha256"]),
-                            str(manifest["local_agent_job_id"]),
-                            int(manifest["local_agent_attempt_count"]),
-                        )
-                        if manifest is not None
-                        else None
-                    ),
-                    submitted=(manifest_sha256, local_agent_job_id, local_agent_attempt_count),
-                    issued=issued,
-                    answers=answers,
-                    failure_cause=failure_cause,
-                )
-                now = _now_iso()
-                cursor = await self.db.executemany(
-                    """UPDATE source_sync_snapshot_confirmations
-                       SET answer = ?, cause = ?, answered_at = ?
-                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?
-                         AND answer IS NULL""",
-                    [
-                        (item.answer.value, item.cause, now, workspace_id, source_id, snapshot_id, item.doc_id)
-                        for item in pending
-                        if item.answer is not None
-                    ],
-                )
-                # After executemany, rowcount is the total of rows the batch changed.
-                if pending and cursor.rowcount != len(pending):
-                    raise SourceActivityConflict("snapshot confirmations were answered by another submission")
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    async def list_source_sync_snapshot_confirmations(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        snapshot_id: str,
-    ) -> tuple[SnapshotConfirmation, ...]:
-        """The confirmations a snapshot was issued, in doc id order, with their answers once stored."""
-        return await self._list_source_sync_snapshot_confirmations_unlocked(workspace_id, source_id, snapshot_id)
-
-    async def _list_source_sync_snapshot_confirmations_unlocked(
-        self,
-        workspace_id: str,
-        source_id: str,
-        snapshot_id: str,
-    ) -> tuple[SnapshotConfirmation, ...]:
-        rows = await self.db.execute_fetchall(
-            """SELECT doc_id, provider_key, answer, cause
-               FROM source_sync_snapshot_confirmations
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
-               ORDER BY doc_id""",
-            (workspace_id, source_id, snapshot_id),
-        )
-        return tuple(
-            snapshot_confirmation(row["doc_id"], row["provider_key"], row["answer"], row["cause"])
-            for row in rows
-        )
-
-    async def list_source_sync_snapshot_excluded_listings(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        snapshot_id: str,
-    ) -> tuple[ExcludedScopeListing, ...]:
-        """What a snapshot's device listed in each excluded scope, in scope key order."""
-        rows = await self.db.execute_fetchall(
-            """SELECT scope_key, doc_id, rejection
-               FROM source_sync_snapshot_excluded_listings
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-            (workspace_id, source_id, snapshot_id),
-        )
-        return excluded_listings_from_rows(
-            (str(row["scope_key"]), row["doc_id"], row["rejection"]) for row in rows
-        )
 
     async def record_source_acquisition(
         self,

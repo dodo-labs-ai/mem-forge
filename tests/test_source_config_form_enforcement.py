@@ -84,14 +84,33 @@ def test_required_applies_only_while_visible(client):
     assert advanced.status_code == 200, advanced.text
 
 
-def test_hidden_option_value_is_refused(client):
-    response = _create(
-        client,
-        "jira",
-        {"base_url": JIRA, "sync_mode": "local_agent", "auth_mode": "pat", "pat": "jira-pat", "projects": ["PAY"]},
+def test_hidden_option_value_is_refused():
+    from memforge.genes.toolkit.config import FieldIssue
+    from memforge.models import ConfigCondition, ConfigField, ConfigFieldType, ConfigGroup, ConfigOption, GeneConfigSchema
+    from memforge.source_types import source_type_descriptor
+    from memforge.source_types.form import check_config
+
+    schema = GeneConfigSchema(
+        groups=[ConfigGroup(key="main", label="Main")],
+        fields=[
+            ConfigField(
+                key="scope", label="Scope", field_type=ConfigFieldType.SELECT, group="main",
+                choices=[ConfigOption("page", "Page"), ConfigOption("tree", "Tree")], default="page",
+            ),
+            ConfigField(
+                key="depth", label="Depth", field_type=ConfigFieldType.SELECT, group="main", order=1,
+                choices=[
+                    ConfigOption("one", "One level"),
+                    ConfigOption("all", "All levels", visible_when=(ConfigCondition("scope", ("tree",)),)),
+                ],
+                default="one",
+            ),
+        ],
     )
 
-    assert _issues(response) == [("auth_mode", "Jira Authentication Method must be one of: Browser session")]
+    issues = check_config(schema, {"scope": "page", "depth": "all"}, {}, source_type_descriptor("jira"))
+
+    assert issues == [FieldIssue("depth", "Jira Depth must be one of: One level")]
 
 
 def test_configured_secret_satisfies_required(client):
@@ -151,13 +170,6 @@ def test_a_new_jira_source_without_auth_mode_uses_a_personal_access_token(client
     assert _issues(without_token) == [("pat", "Jira Personal Access Token is required")]
     assert created.status_code == 200, created.text
     assert _stored_config(database, created.json()["id"])["auth_mode"] == "pat"
-
-
-def test_a_new_local_jira_source_without_auth_mode_uses_a_browser_session(client, database):
-    created = _create(client, "jira", {"base_url": JIRA, "sync_mode": "local_agent", "projects": ["PAY"]})
-
-    assert created.status_code == 200, created.text
-    assert _stored_config(database, created.json()["id"])["auth_mode"] == "browser_cookie"
 
 
 def test_a_new_jira_source_can_choose_a_browser_session(client, database):
@@ -258,7 +270,7 @@ def test_github_pages_single_page_url_is_read_as_one_url(client, database):
 
 
 def test_github_repo_missing_repo_url_is_refused_on_its_field(client):
-    response = _create(client, "github_repo", {"connection_mode": "cloud_pull"})
+    response = _create(client, "github_repo", {})
 
     assert _issues(response) == [("repo_url", "GitHub Repository URL is required")]
 
@@ -316,7 +328,7 @@ def test_preview_discovery_answers_config_invalid(client):
 
 
 def test_browse_tree_answers_config_invalid(client):
-    response = client.post("/api/v1/genes/github_repo/browse-tree", json={"config": {"connection_mode": "cloud_pull"}})
+    response = client.post("/api/v1/genes/github_repo/browse-tree", json={"config": {}})
 
     assert _keys(response) == ["repo_url"]
 
@@ -363,11 +375,6 @@ def test_browse_tree_answers_config_invalid(client):
             "jira",
             {"base_url": JIRA, "pat": "jira-pat", "query_mode": "advanced", "jql": "  "},
             ("jql", "Jira JQL is required"),
-        ),
-        (
-            "github_repo",
-            {"repo_url": "https://github.example.test/org/repo", "connection_mode": "ssh"},
-            ("connection_mode", "GitHub Repository Access must be one of: Cloud access, Local sync"),
         ),
     ],
 )

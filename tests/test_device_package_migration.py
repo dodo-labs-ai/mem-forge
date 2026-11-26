@@ -17,7 +17,6 @@ import json
 import sys
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from pathlib import Path
 from weakref import WeakValueDictionary
 
 import pytest
@@ -27,9 +26,8 @@ from memforge.config import AppConfig
 from memforge.genes import github_repo_gene, jira_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.genes.jira_gene import JiraGene
-from memforge.github_repo_utils import build_github_repo_doc_id, github_content_type, parse_github_repo_url
-from memforge.local_agent.document_identity import build_jira_doc_id
-from memforge.models import Memory
+from memforge.github_repo_utils import build_github_repo_doc_id, parse_github_repo_url
+from memforge.models import Memory, slugify
 from memforge.pipeline.package_migration import (
     apply_package_migration,
     package_path_sources,
@@ -47,7 +45,13 @@ JIRA = DeviceType(
     "jira",
     jira_fakes,
     jira_gene,
-    {"base_url": jira_fakes.BASE_URL, "auth_mode": "pat", "projects": ["PAY"], "issue_types": ["Story"]},
+    {
+        "base_url": jira_fakes.BASE_URL,
+        "auth_mode": "pat",
+        "pat": "token",
+        "projects": ["PAY"],
+        "issue_types": ["Story"],
+    },
     "pat",
 )
 GITHUB = DeviceType(
@@ -59,10 +63,10 @@ GITHUB = DeviceType(
         "ref": "main",
         "include_paths": ["docs/"],
         "include_extensions": ["md"],
+        "pat": "repo-token",
     },
     "pat",
 )
-JIRA_TOKEN = "token"
 
 
 @pytest.fixture(autouse=True)
@@ -109,117 +113,130 @@ def _deployment(tmp_path, kind: DeviceType) -> Iterator[Deployment]:
 # ---------------------------------------------------------------------------
 
 
-def _jira_packages(deployment: Deployment, source_id: str) -> dict[str, dict]:
-    """What the daemon submitted for each PAY issue: the issue as the Gene fetches it, in a package."""
+def _package_path_jira_doc_id(source_id: str, issue_key: str) -> str:
+    """The Document id Jira's package path gave an issue: the Source and the key, slugged and digested."""
 
-    async def fetched() -> dict[str, dict]:
-        async with jira_fakes.FAKES.connect({**deployment.kind.config, "pat": JIRA_TOKEN}) as connection:
-            gene = connection.gene
-            payloads = {}
-            async for item in gene.discover(None):
-                payloads[item.extra["issue_key"]] = json.loads((await gene.fetch(item)).body)
-            return payloads
+    digest = hashlib.sha256(f"{source_id.strip()}|{issue_key.strip().upper()}".encode()).hexdigest()[:12]
+    return "-".join(["jira", slugify(source_id)[:30], slugify(issue_key)[:30] or "issue", digest])
 
-    with deployment.serving():
-        payloads = asyncio.run(fetched())
+
+def _jira_package(source_id: str, stored, body: bytes) -> dict:
+    """The package the daemon submitted for one issue: the issue as the Gene fetches it, wrapped."""
+
+    payload = json.loads(body)
+    key = str(payload["key"])
     return {
-        key: {
-            "package_kind": "jira_document",
-            "doc_id": build_jira_doc_id(source_id=source_id, issue_key=key),
-            "issue_key": key,
-            "base_url": jira_fakes.BASE_URL,
-            "title": payload["fields"]["summary"],
-            "source_url": f"{jira_fakes.BASE_URL}/browse/{key}",
-            "version": payload["fields"]["updated"],
-            "submitted_at": SUBMITTED_AT,
-            "submitted_by": OWNER,
-            "raw_payload": payload,
-        }
-        for key, payload in payloads.items()
+        "package_kind": "jira_document",
+        "doc_id": stored.document_id,
+        "issue_key": key,
+        "base_url": jira_fakes.BASE_URL,
+        "title": payload["fields"]["summary"],
+        "source_url": f"{jira_fakes.BASE_URL}/browse/{key}",
+        "version": payload["fields"]["updated"],
+        "submitted_at": SUBMITTED_AT,
+        "submitted_by": OWNER,
+        "raw_payload": payload,
     }
 
 
-def _github_packages(source_id: str) -> dict[str, dict]:
-    """What the daemon pushed for each selected file: its text, blob and commit time."""
+def _github_package(source_id: str, stored, body: bytes) -> dict:
+    """The package the daemon pushed for one file: its text, blob and commit time."""
 
-    from tests.github_api_fixture import git_blob_sha
-
+    item = stored.item
     repo = parse_github_repo_url(github_repo_fakes.REPO_URL)
-    packages = {}
-    for path, body in github_repo_fakes.FILES.items():
-        if not path.startswith("docs/") or not path.endswith(".md"):
-            continue
-        packages[path] = {
-            "package_kind": "github_repo_document",
-            "doc_id": build_github_repo_doc_id(
-                source_id=source_id, repo_url=repo["repo_url"], repo_ref="main", relative_path=path
-            ),
-            "title": path,
-            "source_url": f"{repo['repo_url']}/blob/main/{path}",
-            "last_modified": SUBMITTED_AT,
-            "version": git_blob_sha(body),
-            "repo_url": repo["repo_url"],
-            "repo_host": repo["host"],
-            "repo_owner": repo["owner"],
-            "repo_name": repo["repo"],
-            "repo_ref": "main",
-            "relative_path": path,
-            "blob_sha": git_blob_sha(body),
-            "content_type": github_content_type(path),
-            "markdown": body.decode(),
-            "source_updated_at": "2026-02-01T00:00:00+00:00",
-            "submitted_at": SUBMITTED_AT,
-            "submitted_by": OWNER,
-        }
-    return packages
+    return {
+        "package_kind": "github_repo_document",
+        "doc_id": stored.document_id,
+        "title": item.extra["relative_path"],
+        "source_url": item.source_url,
+        "last_modified": SUBMITTED_AT,
+        "version": item.extra["blob_sha"],
+        "repo_url": repo["repo_url"],
+        "repo_host": repo["host"],
+        "repo_owner": repo["owner"],
+        "repo_name": repo["repo"],
+        "repo_ref": "main",
+        "relative_path": item.extra["relative_path"],
+        "blob_sha": item.extra["blob_sha"],
+        "content_type": item.content_type,
+        "markdown": body.decode(),
+        "source_updated_at": item.extra[github_repo_gene.LAST_COMMIT_AT_KEY],
+        "submitted_at": SUBMITTED_AT,
+        "submitted_by": OWNER,
+    }
 
 
-def _on_the_package_path(deployment: Deployment, tmp_path: Path, packages_for) -> tuple[str, Path]:
-    """Create the Source on its type's package path and sync what its daemon submitted to its inbox."""
+PACKAGE_PATHS = {
+    "jira": ({"auth_mode": "browser_cookie", "sync_mode": "local_agent"}, "local_agent_documents_dir", _jira_package),
+    "github_repo": ({"connection_mode": "local_push"}, "documents_dir", _github_package),
+}
+
+
+async def _leave_on_the_package_path(db, doc_store, source_id: str, config: dict, inbox: str) -> None:
+    """Store each Unit's input as the package its daemon submitted, and configure the Source's package path."""
+
+    source = await db.get_source(source_id)
+    path_fields, inbox_field, package = PACKAGE_PATHS[source["type"]]
+    for doc_id in await db.list_indexed_doc_ids(source_id):
+        unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        stored = await db.get_source_unit_input(unit.id)
+        body = doc_store.read_artifact(stored.raw_content_uri)
+        packaged = package(source_id, stored, body)
+        doc_store._resolve_artifact_path(stored.raw_content_uri).write_text(json.dumps(packaged))
+    secret_free = {key: value for key, value in config.items() if key != "pat"}
+    await db.upsert_source(
+        id=source_id,
+        type=source["type"],
+        name=source["name"],
+        config_json=json.dumps({**secret_free, **path_fields, inbox_field: inbox}),
+        access_policy="workspace",
+        owner_user_id=OWNER,
+        created_by_user_id=OWNER,
+        execution_owner_user_id=OWNER,
+    )
+
+
+def _on_the_package_path(deployment: Deployment, monkeypatch) -> str:
+    """A Source its owner's daemon collected through its type's package path, as that path left it.
+
+    The Source is synced from the fake provider, with Jira's issues named as
+    the package path named them; each Unit's stored input then becomes the
+    package the daemon submitted, and the configuration the package path's.
+    """
 
     kind = deployment.kind
     source_id = f"src-{kind.source_type}"
-    inbox = tmp_path / "inbox" / source_id
-    inbox.mkdir(parents=True)
-    path_fields = (
-        {"sync_mode": "local_agent", "local_agent_documents_dir": str(inbox)}
-        if kind.source_type == "jira"
-        else {"connection_mode": "local_push", "documents_dir": str(inbox)}
-    )
     asyncio.run(
         deployment.db.upsert_source(
             id=source_id,
             type=kind.source_type,
             name="Team items",
-            config_json=json.dumps({**kind.config, **path_fields}),
+            config_json=json.dumps(kind.config),
             access_policy="workspace",
             owner_user_id=OWNER,
             created_by_user_id=OWNER,
             execution_owner_user_id=OWNER,
         )
     )
-    _submit(inbox, packages_for(source_id))
-    _sync_the_inbox(deployment, source_id)
-    return source_id, inbox
-
-
-def _submit(inbox: Path, packages: dict[str, dict]) -> None:
-    for name, package in packages.items():
-        (inbox / f"{hashlib.sha256(name.encode()).hexdigest()[:12]}.json").write_text(json.dumps(package))
-
-
-def _sync_the_inbox(deployment: Deployment, source_id: str) -> None:
-    source = asyncio.run(deployment.db.get_source(source_id))
-    gene_cls = JiraGene if source["type"] == "jira" else GitHubRepoGene
-    runtime = _Runtime(deployment.db, deployment.app.state.document_store, deployment.extractor)
-    state = asyncio.run(
-        runtime.orchestrator().sync_gene(
-            gene=gene_cls(config=dict(source["config"]), source_id=source_id),
-            source_name=source["name"],
-            source_id=source_id,
+    gene_cls = JiraGene if kind.source_type == "jira" else GitHubRepoGene
+    with monkeypatch.context() as patch:
+        if kind.source_type == "jira":
+            patch.setattr(jira_gene, "_issue_doc_id", lambda key: _package_path_jira_doc_id(source_id, key))
+        with deployment.serving():
+            state = asyncio.run(
+                _runtime(deployment).orchestrator().sync_gene(
+                    gene=gene_cls(config=dict(kind.config), source_id=source_id),
+                    source_name="Team items",
+                    source_id=source_id,
+                )
+            )
+    assert state.last_sync_status == "success", state.error_message
+    asyncio.run(
+        _leave_on_the_package_path(
+            deployment.db, deployment.app.state.document_store, source_id, kind.config, f"/inbox/{source_id}"
         )
     )
-    assert state.last_sync_status == "success", state.error_message
+    return source_id
 
 
 def _runtime(deployment: Deployment) -> _Runtime:
@@ -253,8 +270,8 @@ def _support_on(deployment: Deployment, doc_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_the_inventory_names_only_sources_on_a_package_path(jira, tmp_path):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
+def test_the_inventory_names_only_sources_on_a_package_path(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
     asyncio.run(
         jira.db.upsert_source(
             id="src-server-jira",
@@ -269,8 +286,8 @@ def test_the_inventory_names_only_sources_on_a_package_path(jira, tmp_path):
     assert [source["id"] for source in asyncio.run(package_path_sources(jira.db))] == [source_id]
 
 
-def test_the_dry_run_rebuilds_every_jira_package_without_writing(jira, tmp_path):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
+def test_the_dry_run_rebuilds_every_jira_package_without_writing(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
     before = jira.documents(source_id)
 
     plan = _plan(jira, source_id)
@@ -278,7 +295,7 @@ def test_the_dry_run_rebuilds_every_jira_package_without_writing(jira, tmp_path)
     assert not plan.refused
     assert sorted(unit.document_id for unit in plan.units) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
     assert sorted(plan.moved_document_ids) == sorted(
-        (build_jira_doc_id(source_id=source_id, issue_key=key), f"jira-{key}")
+        (_package_path_jira_doc_id(source_id, key), f"jira-{key}")
         for key in ("PAY-1", "PAY-2", "PAY-3", "PAY-4")
     )
     # The packages held the issues as the Gene fetches them: no Observation changes.
@@ -287,9 +304,9 @@ def test_the_dry_run_rebuilds_every_jira_package_without_writing(jira, tmp_path)
     assert asyncio.run(jira.db.get_source(source_id))["executor"] == "server"
 
 
-def test_the_dry_run_counts_and_apply_extracts_only_a_unit_whose_rewrite_changes_its_content(jira, tmp_path):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
-    old_pay_2 = build_jira_doc_id(source_id=source_id, issue_key="PAY-2")
+def test_the_dry_run_counts_and_apply_extracts_only_a_unit_whose_rewrite_changes_its_content(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
+    old_pay_2 = _package_path_jira_doc_id(source_id, "PAY-2")
 
     def described_differently(package: dict) -> None:
         # PAY-2's stored package reads differently from its committed revision.
@@ -318,9 +335,9 @@ def _rewrite_stored_package(deployment: Deployment, source_id: str, doc_id: str,
     doc_store._resolve_artifact_path(stored.raw_content_uri).write_text(json.dumps(package))
 
 
-def test_the_dry_run_refuses_a_jira_package_without_its_update_time(jira, tmp_path):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
-    old_pay_3 = build_jira_doc_id(source_id=source_id, issue_key="PAY-3")
+def test_the_dry_run_refuses_a_jira_package_without_its_update_time(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
+    old_pay_3 = _package_path_jira_doc_id(source_id, "PAY-3")
     _rewrite_stored_package(jira, source_id, old_pay_3, lambda package: package["raw_payload"]["fields"].pop("updated"))
 
     plan = _plan(jira, source_id)
@@ -333,33 +350,20 @@ def test_the_dry_run_refuses_a_jira_package_without_its_update_time(jira, tmp_pa
     assert old_pay_3 in jira.documents(source_id)
 
 
-def test_the_dry_run_refuses_two_units_that_map_to_one_document(jira, tmp_path):
-    def packages(source_id: str) -> dict[str, dict]:
-        built = _jira_packages(jira, source_id)
-        # Two packages of one key under ids the device built differently.
-        twin = json.loads(json.dumps(built["PAY-1"]))
-        twin["doc_id"] = build_jira_doc_id(source_id=source_id, issue_key="PAY-1-twin")
-        twin["raw_payload"]["id"] = "200001"
-        built["PAY-1-twin"] = twin
-        return built
-
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, packages)
+def test_the_dry_run_refuses_two_units_that_map_to_one_document(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
+    old_pay_1, old_pay_2 = (_package_path_jira_doc_id(source_id, key) for key in ("PAY-1", "PAY-2"))
+    # PAY-2's package names the issue PAY-1, as a device that read one key twice may have stored it.
+    _rewrite_stored_package(jira, source_id, old_pay_2, lambda package: package["raw_payload"].update(key="PAY-1"))
 
     plan = _plan(jira, source_id)
 
     assert plan.refused
-    assert plan.collisions == (
-        (
-            "jira-PAY-1",
-            tuple(
-                sorted(build_jira_doc_id(source_id=source_id, issue_key=key) for key in ("PAY-1", "PAY-1-twin"))
-            ),
-        ),
-    )
+    assert plan.collisions == (("jira-PAY-1", tuple(sorted((old_pay_1, old_pay_2)))),)
 
 
-def test_the_github_dry_run_shows_the_genes_ids_equal_the_stored_ones(github, tmp_path):
-    source_id, _inbox = _on_the_package_path(github, tmp_path, _github_packages)
+def test_the_github_dry_run_shows_the_genes_ids_equal_the_stored_ones(github, monkeypatch):
+    source_id = _on_the_package_path(github, monkeypatch)
 
     plan = _plan(github, source_id)
 
@@ -369,8 +373,8 @@ def test_the_github_dry_run_shows_the_genes_ids_equal_the_stored_ones(github, tm
     assert plan.changed_document_ids == ()
 
 
-def test_the_github_dry_run_refuses_a_file_the_configured_repository_names_differently(github, tmp_path):
-    source_id, _inbox = _on_the_package_path(github, tmp_path, _github_packages)
+def test_the_github_dry_run_refuses_a_file_the_configured_repository_names_differently(github, monkeypatch):
+    source_id = _on_the_package_path(github, monkeypatch)
     # The Source's configuration now names another ref than its packages were pushed at.
     source = asyncio.run(github.db.get_source(source_id))
     asyncio.run(
@@ -395,9 +399,9 @@ def test_the_github_dry_run_refuses_a_file_the_configured_repository_names_diffe
 # ---------------------------------------------------------------------------
 
 
-def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_changed(jira, tmp_path, monkeypatch):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
-    old_pay_1 = build_jira_doc_id(source_id=source_id, issue_key="PAY-1")
+def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_changed(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
+    old_pay_1 = _package_path_jira_doc_id(source_id, "PAY-1")
     memory_id = _support_on(jira, old_pay_1)
     cursor = asyncio.run(jira.db.get_sync_state(source_id)).last_sync_at
     jira.extractor.fragment_calls.clear()
@@ -418,7 +422,10 @@ def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_
     # PAY-2 is edited after the migration; nothing else changes.
     from memforge.local_agent.device_credentials import device_credentials
 
-    device_credentials(DAEMON_SERVER).set(source_id, {"pat": JIRA_TOKEN})
+    # The package path signed in with the browser session; the owner signs in on the device.
+    assert moved["config"]["auth_mode"] == "browser_cookie"
+    device_credentials(DAEMON_SERVER).hold_session(source_id, "jira", jira_fakes.BASE_URL, "JSESSIONID=device")
+    _jira_accepts_the_device_session(monkeypatch)
     issue_id, labels, _updated = jira_fakes.ISSUES["PAY-2"]
     monkeypatch.setitem(jira_fakes.ISSUES, "PAY-2", (issue_id, labels, datetime.now(timezone.utc)))
     issue = jira_fakes._issue
@@ -437,11 +444,24 @@ def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_
     assert sorted(jira.documents(source_id)) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
 
 
-def test_a_moved_github_local_push_source_extracts_only_the_file_that_changed(github, tmp_path, monkeypatch):
+def _jira_accepts_the_device_session(monkeypatch) -> None:
+    from dataclasses import replace
+
+    from memforge.auth import browser_session
+
+    async def accept(origin, cookie_header, tls_config):
+        return {"name": OWNER}
+
+    browser_session.ensure_builtin_providers()
+    provider = browser_session.get_provider("jira")
+    monkeypatch.setitem(browser_session._PROVIDERS, "jira", replace(provider, validate_session=accept))
+
+
+def test_a_moved_github_local_push_source_extracts_only_the_file_that_changed(github, monkeypatch):
     from tests.github_api_fixture import git_blob_sha
     from memforge.local_agent.device_credentials import device_credentials
 
-    source_id, _inbox = _on_the_package_path(github, tmp_path, _github_packages)
+    source_id = _on_the_package_path(github, monkeypatch)
     held = github.documents(source_id)
     github.extractor.fragment_calls.clear()
 
@@ -467,8 +487,8 @@ def test_a_moved_github_local_push_source_extracts_only_the_file_that_changed(gi
     assert github.documents(source_id)[guide][1] == git_blob_sha(edited["docs/guide.md"])
 
 
-def test_an_interrupted_migration_continues_where_it_stopped(jira, tmp_path, monkeypatch):
-    source_id, _inbox = _on_the_package_path(jira, tmp_path, lambda source_id: _jira_packages(jira, source_id))
+def test_an_interrupted_migration_continues_where_it_stopped(jira, monkeypatch):
+    source_id = _on_the_package_path(jira, monkeypatch)
     jira.extractor.fragment_calls.clear()
     from memforge.pipeline import sync as sync_module
 
@@ -529,35 +549,35 @@ def installation(tmp_path, monkeypatch):
         return _Runtime(db, LocalDocumentStore(config.storage.docs_path), extractor)
 
     monkeypatch.setattr("memforge.runtime.DefaultRuntimeProvider.build_sync_runtime", build_sync_runtime)
-    inbox = tmp_path / "inbox"
-    inbox.mkdir()
-    _submit(inbox, _github_packages("src-github"))
+    provider = github_repo_fakes._Provider(ProviderListing.COMPLETE)
 
     async def install() -> None:
         db = Database(str(config.storage.db_path))
         await db.connect()
+        doc_store = LocalDocumentStore(config.storage.docs_path)
         try:
             await db.upsert_source(
                 id="src-github",
                 type="github_repo",
                 name="Architecture",
-                config_json=json.dumps({**GITHUB.config, "connection_mode": "local_push", "documents_dir": str(inbox)}),
+                config_json=json.dumps(GITHUB.config),
                 access_policy="workspace",
                 owner_user_id=OWNER,
                 execution_owner_user_id=OWNER,
             )
-            runtime = _Runtime(db, LocalDocumentStore(config.storage.docs_path), extractor)
-            source = await db.get_source("src-github")
+            runtime = _Runtime(db, doc_store, extractor)
             state = await runtime.orchestrator().sync_gene(
-                gene=GitHubRepoGene(config=dict(source["config"]), source_id="src-github"),
+                gene=GitHubRepoGene(config=dict(GITHUB.config), source_id="src-github"),
                 source_name="Architecture",
                 source_id="src-github",
             )
             assert state.last_sync_status == "success", state.error_message
+            await _leave_on_the_package_path(db, doc_store, "src-github", GITHUB.config, str(tmp_path / "inbox"))
         finally:
             await db.close()
 
-    asyncio.run(install())
+    with provider.http.serving(github_repo_gene):
+        asyncio.run(install())
     return config
 
 

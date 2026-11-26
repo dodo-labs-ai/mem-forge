@@ -45,17 +45,17 @@ test("lists every registered type", async () => {
   expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent("/sources/new/github_pages");
 });
 
-test("a local-only type shows the Local sync badge", async () => {
+test("each type names where its syncs can run", async () => {
   renderPicker("offline");
 
   const types = await screen.findByRole("list", { name: "Source types" });
   const local = within(types).getByRole("link", { name: /Local Repository/ });
   expect(within(local).getByText("Local sync")).toBeInTheDocument();
   expect(await within(local).findByText("Local sync offline")).toBeInTheDocument();
-  const confluence = within(types).getByRole("link", { name: /Confluence/ });
-  expect(within(confluence).getByText("Cloud")).toBeInTheDocument();
-  expect(within(confluence).queryByText(/Local sync/)).not.toBeInTheDocument();
-  expect(within(within(types).getByRole("link", { name: /Jira/ })).getByText("Cloud or local sync")).toBeInTheDocument();
+  expect(within(within(types).getByRole("link", { name: /Microsoft Teams/ })).getByText("Local sync")).toBeInTheDocument();
+  const jira = within(types).getByRole("link", { name: /Jira/ });
+  expect(within(jira).getByText("Cloud or local sync")).toBeInTheDocument();
+  expect(within(jira).getByText("Local sync offline")).toBeInTheDocument();
 });
 
 test("a coding agent shows the commands that install its memory-tools plugin", async () => {

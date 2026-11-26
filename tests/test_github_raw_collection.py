@@ -1,20 +1,14 @@
 """GitHub collection contracts at the provider transport boundary."""
 
 import base64
-import json
-import subprocess
-import sys
 import hashlib
-from tempfile import TemporaryFile
 
 import httpx
 import pytest
 
 from memforge.genes import github_repo_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
-from memforge import main
 from tests.connector_http_fixture import FakeConnectorHttp
-from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client
 
 
 HELLO = b"hello\n"
@@ -94,7 +88,7 @@ class _Chunks(httpx.AsyncByteStream):
 
 
 async def _cloud_gene(session: RepositorySession) -> GitHubRepoGene:
-    """A cloud-pull Gene whose GitHub requests ``session`` answers."""
+    """A Gene whose GitHub requests ``session`` answers."""
 
     def handle(request: httpx.Request) -> httpx.Response:
         response = session.get(str(request.url), headers=request.headers)
@@ -136,57 +130,6 @@ async def test_collection_reads_original_blob_despite_transformed_contents(cloud
     assert any(url.endswith("/git/blobs/" + HELLO_SHA) for url in urls)
     assert not any("/contents/" in url for url in urls)
     assert item.extra["repo_ref"] == "main"
-
-
-@pytest.mark.parametrize("body,size,error", [
-    (HELLO, 6, None),
-    (b"", 0, None),
-    ("中文 — hello\n".encode(), None, None),
-    (b"bad\xd6", 4, "invalid UTF-8"),
-    (HELLO, 7, "size mismatch"),
-    (HELLO, 5, "exceeds declared size"),
-])
-def test_daemon_collects_raw_blob_and_uploads_exact_text(monkeypatch, body, size, error):
-    session = RepositorySession()
-    session.body = body
-    session.size = size
-    session.sha = hashlib.sha1(b"blob " + str(len(body)).encode() + b"\0" + body).hexdigest()
-    real_popen = subprocess.Popen
-
-    def metadata(cmd, **kwargs):
-        response = session.get("https://api.github.com/" + cmd[2])
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(response.json()), stderr="")
-
-    def raw_process(cmd, **kwargs):
-        assert cmd[:2] == ["gh", "api"]
-        assert cmd[2].endswith("/git/blobs/" + session.sha)
-        assert "Accept: application/vnd.github.raw+json" in cmd
-        with TemporaryFile() as input_file:
-            input_file.write(body)
-            input_file.seek(0)
-            return real_popen([sys.executable, "-c",
-                               "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
-                              stdin=input_file, **kwargs)
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
-    FakeToolClient.reset({"doc_id": "doc", "document_hash": "hash"})
-    result = main._run_cloud_local_agent_job({
-        "job_id": "laj-test", "attempt_count": 1, "workspace_id": "workspace-a",
-        "operation": "github_repo_sync", "source_id": "src-test",
-        "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
-    }, _cloud_test_client())
-    if error:
-        assert result["counts"]["failed"] == 1, result
-        assert error in result["error"]
-        assert not any(call[0] in ("push_github_repo_document", "start_source_processing")
-                       for call in FakeToolClient.calls)
-        return
-    assert result["counts"]["pushed"] == 1, result
-    [call] = [call for call in FakeToolClient.calls if call[0] == "push_github_repo_document"]
-    assert call[1]["markdown_body"] == body.decode()
-    assert call[1]["blob_sha"] == session.sha
-    assert call[1]["source_updated_at"] == COMMIT_TIME
 
 
 @pytest.mark.asyncio
@@ -373,123 +316,6 @@ async def test_cloud_collection_rejects_text_symlink_to_binary_target():
         [item async for item in gene.discover()]
 
 
-def test_daemon_collection_resolves_selected_text_symlink_with_cloud_parity(monkeypatch):
-    link_target = b"docs/CONTRIBUTIONS.md"
-    link_sha = hashlib.sha1(
-        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
-    ).hexdigest()
-    target_body = b"# Contributions\n\nUse reviewed changes.\n"
-    target_sha = hashlib.sha1(
-        b"blob " + str(len(target_body)).encode() + b"\0" + target_body
-    ).hexdigest()
-    real_popen = subprocess.Popen
-
-    def metadata(cmd, **kwargs):
-        endpoint = cmd[2]
-        if "/commits/main" in endpoint:
-            payload = {"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}}
-        elif "/commits?" in endpoint:
-            payload = commits_listing(
-                "2026-06-02T08:00:00Z" if "path=docs/CONTRIBUTIONS.md" in endpoint else COMMIT_DATE
-            )
-        elif "/git/trees/" in endpoint:
-            payload = {"truncated": False, "tree": [
-                {"path": "README.md", "type": "blob", "mode": "120000",
-                 "sha": link_sha, "size": len(link_target)},
-                {"path": "docs/CONTRIBUTIONS.md", "type": "blob", "mode": "100644",
-                 "sha": target_sha, "size": len(target_body)},
-            ]}
-        else:
-            raise AssertionError(endpoint)
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
-
-    def raw_process(cmd, **kwargs):
-        if cmd[2].endswith("/git/blobs/" + link_sha):
-            body = link_target
-        elif cmd[2].endswith("/git/blobs/" + target_sha):
-            body = target_body
-        else:
-            raise AssertionError(cmd[2])
-        with TemporaryFile() as input_file:
-            input_file.write(body)
-            input_file.seek(0)
-            return real_popen(
-                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
-                stdin=input_file,
-                **kwargs,
-            )
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
-    FakeToolClient.reset({"doc_id": "doc", "document_hash": "hash"})
-
-    result = main._run_cloud_local_agent_job({
-        "job_id": "laj-symlink", "attempt_count": 1, "workspace_id": "workspace-a",
-        "operation": "github_repo_sync", "source_id": "src-test",
-        "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
-    }, _cloud_test_client())
-
-    assert result["counts"] == {"selected": 2, "reused": 0, "fetched": 2, "pushed": 2, "failed": 0}
-    call = next(
-        call for call in FakeToolClient.calls
-        if call[0] == "push_github_repo_document" and call[1]["relative_path"] == "README.md"
-    )
-    assert call[1]["markdown_body"] == target_body.decode()
-    assert call[1]["blob_sha"] == target_sha
-    assert call[1]["resolved_relative_path"] == "docs/CONTRIBUTIONS.md"
-    assert call[1]["symlink_chain"] == [{
-        "path": "README.md", "blob_sha": link_sha, "target_path": "docs/CONTRIBUTIONS.md",
-    }]
-    assert call[1]["source_updated_at"] == "2026-06-02T08:00:00+00:00"
-
-
-def test_daemon_collection_rejects_text_symlink_to_binary_before_manifest(monkeypatch):
-    link_target = b"assets/photo.png"
-    link_sha = hashlib.sha1(
-        b"blob " + str(len(link_target)).encode() + b"\0" + link_target
-    ).hexdigest()
-    real_popen = subprocess.Popen
-
-    def metadata(cmd, **kwargs):
-        endpoint = cmd[2]
-        if "/commits/main" in endpoint:
-            payload = {"sha": "commit-one", "commit": {"tree": {"sha": "tree-one"}}}
-        elif "/git/trees/" in endpoint:
-            payload = {"truncated": False, "tree": [
-                {"path": "README.md", "type": "blob", "mode": "120000",
-                 "sha": link_sha, "size": len(link_target)},
-                {"path": "assets/photo.png", "type": "blob", "mode": "100644",
-                 "sha": "b" * 40, "size": 8},
-            ]}
-        else:
-            raise AssertionError(endpoint)
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
-
-    def raw_process(cmd, **kwargs):
-        assert cmd[2].endswith("/git/blobs/" + link_sha)
-        with TemporaryFile() as input_file:
-            input_file.write(link_target)
-            input_file.seek(0)
-            return real_popen(
-                [sys.executable, "-c", "import shutil,sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"],
-                stdin=input_file,
-                **kwargs,
-            )
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
-    FakeToolClient.reset({})
-    with pytest.raises(main.click.ClickException, match="binary Artifact"):
-        main._run_cloud_local_agent_job({
-            "job_id": "laj-binary-link", "attempt_count": 1, "workspace_id": "workspace-a",
-            "operation": "github_repo_sync", "source_id": "src-test",
-            "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
-        }, _cloud_test_client())
-    assert not any(
-        call[0] in {"prepare_local_source_snapshot", "start_source_processing"}
-        for call in FakeToolClient.calls
-    )
-
 @pytest.mark.asyncio
 async def test_stream_stops_before_buffering_more_than_declared_size(cloud_collection):
     gene, session = cloud_collection
@@ -535,91 +361,3 @@ async def test_unknown_lengths_still_bound_actual_stream_bytes(cloud_collection,
         await gene.fetch(item)
 
 
-@pytest.mark.parametrize("failure", ["overflow", "timeout", "network", "http"])
-def test_daemon_raw_transfer_failure_closes_process_and_never_processes(monkeypatch, failure):
-    session = RepositorySession()
-    real_popen = subprocess.Popen
-    processes = []
-
-    def metadata(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
-            session.get("https://api.github.com/" + cmd[2]).json()), stderr="")
-
-    scripts = {
-        "overflow": "import sys,time; sys.stdout.buffer.write(b'too long'); sys.stdout.flush(); time.sleep(60)",
-        "timeout": "import time; time.sleep(60)",
-        "network": "import sys; sys.stderr.write('error connecting to GitHub'); sys.exit(1)",
-        "http": "import sys; sys.stderr.write('HTTP 403 Forbidden'); sys.exit(1)",
-    }
-
-    def raw_process(cmd, **kwargs):
-        process = real_popen([sys.executable, "-c", scripts[failure]], **kwargs)
-        processes.append(process)
-        return process
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    monkeypatch.setattr(main.subprocess, "Popen", raw_process)
-    if failure == "timeout":
-        # Only the timeout case reaches the deadline; the others end on their own.
-        monkeypatch.setattr(main, "GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS", 0.5)
-    FakeToolClient.reset({})
-    job = {
-        "job_id": "laj-error", "attempt_count": 1, "workspace_id": "workspace-a",
-        "operation": "github_repo_sync", "source_id": "src-test",
-        "payload": {"repo_url": "https://github.com/example/repo", "ref": "main"},
-    }
-    if failure in {"timeout", "network"}:
-        # The runner owns the existing network-backoff classification.
-        with pytest.raises(main.GitHubProviderConnectionError):
-            main._run_cloud_local_agent_job(job, _cloud_test_client())
-    else:
-        result = main._run_cloud_local_agent_job(job, _cloud_test_client())
-        assert result["counts"]["failed"] == 1
-    [process] = processes
-    assert process.poll() is not None
-    assert process.stdout.closed and process.stderr.closed
-    assert not any(call[0] == "start_source_processing" for call in FakeToolClient.calls)
-
-
-def test_daemon_selected_gitlink_is_not_an_empty_complete_snapshot(monkeypatch):
-    session = RepositorySession()
-    session.mode = "160000"
-    session.entry_type = "commit"
-
-    def metadata(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
-            session.get("https://api.github.com/" + cmd[2]).json()), stderr="")
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    FakeToolClient.reset({})
-    with pytest.raises(main.click.ClickException, match="unsupported file mode"):
-        main._run_cloud_local_agent_job({
-            "job_id": "laj-gitlink", "attempt_count": 1, "workspace_id": "workspace-a",
-            "operation": "github_repo_sync", "source_id": "src-test",
-            "payload": {"repo_url": "https://github.com/example/repo", "ref": "main",
-                        "include_paths": ["README.md"]},
-        }, _cloud_test_client())
-    assert not any(call[0] in {"prepare_local_source_snapshot", "start_source_processing"}
-                   for call in FakeToolClient.calls)
-
-
-def test_daemon_malformed_symlink_is_not_an_empty_complete_snapshot(monkeypatch):
-    session = RepositorySession()
-    session.mode = "120000"
-    session.entry_type = "tree"
-
-    def metadata(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
-            session.get("https://api.github.com/" + cmd[2]).json()), stderr="")
-
-    monkeypatch.setattr(main.subprocess, "run", metadata)
-    FakeToolClient.reset({})
-    with pytest.raises(main.click.ClickException, match="not represented by a blob"):
-        main._run_cloud_local_agent_job({
-            "job_id": "laj-malformed-symlink", "attempt_count": 1, "workspace_id": "workspace-a",
-            "operation": "github_repo_sync", "source_id": "src-test",
-            "payload": {"repo_url": "https://github.com/example/repo", "ref": "main",
-                        "include_paths": ["README.md"]},
-        }, _cloud_test_client())
-    assert not any(call[0] in {"prepare_local_source_snapshot", "start_source_processing"}
-                   for call in FakeToolClient.calls)

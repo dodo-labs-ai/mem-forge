@@ -1656,9 +1656,8 @@ class SourceSyncWorker:
                             for source_input in inputs
                             if source_input.input_generation <= run.input_generation_watermark
                         ]
-                # The package path of Jira, GitHub repository and local
-                # Markdown binds the run to the complete snapshot its daemon
-                # submitted.
+                # Local Markdown's package path binds the run to the complete
+                # snapshot its daemon submitted.
                 if (
                     run.input_snapshot_id is not None
                     and descriptor is not None
@@ -1667,16 +1666,6 @@ class SourceSyncWorker:
                     input_snapshot = SnapshotBinding(
                         snapshot_id=run.input_snapshot_id,
                         doc_ids=snapshot_document_ids(inputs),
-                        confirmations=await self.db.list_source_sync_snapshot_confirmations(
-                            source_id=run.source_id,
-                            workspace_id=run.workspace_id,
-                            snapshot_id=run.input_snapshot_id,
-                        ),
-                        excluded_listings=await self.db.list_source_sync_snapshot_excluded_listings(
-                            source_id=run.source_id,
-                            workspace_id=run.workspace_id,
-                            snapshot_id=run.input_snapshot_id,
-                        ),
                     )
                 if run.input_snapshot_id is not None and not run.force_full_sync:
                     reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(

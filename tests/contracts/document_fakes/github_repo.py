@@ -24,8 +24,6 @@ from memforge.genes.toolkit.github_api import TREE_REQUEST_BUDGET
 from memforge.github_repo_utils import build_github_repo_doc_id
 from tests.contracts.document_fakes import (
     IN_THE_CURSOR_MINUTE,
-    LONG_AGO,
-    RECENTLY,
     DocumentConnectorFakes,
     FakeConnection,
     ListingConfig,
@@ -66,15 +64,14 @@ class _Provider(FakeGitHub):
 
 class GitHubRepoFakes(DocumentConnectorFakes):
     listing_configs = {
-        "cloud-pull": ListingConfig(
-            {**_SCOPE, "connection_mode": "cloud_pull"},
+        "repository": ListingConfig(
+            dict(_SCOPE),
             walks_scope=True,
             edited_in_the_cursor_minute=build_github_repo_doc_id(
                 source_id="src-contract", repo_url=REPO_URL, repo_ref="main", relative_path="docs/release-notes.md"
             ),
         )
     }
-    device_configs = {"local-push": {**_SCOPE, "connection_mode": "local_push"}}
 
     @asynccontextmanager
     async def connect(
@@ -90,25 +87,5 @@ class GitHubRepoFakes(DocumentConnectorFakes):
             yield provider.connection(gene)
         finally:
             await gene.close()
-
-    def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
-        return [
-            {
-                "doc_id": f"github-repo-{path}",
-                "repo_url": REPO_URL,
-                "repo_ref": "main",
-                "relative_path": path,
-                "title": path,
-                "version": f"sha-{path}",
-                "last_modified": changed_at.isoformat(),
-                "change_kind": "upsert",
-            }
-            for path, changed_at in (
-                ("docs/guide.md", LONG_AGO),
-                ("docs/runbooks/restart.md", RECENTLY),
-                ("docs/release-notes.md", IN_THE_CURSOR_MINUTE),
-            )
-        ]
-
 
 FAKES = GitHubRepoFakes()

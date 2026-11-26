@@ -1689,16 +1689,6 @@ async def test_scope_listing_that_ends_before_its_total_raises():
 
 
 @pytest.mark.asyncio
-async def test_local_agent_jira_is_listed_by_its_device_manifest():
-    config = {"base_url": "https://jira.example.test", "sync_mode": "local_agent"}
-    gene = JiraGene(config=config, source_id="src-jira")
-
-    assert JiraGene.lists_scope(config) is True
-    with pytest.raises(ValueError, match="snapshot manifest"):
-        await gene.list_scope()
-
-
-@pytest.mark.asyncio
 async def test_confirming_unlisted_issues_keeps_every_issue_jira_still_has():
     searches: list[dict] = []
     reads: list[str] = []

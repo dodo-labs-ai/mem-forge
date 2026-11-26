@@ -5,11 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any
 
-from memforge.source_activity import SourceActivityConflict
 from memforge.source_time import SOURCE_UPDATED_AT_KEY
 
 SNAPSHOT_MANIFEST_MAX_ITEMS = 10_000
@@ -29,16 +27,11 @@ class SnapshotManifestItem:
     revision: str
 
 
-def snapshot_manifest_sha256(
-    items: Iterable[SnapshotManifestItem],
-    excluded_listings: Iterable[ExcludedScopeListing] = (),
-) -> str:
-    """The digest that binds a device manifest: its coverage, its items and its excluded listings.
+def snapshot_manifest_sha256(items: Iterable[SnapshotManifestItem]) -> str:
+    """The digest that binds a device manifest: its coverage and its items.
 
     Items are in Document id order. Coverage and change kind are constants,
-    and both stay in the digest, so a manifest hashes as it always has. The
-    excluded listings, in scope key order, are hashed only when the manifest
-    carries any, so a manifest without them keeps the digest it always had.
+    and both stay in the digest, so a manifest hashes as it always has.
     """
     payload: dict[str, object] = {
         "coverage": COMPLETE_SNAPSHOT,
@@ -47,12 +40,6 @@ def snapshot_manifest_sha256(
             key=lambda item: item["doc_id"],
         ),
     }
-    listings = sorted(excluded_listings, key=lambda listing: listing.scope_key)
-    if listings:
-        payload["excluded_listings"] = [
-            {"scope_key": listing.scope_key, "doc_ids": sorted(listing.doc_ids), "rejection": listing.rejection}
-            for listing in listings
-        ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
@@ -80,45 +67,6 @@ def validate_snapshot_manifest_values(coverage: str, manifest_items: Sequence[tu
         raise ValueError("snapshot manifest coverage is invalid")
     if any(change_kind != UPSERT for _doc_id, _revision, change_kind in manifest_items):
         raise ValueError("snapshot manifest change_kind is invalid")
-
-
-class SnapshotConfirmationAnswer(str, Enum):
-    """A device's answer for one item the server asked it to confirm.
-
-    ``absent``, ``exists`` and ``hidden`` are ``confirm_absent``'s answers for
-    the item. ``failed`` means ``confirm_absent`` raised; every issued item
-    then carries it with the cause.
-    """
-
-    ABSENT = "absent"
-    EXISTS = "exists"
-    HIDDEN = "hidden"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class SnapshotConfirmation:
-    """One unlisted item a snapshot asks its device to confirm, and the answer once stored.
-
-    The server issues it with the manifest: ``doc_id`` is the Document id and
-    ``provider_key`` the provider's key of the item, by which the device
-    confirms it. For Jira it is the issue id, such as ``10007``, which the
-    issue's Unit records; only a failed issue that never became a Unit is
-    named by its issue key, such as ``PAY-7``, when its stored item lacks the
-    id. ``answer`` is ``None`` until the device answers; ``cause`` accompanies
-    only ``failed``.
-    """
-
-    doc_id: str
-    provider_key: str
-    answer: SnapshotConfirmationAnswer | None = None
-    cause: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.doc_id or not self.provider_key:
-            raise ValueError("snapshot confirmation requires doc_id and provider_key")
-        if (self.answer is SnapshotConfirmationAnswer.FAILED) != bool(self.cause):
-            raise ValueError("snapshot confirmation carries a cause exactly when it failed")
 
 
 @dataclass(frozen=True)
@@ -217,131 +165,3 @@ def plan_snapshot_manifest(
     )
 
 
-def validate_snapshot_manifest_extras(
-    manifest_items: Sequence[tuple[str, str, str]],
-    confirm: Sequence[SnapshotConfirmation],
-    excluded_listings: Sequence[ExcludedScopeListing],
-) -> None:
-    """Check a manifest's issued confirmations and excluded listings before they are stored."""
-    confirm_doc_ids = [item.doc_id for item in confirm]
-    if len(set(confirm_doc_ids)) != len(confirm_doc_ids):
-        raise ValueError("snapshot confirmations contain duplicate doc_id")
-    if any(item.answer is not None for item in confirm):
-        raise ValueError("snapshot confirmations are issued unanswered")
-    if set(confirm_doc_ids) & {doc_id for doc_id, _revision, _change_kind in manifest_items}:
-        raise ValueError("snapshot confirmations name only items the manifest does not list")
-    scope_keys = [listing.scope_key for listing in excluded_listings]
-    if len(set(scope_keys)) != len(scope_keys):
-        raise ValueError("snapshot excluded listings contain duplicate scope_key")
-
-
-def excluded_listing_rows(
-    listings: Sequence[ExcludedScopeListing],
-) -> list[tuple[str, str | None, str | None]]:
-    """The stored rows of excluded listings: one scope row each, then one row per listed Document."""
-    rows: list[tuple[str, str | None, str | None]] = []
-    for listing in listings:
-        rows.append((listing.scope_key, None, listing.rejection))
-        rows.extend((listing.scope_key, doc_id, None) for doc_id in sorted(listing.doc_ids))
-    return rows
-
-
-def excluded_listings_from_rows(
-    rows: Iterable[tuple[str, str | None, str | None]],
-) -> tuple[ExcludedScopeListing, ...]:
-    rejections: dict[str, str | None] = {}
-    doc_ids: dict[str, set[str]] = {}
-    for scope_key, doc_id, rejection in rows:
-        if doc_id is None:
-            rejections[scope_key] = rejection
-        else:
-            doc_ids.setdefault(scope_key, set()).add(doc_id)
-    return tuple(
-        ExcludedScopeListing(
-            scope_key=scope_key,
-            doc_ids=frozenset(doc_ids.get(scope_key, ())),
-            rejection=rejections[scope_key],
-        )
-        for scope_key in sorted(rejections)
-    )
-
-
-def snapshot_confirmation(
-    doc_id: object,
-    provider_key: object,
-    answer: object,
-    cause: object,
-) -> SnapshotConfirmation:
-    return SnapshotConfirmation(
-        doc_id=str(doc_id),
-        provider_key=str(provider_key),
-        answer=SnapshotConfirmationAnswer(str(answer)) if answer is not None else None,
-        cause=str(cause) if cause is not None else None,
-    )
-
-
-def validate_snapshot_confirmation_submission(
-    answers: Sequence[SnapshotConfirmation],
-    failure_cause: str | None,
-) -> None:
-    """Check the shape of a device's confirmation answers, before the issued set is read."""
-    if failure_cause is not None:
-        if not failure_cause or answers:
-            raise ValueError("a failed confirmation carries its cause and no answers")
-        return
-    if any(
-        item.answer not in {
-            SnapshotConfirmationAnswer.ABSENT,
-            SnapshotConfirmationAnswer.EXISTS,
-            SnapshotConfirmationAnswer.HIDDEN,
-        }
-        for item in answers
-    ):
-        raise ValueError("each confirmation answer is absent, exists or hidden")
-    doc_ids = [item.doc_id for item in answers]
-    if len(set(doc_ids)) != len(doc_ids):
-        raise ValueError("snapshot confirmations answer an item twice")
-
-
-def snapshot_confirmation_updates(
-    *,
-    manifest: tuple[str, str, int] | None,
-    submitted: tuple[str, str, int],
-    issued: Sequence[SnapshotConfirmation],
-    answers: Sequence[SnapshotConfirmation],
-    failure_cause: str | None,
-) -> tuple[SnapshotConfirmation, ...]:
-    """The issued confirmations a valid submission answers now.
-
-    ``manifest`` and ``submitted`` are (digest, job id, attempt count). The
-    result is empty for an identical replay. Raises for a missing manifest,
-    another digest or attempt, an unissued or missing item, and answers that
-    differ from the stored ones.
-    """
-    if manifest is None:
-        raise ValueError("source snapshot manifest not found")
-    if manifest[0] != submitted[0]:
-        raise SourceActivityConflict("snapshot confirmations answer another manifest digest")
-    if manifest[1:] != submitted[1:]:
-        raise SourceActivityConflict("snapshot confirmations belong to another collection attempt")
-    issued_keys = {item.doc_id: item.provider_key for item in issued}
-    if failure_cause is not None:
-        wanted = {
-            item.doc_id: replace(item, answer=SnapshotConfirmationAnswer.FAILED, cause=failure_cause)
-            for item in issued
-        }
-    else:
-        for item in answers:
-            if issued_keys.get(item.doc_id) != item.provider_key:
-                raise ValueError(f"snapshot confirmation was not issued: {item.doc_id}")
-        wanted = {item.doc_id: item for item in answers}
-        if set(wanted) != set(issued_keys):
-            raise ValueError("snapshot confirmations must answer every issued item")
-    pending: list[SnapshotConfirmation] = []
-    for item in issued:
-        answer = wanted[item.doc_id]
-        if item.answer is None:
-            pending.append(answer)
-        elif (item.answer, item.cause) != (answer.answer, answer.cause):
-            raise SourceActivityConflict("snapshot confirmations were already answered differently")
-    return tuple(pending)

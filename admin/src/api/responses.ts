@@ -38,7 +38,6 @@ export type LocalAgentJob = Omit<Schemas["LocalAgentJobResponse"], "result"> & {
  */
 export interface SetupJobResults {
   credential_check: Schemas["CredentialCheckResult"];
-  github_repo_preview_tree: Schemas["GitHubRepoPreviewTreeResult"];
   local_markdown_pick_root: Schemas["LocalMarkdownPickRootResult"];
   local_markdown_preview_tree: Schemas["LocalMarkdownPreviewTreeResult"];
   teams_auth: Schemas["TeamsAuthResult"];

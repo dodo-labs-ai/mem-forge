@@ -640,14 +640,14 @@ class ConfigOption:
     otherwise::
 
         ConfigField(
-            key="auth_mode", label="Authentication Method", field_type=ConfigFieldType.SELECT,
+            key="depth", label="Depth", field_type=ConfigFieldType.SELECT,
             choices=[
-                # A token works only when MemForge itself reads Jira.
-                ConfigOption("pat", "Personal access token",
-                             visible_when=(ConfigCondition("sync_mode", ("cloud",)),)),
-                ConfigOption("browser_cookie", "Browser session"),
+                ConfigOption("page", "This page only"),
+                # Offered only while the scope is a tree.
+                ConfigOption("subtree", "The page and its children",
+                             visible_when=(ConfigCondition("scope", ("tree",)),)),
             ],
-            default="pat",
+            default="page",
         )
     """
 

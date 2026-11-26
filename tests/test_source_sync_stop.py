@@ -18,9 +18,9 @@ from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_activity import SOURCE_SYNC_CANCELLED_BY_USER, SourceSyncHeartbeat, SourceSyncRunActive
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
 from memforge.storage.database import Database
-from tests.device_report_fixture import DAEMON_DEVICE
+from tests.device_report_fixture import device_report
 from tests.test_document_absence import JIRA_CONFIG, SOURCE_ID, JiraProject, Workspace
-from tests.test_source_authority_api import _app, _confluence_payload, _connect_database, _jira_payload
+from tests.test_source_authority_api import _app, _confluence_payload, _connect_database, _device_jira_payload
 from tests.test_sync_bookkeeping import (
     NoopMemoryEngine,
     ProjectionFragmentRecordingExtractor,
@@ -472,7 +472,7 @@ def test_whoever_can_pause_a_device_source_can_stop_its_sync(tmp_path: Path):
     try:
         with TestClient(_app(tmp_path, database)) as client:
             source_id = client.post(
-                "/api/v1/sources", headers=owner, json=_jira_payload(sync_mode="local_agent")
+                "/api/v1/sources", headers=owner, json=_device_jira_payload()
             ).json()["id"]
             client.post(f"/api/v1/sources/{source_id}/sync", headers=owner)
             member = client.post(
@@ -497,11 +497,11 @@ def test_a_stopped_device_job_fences_the_daemon_that_is_collecting_it(tmp_path: 
     try:
         with TestClient(_app(tmp_path, database)) as client:
             source_id = client.post(
-                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
+                "/api/v1/sources", headers=headers, json=_device_jira_payload()
             ).json()["id"]
             queued = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             [job] = client.post(
-                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60}
+                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": device_report([source_id]).to_payload(), "limit": 1, "lease_seconds": 60}
             ).json()["jobs"]
 
             stopped = client.post(f"/api/v1/sources/{source_id}/sync/stop", headers=headers)
@@ -510,7 +510,7 @@ def test_a_stopped_device_job_fences_the_daemon_that_is_collecting_it(tmp_path: 
                 response = client.post(
                     f"/api/cloud/local-agent/jobs/{job_id}/heartbeat",
                     headers=headers,
-                    json={"device": DAEMON_DEVICE, "attempt_count": attempt_count, "lease_seconds": lease_seconds, "progress": progress},
+                    json={"device": device_report([source_id]).to_payload(), "attempt_count": attempt_count, "lease_seconds": lease_seconds, "progress": progress},
                 )
                 body = response.json()
                 return body if response.is_success else {"status_code": response.status_code, **body}
@@ -536,7 +536,7 @@ def test_a_stopped_device_job_fences_the_daemon_that_is_collecting_it(tmp_path: 
                 json={"attempt_count": job["attempt_count"], "status": "succeeded", "result": {}},
             )
             leased_again = client.post(
-                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60}
+                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": device_report([source_id]).to_payload(), "limit": 1, "lease_seconds": 60}
             ).json()["jobs"]
 
         assert queued.status_code == 202, queued.text

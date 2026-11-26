@@ -172,14 +172,15 @@ def _confluence(name: str, root: str, *, access_policy: str = "workspace") -> di
 
 
 def _local_jira() -> dict:
+    """A Jira Source acquired on its owner's device."""
     return {
         "type": "jira",
         "name": "Payroll Jira",
         "access_policy": "workspace",
+        "executor": "device",
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
-            "sync_mode": "local_agent",
             "projects": ["PAY"],
         },
     }
@@ -277,7 +278,8 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
             "viewer_role",
             "viewer_relationship",
         }
-        assert set(row["execution"]) == {"kind", "operation", "immutable_config_fields"}
+        execution_keys = {"Payroll Jira": {"device"}}
+        assert set(row["execution"]) == {"kind", "operation", "immutable_config_fields"} | execution_keys.get(name, set())
 
     history = rows["History Wiki"]
     assert set(history["sync"]) == HISTORY_SYNC_KEYS
@@ -471,9 +473,13 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
             local_receipt = client.post(f"/api/v1/sources/{jira_id}/sync")
 
             offline = client.get("/api/cloud/local-agent/status")
+            notes_id = client.post(
+                "/api/v1/sources",
+                json={"type": "local_markdown", "name": "Notes", "access_policy": "workspace", "config": {"root": "/notes"}},
+            ).json()["id"]
             sync_job = client.post(
                 "/api/cloud/local-agent/jobs",
-                json={"source_id": jira_id, "source_type": "jira", "operation": "jira_sync", "payload": {}},
+                json={"source_id": notes_id, "source_type": "local_markdown", "operation": "local_markdown_sync", "payload": {}},
             )
             setup_job = client.post(
                 "/api/cloud/local-agent/jobs",

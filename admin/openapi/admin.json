@@ -1300,12 +1300,6 @@
             "title": "Field Type",
             "type": "string"
           },
-          "fixed_after_create": {
-            "default": false,
-            "description": "Chooses the executor; a stored Source keeps it.",
-            "title": "Fixed After Create",
-            "type": "boolean"
-          },
           "group": {
             "default": "general",
             "title": "Group",
@@ -2725,214 +2719,6 @@
         "title": "GeneMetadataResponse",
         "type": "object"
       },
-      "GitHubRepoPreviewCounts": {
-        "additionalProperties": false,
-        "description": "Files the configured paths and extensions include, and files they leave out.",
-        "properties": {
-          "ignored": {
-            "title": "Ignored",
-            "type": "integer"
-          },
-          "included": {
-            "title": "Included",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "included",
-          "ignored"
-        ],
-        "title": "GitHubRepoPreviewCounts",
-        "type": "object"
-      },
-      "GitHubRepoPreviewItem": {
-        "additionalProperties": false,
-        "description": "One repository file the Source would read.\n\n``relative_path`` is the path the Source names the file by. When it is a\nsymbolic link, ``symlink_chain`` lists the links followed and\n``resolved_relative_path`` is the file whose content is read.",
-        "properties": {
-          "blob_sha": {
-            "title": "Blob Sha",
-            "type": "string"
-          },
-          "bytes": {
-            "title": "Bytes",
-            "type": "integer"
-          },
-          "content_type": {
-            "title": "Content Type",
-            "type": "string"
-          },
-          "file_mode": {
-            "title": "File Mode",
-            "type": "string"
-          },
-          "logical_file_mode": {
-            "title": "Logical File Mode",
-            "type": "string"
-          },
-          "relative_path": {
-            "title": "Relative Path",
-            "type": "string"
-          },
-          "resolved_relative_path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Resolved Relative Path"
-          },
-          "symlink_chain": {
-            "items": {
-              "$ref": "#/components/schemas/GitHubSymlinkHop"
-            },
-            "title": "Symlink Chain",
-            "type": "array"
-          }
-        },
-        "required": [
-          "relative_path",
-          "blob_sha",
-          "bytes",
-          "file_mode",
-          "logical_file_mode",
-          "symlink_chain",
-          "resolved_relative_path",
-          "content_type"
-        ],
-        "title": "GitHubRepoPreviewItem",
-        "type": "object"
-      },
-      "GitHubRepoPreviewTreeResult": {
-        "additionalProperties": false,
-        "description": "A remote repository's tree as the daemon's Git access reads it.\n\nThe daemon lists the whole tree at ``commit_sha`` of ``ref`` with the\nconfigured include and exclude paths cleared, so the folder picker can\noffer every folder. ``items`` holds at most the requested number of files,\nand ``counts`` counts all of them. ``extension_counts`` counts the\nincluded files by extension.",
-        "properties": {
-          "commit_sha": {
-            "title": "Commit Sha",
-            "type": "string"
-          },
-          "counts": {
-            "$ref": "#/components/schemas/GitHubRepoPreviewCounts"
-          },
-          "error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error"
-          },
-          "error_type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error Type"
-          },
-          "exclude_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Exclude Paths",
-            "type": "array"
-          },
-          "extension_counts": {
-            "additionalProperties": {
-              "type": "integer"
-            },
-            "title": "Extension Counts",
-            "type": "object"
-          },
-          "heartbeat_errors": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Heartbeat Errors"
-          },
-          "include_extensions": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Include Extensions",
-            "type": "array"
-          },
-          "include_paths": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Include Paths",
-            "type": "array"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/GitHubRepoPreviewItem"
-            },
-            "title": "Items",
-            "type": "array"
-          },
-          "operation": {
-            "title": "Operation",
-            "type": "string"
-          },
-          "profile": {
-            "title": "Profile",
-            "type": "string"
-          },
-          "ref": {
-            "title": "Ref",
-            "type": "string"
-          },
-          "repo_url": {
-            "title": "Repo Url",
-            "type": "string"
-          },
-          "root_tree_sha": {
-            "title": "Root Tree Sha",
-            "type": "string"
-          },
-          "source_id": {
-            "title": "Source Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation",
-          "source_id",
-          "profile",
-          "repo_url",
-          "ref",
-          "commit_sha",
-          "root_tree_sha",
-          "include_paths",
-          "exclude_paths",
-          "include_extensions",
-          "counts",
-          "extension_counts",
-          "items"
-        ],
-        "title": "GitHubRepoPreviewTreeResult",
-        "type": "object"
-      },
       "GitHubRepoTreeItemResponse": {
         "properties": {
           "path": {
@@ -3033,31 +2819,6 @@
           "items"
         ],
         "title": "GitHubRepoTreeResponse",
-        "type": "object"
-      },
-      "GitHubSymlinkHop": {
-        "additionalProperties": false,
-        "description": "One symbolic link followed on the way to a file's content.",
-        "properties": {
-          "blob_sha": {
-            "title": "Blob Sha",
-            "type": "string"
-          },
-          "path": {
-            "title": "Path",
-            "type": "string"
-          },
-          "target_path": {
-            "title": "Target Path",
-            "type": "string"
-          }
-        },
-        "required": [
-          "path",
-          "blob_sha",
-          "target_path"
-        ],
-        "title": "GitHubSymlinkHop",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -4140,129 +3901,6 @@
         "title": "LocalMarkdownPreviewTreeResult",
         "type": "object"
       },
-      "LocalSourceConfirmationAnswerRequest": {
-        "description": "The device's answer for one item its manifest response asked it to confirm.",
-        "properties": {
-          "answer": {
-            "enum": [
-              "absent",
-              "exists",
-              "hidden"
-            ],
-            "title": "Answer",
-            "type": "string"
-          },
-          "doc_id": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Doc Id",
-            "type": "string"
-          },
-          "provider_key": {
-            "maxLength": 512,
-            "minLength": 1,
-            "title": "Provider Key",
-            "type": "string"
-          }
-        },
-        "required": [
-          "doc_id",
-          "provider_key",
-          "answer"
-        ],
-        "title": "LocalSourceConfirmationAnswerRequest",
-        "type": "object"
-      },
-      "LocalSourceConfirmationsRequest": {
-        "description": "A device's answers for the items its query manifest left out, bound to that manifest.\n\n``manifest_sha256`` is the digest the manifest response returned, and the\njob attempt is the one that submitted the manifest. The request answers\nevery item the response named in ``confirm``, or, when the device could\nnot confirm them, gives ``failure_cause`` and no answers.",
-        "properties": {
-          "answers": {
-            "items": {
-              "$ref": "#/components/schemas/LocalSourceConfirmationAnswerRequest"
-            },
-            "maxItems": 10000,
-            "title": "Answers",
-            "type": "array"
-          },
-          "failure_cause": {
-            "anyOf": [
-              {
-                "maxLength": 2000,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failure Cause"
-          },
-          "local_agent_attempt_count": {
-            "minimum": 1.0,
-            "title": "Local Agent Attempt Count",
-            "type": "integer"
-          },
-          "local_agent_job_id": {
-            "title": "Local Agent Job Id",
-            "type": "string"
-          },
-          "manifest_sha256": {
-            "maxLength": 64,
-            "minLength": 64,
-            "title": "Manifest Sha256",
-            "type": "string"
-          },
-          "sync_snapshot_id": {
-            "title": "Sync Snapshot Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "sync_snapshot_id",
-          "local_agent_job_id",
-          "local_agent_attempt_count",
-          "manifest_sha256"
-        ],
-        "title": "LocalSourceConfirmationsRequest",
-        "type": "object"
-      },
-      "LocalSourceExcludedListingRequest": {
-        "description": "What the device listed in one scope its job's open transition excludes, or that the provider rejected it.\n\n``scope_key`` is the key the job named the scope by. A listing holds the\nDocument ids the scope lists, up to the manifest's item bound. A\ndefinitive rejection, such as a JQL the provider refuses, gives its cause\nin ``rejection`` and lists nothing.",
-        "properties": {
-          "doc_ids": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 10000,
-            "title": "Doc Ids",
-            "type": "array"
-          },
-          "rejection": {
-            "anyOf": [
-              {
-                "maxLength": 2000,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rejection"
-          },
-          "scope_key": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Scope Key",
-            "type": "string"
-          }
-        },
-        "required": [
-          "scope_key"
-        ],
-        "title": "LocalSourceExcludedListingRequest",
-        "type": "object"
-      },
       "LocalSourceManifestItemRequest": {
         "description": "One item of a device manifest: the item as the device read it.",
         "properties": {
@@ -4293,20 +3931,12 @@
         "type": "object"
       },
       "LocalSourceManifestRequest": {
-        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none. ``excluded_listings`` answers the\nexcluded scopes the job carried, one entry per scope at most.",
+        "description": "One complete local collection, planned against the retained packages.\n\nA device manifest lists the complete item set of its scope, so it declares\n``complete_snapshot`` coverage and every item an ``upsert``.\n``package_contract_version`` is the package contract the local agent\ncollects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates\nthe numbered contract sends none.",
         "properties": {
           "coverage": {
             "const": "complete_snapshot",
             "title": "Coverage",
             "type": "string"
-          },
-          "excluded_listings": {
-            "items": {
-              "$ref": "#/components/schemas/LocalSourceExcludedListingRequest"
-            },
-            "maxItems": 100,
-            "title": "Excluded Listings",
-            "type": "array"
           },
           "items": {
             "items": {
@@ -4353,63 +3983,12 @@
         "type": "object"
       },
       "LocalSourcePackageRequest": {
-        "description": "One raw local-source package pushed by the local daemon/adapter.\n\nFile-like sources use ``markdown_body`` as raw file text for the declared\n``content_type``. Structured sources such as Jira use ``raw_payload`` and\ndefer canonical markdown rendering to the source gene.\n``source_updated_at`` is a file-like source's own time for this content\n(an offset-aware ISO time); structured sources carry their times in\n``raw_payload``.",
+        "description": "One raw local-source package pushed by the local daemon/adapter.\n\n``markdown_body`` is the raw file text for the declared ``content_type``;\nthe source gene normalizes it during sync. ``source_updated_at`` is the\nfile's own time for this content (an offset-aware ISO time).",
         "properties": {
-          "artifact_input_hashes": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Artifact Input Hashes",
-            "type": "array"
-          },
-          "artifact_source_unit_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Artifact Source Unit Key"
-          },
-          "base_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Base Url"
-          },
-          "blob_sha": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Blob Sha"
-          },
           "content_type": {
             "default": "text/markdown",
             "title": "Content Type",
             "type": "string"
-          },
-          "issue_key": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Issue Key"
           },
           "local_agent_attempt_count": {
             "anyOf": [
@@ -4439,17 +4018,6 @@
             "title": "Markdown Body",
             "type": "string"
           },
-          "provider_revision": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Provider Revision"
-          },
           "raw_hash": {
             "anyOf": [
               {
@@ -4460,11 +4028,6 @@
               }
             ],
             "title": "Raw Hash"
-          },
-          "raw_payload": {
-            "additionalProperties": true,
-            "title": "Raw Payload",
-            "type": "object"
           },
           "relative_path": {
             "anyOf": [
@@ -4477,39 +4040,6 @@
             ],
             "title": "Relative Path"
           },
-          "repo_ref": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repo Ref"
-          },
-          "repo_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repo Url"
-          },
-          "resolved_relative_path": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Resolved Relative Path"
-          },
           "source_updated_at": {
             "anyOf": [
               {
@@ -4520,17 +4050,6 @@
               }
             ],
             "title": "Source Updated At"
-          },
-          "source_url": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Url"
           },
           "submitted_at": {
             "anyOf": [
@@ -4553,16 +4072,6 @@
               }
             ],
             "title": "Submitted By"
-          },
-          "symlink_chain": {
-            "items": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "title": "Symlink Chain",
-            "type": "array"
           },
           "sync_snapshot_id": {
             "anyOf": [
@@ -9785,6 +9294,8 @@
             "description": "Present for a Source whose acquisition runs on its execution owner's device."
           },
           "immutable_config_fields": {
+            "default": [],
+            "deprecated": true,
             "items": {
               "type": "string"
             },
@@ -9813,8 +9324,7 @@
         },
         "required": [
           "kind",
-          "operation",
-          "immutable_config_fields"
+          "operation"
         ],
         "title": "SourceExecutionResponse",
         "type": "object"
@@ -10566,7 +10076,7 @@
         "description": "Why saving the configuration would be refused (409).",
         "properties": {
           "code": {
-            "description": "scope_change_requires_listing, transition_requires_listing, source_provider_namespace_immutable or source_execution_mode_immutable.",
+            "description": "scope_change_requires_listing, transition_requires_listing or source_provider_namespace_immutable.",
             "title": "Code",
             "type": "string"
           },
@@ -14140,7 +13650,7 @@
     },
     "/api/v1/genes/{name}/config-schema": {
       "get": {
-        "description": "The form description of a source type, which the admin UI draws without per-type code.\n\nBesides what the Gene declares, each field says whether it is a scope\nfield and whether it is fixed after create, from the type's descriptor.",
+        "description": "The form description of a source type, which the admin UI draws without per-type code.\n\nBesides what the Gene declares, each field says whether it is a scope\nfield, from the type's descriptor.",
         "operationId": "get_gene_config_schema_api_v1_genes__name__config_schema_get",
         "parameters": [
           {
@@ -17555,60 +17065,9 @@
         ]
       }
     },
-    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
-      "post": {
-        "description": "Store a device's answers for the items its manifest response asked it to confirm.\n\nThe answers bind to the job attempt and the digest of the manifest. An\nidentical replay is accepted; an item the manifest did not ask about,\nanother digest or attempt, and answers that differ from the stored\nones are refused with 409.",
-        "operationId": "submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "source_id",
-            "required": true,
-            "schema": {
-              "title": "Source Id",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LocalSourceConfirmationsRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Submit Local Source Confirmations",
-        "tags": [
-          "sources"
-        ]
-      }
-    },
     "/api/v1/sources/{source_id}/adapter/packages": {
       "post": {
-        "description": "Receive one local-source package pushed by the local daemon/adapter.\n\nThe service owns the inbox layout and package format. Local clients\nsend raw file text or structured source payloads; source genes perform\ncanonical markdown normalization during sync.",
+        "description": "Receive one local-source package pushed by the local daemon/adapter.\n\nThe service owns the inbox layout and package format. Local clients\nsend raw file text; source genes perform canonical markdown\nnormalization during sync.",
         "operationId": "push_local_source_package_api_v1_sources__source_id__adapter_packages_post",
         "parameters": [
           {

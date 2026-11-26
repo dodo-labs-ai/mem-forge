@@ -431,26 +431,6 @@ test("Wait keeps the edit and does not stop the sync", async () => {
   expect(requestsTo(calls, "PUT", "/api/v1/sources/src-wiki")).toHaveLength(0);
 });
 
-test("fixed-after-create fields are read-only", async () => {
-  const source = makeSource({
-    id: "src-jira",
-    type: "jira",
-    name: "Payroll Jira",
-    config: { base_url: "https://jira.example.com", sync_mode: "local_agent", auth_mode: "browser_cookie", projects: ["PAY"] },
-    execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] },
-  });
-  renderSetup("/sources/src-jira/settings?step=connection", { sources: [source] });
-
-  const local = await screen.findByRole("radio", { name: "Local sync" });
-  expect(local).toBeChecked();
-  expect(local).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByRole("radio", { name: "Cloud" })).toHaveAttribute("aria-disabled", "true");
-  const facts = screen.getByRole("region", { name: "Detected settings" });
-  expect(within(facts).getByText("Sync Location")).toBeInTheDocument();
-  expect(within(facts).getByText("Local sync")).toBeInTheDocument();
-  expect(within(facts).getByText("Fixed when the source was created.")).toBeInTheDocument();
-});
-
 test("a blank secret keeps the stored token", async () => {
   const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
     sources: [makeSource({ config: CONFLUENCE_CONFIG })],

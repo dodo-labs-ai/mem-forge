@@ -236,7 +236,7 @@ def test_a_source_type_name_matches_exactly() -> None:
     assert "Jira" not in GENE_REGISTRY
     assert canonical_projection_scope("Jira", {"projects": ["PAY"]}) == {}
     # The local-agent contract accepts the loose spelling its callers send.
-    assert local_agent_sync_operation(" JIRA ", {"sync_mode": "local_agent"}) == "jira_sync"
+    assert local_agent_sync_operation(" LOCAL_MARKDOWN ", {}) == "local_markdown_sync"
 
 
 def test_a_built_in_gene_that_cannot_load_fails_the_import() -> None:
