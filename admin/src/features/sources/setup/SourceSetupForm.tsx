@@ -156,7 +156,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
   // The server reads no provider for a Source that runs on a device.
   const previewKind = executor === "device" ? null : checkSetupKind(gene.name, schema, state);
-  const discovery = useCheckSetup(gene.name, previewKind, source);
+  const discovery = useCheckSetup(gene.name, previewKind, executor, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
   const currentKey = steps.find((step) => step.key === searchParams.get(SOURCE_SETTINGS_STEP_PARAM))?.key ?? steps[0]!.key;

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import Request
@@ -141,6 +142,41 @@ def test_the_server_does_not_preview_a_device_configuration_or_a_device_source(t
 
     assert (new.status_code, new.json()["detail"]) == (409, "device_preview_unavailable")
     assert (existing.status_code, existing.json()["detail"]) == (409, "device_preview_unavailable")
+
+
+def test_a_device_source_moving_to_the_server_previews_with_the_typed_credential(
+    tmp_path, database, monkeypatch
+) -> None:
+    wiki = {"base_url": "https://wiki.example.test", "sync_mode": "space", "spaces": ["ACME"]}
+    _source(database, "src-device-wiki", executor="device", source_type="confluence", config=wiki)
+    previewed: list[dict] = []
+
+    class _PreviewGene:
+        def __init__(self, config: dict) -> None:
+            previewed.append(config)
+
+        async def authenticate(self) -> None:
+            return None
+
+        async def discover(self, since):
+            yield SimpleNamespace(
+                item_id="page-1", title="Runbook", source_url="https://wiki.example.test/1", last_modified=None
+            )
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(admin_api, "create_gene", lambda name, config, source_id: _PreviewGene(config))
+
+    with TestClient(_app(tmp_path, database)) as client:
+        answer = client.post(
+            "/api/v1/genes/confluence/preview-discovery",
+            json={"source_id": "src-device-wiki", "config": {"pat": "typed-token"}, "executor": "server", "limit": 5},
+        )
+
+    assert answer.status_code == 200, answer.text
+    assert [item["item_id"] for item in answer.json()["items"]] == ["page-1"]
+    assert previewed[0]["pat"] == "typed-token"
 
 
 def test_the_server_does_not_browse_a_device_sources_repository(tmp_path, database) -> None:

@@ -2127,7 +2127,7 @@
         "type": "object"
       },
       "DiscoveryPreviewRequest": {
-        "description": "A configuration to preview; ``executor`` says where the Source it configures runs.",
+        "description": "A configuration to preview where its save will run it.\n\n``executor`` is where the Source runs once saved; without it, a stored\nSource keeps its own executor and a new Source runs on the server.",
         "properties": {
           "config": {
             "additionalProperties": true,
@@ -2135,13 +2135,19 @@
             "type": "object"
           },
           "executor": {
-            "default": "server",
-            "enum": [
-              "server",
-              "device"
+            "anyOf": [
+              {
+                "enum": [
+                  "server",
+                  "device"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Executor",
-            "type": "string"
+            "title": "Executor"
           },
           "limit": {
             "default": 50,
@@ -14148,7 +14154,7 @@
     },
     "/api/v1/genes/{name}/preview-discovery": {
       "post": {
-        "description": "Preview the documents a source config would discover without saving it.\n\nOnly the server's own connection can preview: a configuration that\nruns on a device, or a device Source, answers 409\n``device_preview_unavailable``, because the server never reaches a\ndevice Source's provider.",
+        "description": "Preview the documents a source config would discover without saving it.\n\nOnly the server's own connection can preview. ``executor`` is where\nthe save puts the Source, so a stored device Source moving to the\nserver previews with the configuration the form carries. A\nconfiguration that runs on a device answers 409\n``device_preview_unavailable``, because the server never reaches a\ndevice Source's provider.",
         "operationId": "preview_gene_discovery_api_v1_genes__name__preview_discovery_post",
         "parameters": [
           {

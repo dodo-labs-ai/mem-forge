@@ -803,8 +803,10 @@ export interface paths {
          * Preview Gene Discovery
          * @description Preview the documents a source config would discover without saving it.
          *
-         *     Only the server's own connection can preview: a configuration that
-         *     runs on a device, or a device Source, answers 409
+         *     Only the server's own connection can preview. ``executor`` is where
+         *     the save puts the Source, so a stored device Source moving to the
+         *     server previews with the configuration the form carries. A
+         *     configuration that runs on a device answers 409
          *     ``device_preview_unavailable``, because the server never reaches a
          *     device Source's provider.
          */
@@ -3500,19 +3502,18 @@ export interface components {
         };
         /**
          * DiscoveryPreviewRequest
-         * @description A configuration to preview; ``executor`` says where the Source it configures runs.
+         * @description A configuration to preview where its save will run it.
+         *
+         *     ``executor`` is where the Source runs once saved; without it, a stored
+         *     Source keeps its own executor and a new Source runs on the server.
          */
         DiscoveryPreviewRequest: {
             /** Config */
             config: {
                 [key: string]: unknown;
             };
-            /**
-             * Executor
-             * @default server
-             * @enum {string}
-             */
-            executor: "server" | "device";
+            /** Executor */
+            executor?: ("server" | "device") | null;
             /**
              * Limit
              * @default 50

@@ -24,10 +24,11 @@ const SCOPE_PREVIEW_DELAY_MS = 400;
  * configuration, which return the values save would derive, facts and field
  * issues. `result` is the answer to the latest check, so an earlier answer
  * that arrives late never replaces a later one. `check` also returns its
- * answer, for the check before a save. With `sourceId` the server reads the
- * stored configuration for kept secrets and fixed fields, and the Source's
- * own executor; without it, `executor` says where the new Source runs, and a
- * device Source's form neither requires nor accepts its secrets.
+ * answer, for the check before a save. `executor` is where the Source runs
+ * once saved, so a stored Source moving between the server and a device is
+ * checked against its new executor, and a device Source's form neither
+ * requires nor accepts its secrets. With `sourceId` the server reads the
+ * stored configuration for kept secrets and fixed fields.
  */
 export function useConfigCheck(sourceType: string, sourceId: string | undefined, executor: SourceExecutor) {
   const api = useApi();
@@ -71,13 +72,16 @@ function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
  * saving anything. The server reads the provider through preview-discovery,
  * with `sourceId` supplying what the form leaves out, such as a kept
  * secret; a local folder is listed by local sync on the person's computer
- * (`local_markdown_preview_tree`). The server previews only through its
- * own connection, so the request names the server executor and a
- * configuration on My computer has no Check setup.
+ * (`local_markdown_preview_tree`). `executor` is where the Source runs once
+ * saved, as for config-check: the server previews only through its own
+ * connection, so a configuration on My computer has no Check setup, and a
+ * stored device Source moving to the server previews with the credential
+ * the form carries.
  */
 export function useCheckSetup(
   sourceType: string,
   kind: CheckSetupKind | null,
+  executor: SourceExecutor,
   source?: { id: string; config: Readonly<Record<string, unknown>> },
 ) {
   const api = useApi();
@@ -98,7 +102,7 @@ export function useCheckSetup(
       const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },
-          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor: "server" },
+          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor },
         }),
       );
       return {

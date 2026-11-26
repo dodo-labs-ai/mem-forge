@@ -1945,11 +1945,15 @@ class ConfigCheckResponse(BaseModel):
 
 
 class DiscoveryPreviewRequest(BaseModel):
-    """A configuration to preview; ``executor`` says where the Source it configures runs."""
+    """A configuration to preview where its save will run it.
+
+    ``executor`` is where the Source runs once saved; without it, a stored
+    Source keeps its own executor and a new Source runs on the server.
+    """
 
     source_id: str | None = None
     config: dict[str, Any]
-    executor: Literal["server", "device"] = "server"
+    executor: Literal["server", "device"] | None = None
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -7299,17 +7303,18 @@ def create_admin_app(
     ):
         """Preview the documents a source config would discover without saving it.
 
-        Only the server's own connection can preview: a configuration that
-        runs on a device, or a device Source, answers 409
+        Only the server's own connection can preview. ``executor`` is where
+        the save puts the Source, so a stored device Source moving to the
+        server previews with the configuration the form carries. A
+        configuration that runs on a device answers 409
         ``device_preview_unavailable``, because the server never reaches a
         device Source's provider.
         """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
-        if req.executor == SOURCE_EXECUTOR_DEVICE:
-            raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
 
         preview_config = dict(req.config)
+        existing: dict[str, Any] | None = None
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -7318,15 +7323,17 @@ def create_admin_app(
             _require_local_agent_connection_management(request, existing)
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Preview source type does not match the existing source")
-            if source_runs_on_device(existing):
-                raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
+        executor = req.executor or (source_executor(existing) if existing else SOURCE_EXECUTOR_SERVER)
+        if executor == SOURCE_EXECUTOR_DEVICE:
+            raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
+        if existing:
             stored_config = decrypt_source_config_for_runtime(
                 existing["config"],
                 secret_fields=_source_secret_fields(name),
             )
             preview_config = {**stored_config, **preview_config}
         try:
-            preview_config = _complete_snapshot_config(preview_config, existing["config"] if req.source_id else None)
+            preview_config = _complete_snapshot_config(preview_config, existing["config"] if existing else None)
         except SourceConfigInvalid as exc:
             raise _config_invalid_response(exc) from exc
 

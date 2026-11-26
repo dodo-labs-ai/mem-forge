@@ -600,6 +600,27 @@ test("a device source moves to the server with the secret the form requires", as
   expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "server", secrets: { pat: "token-2" } });
 });
 
+test("a device source moving to the server checks its setup through the server with the typed token", async () => {
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [deviceSource("secret")],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "POST /api/v1/genes/confluence/preview-discovery": () => ({ source_type: "confluence", count: 0, items: [], truncated: false }),
+    },
+  });
+
+  await userEvent.click(await screen.findByRole("radio", { name: /Server/ }));
+  await userEvent.type(screen.getByLabelText("Personal Access Token"), "token-2");
+  await next();
+  await userEvent.click(await screen.findByRole("button", { name: "Check setup" }));
+
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/preview-discovery")).toMatchObject({
+    source_id: "src-wiki",
+    executor: "server",
+    config: { pat: "token-2" },
+  });
+});
+
 test("a device source's token is stored on its computer with a copyable command, never in the form", async () => {
   renderSetup("/sources/src-wiki/settings?step=connection", { sources: [deviceSource("secret")] });
 
