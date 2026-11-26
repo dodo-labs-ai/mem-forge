@@ -8,12 +8,13 @@ import { SOURCE_SETTINGS_STEP_PARAM, SOURCES_PATH } from "@/lib/paths";
 import { Notice, PropertyList, StepRail, useUnsavedChangesGuard, type Property, type RailStep } from "@/patterns";
 import { Button } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
-import { sourceExecutor } from "../model/localAgentSources";
+import { sourceExecutor, type SourceExecutor } from "../model/localAgentSources";
 import { sourceProjectBinding } from "../model/projectBinding";
 import { ACCESS_CHOICES, type AccessPolicy } from "../model/sourceAccess";
 import { scopeChangeErrorMessage } from "../model/sourceScopeTransition";
 import type { Source } from "../model/types";
 import {
+  useChangeSourceExecutor,
   useConfigCheck,
   useCreateSource,
   useCheckSetup,
@@ -48,10 +49,13 @@ import {
 } from "./model/productSteps";
 import { activeSyncRunOf, runningSyncOfRefusedSave } from "./model/runningSyncSave";
 import { scopeChangeNotice } from "./model/scopeChangeNotice";
+import { deviceFormSchema, executorChoices } from "./model/sourceExecutor";
 import { configIssuesOf, issueView, type FieldIssue } from "./model/setupIssues";
 import { checkSetupGroup, groupComplete, groupSummary, issueCountsByGroup, setupSteps, type SetupStep } from "./model/setupSteps";
 import { AccessStep, BasicsStep, ProjectStep, ScheduleStep } from "./ProductSteps";
 import { useRunningSyncSave } from "./useRunningSyncSave";
+import { useDeviceChoice } from "./useDeviceChoice";
+import { DeviceChoicePanel, DeviceCredentialStep, WhereItRunsChoice } from "./WhereItRuns";
 
 type GeneMetadata = components["schemas"]["GeneMetadataResponse"];
 type SavePayload = CreateSourceBody | UpdateSourceBody;
@@ -96,8 +100,13 @@ function sameJson(a: unknown, b: unknown): boolean {
  *   change the page saw in progress.
  * - A save while a sync runs asks to stop it first or wait.
  * - Leaving with unsaved changes asks first.
+ * - A type that runs on the server or a device shows Where it runs on its
+ *   connection step. On My computer the form holds no secret: a new choice
+ *   saves only while one of the person's devices is ready, and a Source
+ *   that runs on a device shows how to store its credential there. Save
+ *   changes the executor first, then the rest of the settings.
  */
-export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) {
+export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetupFormProps) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const sharedWorkspace = useSharedWorkspace();
@@ -107,13 +116,21 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const canEditConfig = !source || Boolean(source.capabilities?.can_configure_connection);
   const binding = source ? sourceProjectBinding(source) : null;
   const routedByField = binding?.mode === "by_field";
+  const storedExecutor: SourceExecutor = source ? sourceExecutor(source) : "server";
+  const [executor, setExecutor] = useState<SourceExecutor>(storedExecutor);
+  const executorOptions = canEditConfig ? executorChoices(gene.executors) : [];
+  const executorChanged = executor !== storedExecutor;
+  const schema = useMemo(() => (executor === "device" ? deviceFormSchema(typeSchema) : typeSchema), [executor, typeSchema]);
+  const choosesDevice = executor === "device" && executorChanged;
+  const deviceChoice = useDeviceChoice(gene.name, choosesDevice);
+  const awaitsDevice = choosesDevice && !deviceChoice.ready;
 
   const [initial] = useState(() => {
-    const values = defaultValues(schema, source?.config ?? {});
+    const values = defaultValues(typeSchema, source?.config ?? {});
     return {
       name: source?.name ?? "",
       values,
-      config: serializeConfig(schema, values),
+      config: serializeConfig(typeSchema, values),
       projectKey: binding?.mode === "fixed" ? (binding.project_key ?? null) : null,
       schedule: initialSchedule(source, gene),
     };
@@ -132,12 +149,13 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const [checkingBeforeSave, setCheckingBeforeSave] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const executor = source ? sourceExecutor(source) : "server";
   const configCheck = useConfigCheck(gene.name, sourceId, executor);
   const createSource = useCreateSource();
   const updateSource = useUpdateSource(sourceId ?? "");
+  const changeExecutor = useChangeSourceExecutor(sourceId ?? "");
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
-  const previewKind = checkSetupKind(gene.name, schema, state);
+  // The server reads no provider for a Source that runs on a device.
+  const previewKind = executor === "device" ? null : checkSetupKind(gene.name, schema, state);
   const discovery = useCheckSetup(gene.name, previewKind, executor, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
@@ -153,12 +171,13 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   }, [check, sourceId, canEditConfig, initial.config]);
 
   // What the person changed that a save would send.
-  const dirty =
+  const settingsDirty =
     name !== initial.name ||
     !sameJson(config, initial.config) ||
     projectKey !== initial.projectKey ||
     !sameJson(schedule, initial.schedule) ||
     access !== null;
+  const dirty = settingsDirty || executorChanged;
   const blocker = useUnsavedChangesGuard(dirty && !saved);
 
   // Declared after the guard, so the guard has let go of the saved page before it leaves.
@@ -168,7 +187,10 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
     navigate(SOURCES_PATH);
   }, [saved, source, name, navigate]);
 
-  const secretKeys = useMemo(() => schema.fields.filter((field) => field.field_type === "secret").map((field) => field.key), [schema]);
+  const secretKeys = useMemo(
+    () => typeSchema.fields.filter((field) => field.field_type === "secret").map((field) => field.key),
+    [typeSchema],
+  );
   const scopeChanged =
     source !== undefined && canEditConfig && schema.fields.some((field) => field.scope && !sameJson(config[field.key], initial.config[field.key]));
   const missing = missingRequired(schema, state);
@@ -176,10 +198,38 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const scopeNotice = scopeChanged ? scopeChangeNotice(scopePreview) : null;
   const scopeRefused = scopeNotice?.tone === "danger";
 
+  /** The secrets the person typed, which a move to the server sends with the executor change. */
+  function typedSecrets(): Record<string, string> {
+    return Object.fromEntries(
+      secretKeys.flatMap((key) => {
+        const value = valuesRef.current[key];
+        return typeof value === "string" && value.trim() !== "" ? [[key, value]] : [];
+      }),
+    );
+  }
+
+  /**
+   * Saves an edited Source: a changed executor first, with the secrets a move
+   * to the server needs, then the other settings, whose configuration then
+   * leaves the secrets out, as the executor change already holds them.
+   */
+  async function saveSource(payload: UpdateSourceBody) {
+    if (!executorChanged) {
+      await updateSource.mutateAsync(payload);
+      return;
+    }
+    await changeExecutor.mutateAsync(executor === "server" ? { executor, secrets: typedSecrets() } : { executor });
+    if (!settingsDirty) return;
+    const config = payload.config
+      ? Object.fromEntries(Object.entries(payload.config).filter(([key]) => !secretKeys.includes(key)))
+      : undefined;
+    await updateSource.mutateAsync({ ...payload, ...(config ? { config } : {}) });
+  }
+
   async function persist(payload: SavePayload) {
     setSaveError(null);
     try {
-      if (source) await updateSource.mutateAsync(payload as UpdateSourceBody);
+      if (source) await saveSource(payload as UpdateSourceBody);
       else await createSource.mutateAsync(payload as CreateSourceBody);
     } catch (error) {
       if (runningSyncOfRefusedSave(error) === null) {
@@ -269,7 +319,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
       ...(routedByField ? {} : { project_binding: fixedProjectBinding(projectKey) }),
     };
     if (!source) {
-      return { ...common, type: gene.name, access_policy: sharedWorkspace ? access! : PERSONAL_ACCESS_POLICY, config };
+      return { ...common, type: gene.name, access_policy: sharedWorkspace ? access! : PERSONAL_ACCESS_POLICY, config, executor };
     }
     return {
       ...common,
@@ -344,7 +394,8 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
     }
   });
 
-  const saving = checkingBeforeSave || createSource.isPending || updateSource.isPending || runningSync.stopping;
+  const saving =
+    checkingBeforeSave || createSource.isPending || updateSource.isPending || changeExecutor.isPending || runningSync.stopping;
   const saveLabel = source ? "Save changes" : "Create source";
   const previous = steps[currentIndex - 1];
   const next = steps[currentIndex + 1];
@@ -370,6 +421,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
             issues={shownFieldIssues}
             notes={notes}
             facts={groupFacts(step)}
+            executor={step.group?.purpose === "connection" ? executorStep() : null}
             onChange={changeField}
             onBlur={leaveField}
             checkSetup={
@@ -390,6 +442,22 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
           </p>
         );
     }
+  }
+
+  /**
+   * Where it runs, on the connection step of a type that offers the choice,
+   * and the device's part: the chooser's devices while a move to My
+   * computer waits for one, or the credential step of a Source on a device.
+   */
+  function executorStep(): ReactNode {
+    const onDevice = source !== undefined && storedExecutor === "device" && executor === "device";
+    if (executorOptions.length === 0 && !onDevice) return null;
+    return (
+      <div className="space-y-3">
+        {executorOptions.length > 0 ? <WhereItRunsChoice executors={executorOptions} value={executor} onChange={setExecutor} /> : null}
+        {onDevice ? <DeviceCredentialStep source={source} /> : executor === "device" ? <DeviceChoicePanel choice={deviceChoice} /> : null}
+      </div>
+    );
   }
 
   /**
@@ -470,7 +538,7 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
             <Button type="button" variant="ghost" nativeButton={false} render={<Link to={SOURCES_PATH} />}>
               Cancel
             </Button>
-            <Button type="submit" disabled={saving || scopeRefused || (source !== undefined && !dirty)}>
+            <Button type="submit" disabled={saving || scopeRefused || awaitsDevice || (source !== undefined && !dirty)}>
               {saving ? "Saving…" : saveLabel}
             </Button>
           </div>
@@ -499,15 +567,18 @@ interface GroupStepProps {
   issues: Readonly<Record<string, string>>;
   notes: Readonly<Record<string, string>>;
   facts: Property[];
+  /** Where it runs, on the connection step. */
+  executor: ReactNode;
   onChange: (key: string, value: FieldValue) => void;
   onBlur: (key: string) => void;
   checkSetup: ReactNode;
 }
 
-/** One of the type's groups: its fields, what config-check states about the configuration, and "Check setup". */
-function GroupStep({ step, schema, state, sourceType, sourceId, issues, notes, facts, onChange, onBlur, checkSetup }: GroupStepProps) {
+/** One of the type's groups: where the Source runs, its fields, what config-check states about the configuration, and "Check setup". */
+function GroupStep({ step, schema, state, sourceType, sourceId, issues, notes, facts, executor, onChange, onBlur, checkSetup }: GroupStepProps) {
   return (
     <div className="space-y-5">
+      {executor}
       <ConfigGroupFields
         schema={schema}
         group={step.group!}

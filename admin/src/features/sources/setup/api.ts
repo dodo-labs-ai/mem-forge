@@ -11,6 +11,7 @@ type Schemas = components["schemas"];
 export type ConfigCheck = Schemas["ConfigCheckResponse"];
 export type CreateSourceBody = Schemas["CreateSourceRequest"];
 export type UpdateSourceBody = Schemas["UpdateSourceRequest"];
+export type SourceExecutorChangeBody = Schemas["SourceExecutorChangeRequest"];
 export type ScopeChangePreview = Schemas["SourceScopeChangePreviewResponse"];
 
 /** How many items "Check setup" lists. */
@@ -135,6 +136,21 @@ export function useUpdateSource(sourceId: string) {
   return useMutation({
     mutationFn: (body: UpdateSourceBody) =>
       unwrap(api.PUT("/api/v1/sources/{source_id}", { params: { path: { source_id: sourceId } }, body })),
+    onSuccess: invalidate,
+  });
+}
+
+/**
+ * Changes where a Source runs (`PUT /sources/{id}/executor`). Moving it to a
+ * device makes the person its execution owner and deletes the server's
+ * copies of its secrets; moving it to the server sends them.
+ */
+export function useChangeSourceExecutor(sourceId: string) {
+  const api = useApi();
+  const invalidate = useInvalidateAfterSave();
+  return useMutation({
+    mutationFn: (body: SourceExecutorChangeBody) =>
+      unwrap(api.PUT("/api/v1/sources/{source_id}/executor", { params: { path: { source_id: sourceId } }, body })),
     onSuccess: invalidate,
   });
 }

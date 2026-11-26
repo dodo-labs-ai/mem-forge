@@ -3,6 +3,7 @@ export { BackLink } from "./BackLink";
 export { BrandMark } from "./BrandMark";
 export { ChoiceGroup, MAX_RADIO_CHOICES, type Choice } from "./ChoiceGroup";
 export { ConfirmDialog } from "./ConfirmDialog";
+export { CopyableCommand } from "./CopyableCommand";
 export {
   DataTable,
   dataColumns,

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { makeFailedItem, makeSource } from "@/test/sourceFixtures";
-import { OVERDUE_GRACE_MS, sourceAttention } from "./sourceAttention";
+import { OVERDUE_GRACE_MS, sourceAttention, sourceAttentionTone } from "./sourceAttention";
 import { sourceSyncActivityFromStatus } from "./sourceSyncActivity";
 
 const NOW = new Date("2026-09-29T12:00:00Z");
@@ -35,6 +35,18 @@ describe("sourceAttention", () => {
     });
     expect(attention).toMatchObject({ reason: "file_limit_exceeded", action: "configure_scope" });
     expect(attention?.detail).toContain(`Last sync matched ${count} files, exceeding its configured limit of 5000`);
+  });
+
+  test.each([
+    [true, { title: "Update local sync", action: "update_device", actionLabel: "Update" }],
+    [false, { title: "Waiting for user-2 to update local sync", action: null, actionLabel: null }],
+  ])("a source waiting for its device update, seen by its execution owner: %s", (viewerOwns, expected) => {
+    const source = makeSource({
+      ownership: { ...makeSource().ownership, execution_owner_user_id: "user-2", viewer_is_execution_owner: viewerOwns },
+    });
+    const attention = sourceAttention({ source, readiness: "update_local_sync", activity: { state: "failed" }, now: NOW });
+    expect(attention).toMatchObject({ reason: "update_local_sync", ...expected });
+    expect(sourceAttentionTone("update_local_sync")).toBe("warn");
   });
 
   test("other failures offer a retry", () => {

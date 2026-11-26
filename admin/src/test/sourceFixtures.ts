@@ -1,4 +1,5 @@
 import type { LocalAgentJob, Source } from "@/api/responses";
+import type { components } from "@/api/schema.gen";
 
 const FULL_CAPABILITIES = {
   can_subscribe: true,
@@ -117,5 +118,34 @@ export function makeLocalAgentJob(overrides: Partial<LocalAgentJob> = {}): Local
     updated_at: "2026-07-08T09:00:00Z",
     finished_at: null,
     ...overrides,
+  };
+}
+
+type LocalSyncStatus = components["schemas"]["LocalAgentDaemonStatusResponse"];
+type LocalSyncDevice = components["schemas"]["LocalAgentDeviceStatus"];
+
+/** One of the viewer's devices, online with the server's contracts; override what a test needs. */
+export function makeDevice(overrides: Partial<LocalSyncDevice> = {}): LocalSyncDevice {
+  return {
+    device_id: "dev-1",
+    name: "Alex's MacBook",
+    version: "0.2.0b7",
+    status: "online",
+    last_seen_at: "2026-11-27T10:00:00Z",
+    acquisition_contracts: { confluence: 2, jira: 2, notion: 2, github_pages: 2, github_repo: 2 },
+    ...overrides,
+  };
+}
+
+/** The viewer's local sync status with the given devices; the server runs 0.2.0b7 with contract 2 for each type. */
+export function makeLocalSyncStatus(devices: LocalSyncDevice[] = [makeDevice()]): LocalSyncStatus {
+  return {
+    status: devices.some((device) => device.status === "online") ? "online" : "offline",
+    last_seen_at: devices[0]?.last_seen_at ?? null,
+    checked_at: "2026-11-27T10:00:00Z",
+    stale_after_seconds: 90,
+    devices,
+    sources: [],
+    server: { version: "0.2.0b7", acquisition_contracts: { confluence: 2, jira: 2, notion: 2, github_pages: 2, github_repo: 2 } },
   };
 }

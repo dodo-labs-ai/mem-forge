@@ -780,3 +780,122 @@ test("deleting a source asks for one confirmation that names what it removes, wi
     expect(calls.some((request) => request.method === "DELETE" && new URL(request.url).pathname === "/api/v1/sources/src-wiki")).toBe(true),
   );
 });
+
+type DeviceState = "online" | "offline" | "update_required";
+
+/** A Source that runs on its execution owner's device, as the source API lists it to the viewer. */
+function onDevice(id: string, name: string, state: DeviceState, { device = "Alex's MacBook", owner = "local", viewerOwns = true } = {}) {
+  return makeSource({
+    id,
+    name,
+    ownership: { ...makeSource().ownership, execution_owner_user_id: owner, viewer_is_execution_owner: viewerOwns },
+    execution: {
+      kind: "local_agent",
+      operation: "document_acquisition",
+      immutable_config_fields: [],
+      device: {
+        name: viewerOwns ? device : null,
+        state,
+        installed_version: state === "update_required" ? "0.2.0b8" : "0.2.0b7",
+        required_version: "0.2.0b7",
+        credential: "secret",
+      },
+    },
+  });
+}
+
+test("one banner per device that needs an update, shown only to the execution owner", async () => {
+  renderPage([
+    onDevice("src-a", "Payroll wiki", "update_required"),
+    onDevice("src-b", "Payroll notes", "update_required"),
+    onDevice("src-c", "Build docs", "update_required", { device: "Build box" }),
+    onDevice("src-d", "Team wiki", "update_required", { owner: "user-2", viewerOwns: false }),
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Team wiki");
+  const banners = screen.getAllByText(/needs an update to sync/).map((banner) => banner.textContent);
+  expect(banners).toEqual([
+    "MemForge on Alex's MacBook needs an update to sync 2 sources.",
+    "MemForge on Build box needs an update to sync 1 source.",
+  ]);
+
+  const memberRow = within(table).getByText("Team wiki").closest("tr")!;
+  expect(within(memberRow).getByText("Waiting for user-2 to update local sync")).toBeInTheDocument();
+  expect(within(memberRow).queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
+  expect(within(memberRow).queryByText("Alex's MacBook")).not.toBeInTheDocument();
+  const ownerRow = within(table).getByText("Payroll wiki").closest("tr")!;
+  expect(within(ownerRow).getByText("Update local sync")).toBeInTheDocument();
+  expect(within(ownerRow).getByRole("button", { name: "Update" })).toBeInTheDocument();
+});
+
+test("another member's waiting source shows no banner and cannot queue a sync", async () => {
+  renderPage([onDevice("src-d", "Team wiki", "update_required", { owner: "user-2", viewerOwns: false })]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Team wiki");
+  expect(screen.queryByText(/needs an update to sync/)).not.toBeInTheDocument();
+  await userEvent.click(within(table).getByRole("button", { name: "More actions for Team wiki" }));
+  expect(await screen.findByRole("menuitem", { name: "Sync now" })).toHaveAttribute("aria-disabled", "true");
+});
+
+test("Sync now on a waiting source opens the update dialog instead of queuing a sync", async () => {
+  const { calls } = renderPage([onDevice("src-wiki", "Payroll wiki", "update_required"), onDevice("src-b", "Payroll notes", "update_required")]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Sync now" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  expect(within(dialog).getByText(/This computer runs MemForge 0.2.0b8. The server runs 0.2.0b7/)).toBeInTheDocument();
+  const waiting = within(dialog).getByRole("list", { name: "Sources waiting for the update" });
+  expect(within(waiting).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Payroll wiki", "Payroll notes"]);
+  expect(within(dialog).getByText("memforge upgrade")).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Copy memforge upgrade" })).toBeInTheDocument();
+  expect(within(dialog).getByText("Syncs wait until the update. Nothing is removed, and they start on their own after it.")).toBeInTheDocument();
+  expect(calls.some((request) => request.method === "POST")).toBe(false);
+});
+
+test("the update dialog closes itself once the device reports a matching contract", async () => {
+  let state: DeviceState = "update_required";
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Payroll wiki", state)] }) });
+
+  const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
+  await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  expect(screen.getByRole("dialog", { name: "Update MemForge on Alex's MacBook" })).toBeInTheDocument();
+
+  state = "online";
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Updated. Syncing again."));
+  await vi.waitFor(() => expect(screen.queryByRole("dialog", { name: "Update MemForge on Alex's MacBook" })).not.toBeInTheDocument());
+});
+
+test("an offline device is started before it is updated", async () => {
+  let state: DeviceState = "update_required";
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Payroll wiki", state)] }) });
+
+  const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
+  await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  state = "offline";
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+
+  expect(await within(dialog).findByText("memforge daemon start")).toBeInTheDocument();
+  expect(within(dialog).queryByText("memforge upgrade")).not.toBeInTheDocument();
+});
+
+test("Runs on names the device once its report names the source", async () => {
+  renderPage([
+    onDevice("src-wiki", "Payroll wiki", "online"),
+    { ...onDevice("src-b", "Payroll notes", "online"), connection_status: { state: "action_required", reason: "authentication" } },
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const named = (await within(table).findByText("Payroll wiki")).closest("tr")!;
+  expect(within(named).getByText("Alex's MacBook")).toBeInTheDocument();
+  const unnamed = within(table).getByText("Payroll notes").closest("tr")!;
+  expect(within(unnamed).getByText("Local sync")).toBeInTheDocument();
+  expect(within(unnamed).getByText("Sign-in required")).toBeInTheDocument();
+});

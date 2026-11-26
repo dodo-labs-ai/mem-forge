@@ -7,6 +7,7 @@ import { errorMessage } from "@/lib/errors";
 import { sourceSettingsPath } from "@/lib/paths";
 import { configSchemaQuery, useSetPaused, useSetPinned, useSetUsedInSearches, useStopSync, useSyncSource } from "./api";
 import { firstGroupWithPurpose } from "./model/configGroups";
+import { viewerUpdatesDevice, waitsForDeviceUpdate } from "./model/deviceUpdates";
 import type { SourceAttentionAction } from "./model/sourceAttention";
 import {
   sourceSyncCanStop,
@@ -18,8 +19,18 @@ import type { Source } from "./model/types";
 import { useCredentialCheck } from "./useCredentialCheck";
 import { useTeamsSignIn } from "./useTeamsSignIn";
 
-/** Runs row and drawer actions, reporting the outcome in a toast. */
-export function useSourceActions({ onViewDetails }: { onViewDetails: (source: Source) => void }) {
+interface SourceActionHandlers {
+  onViewDetails: (source: Source) => void;
+  /** Opens the update dialog of the device a waiting Source runs on. */
+  onUpdateDevice: (source: Source) => void;
+}
+
+/**
+ * Runs row and drawer actions, reporting the outcome in a toast. A Source
+ * that waits for its device to be updated queues no sync: Sync now opens the
+ * update dialog for the execution owner and is unavailable to anyone else.
+ */
+export function useSourceActions({ onViewDetails, onUpdateDevice }: SourceActionHandlers) {
   const sync = useSyncSource();
   const setPinned = useSetPinned();
   const setUsedInSearches = useSetUsedInSearches();
@@ -50,9 +61,11 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
    * How a source's sign-in is renewed: in place through local sync for a Jira
    * browser session (a credential check) or Teams, and otherwise on the
    * connection step, where a token is entered. Jira's `auth_mode` is always
-   * in its configuration.
+   * in its configuration. A device Source's credential lives on its device,
+   * and its connection step shows how to store it there.
    */
   function signInRenewal(source: Source): typeof credentialCheck | typeof teamsSignIn | null {
+    if (source.execution?.device) return null;
     if (source.type === "teams") return teamsSignIn;
     if (source.type === "jira" && source.config.auth_mode === "browser_cookie") return credentialCheck;
     return null;
@@ -69,9 +82,15 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
     },
     /** The sync button for a source, which reads Starting while this page's request for it is on its way. */
     syncControl(source: Source, activity: SourceSyncActivity | undefined) {
+      const running = activity?.state === "active" || activity?.state === "recovering";
+      if (waitsForDeviceUpdate(source) && !running) return { label: "Sync now", enabled: viewerUpdatesDevice(source) };
       return sourceSyncControl(activity, sync.isPending && sync.variables?.source.id === source.id);
     },
     syncNow(source: Source, retryTarget?: SourceSyncRetryTarget) {
+      if (viewerUpdatesDevice(source)) {
+        onUpdateDevice(source);
+        return;
+      }
       report(
         sync.mutateAsync({ source, retryTarget }),
         retryTarget ? `Retry started for ${source.name}` : `Sync started for ${source.name}`,
@@ -131,6 +150,9 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
         case "sync_now":
         case "retry":
           this.syncNow(source);
+          return;
+        case "update_device":
+          onUpdateDevice(source);
           return;
         case "start_local_sync":
           report(navigator.clipboard.writeText(LOCAL_SYNC_START_COMMAND), "Start command copied", "Could not copy");

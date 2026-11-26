@@ -10,6 +10,7 @@ export const OVERDUE_GRACE_MS = 15 * 60_000;
 
 export type SourceAttentionReason =
   | "local_sync_unavailable"
+  | "update_local_sync"
   | "sign_in_required"
   | "account_mismatch"
   | "configuration_required"
@@ -22,6 +23,7 @@ export type SourceAttentionReason =
 /** What resolves the problem. The page decides how each action is carried out. */
 export type SourceAttentionAction =
   | "start_local_sync"
+  | "update_device"
   | "sign_in"
   | "configure"
   | "configure_scope"
@@ -30,12 +32,48 @@ export type SourceAttentionAction =
   | "sync_now"
   | "assign_project";
 
-export interface SourceAttention {
+/** What the user can do about the problem; null when it waits on someone else. */
+export interface SourceAttentionFix {
+  action: SourceAttentionAction;
+  actionLabel: string;
+}
+
+export type SourceAttention = {
   reason: SourceAttentionReason;
   title: string;
   detail: string;
-  action: SourceAttentionAction;
-  actionLabel: string;
+} & (SourceAttentionFix | { action: null; actionLabel: null });
+
+const WARNING_REASONS: ReadonlySet<SourceAttentionReason> = new Set(["update_local_sync", "overdue", "unmapped"]);
+
+/** How strongly a problem is shown: a warning for what only waits, danger for what fails. */
+export function sourceAttentionTone(reason: SourceAttentionReason): "warn" | "danger" {
+  return WARNING_REASONS.has(reason) ? "warn" : "danger";
+}
+
+/**
+ * Update local sync: the execution owner updates their device; another
+ * member waits for them, without an action or the device's name.
+ */
+function updateLocalSyncAttention(source: Source): SourceAttention {
+  if (source.ownership.viewer_is_execution_owner) {
+    const device = source.execution?.device?.name ?? "your computer";
+    return {
+      reason: "update_local_sync",
+      title: "Update local sync",
+      detail: `MemForge on ${device} needs an update to sync this source.`,
+      action: "update_device",
+      actionLabel: "Update",
+    };
+  }
+  const owner = source.ownership.execution_owner_user_id ?? "its owner";
+  return {
+    reason: "update_local_sync",
+    title: `Waiting for ${owner} to update local sync`,
+    detail: "This source syncs again once MemForge on their computer is updated.",
+    action: null,
+    actionLabel: null,
+  };
 }
 
 interface SourceAttentionInput {
@@ -71,6 +109,8 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
         action: "start_local_sync",
         actionLabel: "Copy start command",
       };
+    case "update_local_sync":
+      return updateLocalSyncAttention(source);
     case "sign_in_required":
       return {
         reason: "sign_in_required",

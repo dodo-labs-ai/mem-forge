@@ -1,11 +1,12 @@
 import type { SetupJobOperation } from "@/api";
 import type { Route } from "./fakeApi";
+import { makeLocalSyncStatus } from "./sourceFixtures";
 
 /** How a fake daemon completes one setup operation: the job it reports, as the host job route returns it. */
 export type FakeSetupJob = { status: "succeeded" | "failed"; result: Record<string, unknown>; last_error?: string | null };
 
 /**
- * Fake API routes for local setup jobs: local sync is online, creating a job
+ * Fake API routes for local setup jobs: local sync is online on one device, creating a job
  * answers `laj-<operation>`, and reading it answers what `jobs` gives for that
  * operation, a job or a function of how often it was read. Each created job's
  * request body is pushed to `created`.
@@ -15,7 +16,7 @@ export function setupJobRoutes(
   created: { operation: SetupJobOperation; source_id: string; payload: Record<string, unknown> }[] = [],
 ): Record<string, Route> {
   const routes: Record<string, Route> = {
-    "GET /api/cloud/local-agent/status": () => ({ status: "online" }),
+    "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus(),
     "POST /api/cloud/local-agent/jobs": async (request) => {
       const body = (await request.clone().json()) as (typeof created)[number];
       created.push(body);
