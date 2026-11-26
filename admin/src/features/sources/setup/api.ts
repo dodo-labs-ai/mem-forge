@@ -3,6 +3,7 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { projectQueryKeys, unwrap, useApi, type components } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { sourceKeys } from "../api";
+import type { SourceExecutor } from "../model/localAgentSources";
 import { useLocalSetupJob } from "../useLocalSetupJob";
 import type { CheckSetupKind } from "./model/checkSetup";
 
@@ -23,9 +24,11 @@ const SCOPE_PREVIEW_DELAY_MS = 400;
  * issues. `result` is the answer to the latest check, so an earlier answer
  * that arrives late never replaces a later one. `check` also returns its
  * answer, for the check before a save. With `sourceId` the server reads the
- * stored configuration for kept secrets and fixed fields.
+ * stored configuration for kept secrets and fixed fields, and the Source's
+ * own executor; without it, `executor` says where the new Source runs, and a
+ * device Source's form neither requires nor accepts its secrets.
  */
-export function useConfigCheck(sourceType: string, sourceId: string | undefined) {
+export function useConfigCheck(sourceType: string, sourceId: string | undefined, executor: SourceExecutor) {
   const api = useApi();
   const latest = useRef(0);
   const [result, setResult] = useState<ConfigCheck | null>(null);
@@ -35,13 +38,13 @@ export function useConfigCheck(sourceType: string, sourceId: string | undefined)
       const answer = await unwrap(
         api.POST("/api/v1/genes/{name}/config-check", {
           params: { path: { name: sourceType } },
-          body: { config, source_id: sourceId ?? null },
+          body: { config, source_id: sourceId ?? null, executor },
         }),
       );
       if (ticket === latest.current) setResult(answer);
       return answer;
     },
-    [api, sourceType, sourceId],
+    [api, sourceType, sourceId, executor],
   );
   return { result, check };
 }
@@ -67,9 +70,15 @@ function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
  * saving anything. The server reads the provider through preview-discovery,
  * with `sourceId` supplying what the form leaves out, such as a kept
  * secret; a local folder is listed by local sync on the person's computer
- * (`local_markdown_preview_tree`).
+ * (`local_markdown_preview_tree`). `executor` says where the configured
+ * Source runs; the server reads only its own connection.
  */
-export function useCheckSetup(sourceType: string, kind: CheckSetupKind | null, source?: { id: string; config: Readonly<Record<string, unknown>> }) {
+export function useCheckSetup(
+  sourceType: string,
+  kind: CheckSetupKind | null,
+  executor: SourceExecutor,
+  source?: { id: string; config: Readonly<Record<string, unknown>> },
+) {
   const api = useApi();
   const previewFolder = useLocalSetupJob("local_markdown_preview_tree");
   return useMutation({
@@ -88,7 +97,7 @@ export function useCheckSetup(sourceType: string, kind: CheckSetupKind | null, s
       const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },
-          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null },
+          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor },
         }),
       );
       return {

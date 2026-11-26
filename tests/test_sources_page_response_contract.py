@@ -273,6 +273,7 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
             "created_by_user_id",
             "owner_user_id",
             "execution_owner_user_id",
+            "viewer_is_execution_owner",
             "viewer_role",
             "viewer_relationship",
         }

@@ -366,6 +366,7 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
             "created_by_user_id": "owner-user",
             "owner_user_id": "owner-user",
             "execution_owner_user_id": None,
+            "viewer_is_execution_owner": False,
             "viewer_role": "member",
             "viewer_relationship": "member",
         }

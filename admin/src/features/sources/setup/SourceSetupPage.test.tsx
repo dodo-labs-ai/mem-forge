@@ -160,6 +160,7 @@ test("Check setup lists the first five items", async () => {
     config: { base_url: "https://wiki.example.com", pat: "token-1", spaces: ["PAY"] },
     limit: 5,
     source_id: null,
+    executor: "server",
   });
 });
 
@@ -227,7 +228,7 @@ test("a pasted Confluence page URL fills the page tree root and switches an unch
   expect(screen.getByLabelText("Page Tree Root")).toHaveValue("12345");
   expect(screen.getByLabelText("Page Tree Root")).toHaveAccessibleDescription(expect.stringContaining("Filled from the URL"));
   expect(screen.queryByLabelText("Spaces to Sync")).not.toBeInTheDocument();
-  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({ config: { base_url: pageUrl }, source_id: null });
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({ config: { base_url: pageUrl }, source_id: null, executor: "server" });
 });
 
 test("a sync scope the user chose is not overwritten by a derived value", async () => {
@@ -250,11 +251,11 @@ test("a radio change and a switch toggle check the configuration they commit", a
 
   await userEvent.click(await screen.findByRole("radio", { name: "This page tree" }));
   await waitFor(() => expect(checks()).toHaveLength(1));
-  expect(await checks()[0]!.clone().json()).toEqual({ config: { sync_mode: "page_tree" }, source_id: null });
+  expect(await checks()[0]!.clone().json()).toEqual({ config: { sync_mode: "page_tree" }, source_id: null, executor: "server" });
 
   await userEvent.click(screen.getByRole("switch", { name: "Include Child Pages" }));
   await waitFor(() => expect(checks()).toHaveLength(2));
-  expect(await checks()[1]!.clone().json()).toEqual({ config: { sync_mode: "page_tree", include_children: false }, source_id: null });
+  expect(await checks()[1]!.clone().json()).toEqual({ config: { sync_mode: "page_tree", include_children: false }, source_id: null, executor: "server" });
 });
 
 test("an untouched mode field is sent absent", async () => {
@@ -308,6 +309,7 @@ test("a stored Confluence source with a root and a blank sync scope opens on the
   expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({
     config: { base_url: "https://wiki.example.com", page_tree_root: "12345" },
     source_id: "src-wiki",
+    executor: "server",
   });
 });
 

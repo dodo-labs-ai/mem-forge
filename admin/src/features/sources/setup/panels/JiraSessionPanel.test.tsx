@@ -34,7 +34,7 @@ test("an existing source signs in again through local sync, then reads the sessi
   const created: Parameters<typeof setupJobRoutes>[1] = [];
   renderWithApi(<JiraSessionPanel sourceType="jira" sourceId="src-jira" config={{ base_url: BASE_URL }} />, {
     "GET /api/v1/auth/jira-session": () => (++reads === 1 ? { ...ACTIVE, status: "expired" } : ACTIVE),
-    ...setupJobRoutes({ jira_auth: { status: "succeeded", result: { operation: "jira_auth", authenticated: true, origin: BASE_URL } } }, created),
+    ...setupJobRoutes({ credential_check: { status: "succeeded", result: { operation: "credential_check", authenticated: true, origin: BASE_URL } } }, created),
   });
 
   expect(await screen.findByText("Expired")).toBeInTheDocument();
@@ -42,6 +42,6 @@ test("an existing source signs in again through local sync, then reads the sessi
 
   expect(await screen.findByText("Active")).toBeInTheDocument();
   expect(created).toEqual([
-    { source_id: "src-jira", source_type: "jira", operation: "jira_auth", payload: { base_url: BASE_URL, auth_mode: "browser_cookie" } },
+    { source_id: "src-jira", source_type: "jira", operation: "credential_check", payload: {} },
   ]);
 });

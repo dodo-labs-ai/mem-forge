@@ -175,8 +175,8 @@ test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentica
   expect(await authCall.clone().json()).toMatchObject({
     source_id: "src-jira",
     source_type: "jira",
-    operation: "jira_auth",
-    payload: { base_url: "https://jira.example.invalid", auth_mode: "browser_cookie" },
+    operation: "credential_check",
+    payload: {},
   });
   expect(router.state.location.pathname).toBe("/sources");
   await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Signed in to Payroll Jira"));
@@ -236,8 +236,8 @@ test.each(["daemon", "job", "permission", "timeout"])("reports %s failure withou
   await userEvent.click(await within(table).findByRole("button", { name: "Sign in" }));
   await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("Jira sign-in failed", {
     description: failure === "daemon" ? "Start local sync on your computer, then try signing in again."
-      : failure === "timeout" ? "Still waiting for Jira sign-in. Check the browser on your computer, then try again."
-      : failure === "job" ? "Signed in with a different Jira account. Use the account this source was set up with, then try again."
+      : failure === "timeout" ? "Still waiting for sign-in. Check the browser on your computer, then try again."
+      : failure === "job" ? "Signed in with a different account. Use the account this source was set up with, then try again."
         : "You do not have permission to renew this connection. Ask a workspace admin for help.",
   }));
   expect(toast.success).not.toHaveBeenCalled();

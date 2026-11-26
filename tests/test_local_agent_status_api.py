@@ -89,6 +89,7 @@ def test_self_hosted_status_observes_public_lease_heartbeat_for_only_its_princip
             "device_id": "dev-laptop",
             "name": "Laptop",
             "version": "0.2.0",
+            "acquisition_contracts": declared_acquisition_contracts(),
             "status": "online",
             "last_seen_at": online.json()["last_seen_at"],
         }
@@ -133,6 +134,7 @@ def test_status_reports_each_device_of_the_caller_by_its_latest_report(
             "device_id": "dev-laptop",
             "name": "Work laptop",
             "version": "0.3.0",
+            "acquisition_contracts": declared_acquisition_contracts(),
             "status": "online",
             "last_seen_at": (first + timedelta(seconds=100)).isoformat(),
         },
@@ -140,6 +142,7 @@ def test_status_reports_each_device_of_the_caller_by_its_latest_report(
             "device_id": "dev-desktop",
             "name": "Desktop",
             "version": "0.2.0",
+            "acquisition_contracts": declared_acquisition_contracts(),
             "status": "offline",
             "last_seen_at": first.isoformat(),
         },
@@ -219,3 +222,18 @@ def test_a_lease_or_heartbeat_without_a_device_report_names_the_update(tmp_path:
         assert detail["error"] == "device_report_required"
         assert f"Install MemForge {installed_version()}" in detail["message"]
     assert status.json()["devices"] == []
+
+
+def test_status_names_each_devices_acquisition_contracts_so_a_client_tells_which_types_need_an_update(
+    tmp_path: Path,
+) -> None:
+    app = admin_api.create_admin_app(config=_config(tmp_path), principal_resolver=_principal)
+    contracts = {**declared_acquisition_contracts(), "confluence": declared_acquisition_contracts()["confluence"] + 1}
+
+    with TestClient(app) as client:
+        _lease(client, "owner-a", acquisition_contracts=contracts)
+        body = client.get(STATUS_PATH, headers={PRINCIPAL_HEADER: "owner-a"}).json()
+
+    [device] = body["devices"]
+    assert device["acquisition_contracts"] == contracts
+    assert device["acquisition_contracts"]["confluence"] != body["server"]["acquisition_contracts"]["confluence"]

@@ -4,10 +4,12 @@ import { HTTP_STATUS, isApiErrorStatus, unwrap, useApi, type SetupJobOperation, 
 import { localSyncStatusQuery } from "@/features/local-sync";
 import { ACTIVE_POLL_MS } from "./constants";
 
-/** The Source type each setup operation belongs to, as the server's job route checks it. */
-const SETUP_JOB_SOURCE_TYPES: Readonly<Record<SetupJobOperation, string>> = {
+/** The operation every Source type shares; its request names the Source's type. */
+type SharedSetupJobOperation = "credential_check";
+
+/** The Source type each type's own setup operation belongs to, as the server's job route checks it. */
+const SETUP_JOB_SOURCE_TYPES: Readonly<Record<Exclude<SetupJobOperation, SharedSetupJobOperation>, string>> = {
   github_repo_preview_tree: "github_repo",
-  jira_auth: "jira",
   local_markdown_pick_root: "local_markdown",
   local_markdown_preview_tree: "local_markdown",
   teams_auth: "teams",
@@ -21,14 +23,14 @@ const FINISHED: ReadonlySet<string> = new Set(["succeeded", "failed"]);
 const MINUTE_MS = 60_000;
 
 /**
- * How long the page waits for each operation. A Jira sign-in or the folder
- * picker waits for the person at their computer for up to an hour; a Teams
+ * How long the page waits for each operation. A credential check, which may
+ * wait for a browser sign-in, or the folder picker waits for the person at their computer for up to an hour; a Teams
  * sign-in gives up on its own after a few minutes, and listing conversations
  * may run one first; the rest only read.
  */
 const SETUP_JOB_TIMEOUT_MS: Readonly<Record<SetupJobOperation, number>> = {
+  credential_check: 60 * MINUTE_MS,
   github_repo_preview_tree: 3 * MINUTE_MS,
-  jira_auth: 60 * MINUTE_MS,
   local_markdown_pick_root: 60 * MINUTE_MS,
   local_markdown_preview_tree: 3 * MINUTE_MS,
   teams_auth: 10 * MINUTE_MS,
@@ -36,10 +38,20 @@ const SETUP_JOB_TIMEOUT_MS: Readonly<Record<SetupJobOperation, number>> = {
   teams_browse: 10 * MINUTE_MS,
 };
 
-/** What a setup job is asked to do: the edited Source, when there is one, and the operation's payload. */
-export interface LocalSetupJobRequest {
+/**
+ * What a setup job is asked to do: the edited Source, when there is one, and
+ * the operation's payload. `credential_check`, which every type shares, also
+ * names the Source's type.
+ */
+export type LocalSetupJobRequest<Op extends SetupJobOperation = SetupJobOperation> = {
   sourceId?: string;
   payload: Record<string, unknown>;
+} & (Op extends SharedSetupJobOperation ? { sourceType: string } : { sourceType?: never });
+
+function jobSourceType<Op extends SetupJobOperation>(operation: Op, request: LocalSetupJobRequest<Op>): string {
+  return operation === "credential_check"
+    ? (request.sourceType as string)
+    : SETUP_JOB_SOURCE_TYPES[operation as Exclude<SetupJobOperation, SharedSetupJobOperation>];
 }
 
 /** The sentences a caller can word for its own step; each has a general default. */
@@ -112,7 +124,8 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
   const admitted = useRef<{ jobId: string; request: string } | null>(null);
 
   return useCallback(
-    async ({ sourceId, payload }: LocalSetupJobRequest): Promise<SetupJobResults[Op]> => {
+    async (jobRequest: LocalSetupJobRequest<Op>): Promise<SetupJobResults[Op]> => {
+      const { sourceId, payload } = jobRequest;
       const messages = { ...DEFAULT_MESSAGES, ...options.messages };
       const request = JSON.stringify([sourceId ?? "", payload]);
       try {
@@ -131,7 +144,7 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
           if (daemon?.status !== "online") throw new Error(messages.offline);
           const created = await unwrap(
             api.POST("/api/cloud/local-agent/jobs", {
-              body: { source_id: sourceId ?? "", source_type: SETUP_JOB_SOURCE_TYPES[operation], operation, payload },
+              body: { source_id: sourceId ?? "", source_type: jobSourceType(operation, jobRequest), operation, payload },
             }),
           );
           admitted.current = { jobId: created.job_id, request };

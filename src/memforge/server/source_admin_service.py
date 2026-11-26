@@ -119,6 +119,7 @@ def source_ownership_and_capabilities(
         "created_by_user_id": source.get("created_by_user_id"),
         "owner_user_id": source_owner_user_id(source),
         "execution_owner_user_id": execution_owner,
+        "viewer_is_execution_owner": can_execute_locally,
         "viewer_role": viewer_role,
         "viewer_relationship": relationship,
     }

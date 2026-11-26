@@ -133,6 +133,7 @@ def test_a_device_source_named_by_its_online_device_is_ready(client, database, d
             "state": "online",
             "installed_version": installed_version(),
             "required_version": installed_version(),
+            "credential": "secret",
         },
     }
     assert row["connection_status"] == {"state": "ready", "reason": None}
@@ -156,6 +157,7 @@ def test_without_any_device_the_source_is_offline_and_needs_its_credential(clien
         "state": "offline",
         "installed_version": None,
         "required_version": installed_version(),
+        "credential": "secret",
     }
     assert row["connection_status"] == {"state": "action_required", "reason": "authentication"}
 
@@ -173,6 +175,7 @@ def test_a_device_whose_contract_for_the_type_differs_needs_an_update(client, da
         "state": "update_required",
         "installed_version": "0.2.0b8",
         "required_version": installed_version(),
+        "credential": "secret",
     }
     assert row["connection_status"] == {"state": "ready", "reason": None}
 
@@ -222,3 +225,97 @@ def test_another_member_sees_the_state_without_the_devices_name(client, database
 
     assert device["name"] is None
     assert device["state"] == "update_required"
+
+
+def test_a_token_source_tells_its_owner_to_store_the_secret_on_the_device(client, database, device_source):
+    owner_row = _row(client, device_source)
+    member_row = _row(client, device_source, viewer=CREATOR)
+
+    assert owner_row["execution"]["device"]["credential"] == "secret"
+    assert owner_row["ownership"]["viewer_is_execution_owner"] is True
+    assert member_row["ownership"]["viewer_is_execution_owner"] is False
+
+
+def test_a_browser_session_source_signs_in_on_the_device(client):
+    created = client.post(
+        "/api/v1/sources",
+        json={
+            "type": "jira",
+            "name": "Issues",
+            "config": {
+                "base_url": "https://jira.example.com",
+                "sync_mode": "cloud",
+                "auth_mode": "browser_cookie",
+                "projects": ["ACME"],
+            },
+            "access_policy": "workspace",
+        },
+    )
+    assert created.status_code == 200, created.text
+    source_id = created.json()["id"]
+    moved = client.put(
+        f"/api/v1/sources/{source_id}/executor",
+        json={"executor": "device"},
+        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+    )
+    assert moved.status_code == 200, moved.text
+
+    assert _row(client, source_id)["execution"]["device"]["credential"] == "browser_session"
+
+
+def test_a_source_created_on_my_computer_needs_no_secret_and_waits_for_its_credential(client):
+    config = {key: value for key, value in CONFLUENCE.items() if key != "pat"}
+    checked = client.post(
+        "/api/v1/genes/confluence/config-check",
+        json={"config": config, "executor": "device"},
+        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+    )
+    assert checked.status_code == 200, checked.text
+    assert checked.json()["issues"] == []
+
+    created = client.post(
+        "/api/v1/sources",
+        json={"type": "confluence", "name": "Wiki", "config": config, "access_policy": "workspace", "executor": "device"},
+        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+    )
+    assert created.status_code == 200, created.text
+
+    row = _row(client, created.json()["id"])
+    assert row["execution"]["operation"] == DOCUMENT_ACQUISITION_OPERATION
+    assert row["ownership"]["execution_owner_user_id"] == EXECUTION_OWNER
+    assert row["ownership"]["viewer_is_execution_owner"] is True
+    assert row["connection_status"] == {"state": "action_required", "reason": "authentication"}
+
+
+def test_a_source_created_on_my_computer_refuses_a_secret(client):
+    created = client.post(
+        "/api/v1/sources",
+        json={"type": "confluence", "name": "Wiki", "config": CONFLUENCE, "access_policy": "workspace", "executor": "device"},
+    )
+
+    assert created.status_code == 400, created.text
+
+
+def test_a_type_without_the_device_executor_is_not_created_on_my_computer(client):
+    created = client.post(
+        "/api/v1/sources",
+        json={
+            "type": "teams",
+            "name": "Chats",
+            "config": {"region": "emea"},
+            "access_policy": "private",
+            "executor": "device",
+        },
+    )
+
+    assert created.status_code == 400, created.text
+    assert "runs on" in created.text
+
+
+def test_a_server_source_has_no_execution_owner_viewer(client):
+    created = client.post(
+        "/api/v1/sources",
+        json={"type": "confluence", "name": "Team wiki", "config": CONFLUENCE, "access_policy": "workspace"},
+    )
+
+    assert _row(client, created.json()["id"], viewer=CREATOR)["ownership"]["viewer_is_execution_owner"] is False

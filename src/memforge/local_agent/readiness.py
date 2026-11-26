@@ -36,6 +36,9 @@ LOCAL_AGENT_DEVICE_STALE_SECONDS = 90
 """How long a device stays online after its latest report; the daemon reports with every lease and heartbeat."""
 
 DeviceState = Literal["online", "offline", "update_required"]
+DeviceCredential = Literal["secret", "browser_session"]
+"""How a device Source's credential reaches its device: a secret ``memforge source credentials set`` stores, or a
+browser session a ``credential_check`` job captures."""
 _STATE_RANK: dict[str, int] = {"online": 0, "update_required": 1, "offline": 2}
 
 
@@ -46,12 +49,14 @@ class SourceExecutionDevice(TypedDict):
     for any other viewer or when the owner has no device. ``installed_version``
     is the MemForge version of the device's latest report, and
     ``required_version`` the server's, which ``memforge upgrade`` installs.
+    ``credential`` says how the Source's credential reaches the device.
     """
 
     name: str | None
     state: DeviceState
     installed_version: str | None
     required_version: str
+    credential: DeviceCredential
 
 
 def device_source_readiness(
@@ -63,6 +68,7 @@ def device_source_readiness(
     server_version: str,
     now: datetime,
     reveal_device: bool,
+    credential: DeviceCredential,
 ) -> tuple[SourceExecutionDevice, SourceConnectionStatus]:
     """Device and connection readiness of a device Source from its execution owner's device reports.
 
@@ -90,7 +96,13 @@ def device_source_readiness(
     )
     if not candidates:
         return (
-            {"name": None, "state": "offline", "installed_version": None, "required_version": server_version},
+            {
+                "name": None,
+                "state": "offline",
+                "installed_version": None,
+                "required_version": server_version,
+                "credential": credential,
+            },
             connection,
         )
     device = min(candidates, key=lambda candidate: (_STATE_RANK[state(candidate)], -candidate.last_seen_at.timestamp()))
@@ -100,6 +112,7 @@ def device_source_readiness(
             "state": state(device),
             "installed_version": device.report.version,
             "required_version": server_version,
+            "credential": credential,
         },
         connection,
     )

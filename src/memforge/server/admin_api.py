@@ -1915,8 +1915,11 @@ class GeneConfigSchemaResponse(BaseModel):
 
 
 class ConfigCheckRequest(BaseModel):
+    """A configuration to check; ``executor`` says where a new Source runs, and a stored Source keeps its own."""
+
     config: dict[str, Any]
     source_id: str | None = None
+    executor: Literal["server", "device"] = "server"
 
 
 class ConfigFactResponse(BaseModel):
@@ -2171,6 +2174,9 @@ class SourceOwnershipResponse(BaseModel):
     created_by_user_id: str | None
     owner_user_id: str
     execution_owner_user_id: str | None
+    viewer_is_execution_owner: bool = Field(
+        description="Whether the viewer is the execution owner, whose device collects a Source collected on a device.",
+    )
     viewer_role: SourceViewerRole
     viewer_relationship: SourceViewerRole
 
@@ -2201,6 +2207,13 @@ class SourceExecutionDeviceResponse(BaseModel):
     )
     installed_version: str | None = Field(description="The MemForge version the device runs; null without a device.")
     required_version: str = Field(description="The server's MemForge version, which `memforge upgrade` installs.")
+    credential: Literal["secret", "browser_session"] = Field(
+        description=(
+            "How the Source's credential reaches its device: secret, stored on the device with "
+            "`memforge source credentials set <source-id>`; browser_session, captured from the device's browser by "
+            "a credential_check job."
+        ),
+    )
 
 
 class SourceExecutionResponse(BaseModel):
@@ -2554,6 +2567,13 @@ class CreateSourceRequest(BaseModel):
     name: str
     access_policy: Literal["private", "workspace"]
     config: dict
+    executor: Literal["server", "device"] = Field(
+        default="server",
+        description=(
+            "server: the server reaches the provider with the secrets in config; device: the creator's own device "
+            "does, with the credential stored there, so config holds no secret."
+        ),
+    )
     project_binding: dict | None = None
     sync_schedule: SourceSyncScheduleRequest | None = None
 
@@ -2739,6 +2759,12 @@ class LocalAgentDeviceStatus(BaseModel):
     device_id: str
     name: str
     version: str
+    acquisition_contracts: dict[str, int] = Field(
+        description=(
+            "The acquisition contract of each document type, as the device's latest report declares it. A device "
+            "acquires a type only while its contract equals the server's."
+        ),
+    )
     status: Literal["online", "offline"]
     last_seen_at: str
 
@@ -7216,7 +7242,7 @@ def create_admin_app(
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
         existing_config: dict[str, Any] | None = None
-        executor = SOURCE_EXECUTOR_SERVER
+        executor = req.executor
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -7448,6 +7474,11 @@ def create_admin_app(
                     server_version=installed_version(),
                     now=now,
                     reveal_device=owner == viewer_id,
+                    credential=(
+                        "browser_session"
+                        if signs_in_with_browser_session(str(s["type"]), s.get("config") or {})
+                        else "secret"
+                    ),
                 )
                 s["execution"] = {**s["execution"], "device": device}
                 s["connection_status"] = connection
@@ -8760,10 +8791,25 @@ def create_admin_app(
                 detail=f"Unknown gene type '{req.type}'. Available: {', '.join(sorted(GENE_REGISTRY))}",
             )
 
+        on_device = req.executor == SOURCE_EXECUTOR_DEVICE
+        if on_device:
+            descriptor = source_type_descriptor(req.type)
+            executors = descriptor.executors if descriptor and descriptor.family is CollectionFamilyKind.DOCUMENT else ()
+            if SOURCE_EXECUTOR_DEVICE not in executors:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "executor_invalid",
+                        "message": f"A {req.type} source runs on: {', '.join(sorted(executors)) or 'server'}.",
+                    },
+                )
+            if is_local_agent_backed_source({"type": req.type, "config": req.config}):
+                raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
             incoming_config = _complete_source_config(req.type, req.config, source_id)
-            _validate_source_config(req.type, incoming_config)
+            _validate_source_config(req.type, incoming_config, executor=req.executor)
             source_config = prepare_source_config_for_storage(
                 incoming_config,
                 secret_fields=_source_secret_fields(req.type),
@@ -8786,8 +8832,9 @@ def create_admin_app(
             project_binding=req.project_binding,
             created_by_user_id=creator_user_id,
             execution_owner_user_id=(
-                creator_user_id if is_local_agent_backed_source(source_for_classification) else None
+                creator_user_id if on_device or is_local_agent_backed_source(source_for_classification) else None
             ),
+            executor=req.executor,
         )
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -11426,6 +11473,7 @@ def create_admin_app(
                 "device_id": device.report.device_id,
                 "name": device.report.name,
                 "version": device.report.version,
+                "acquisition_contracts": dict(sorted(device.report.acquisition_contracts.items())),
                 "status": (
                     "online"
                     if (now - device.last_seen_at).total_seconds() <= LOCAL_AGENT_DEVICE_STALE_SECONDS

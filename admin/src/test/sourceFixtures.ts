@@ -26,6 +26,7 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
       created_by_user_id: "local",
       owner_user_id: "local",
       execution_owner_user_id: null,
+      viewer_is_execution_owner: false,
       viewer_role: "owner",
       viewer_relationship: "owner",
     },

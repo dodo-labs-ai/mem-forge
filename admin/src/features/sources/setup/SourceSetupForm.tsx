@@ -8,6 +8,7 @@ import { SOURCE_SETTINGS_STEP_PARAM, SOURCES_PATH } from "@/lib/paths";
 import { Notice, PropertyList, StepRail, useUnsavedChangesGuard, type Property, type RailStep } from "@/patterns";
 import { Button } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
+import { sourceExecutor } from "../model/localAgentSources";
 import { sourceProjectBinding } from "../model/projectBinding";
 import { ACCESS_CHOICES, type AccessPolicy } from "../model/sourceAccess";
 import { scopeChangeErrorMessage } from "../model/sourceScopeTransition";
@@ -131,12 +132,13 @@ export function SourceSetupForm({ gene, schema, source }: SourceSetupFormProps) 
   const [checkingBeforeSave, setCheckingBeforeSave] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const configCheck = useConfigCheck(gene.name, sourceId);
+  const executor = source ? sourceExecutor(source) : "server";
+  const configCheck = useConfigCheck(gene.name, sourceId, executor);
   const createSource = useCreateSource();
   const updateSource = useUpdateSource(sourceId ?? "");
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
   const previewKind = checkSetupKind(gene.name, schema, state);
-  const discovery = useCheckSetup(gene.name, previewKind, source);
+  const discovery = useCheckSetup(gene.name, previewKind, executor, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
   const currentKey = steps.find((step) => step.key === searchParams.get(SOURCE_SETTINGS_STEP_PARAM))?.key ?? steps[0]!.key;

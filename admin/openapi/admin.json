@@ -1,6 +1,91 @@
 {
   "components": {
     "schemas": {
+      "AcquiredInputRequest": {
+        "description": "One acquired input of a device run, bound to its job attempt.",
+        "properties": {
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "package": {
+            "additionalProperties": true,
+            "title": "Package",
+            "type": "object"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "package"
+        ],
+        "title": "AcquiredInputRequest",
+        "type": "object"
+      },
+      "AcquisitionAnswersRequest": {
+        "description": "A device run's answers to what its manifest response asked, bound to the manifest's digest.",
+        "properties": {
+          "answers": {
+            "additionalProperties": true,
+            "title": "Answers",
+            "type": "object"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "manifest_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Manifest Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "manifest_sha256",
+          "answers"
+        ],
+        "title": "AcquisitionAnswersRequest",
+        "type": "object"
+      },
+      "AcquisitionManifestRequest": {
+        "description": "A device run's manifest (:class:`~memforge.local_agent.document_acquisition.AcquisitionManifest`).",
+        "properties": {
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          },
+          "manifest": {
+            "additionalProperties": true,
+            "title": "Manifest",
+            "type": "object"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "manifest"
+        ],
+        "title": "AcquisitionManifestRequest",
+        "type": "object"
+      },
       "AddAliasRequest": {
         "properties": {
           "alias": {
@@ -1052,11 +1137,21 @@
         "type": "object"
       },
       "ConfigCheckRequest": {
+        "description": "A configuration to check; ``executor`` says where a new Source runs, and a stored Source keeps its own.",
         "properties": {
           "config": {
             "additionalProperties": true,
             "title": "Config",
             "type": "object"
+          },
+          "executor": {
+            "default": "server",
+            "enum": [
+              "server",
+              "device"
+            ],
+            "title": "Executor",
+            "type": "string"
           },
           "source_id": {
             "anyOf": [
@@ -1505,6 +1600,16 @@
             "title": "Config",
             "type": "object"
           },
+          "executor": {
+            "default": "server",
+            "description": "server: the server reaches the provider with the secrets in config; device: the creator's own device does, with the credential stored there, so config holds no secret.",
+            "enum": [
+              "server",
+              "device"
+            ],
+            "title": "Executor",
+            "type": "string"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -1543,6 +1648,132 @@
           "config"
         ],
         "title": "CreateSourceRequest",
+        "type": "object"
+      },
+      "CredentialCheckResult": {
+        "additionalProperties": false,
+        "description": "A Source's credential checked, and a browser session captured, on the user's computer.\n\nFor a Source whose configuration signs in with a browser session, the\nsession is captured from the user's browser and checked against the\nprovider. A device Source keeps it in the device's keyring for the\nsession's origin; a server Source's session is stored on the server. For\na device Source that signs in with a token, the device's stored token is\nchecked by the type's ``authenticate``.\n\nOn success ``authenticated`` is true and ``origin`` is the site a captured\nsession belongs to. ``error`` is ``principal_changed`` when the user\nsigned in as a different account than the one the server's stored session\nnames; ``old_principal_id`` and ``new_principal_id`` then name both\naccounts. ``retryable`` is false for every failure, because renewing a\ncredential needs the user.",
+        "properties": {
+          "authenticated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Authenticated"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Type"
+          },
+          "heartbeat_errors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Heartbeat Errors"
+          },
+          "new_principal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "New Principal Id"
+          },
+          "old_principal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Old Principal Id"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Origin"
+          },
+          "retryable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retryable"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Id"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "CredentialCheckResult",
         "type": "object"
       },
       "CrossSourceReviewConversionApplyRequest": {
@@ -1890,11 +2121,21 @@
         "type": "object"
       },
       "DiscoveryPreviewRequest": {
+        "description": "A configuration to preview; ``executor`` says where the Source it configures runs.",
         "properties": {
           "config": {
             "additionalProperties": true,
             "title": "Config",
             "type": "object"
+          },
+          "executor": {
+            "default": "server",
+            "enum": [
+              "server",
+              "device"
+            ],
+            "title": "Executor",
+            "type": "string"
           },
           "limit": {
             "default": 50,
@@ -2406,6 +2647,25 @@
             "title": "Execution Kinds",
             "type": "array"
           },
+          "executors": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "server",
+                    "device"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where a document Source of the type can run, which Configure offers as Where it runs; null for a conversation type.",
+            "title": "Executors"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2418,7 +2678,8 @@
           "default_sync_interval_minutes",
           "auth_method",
           "data_shape",
-          "execution_kinds"
+          "execution_kinds",
+          "executors"
         ],
         "title": "GeneMetadataResponse",
         "type": "object"
@@ -2883,132 +3144,6 @@
         "title": "ImageDocumentsResponse",
         "type": "object"
       },
-      "JiraAuthResult": {
-        "additionalProperties": false,
-        "description": "A Jira browser session captured on the user's computer and stored for the Source.\n\nOn success ``authenticated`` is true and ``origin`` is the Jira site the\nsession belongs to. ``error`` is ``principal_changed`` when the user signed\nin as a different Jira account than the one the stored session names;\n``old_principal_id`` and ``new_principal_id`` then name both accounts.\n``retryable`` is false for every failure, because renewing again needs the\nuser at the browser.",
-        "properties": {
-          "authenticated": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Authenticated"
-          },
-          "error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error"
-          },
-          "error_type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error Type"
-          },
-          "heartbeat_errors": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Heartbeat Errors"
-          },
-          "new_principal_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "New Principal Id"
-          },
-          "old_principal_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Old Principal Id"
-          },
-          "operation": {
-            "title": "Operation",
-            "type": "string"
-          },
-          "origin": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Origin"
-          },
-          "retryable": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Retryable"
-          },
-          "source_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Source Id"
-          }
-        },
-        "required": [
-          "operation"
-        ],
-        "title": "JiraAuthResult",
-        "type": "object"
-      },
       "JiraSessionExpireRequest": {
         "properties": {
           "base_url": {
@@ -3175,10 +3310,18 @@
         "type": "object"
       },
       "LocalAgentDaemonStatusResponse": {
+        "description": "The caller's devices, whether any of them is online, the caller's device Sources and the server's contracts.",
         "properties": {
           "checked_at": {
             "title": "Checked At",
             "type": "string"
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/LocalAgentDeviceStatus"
+            },
+            "title": "Devices",
+            "type": "array"
           },
           "last_seen_at": {
             "anyOf": [
@@ -3190,6 +3333,16 @@
               }
             ],
             "title": "Last Seen At"
+          },
+          "server": {
+            "$ref": "#/components/schemas/LocalAgentServerContracts"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/LocalAgentDeviceSource"
+            },
+            "title": "Sources",
+            "type": "array"
           },
           "stale_after_seconds": {
             "title": "Stale After Seconds",
@@ -3207,10 +3360,89 @@
         "required": [
           "status",
           "last_seen_at",
+          "devices",
+          "sources",
+          "server",
           "checked_at",
           "stale_after_seconds"
         ],
         "title": "LocalAgentDaemonStatusResponse",
+        "type": "object"
+      },
+      "LocalAgentDeviceSource": {
+        "description": "A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets.",
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "title": "Config",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "config"
+        ],
+        "title": "LocalAgentDeviceSource",
+        "type": "object"
+      },
+      "LocalAgentDeviceStatus": {
+        "properties": {
+          "acquisition_contracts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "description": "The acquisition contract of each document type, as the device's latest report declares it. A device acquires a type only while its contract equals the server's.",
+            "title": "Acquisition Contracts",
+            "type": "object"
+          },
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "title": "Last Seen At",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "online",
+              "offline"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "name",
+          "version",
+          "acquisition_contracts",
+          "status",
+          "last_seen_at"
+        ],
+        "title": "LocalAgentDeviceStatus",
         "type": "object"
       },
       "LocalAgentJobCompleteRequest": {
@@ -3353,6 +3585,18 @@
             "title": "Attempt Count",
             "type": "integer"
           },
+          "device": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device"
+          },
           "lease_seconds": {
             "default": 60,
             "maximum": 3600.0,
@@ -3381,6 +3625,18 @@
       },
       "LocalAgentJobLeaseRequest": {
         "properties": {
+          "device": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device"
+          },
           "lease_seconds": {
             "default": 60,
             "maximum": 3600.0,
@@ -3545,6 +3801,28 @@
           "finished_at"
         ],
         "title": "LocalAgentJobResponse",
+        "type": "object"
+      },
+      "LocalAgentServerContracts": {
+        "description": "The server's MemForge version and the acquisition contract of each document type.",
+        "properties": {
+          "acquisition_contracts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Acquisition Contracts",
+            "type": "object"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "acquisition_contracts"
+        ],
+        "title": "LocalAgentServerContracts",
         "type": "object"
       },
       "LocalCollectionReceiptResponse": {
@@ -9390,8 +9668,81 @@
         "title": "SourceCurrentAccessTransitionResponse",
         "type": "object"
       },
+      "SourceExecutionDeviceResponse": {
+        "description": "The device a device Source runs on, from its execution owner's device reports.",
+        "properties": {
+          "credential": {
+            "description": "How the Source's credential reaches its device: secret, stored on the device with `memforge source credentials set <source-id>`; browser_session, captured from the device's browser by a credential_check job.",
+            "enum": [
+              "secret",
+              "browser_session"
+            ],
+            "title": "Credential",
+            "type": "string"
+          },
+          "installed_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The MemForge version the device runs; null without a device.",
+            "title": "Installed Version"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The device's name; null for a viewer other than the execution owner, or when the owner has no device.",
+            "title": "Name"
+          },
+          "required_version": {
+            "description": "The server's MemForge version, which `memforge upgrade` installs.",
+            "title": "Required Version",
+            "type": "string"
+          },
+          "state": {
+            "description": "online: it can take the Source's job; offline: no recent report; update_required: online, but its acquisition contract for the type differs from the server's.",
+            "enum": [
+              "online",
+              "offline",
+              "update_required"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "installed_version",
+          "required_version",
+          "credential"
+        ],
+        "title": "SourceExecutionDeviceResponse",
+        "type": "object"
+      },
       "SourceExecutionResponse": {
         "properties": {
+          "device": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceExecutionDeviceResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for a Source whose acquisition runs on its execution owner's device."
+          },
           "immutable_config_fields": {
             "items": {
               "type": "string"
@@ -9425,6 +9776,78 @@
           "immutable_config_fields"
         ],
         "title": "SourceExecutionResponse",
+        "type": "object"
+      },
+      "SourceExecutorChangeRequest": {
+        "description": "Where a document Source's acquisition runs from now on (ADR 0058).",
+        "properties": {
+          "executor": {
+            "description": "server: the server reaches the provider; device: the changer's own device does.",
+            "enum": [
+              "server",
+              "device"
+            ],
+            "title": "Executor",
+            "type": "string"
+          },
+          "secrets": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The secret fields of the type's form, which the server holds from now on. Required to move to the server, as the form requires them; refused otherwise.",
+            "title": "Secrets",
+            "type": "object"
+          }
+        },
+        "required": [
+          "executor"
+        ],
+        "title": "SourceExecutorChangeRequest",
+        "type": "object"
+      },
+      "SourceExecutorChangeResponse": {
+        "description": "The Source's executor after the change, and the queued sync jobs it cancelled.",
+        "properties": {
+          "cancelled_job_ids": {
+            "description": "The Source's queued sync jobs, which were planned for the previous executor.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Job Ids",
+            "type": "array"
+          },
+          "execution_owner_user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whose device runs the Source; the person who moved it to the device.",
+            "title": "Execution Owner User Id"
+          },
+          "executor": {
+            "enum": [
+              "server",
+              "device"
+            ],
+            "title": "Executor",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "executor",
+          "execution_owner_user_id",
+          "cancelled_job_ids"
+        ],
+        "title": "SourceExecutorChangeResponse",
         "type": "object"
       },
       "SourceFacetFilterRequest": {
@@ -9651,6 +10074,11 @@
             "title": "Owner User Id",
             "type": "string"
           },
+          "viewer_is_execution_owner": {
+            "description": "Whether the viewer is the execution owner, whose device collects a Source collected on a device.",
+            "title": "Viewer Is Execution Owner",
+            "type": "boolean"
+          },
           "viewer_relationship": {
             "enum": [
               "owner",
@@ -9676,6 +10104,7 @@
           "created_by_user_id",
           "owner_user_id",
           "execution_owner_user_id",
+          "viewer_is_execution_owner",
           "viewer_role",
           "viewer_relationship"
         ],
@@ -9876,7 +10305,7 @@
                 "type": "null"
               }
             ],
-            "description": "Readiness of a browser-session connection; present only for Sources that use one."
+            "description": "Readiness of the connection: a browser session's on the server, or, for a device Source, whether a device report names it, which it does once its device holds the credential. Present only for Sources with such a dependency."
           },
           "created_at": {
             "anyOf": [
@@ -12131,6 +12560,7 @@
     },
     "/api/cloud/local-agent/jobs/lease": {
       "post": {
+        "description": "Lease the device its due jobs.\n\nThe answer also names the server's version and acquisition contracts,\nand, among the Sources the device report names, those that are no\nlonger device Sources of the caller (deleted, moved to the server or\nhanded to another execution owner), whose credentials the device\ndeletes.",
         "operationId": "lease_local_agent_jobs_api_cloud_local_agent_jobs_lease_post",
         "requestBody": {
           "content": {
@@ -12310,6 +12740,7 @@
     },
     "/api/cloud/local-agent/status": {
       "get": {
+        "description": "Each of the caller's devices by its latest report, online while that report is recent.\n\nIt also names the caller's device Sources and the server's version\nand acquisition contracts, from which a device tells, per Source,\nwhether it is ready, waits for a credential or waits for an update.",
         "operationId": "read_local_agent_status_api_cloud_local_agent_status_get",
         "responses": {
           "200": {
@@ -13573,7 +14004,7 @@
     },
     "/api/v1/genes/github_repo/browse-tree": {
       "post": {
-        "description": "List selectable repository paths for the GitHub Repository source UI.\n\nThe tree is read with the Source's own client and TLS. A tree GitHub\ntruncates is walked folder by folder within\n``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers\n400, and its paths are typed instead.",
+        "description": "List selectable repository paths for the GitHub Repository source UI.\n\nThe tree is read with the Source's own client and TLS. A tree GitHub\ntruncates is walked folder by folder within\n``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers\n400, and its paths are typed instead. A device Source answers 409\n``device_preview_unavailable``, because the server never reaches a\ndevice Source's provider.",
         "operationId": "browse_github_repo_tree_api_v1_genes_github_repo_browse_tree_post",
         "requestBody": {
           "content": {
@@ -13711,7 +14142,7 @@
     },
     "/api/v1/genes/{name}/preview-discovery": {
       "post": {
-        "description": "Preview the documents a source config would discover without saving it.",
+        "description": "Preview the documents a source config would discover without saving it.\n\nOnly the server's own connection can preview: a configuration that\nruns on a device, or a device Source, answers 409\n``device_preview_unavailable``, because the server never reaches a\ndevice Source's provider.",
         "operationId": "preview_gene_discovery_api_v1_genes__name__preview_discovery_post",
         "parameters": [
           {
@@ -16692,6 +17123,159 @@
         ]
       }
     },
+    "/api/v1/sources/{source_id}/acquisition/answers": {
+      "post": {
+        "description": "Keep a device run's answers to what its manifest response asked.\n\nThe answers must answer exactly what the response asked, bound to the\nmanifest's digest and attempt. An identical replay is accepted;\nanything else that differs from the stored answers is refused with 409.",
+        "operationId": "submit_acquisition_answers_api_v1_sources__source_id__acquisition_answers_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquisitionAnswersRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Acquisition Answers",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/acquisition/inputs": {
+      "post": {
+        "description": "Keep one acquired input of a device run for its job attempt.\n\nThe device fetches each discovered item before it submits the\nmanifest, so an input belongs to the attempt, not to a manifest\ndigest; the run reads only the inputs of items it asks for. Each\nartifact body the input names must already be an uploaded input of\nthe Source; an artifact the device could not read names its error\ninstead. The same input uploaded again is kept once.",
+        "operationId": "upload_acquired_input_api_v1_sources__source_id__acquisition_inputs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquiredInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Acquired Input",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/acquisition/manifest": {
+      "post": {
+        "description": "Keep the manifest of one device run and answer what the server run will ask beyond discovery.\n\nThe response's ``requests`` name the unlisted Units to confirm, the\nfailed Documents to rediscover and the failed items to fetch, by the\nserver run's own rules. They are computed when the attempt's manifest\nis first recorded and returned unchanged on a replay. The attempt's\nlease time is the run's start for the sync cursor. A manifest\nabove the bound every device manifest has, a listing of a scope the\njob did not carry, and a reprocess that discovers or lists answer 422.",
+        "operationId": "submit_acquisition_manifest_api_v1_sources__source_id__acquisition_manifest_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquisitionManifestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Acquisition Manifest",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
     "/api/v1/sources/{source_id}/adapter/artifacts": {
       "post": {
         "description": "Receive one bounded binary input for a later local-source package.",
@@ -17237,6 +17821,59 @@
         ]
       }
     },
+    "/api/v1/sources/{source_id}/executor": {
+      "put": {
+        "description": "Change where a document Source's acquisition runs, keeping everything the Source holds.\n\nThe executor is not part of the scope: the change opens no scope\ntransition and keeps the Source's Documents, Units, Memories, cursor,\nfailure ledger and an open transition, so its next run is an\nordinary incremental run. The executor must be one the type declares.\n\n- To ``device``: the server's copies of the Source's secrets are\n  deleted, and the person who changes it becomes its execution owner,\n  whose device then holds the credentials.\n- To ``server``: ``secrets`` must hold what the type's form requires.\n\nLike a scope change, it cancels the Source's pending run and queued\nsync jobs, and answers 409 ``source_sync_running`` while a run is\nrunning or a device holds the Source's acquisition job.",
+        "operationId": "change_source_executor_api_v1_sources__source_id__executor_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceExecutorChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceExecutorChangeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Source Executor",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
     "/api/v1/sources/{source_id}/force-resync": {
       "post": {
         "description": "Enqueue a full source sync without clearing the prior successful cursor.",
@@ -17415,7 +18052,7 @@
     },
     "/api/v1/sources/{source_id}/process": {
       "post": {
-        "description": "Enqueue server processing after the owner daemon persisted raw input.",
+        "description": "Enqueue server processing after the owner daemon persisted raw input.\n\nA document Source the device acquired with its type's own Gene is\nprocessed once its attempt is ready (:func:`ready_acquisition`), in\na run bound to that attempt; one collected through its type's\nlocal-agent package path, once its snapshot manifest is materialized.",
         "operationId": "process_collected_local_source_api_v1_sources__source_id__process_post",
         "parameters": [
           {

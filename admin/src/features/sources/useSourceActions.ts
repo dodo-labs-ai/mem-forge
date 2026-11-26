@@ -15,7 +15,7 @@ import {
   type SourceSyncRetryTarget,
 } from "./model/sourceSyncActivity";
 import type { Source } from "./model/types";
-import { useJiraSignIn } from "./useJiraSignIn";
+import { useCredentialCheck } from "./useCredentialCheck";
 import { useTeamsSignIn } from "./useTeamsSignIn";
 
 /** Runs row and drawer actions, reporting the outcome in a toast. */
@@ -25,7 +25,7 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
   const setUsedInSearches = useSetUsedInSearches();
   const setPaused = useSetPaused();
   const stopSync = useStopSync();
-  const jiraSignIn = useJiraSignIn();
+  const credentialCheck = useCredentialCheck();
   const teamsSignIn = useTeamsSignIn();
   const navigate = useNavigate();
   const api = useApi();
@@ -48,12 +48,13 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
 
   /**
    * How a source's sign-in is renewed: in place through local sync for a Jira
-   * browser session or Teams, and otherwise on the connection step, where
-   * a token is entered. Jira's `auth_mode` is always in its configuration.
+   * browser session (a credential check) or Teams, and otherwise on the
+   * connection step, where a token is entered. Jira's `auth_mode` is always
+   * in its configuration.
    */
-  function signInRenewal(source: Source): typeof jiraSignIn | typeof teamsSignIn | null {
+  function signInRenewal(source: Source): typeof credentialCheck | typeof teamsSignIn | null {
     if (source.type === "teams") return teamsSignIn;
-    if (source.type === "jira" && source.config.auth_mode === "browser_cookie") return jiraSignIn;
+    if (source.type === "jira" && source.config.auth_mode === "browser_cookie") return credentialCheck;
     return null;
   }
 
@@ -141,8 +142,8 @@ export function useSourceActions({ onViewDetails }: { onViewDetails: (source: So
           const renewal = signInRenewal(source);
           if (renewal === teamsSignIn) {
             report(teamsSignIn.mutateAsync(source), `Signed in to Teams for ${source.name}`, "Teams sign-in failed");
-          } else if (renewal === jiraSignIn) {
-            report(jiraSignIn.mutateAsync(source), `Signed in to ${source.name}`, "Jira sign-in failed");
+          } else if (renewal === credentialCheck) {
+            report(credentialCheck.mutateAsync(source), `Signed in to ${source.name}`, "Jira sign-in failed");
           } else {
             navigate(sourceSettingsPath(source.id, "connection"));
           }
