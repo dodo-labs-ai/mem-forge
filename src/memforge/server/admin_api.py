@@ -223,6 +223,7 @@ from memforge.runtime import (
 )
 from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
+from memforge.pipeline.package_migration import PACKAGE_MIGRATION_COMMAND, awaits_package_migration
 from memforge.pipeline.stored_document import reprocess_preview
 from memforge.pipeline.device_acquisition import (
     AcquisitionNotReady,
@@ -2947,6 +2948,28 @@ def _source_acquisition_leased_http_error(source_id: str, job_id: str) -> HTTPEx
             ),
         },
     )
+
+
+def _require_package_migration_done(source: Mapping[str, Any]) -> None:
+    """Refuse to change the configuration or executor of a Source whose stored inputs await the package migration.
+
+    Only the migration moves such a Source: it rewrites the stored inputs
+    to the Gene's form before the Source's configuration leaves the package
+    path, so the Gene continues the stored Units instead of extracting
+    every item again beside them.
+    """
+
+    if awaits_package_migration(source):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_awaits_package_migration",
+                "message": (
+                    "This Source is still on its device package path. Run "
+                    f"`{PACKAGE_MIGRATION_COMMAND}` before changing its configuration or where it runs."
+                ),
+            },
+        )
 
 
 def _executor_change_refused(message: str) -> HTTPException:
@@ -8741,6 +8764,7 @@ def create_admin_app(
             )
         if is_local_agent_backed_source(existing):
             raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+        _require_package_migration_done(existing)
         secret_fields = _source_secret_fields(source_type)
         moving_to_server = req.executor == SOURCE_EXECUTOR_SERVER and source_runs_on_device(existing)
         if req.secrets and not moving_to_server:
@@ -8811,6 +8835,7 @@ def create_admin_app(
         _require_source_management(request, existing)
         if req.config is not None:
             _require_local_agent_connection_management(request, existing)
+            _require_package_migration_done(existing)
 
         _validate_source_status(req.status)
         name = req.name or existing["name"]

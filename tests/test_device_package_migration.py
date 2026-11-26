@@ -563,6 +563,34 @@ def test_a_source_left_on_the_package_path_does_not_sync_until_it_moves(jira, mo
     assert sorted(jira.documents(source_id)) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
 
 
+def test_a_source_on_the_package_path_keeps_its_configuration_and_executor_until_it_moves(jira, monkeypatch):
+    """A settings save or an executor change cannot take a Source off its package path; only the migration does."""
+
+    source_id = _on_the_package_path(jira, monkeypatch)
+    stored = asyncio.run(jira.db.get_source(source_id))
+    without_package_path = {
+        key: value
+        for key, value in stored["config"].items()
+        if key not in {"sync_mode", "local_agent_documents_dir"}
+    }
+
+    saved = jira.client.put(f"/api/v1/sources/{source_id}", json={"config": without_package_path})
+    moved = jira.client.put(f"/api/v1/sources/{source_id}/executor", json={"executor": "device"})
+
+    for answer in (saved, moved):
+        assert answer.status_code == 409, answer.text
+        assert answer.json()["detail"]["code"] == "source_awaits_package_migration"
+        assert "memforge maintenance migrate-device-packages" in answer.json()["detail"]["message"]
+    assert asyncio.run(jira.db.get_source(source_id))["config"] == stored["config"]
+    assert [source["id"] for source in asyncio.run(package_path_sources(jira.db))] == [source_id]
+    # A rename or a pause changes no configuration and is still saved.
+    renamed = jira.client.put(f"/api/v1/sources/{source_id}", json={"name": "Team issues"})
+    assert renamed.status_code == 200, renamed.text
+
+    assert _apply(jira, source_id).status == "migrated"
+    assert sorted(jira.documents(source_id)) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
+
+
 # ---------------------------------------------------------------------------
 # The command on a local installation
 # ---------------------------------------------------------------------------

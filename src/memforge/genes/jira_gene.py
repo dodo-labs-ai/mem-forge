@@ -617,13 +617,19 @@ class JiraGene(DocumentGene):
         first incremental search of a connection also reads ``/myself``.
         """
         self._hydrated_issues = {}
-        async for item in self._discover_remote_search(
-            since,
+        delta = None
+        if since is not None:
+            profile_zone = await self._jql_profile_zone()
+            delta = _delta_clause(since, profile_zone)
+            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
+        async for issue in self._search_issues(
+            _build_jql(self.config, delta),
             fields=JIRA_SEARCH_FIELDS,
             expand=JIRA_SEARCH_EXPAND,
             max_results=HYDRATED_SEARCH_MAX_RESULTS,
         ):
-            yield item
+            self._hydrated_issues[str(issue["key"])] = issue
+            yield issue_content_item(issue, self._base_url)
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
@@ -743,29 +749,6 @@ class JiraGene(DocumentGene):
                     )
                 )
         return answers
-
-    async def _discover_remote_search(
-        self,
-        since: datetime | None,
-        *,
-        fields: list[str],
-        expand: list[str] | None,
-        max_results: int,
-    ) -> AsyncIterator[ContentItem]:
-        delta = None
-        if since is not None:
-            profile_zone = await self._jql_profile_zone()
-            delta = _delta_clause(since, profile_zone)
-            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
-        async for issue in self._search_issues(
-            _build_jql(self.config, delta),
-            fields=fields,
-            expand=expand,
-            max_results=max_results,
-        ):
-            item = issue_content_item(issue, self._base_url)
-            self._hydrated_issues[str(issue["key"])] = issue
-            yield item
 
     async def _jql_profile_zone(self) -> tzinfo:
         """The timezone Jira reads this account's JQL date literals in, read once per connection.
