@@ -523,6 +523,46 @@ def test_an_interrupted_migration_continues_where_it_stopped(jira, monkeypatch):
     assert asyncio.run(jira.db.get_source(source_id))["executor"] == "device"
 
 
+def test_a_source_left_on_the_package_path_does_not_sync_until_it_moves(jira, monkeypatch):
+    """Neither Sync now nor its schedule runs the Gene over a Source whose Units hold packages."""
+
+    from datetime import timedelta
+
+    from memforge.runtime import SyncService
+    from memforge.scheduler import SyncScheduler
+
+    source_id = _on_the_package_path(jira, monkeypatch)
+    held = jira.documents(source_id)
+    jira.extractor.fragment_calls.clear()
+
+    queued = jira.client.post(f"/api/v1/sources/{source_id}/sync")
+    assert queued.status_code == 202, queued.text
+    jira.sync()
+    due = datetime.now(timezone.utc) - timedelta(minutes=1)
+    asyncio.run(jira.db.set_source_sync_schedule(source_id, enabled=True, interval_minutes=60, next_run_at=due))
+    scheduler = SyncScheduler(
+        jira.db,
+        SyncService(jira.db, AppConfig(), workspace_id="default"),
+        document_store=jira.app.state.document_store,
+    )
+    asyncio.run(scheduler._sync_due_sources())
+    jira.sync()
+
+    # Both runs failed before the Gene reached Jira; no jira-<KEY> Document appeared.
+    assert [status for status, _ in jira.runs(source_id)][-2:] == ["failed", "failed"]
+    # The Source shows the command that moves it.
+    listed = jira.client.get("/api/v1/sources")
+    assert listed.status_code == 200, listed.text
+    [shown] = [source for source in listed.json()["data"] if source["id"] == source_id]
+    assert shown["sync"]["status"] == "failed"
+    assert "memforge maintenance migrate-device-packages" in shown["sync"]["error_message"]
+    assert jira.documents(source_id) == held
+    assert jira.extracted_documents(source_id) == []
+
+    assert _apply(jira, source_id).status == "migrated"
+    assert sorted(jira.documents(source_id)) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
+
+
 # ---------------------------------------------------------------------------
 # The command on a local installation
 # ---------------------------------------------------------------------------
@@ -645,3 +685,38 @@ def test_the_command_applies_nothing_while_memforge_has_the_data_open(installati
     assert "Another MemForge process has the data" in " ".join(result.output.split())
     assert _installed_source(installation)["executor"] == "server"
     assert RecoveryPoints.for_config(installation).list() == []
+
+
+def test_the_check_names_each_cause_that_refuses_a_source(installation):
+    from click.testing import CliRunner
+
+    from memforge.main import cli
+
+    # The Source now names another repository than the files it holds.
+    from memforge.storage.database import Database
+
+    async def rename_repository() -> None:
+        db = Database(str(installation.storage.db_path))
+        await db.connect()
+        try:
+            source = await db.get_source("src-github")
+            config = {**source["config"], "repo_url": "https://github.example.com/acme/renamed"}
+            await db.upsert_source(
+                id="src-github",
+                type="github_repo",
+                name=source["name"],
+                config_json=json.dumps(config),
+                access_policy="workspace",
+                owner_user_id=OWNER,
+                execution_owner_user_id=OWNER,
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(rename_repository())
+
+    checked = CliRunner().invoke(cli, ["maintenance", "migrate-device-packages"])
+
+    assert checked.exit_code == 1, checked.output
+    assert "3 file(s) the configured repository names differently" in checked.output
+    assert "not rebuildable" not in checked.output and "collision" not in checked.output

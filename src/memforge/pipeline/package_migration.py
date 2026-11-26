@@ -34,6 +34,10 @@ This recoverable migration (ADR 0032) moves each such Source once:
    committed does the Source move to the device executor without its package
    fields; the cursor, the failure ledger and everything else it holds stay.
 
+Until it moves, the Source does not sync (:func:`awaits_package_migration`):
+a run of its type's Gene would discover its items under the Gene's ids next
+to the stored ones and extract each of them again.
+
 Every step is idempotent. A Unit already in the Gene's form is not planned
 again, and a Source whose replay did not commit every input keeps its
 package path, so running the migration again continues where it stopped.
@@ -73,13 +77,19 @@ if TYPE_CHECKING:
     from memforge.storage.document_store import DocumentStore
 
 __all__ = [
+    "PACKAGE_MIGRATION_COMMAND",
     "MigratedUnit",
     "PackageMigrationResult",
     "SourceMigrationPlan",
     "apply_package_migration",
+    "awaits_package_migration",
     "package_path_sources",
     "plan_package_migration",
 ]
+
+
+# The command that moves a local installation's package-path Sources.
+PACKAGE_MIGRATION_COMMAND = "memforge maintenance migrate-device-packages"
 
 
 class Unrebuildable(ValueError):
@@ -304,10 +314,20 @@ class PackageMigrationResult:
         return {"status": self.status, "sync_status": self.sync_status, "error": self.error, **self.plan.to_payload()}
 
 
+def awaits_package_migration(source: Mapping[str, Any]) -> bool:
+    """Whether the Source's configuration still names a device package path, so its stored inputs await this migration.
+
+    Such a Source does not sync: its type's Gene would name and read its
+    items differently from the packages its Units hold.
+    """
+
+    return _package_path(source) is not None
+
+
 async def package_path_sources(db: Database) -> list[dict[str, Any]]:
     """The inventory: every Source, in every workspace, whose configuration names a device package path."""
 
-    return [source for source in await db.list_sources() if _package_path(source) is not None]
+    return [source for source in await db.list_sources() if awaits_package_migration(source)]
 
 
 async def plan_package_migration(db: Database, doc_store: DocumentStore, source: Mapping[str, Any]) -> SourceMigrationPlan:

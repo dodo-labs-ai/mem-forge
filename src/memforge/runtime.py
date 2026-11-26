@@ -63,6 +63,7 @@ from memforge.pipeline.device_acquisition import (
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.package_migration import PACKAGE_MIGRATION_COMMAND, awaits_package_migration
 from memforge.pipeline.sync_memory import SyncMemoryObserver
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
@@ -1116,6 +1117,13 @@ async def _run_source_sync_held(
         # The server never reaches a device Source's provider: its runs
         # interpret what its device acquired.
         raise SourceSyncBoundaryError(f"device Source {source['id']} runs only on what its device acquired")
+    if replay is None and awaits_package_migration(source):
+        # Its Units hold the packages of its old device path, which only the
+        # migration rewrites into what the type's Gene reads.
+        raise SourceSyncBoundaryError(
+            f"Source {source['id']} is still on its device package path; "
+            f"run `{PACKAGE_MIGRATION_COMMAND}` before it syncs"
+        )
     runtime = runtime or await build_sync_runtime(db, config)
     secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
     source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)

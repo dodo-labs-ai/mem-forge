@@ -121,29 +121,10 @@ const pickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx"
 const setupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
 assert.match(
   pickerSource,
-  /createLocalAgentJob/,
-  "Internal network GitHub folder browsing should enqueue through the target-aware local-agent helper",
+  /\/genes\/github_repo\/browse-tree/,
+  "Folder browsing should list the repository tree through the server",
 );
-assert.match(
-  pickerSource,
-  /getLocalAgentJob\(jobId\)/,
-  "Internal network GitHub folder browsing should poll through the target-aware local-agent helper",
-);
-assert.match(
-  pickerSource,
-  /github_repo_preview_tree/,
-  "Internal network GitHub folder browsing should request a preview-tree job",
-);
-assert.match(
-  pickerSource,
-  /pollLocalAgentJob/,
-  "Internal network GitHub folder browsing should poll until the daemon completes the preview job",
-);
-assert.match(
-  pickerSource,
-  /const LOCAL_AGENT_POLL_ATTEMPTS = 180;/,
-  "Folder browsing should tolerate daemon startup and one missed polling tick",
-);
+assert.doesNotMatch(pickerSource, /github_repo_preview_tree|createLocalAgentJob/);
 assert.match(pickerSource, /Sync all supported files in this repository/);
 assert.match(pickerSource, /Choose exclusions/);
 assert.match(pickerSource, /Sync only selected folders instead/);

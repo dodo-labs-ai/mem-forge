@@ -14,15 +14,12 @@ import {
   X,
 } from "lucide-react";
 import { resourceClient } from "@/api/client";
-import { createLocalAgentJob, getLocalAgentJob } from "@/api/localAgentJobs";
-import type { GitHubRepoTreeResponse, LocalAgentJobStatusResponse } from "@/api/types";
+import type { GitHubRepoTreeResponse } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import {
-  normalizeRepoPickerPath,
   repoEffectiveFiles,
-  repoPickerItemsFromFilePaths,
   repoPickerSelectionState,
   repoPickerTreeRows,
   repoScopeSummary,
@@ -35,13 +32,10 @@ import {
 type ConfigValue = string | number | boolean | string[] | null;
 type ScopeMode = "exclude" | "include";
 
-const LOCAL_SCAN_LIMIT = 2_000;
-const LOCAL_AGENT_POLL_ATTEMPTS = 180;
-const LOCAL_AGENT_POLL_INTERVAL_MS = 1_000;
+const TREE_LIMIT = 2_000;
 const EXCLUSION_SUGGESTION_PATTERN = /(^|\/)(archive|archived|deprecated|obsolete|outdated)(\/|$)/i;
 
 export function GitHubRepoFolderPicker({
-  connectionMode,
   sourceId,
   config,
   items,
@@ -51,7 +45,6 @@ export function GitHubRepoFolderPicker({
   onIncludePathsChange,
   onExcludePathsChange,
 }: {
-  connectionMode: string;
   sourceId?: string;
   config: Record<string, ConfigValue | undefined>;
   items: RepoPickerItem[];
@@ -68,7 +61,6 @@ export function GitHubRepoFolderPicker({
   const [query, setQuery] = useState("");
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const [previewOpen, setPreviewOpen] = useState(false);
-  const isLocalPush = connectionMode === "local_push";
   const selectedPaths = editorMode === "include" ? includePaths : excludePaths;
   const visibleTreeRows = useMemo(
     () => repoPickerTreeRows(items, expandedPaths, query),
@@ -111,39 +103,17 @@ export function GitHubRepoFolderPicker({
       return;
     }
     try {
-      if (isLocalPush) {
-        const created = await createLocalAgentJob({
-          sourceType: "github_repo",
-          operation: "github_repo_preview_tree",
-          payload: { ...config, limit: LOCAL_SCAN_LIMIT },
-        });
-        const status = await pollLocalAgentJob(created.job_id);
-        if (status.status === "failed") {
-          setMessage(status.last_error || "Local sync could not load the remote repository tree.");
-          return;
-        }
-        const paths = localAgentJobPaths(status);
-        applyTreeItems(repoPickerItemsFromFilePaths(paths));
-        if (status.result?.truncated || paths.length >= LOCAL_SCAN_LIMIT) {
-          setMessage("Repository tree is large. Search for a folder or file to narrow the list.");
-        }
-      } else {
-        const response = await resourceClient.post<GitHubRepoTreeResponse>("/genes/github_repo/browse-tree", {
-          ...(sourceId ? { source_id: sourceId } : {}),
-          config,
-          limit: LOCAL_SCAN_LIMIT,
-        });
-        applyTreeItems(response.data.items);
-        if (response.data.truncated) {
-          setMessage("Repository tree is large. Search for a folder or file to narrow the list.");
-        }
+      const response = await resourceClient.post<GitHubRepoTreeResponse>("/genes/github_repo/browse-tree", {
+        ...(sourceId ? { source_id: sourceId } : {}),
+        config,
+        limit: TREE_LIMIT,
+      });
+      applyTreeItems(response.data.items);
+      if (response.data.truncated) {
+        setMessage("Repository tree is large. Search for a folder or file to narrow the list.");
       }
     } catch (error) {
-      setMessage(extractMessage(error) || (
-        isLocalPush
-          ? "Could not reach local sync. Check the daemon, VPN, and gh login."
-          : "Could not load the repository tree."
-      ));
+      setMessage(extractMessage(error) || "Could not load the repository tree.");
     } finally {
       setLoading(false);
     }
@@ -237,7 +207,7 @@ export function GitHubRepoFolderPicker({
                 {editorMode === "exclude" ? "Choose folders or files to exclude" : "Choose folders or files to include"}
               </p>
               <p className="text-xs text-muted-foreground">
-                {isLocalPush ? "Loaded from the remote repository through local sync." : "Loaded from the remote repository by MemForge Cloud."}
+                Loaded from the remote repository by MemForge Cloud.
               </p>
             </div>
             <div className="flex gap-2">
@@ -484,25 +454,6 @@ function PathChips({
       ))}
     </div>
   );
-}
-
-async function pollLocalAgentJob(jobId: string): Promise<LocalAgentJobStatusResponse> {
-  for (let attempt = 0; attempt < LOCAL_AGENT_POLL_ATTEMPTS; attempt += 1) {
-    const status = await getLocalAgentJob(jobId);
-    if (status.status === "succeeded" || status.status === "failed") return status;
-    await wait(LOCAL_AGENT_POLL_INTERVAL_MS);
-  }
-  throw new Error("Timed out waiting for local sync.");
-}
-
-function localAgentJobPaths(status: LocalAgentJobStatusResponse): string[] {
-  return (status.result?.items ?? [])
-    .map((item) => normalizeRepoPickerPath(item.relative_path ?? item.path ?? ""))
-    .filter((path) => path.length > 0);
-}
-
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function extractMessage(error: unknown): string {

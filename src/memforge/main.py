@@ -4808,7 +4808,8 @@ def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, .
     GitHub file whose Document the configured repository names differently.
     --apply first takes a recovery point (`memforge backup list`), so stop
     the MemForge server before it. A Source whose replay fails keeps its
-    package path and moves the next time --apply runs.
+    package path and moves the next time --apply runs. Until a Source moves,
+    it does not sync.
     """
 
     async def _run() -> int:
@@ -4871,8 +4872,14 @@ def _print_package_migration(rows: list[dict[str, Any]], *, as_json: bool) -> No
     table.add_column("Result")
     for row in rows:
         if row["refused"]:
-            reasons = [*row["unrebuildable"], *row["id_changes_refused"]]
-            result = f"[red]refused[/]: {len(reasons)} item(s) not rebuildable, {len(row['collisions'])} collision(s)"
+            causes = [
+                f"{len(row['unrebuildable'])} item(s) not rebuildable" if row["unrebuildable"] else "",
+                f"{len(row['collisions'])} collision(s)" if row["collisions"] else "",
+                f"{len(row['id_changes_refused'])} file(s) the configured repository names differently"
+                if row["id_changes_refused"]
+                else "",
+            ]
+            result = "[red]refused[/]: " + ", ".join(cause for cause in causes if cause)
         else:
             result = {
                 None: "[green]ready[/]",

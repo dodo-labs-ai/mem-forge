@@ -41,21 +41,18 @@ assert.equal(confluence.sectionForField(field({ key: "exclude_labels" }), {}), "
 
 const github = sourceSetupAdapterFor("github_repo");
 assert.equal(
-  github.sectionForField(field({ key: "include_paths" }), { connection_mode: "cloud_pull" }),
+  github.sectionForField(field({ key: "include_paths" }), {}),
   "hidden",
   "repository paths are owned by the tree picker instead of a second text field",
 );
 assert.equal(
-  github.sectionForField(field({ key: "exclude_paths" }), { connection_mode: "local_push" }),
+  github.sectionForField(field({ key: "exclude_paths" }), {}),
   "hidden",
   "repository exclusions are owned by the shared tree picker",
 );
 assert.equal(
-  github.connectionSummary({
-    connection_mode: "local_push",
-    repo_url: "https://github.example.com/org/repo",
-  }),
-  "Local sync · github.example.com",
+  github.connectionSummary({ repo_url: "https://github.example.com/org/repo" }),
+  "github.example.com",
 );
 
 const pages = sourceSetupAdapterFor("github_pages");
@@ -69,12 +66,6 @@ assert.equal(
 );
 
 const jira = sourceSetupAdapterFor("jira");
-const switched = jira.normalizeFieldChange(
-  field({ key: "sync_mode" }),
-  "local_agent",
-  { auth_mode: "pat", sync_mode: "cloud" },
-);
-assert.equal(switched.auth_mode, "browser_cookie");
 
 const schema: GeneConfigSchema = {
   groups: [],

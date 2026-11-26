@@ -414,7 +414,6 @@ assert.doesNotMatch(
 );
 
 const sourceSetupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
-const sourceSetupAdaptersSource = readFileSync("src/views/sources/sourceSetupAdapters.ts", "utf8");
 const teamsSourceSetupSource = readFileSync("src/views/sources/TeamsSourceSetup.tsx", "utf8");
 const githubRepoFolderPickerSource = readFileSync("src/views/sources/GitHubRepoFolderPicker.tsx", "utf8");
 assert.match(
@@ -460,11 +459,6 @@ assert.match(
   /createLocalAgentJob/,
   "Teams auth and browse jobs should use the centralized target-aware helper",
 );
-assert.match(
-  githubRepoFolderPickerSource,
-  /createLocalAgentJob/,
-  "GitHub local-agent browse jobs should use the centralized target-aware helper",
-);
 assert.doesNotMatch(
   [sourcesPageSource, sourceSetupSource, teamsSourceSetupSource, githubRepoFolderPickerSource].join("\n"),
   /(?:resourceClient|hostClient)\.post<[^>]+>\([^)]*\/local-agent\/jobs/,
@@ -484,21 +478,6 @@ assert.match(
   sourceSetupSource,
   /jiraSessionQuery\.refetch\(\)/,
   "Jira browser-session guidance should allow users to re-check after running the CLI refresh",
-);
-assert.match(
-  sourceSetupAdaptersSource,
-  /field\.key === "auth_mode"[\s\S]*sync_mode: "cloud"/,
-  "Jira PAT mode should not leave Local daemon sync selected because the UI cannot pass redacted PAT secrets to daemon jobs",
-);
-assert.match(
-  sourceSetupAdaptersSource,
-  /field\.key === "sync_mode"[\s\S]*auth_mode: "browser_cookie"/,
-  "Jira Local daemon sync should use browser-session auth in the current contract",
-);
-assert.match(
-  sourceSetupSource,
-  /showDiscoveryPreview[\s\S]*sourceType === "jira"[\s\S]*config\.sync_mode[\s\S]*local_agent/,
-  "Jira Local daemon sync should not expose the server-side discovery preview",
 );
 assert.match(
   sourceSetupSource,

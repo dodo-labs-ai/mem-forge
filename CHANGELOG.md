@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Jira and GitHub repository Sources that collect on your own computer run the
+  type's own connector on the device: choose Where it runs: My computer, and
+  store the device's credential with `memforge source credentials set <id>`.
+  Jira `sync_mode: local_agent` and GitHub repository
+  `connection_mode: local_push` are removed, with
+  `POST /sources/{id}/adapter/manifest/confirmations`, the manifest route's
+  `confirm` field and its `awaiting_confirmations` status. The manifest's
+  `snapshot_manifest_sha256` now hashes its items only.
+
+- Upgrading a self-hosted installation with a Jira Source on local agent sync
+  or a GitHub repository Source on local push: these Sources hold what the old
+  path stored and do not sync until they move. Before you start the upgraded
+  server, run `memforge maintenance migrate-device-packages` to see what moves
+  and what would be extracted again, then, with the server stopped,
+  `memforge maintenance migrate-device-packages --apply`. It takes a recovery
+  point first (`memforge backup restore` undoes it), keeps every Memory and its
+  Support (Jira issues move to their `jira-<KEY>` Documents), extracts only
+  items whose content the move changes, and sets each Source to run on its
+  owner's device. Then store each moved Source's device credential with
+  `memforge source credentials set <id>`. A Source whose move failed keeps its
+  old path and shows the command in its sync error; run `--apply` again. A
+  Source the check refuses names the cause: an item that cannot be rebuilt, two
+  items that map to one Document, or a GitHub file the configured repository
+  names differently.
+
 - Search: a Memory that a newer Memory updates reports `freshness: outdated` in
   search results and recent-memory listings, beside the `relation_notice` that
   names the newer Memory. It is `outdated` for as long as the caller sees that

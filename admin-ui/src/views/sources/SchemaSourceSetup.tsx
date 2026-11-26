@@ -198,9 +198,6 @@ function SourceConfigForm({
     initialFocus?.step ?? "basics",
   );
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
-  const githubConnectionMode = sourceType === "github_repo"
-    ? stringValue(config.connection_mode) || "cloud_pull"
-    : "";
   const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
   const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
@@ -343,8 +340,7 @@ function SourceConfigForm({
     isEdit && canConfigureConnection && previewReady ? serializeConfig(schema.fields, config) : null,
     secretFieldKeys(schema.fields),
   );
-  const showDiscoveryPreview = sourceType !== "github_repo"
-    && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
+  const showDiscoveryPreview = sourceType !== "github_repo";
   const scheduleSummary = scheduleEnabled
     ? scheduleIntervalLabel(scheduleInterval)
     : "Manual only";
@@ -353,7 +349,7 @@ function SourceConfigForm({
     setValidationMessage(null);
     if (
       sourceType === "github_repo"
-      && ["connection_mode", "repo_url", "ref"].includes(field.key)
+      && ["repo_url", "ref"].includes(field.key)
     ) {
       setGitHubRepoTreeItems([]);
     }
@@ -437,7 +433,6 @@ function SourceConfigForm({
         )}
         {sourceType === "github_repo" && field.key === "ref" && (
           <GitHubRepoFolderPicker
-            connectionMode={githubConnectionMode}
             sourceId={source?.id}
             config={githubPickerConfig}
             items={githubRepoTreeItems}

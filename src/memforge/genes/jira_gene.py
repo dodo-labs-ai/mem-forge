@@ -73,7 +73,6 @@ COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
-JIRA_INVENTORY_FIELDS = ["summary", "updated", "project"]
 JIRA_INVENTORY_MAX_RESULTS = 100
 # Listing and confirming the scope read identifiers only; id and key come with
 # every search result, and one small field keeps the response minimal.
@@ -623,7 +622,6 @@ class JiraGene(DocumentGene):
             fields=JIRA_SEARCH_FIELDS,
             expand=JIRA_SEARCH_EXPAND,
             max_results=HYDRATED_SEARCH_MAX_RESULTS,
-            cache_hydrated=True,
         ):
             yield item
 
@@ -668,18 +666,6 @@ class JiraGene(DocumentGene):
         current = issue_content_item(issue, self._base_url)
         self._hydrated_issues[current.extra["issue_key"]] = issue
         return current
-
-    async def discover_inventory(self) -> AsyncIterator[ContentItem]:
-        """Discover a complete lightweight issue inventory for daemon planning."""
-        self._hydrated_issues = {}
-        async for item in self._discover_remote_search(
-            None,
-            fields=JIRA_INVENTORY_FIELDS,
-            expand=None,
-            max_results=JIRA_INVENTORY_MAX_RESULTS,
-            cache_hydrated=False,
-        ):
-            yield item
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
@@ -765,7 +751,6 @@ class JiraGene(DocumentGene):
         fields: list[str],
         expand: list[str] | None,
         max_results: int,
-        cache_hydrated: bool,
     ) -> AsyncIterator[ContentItem]:
         delta = None
         if since is not None:
@@ -779,10 +764,7 @@ class JiraGene(DocumentGene):
             max_results=max_results,
         ):
             item = issue_content_item(issue, self._base_url)
-            if cache_hydrated:
-                self._hydrated_issues[str(issue["key"])] = issue
-            else:
-                item.extra["attest_materialized_revision"] = True
+            self._hydrated_issues[str(issue["key"])] = issue
             yield item
 
     async def _jql_profile_zone(self) -> tzinfo:
@@ -902,9 +884,6 @@ class JiraGene(DocumentGene):
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
         key = item.extra.get("issue_key", item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX))
-        attested = item.extra.get("attest_materialized_revision") is True
-        if attested:
-            await self._hydrate_inventory_issue(item, key)
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
             payload = _issue_payload_from_search(hydrated_issue, self.config)
@@ -916,8 +895,6 @@ class JiraGene(DocumentGene):
             if comments_read_apart:
                 await self._fetch_comment_snapshot(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
-            if attested and comments_read_apart:
-                await self._attest_materialized_revision(key, str(item.version or ""))
             artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
                 item=item,
@@ -1100,49 +1077,6 @@ class JiraGene(DocumentGene):
         if len(matches) == 1:
             return "comment", matches[0]
         return "issue_core", f"{issue_id}:core"
-
-    async def _hydrate_inventory_issue(self, item: ContentItem, key: str) -> None:
-        """Read a listed issue in full with a one-issue search in the scope, at the listed revision.
-
-        Jira writes ``updated`` per endpoint: a search can answer it at a
-        coarser precision than an issue read, so a listed revision is
-        compared only with another search.
-        """
-        current = await self.rediscover(item)
-        if current is None or current.extra["issue_key"] != key or current.version != item.version:
-            if current is not None:
-                self._hydrated_issues.pop(current.extra["issue_key"], None)
-            raise RuntimeError(
-                f"Jira issue {key} changed during materialization; retry inventory"
-            )
-
-    async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
-        """Search the issue again after its comments are read apart, and require the listed revision."""
-        issues = [
-            issue
-            async for issue in self._search_issues(
-                _single_issue_jql(self.config, key),
-                fields=JIRA_IDENTITY_FIELDS,
-                expand=None,
-                max_results=1,
-                validate_query=False,
-            )
-        ]
-        fields = issues[0].get("fields") if len(issues) == 1 else None
-        current_revision = (
-            str(fields.get("updated") or "").strip()
-            if isinstance(fields, dict)
-            else ""
-        )
-        if (
-            len(issues) != 1
-            or str(issues[0].get("key") or "").strip() != key
-            or not current_revision
-            or current_revision != expected_revision
-        ):
-            raise RuntimeError(
-                f"Jira issue {key} changed during materialization; retry inventory"
-            )
 
     async def _fetch_comment_snapshot(self, key: str, payload: dict) -> None:
         comments_resp = await self._request(
