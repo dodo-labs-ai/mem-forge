@@ -44,7 +44,7 @@ export function viewerDeviceUpdates(sources: readonly Source[]): DeviceUpdate[] 
     if (!device?.name || !viewerUpdatesDevice(source)) continue;
     const update = byDevice.get(device.name);
     if (update) update.sources.push(source);
-    else byDevice.set(device.name, deviceUpdate(device, [source]));
+    else byDevice.set(device.name, deviceUpdate(device.name, device, [source]));
   }
   return [...byDevice.values()];
 }
@@ -55,9 +55,9 @@ export function deviceUpdateOf(source: Source, sources: readonly Source[]): Devi
   return viewerDeviceUpdates(sources).find((update) => update.deviceName === name) ?? null;
 }
 
-function deviceUpdate(device: SourceDevice, sources: Source[]): DeviceUpdate {
+function deviceUpdate(deviceName: string, device: SourceDevice, sources: Source[]): DeviceUpdate {
   return {
-    deviceName: device.name ?? "",
+    deviceName,
     installedVersion: device.installed_version,
     requiredVersion: device.required_version,
     sources,

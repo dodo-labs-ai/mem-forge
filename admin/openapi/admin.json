@@ -1137,7 +1137,7 @@
         "type": "object"
       },
       "ConfigCheckRequest": {
-        "description": "A configuration to check; ``executor`` says where a new Source runs, and a stored Source keeps its own.",
+        "description": "A configuration to check against the executor its save will use.\n\n``executor`` is where the Source runs once saved; without it, a stored\nSource keeps its own executor and a new Source runs on the server.",
         "properties": {
           "config": {
             "additionalProperties": true,
@@ -1145,13 +1145,19 @@
             "type": "object"
           },
           "executor": {
-            "default": "server",
-            "enum": [
-              "server",
-              "device"
+            "anyOf": [
+              {
+                "enum": [
+                  "server",
+                  "device"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Executor",
-            "type": "string"
+            "title": "Executor"
           },
           "source_id": {
             "anyOf": [
@@ -14046,7 +14052,7 @@
     },
     "/api/v1/genes/{name}/config-check": {
       "post": {
-        "description": "What saving this configuration would store and refuse, without saving it.\n\nIt runs save's own steps (``complete`` and every configuration check)\non a copy, and writes nothing: no Source, no inbox, no encrypted\nsecret. ``derived`` holds the declared non-secret fields whose\neffective value the steps change, such as the page tree a pasted\nConfluence page URL names; ``facts`` states what the type can tell\nabout the configuration; ``issues`` holds every refusal. With\n``source_id``, the stored configuration completes the copy as it does\non update, and the caller needs the access that update needs.",
+        "description": "What saving this configuration would store and refuse, without saving it.\n\nIt runs save's own steps (``complete`` and every configuration check)\non a copy, and writes nothing: no Source, no inbox, no encrypted\nsecret. ``derived`` holds the declared non-secret fields whose\neffective value the steps change, such as the page tree a pasted\nConfluence page URL names; ``facts`` states what the type can tell\nabout the configuration; ``issues`` holds every refusal. With\n``source_id``, the stored configuration completes the copy as it does\non update, and the caller needs the access that update needs.\n``executor`` is where the save puts the Source, so a stored Source\nmoving between the server and a device is checked against its new\nexecutor: a move to the server must carry the secrets the server\nrequires.",
         "operationId": "check_gene_config_api_v1_genes__name__config_check_post",
         "parameters": [
           {

@@ -498,6 +498,19 @@ function deviceSource(credential: "secret" | "browser_session", overrides: Parti
   });
 }
 
+/**
+ * Config-check for a stored device Source, answering as the server does for
+ * the executor the request names: on its device the server holds no token, so
+ * a typed one is refused; on the server the token is required.
+ */
+async function deviceSourceConfigCheck(request: Request) {
+  const { config, executor } = (await request.clone().json()) as { config: Record<string, unknown>; executor?: string };
+  if ((executor ?? "device") === "device") {
+    return config.pat ? { ...NO_ISSUES, issues: [{ key: "pat", message: "The token is stored on the device that runs this source, not on the server." }] } : NO_ISSUES;
+  }
+  return config.pat ? NO_ISSUES : { ...NO_ISSUES, issues: [{ key: "pat", message: "Personal Access Token is required." }] };
+}
+
 async function chooseMyComputer() {
   await userEvent.click(await screen.findByRole("radio", { name: /My computer/ }));
 }
@@ -507,7 +520,7 @@ test("Where it runs on My computer creates the source without its secret once a 
     routes: { "POST /api/v1/sources": () => CREATED, "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus() },
   });
 
-  await userEvent.type(await screen.findByLabelText("Source name"), "Payroll wiki");
+  await userEvent.type(await screen.findByLabelText("Source name"), "Team wiki");
   await next();
   expect(screen.getByRole("radio", { name: /Server/ })).toBeChecked();
   await chooseMyComputer();
@@ -569,13 +582,21 @@ test("a device source moves to the server with the secret the form requires", as
   const source = deviceSource("secret");
   const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
     sources: [source],
-    routes: { "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "server", cancelled_jobs: 0 }) },
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "server", cancelled_jobs: 0 }),
+    },
   });
 
   await userEvent.click(await screen.findByRole("radio", { name: /Server/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(await screen.findByText("Personal Access Token is required.")).toBeInTheDocument();
+  expect(requestsTo(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toHaveLength(0);
+
   await userEvent.type(screen.getByLabelText("Personal Access Token"), "token-2");
   await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toMatchObject({ source_id: "src-wiki", executor: "server" });
   expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "server", secrets: { pat: "token-2" } });
 });
 

@@ -1915,11 +1915,15 @@ class GeneConfigSchemaResponse(BaseModel):
 
 
 class ConfigCheckRequest(BaseModel):
-    """A configuration to check; ``executor`` says where a new Source runs, and a stored Source keeps its own."""
+    """A configuration to check against the executor its save will use.
+
+    ``executor`` is where the Source runs once saved; without it, a stored
+    Source keeps its own executor and a new Source runs on the server.
+    """
 
     config: dict[str, Any]
     source_id: str | None = None
-    executor: Literal["server", "device"] = "server"
+    executor: Literal["server", "device"] | None = None
 
 
 class ConfigFactResponse(BaseModel):
@@ -7238,11 +7242,15 @@ def create_admin_app(
         about the configuration; ``issues`` holds every refusal. With
         ``source_id``, the stored configuration completes the copy as it does
         on update, and the caller needs the access that update needs.
+        ``executor`` is where the save puts the Source, so a stored Source
+        moving between the server and a device is checked against its new
+        executor: a move to the server must carry the secrets the server
+        requires.
         """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
         existing_config: dict[str, Any] | None = None
-        executor = req.executor
+        executor = req.executor or SOURCE_EXECUTOR_SERVER
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -7252,7 +7260,7 @@ def create_admin_app(
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Config-check source type does not match the existing source")
             existing_config = existing["config"]
-            executor = source_executor(existing)
+            executor = req.executor or source_executor(existing)
 
         submitted = copy.deepcopy(req.config)
         config = copy.deepcopy(req.config)

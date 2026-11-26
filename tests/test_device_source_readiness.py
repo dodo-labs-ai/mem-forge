@@ -319,3 +319,31 @@ def test_a_server_source_has_no_execution_owner_viewer(client):
     )
 
     assert _row(client, created.json()["id"], viewer=CREATOR)["ownership"]["viewer_is_execution_owner"] is False
+
+
+def _check_stored(client, source_id: str, config: dict, **request) -> list[dict]:
+    checked = client.post(
+        "/api/v1/genes/confluence/config-check",
+        json={"config": config, "source_id": source_id, **request},
+        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+    )
+    assert checked.status_code == 200, checked.text
+    return checked.json()["issues"]
+
+
+def test_a_device_source_moving_to_the_server_is_checked_with_the_secret_the_server_needs(client, device_source):
+    without_secret = {key: value for key, value in CONFLUENCE.items() if key != "pat"}
+
+    assert _check_stored(client, device_source, CONFLUENCE, executor="server") == []
+    [issue] = _check_stored(client, device_source, without_secret, executor="server")
+    assert issue["key"] == "pat"
+    assert "on the device" not in issue["message"]
+
+
+def test_a_stored_device_source_without_an_executor_is_checked_on_its_device(client, device_source):
+    without_secret = {key: value for key, value in CONFLUENCE.items() if key != "pat"}
+
+    assert _check_stored(client, device_source, without_secret) == []
+    [issue] = _check_stored(client, device_source, CONFLUENCE)
+    assert issue["key"] == "pat"
+    assert "on the device" in issue["message"]

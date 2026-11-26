@@ -53,23 +53,23 @@ export function sourceAttentionTone(reason: SourceAttentionReason): "warn" | "da
 
 /**
  * Update local sync: the execution owner updates their device; another
- * member waits for them, without an action or the device's name.
+ * member waits for them, without an action or the device's name. Only a
+ * device Source reaches this state, and every device Source has an
+ * execution owner.
  */
 function updateLocalSyncAttention(source: Source): SourceAttention {
   if (source.ownership.viewer_is_execution_owner) {
-    const device = source.execution?.device?.name ?? "your computer";
     return {
       reason: "update_local_sync",
       title: "Update local sync",
-      detail: `MemForge on ${device} needs an update to sync this source.`,
+      detail: "MemForge on your computer needs an update to sync this source.",
       action: "update_device",
       actionLabel: "Update",
     };
   }
-  const owner = source.ownership.execution_owner_user_id ?? "its owner";
   return {
     reason: "update_local_sync",
-    title: `Waiting for ${owner} to update local sync`,
+    title: `Waiting for ${source.ownership.execution_owner_user_id} to update local sync`,
     detail: "This source syncs again once MemForge on their computer is updated.",
     action: null,
     actionLabel: null,

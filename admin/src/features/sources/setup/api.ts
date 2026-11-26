@@ -71,13 +71,13 @@ function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
  * saving anything. The server reads the provider through preview-discovery,
  * with `sourceId` supplying what the form leaves out, such as a kept
  * secret; a local folder is listed by local sync on the person's computer
- * (`local_markdown_preview_tree`). `executor` says where the configured
- * Source runs; the server reads only its own connection.
+ * (`local_markdown_preview_tree`). The server previews only through its
+ * own connection, so the request names the server executor and a
+ * configuration on My computer has no Check setup.
  */
 export function useCheckSetup(
   sourceType: string,
   kind: CheckSetupKind | null,
-  executor: SourceExecutor,
   source?: { id: string; config: Readonly<Record<string, unknown>> },
 ) {
   const api = useApi();
@@ -98,7 +98,7 @@ export function useCheckSetup(
       const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },
-          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor },
+          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor: "server" },
         }),
       );
       return {

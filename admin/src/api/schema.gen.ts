@@ -755,6 +755,10 @@ export interface paths {
          *     about the configuration; ``issues`` holds every refusal. With
          *     ``source_id``, the stored configuration completes the copy as it does
          *     on update, and the caller needs the access that update needs.
+         *     ``executor`` is where the save puts the Source, so a stored Source
+         *     moving between the server and a device is checked against its new
+         *     executor: a move to the server must carry the secrets the server
+         *     requires.
          */
         post: operations["check_gene_config_api_v1_genes__name__config_check_post"];
         delete?: never;
@@ -3035,19 +3039,18 @@ export interface components {
         };
         /**
          * ConfigCheckRequest
-         * @description A configuration to check; ``executor`` says where a new Source runs, and a stored Source keeps its own.
+         * @description A configuration to check against the executor its save will use.
+         *
+         *     ``executor`` is where the Source runs once saved; without it, a stored
+         *     Source keeps its own executor and a new Source runs on the server.
          */
         ConfigCheckRequest: {
             /** Config */
             config: {
                 [key: string]: unknown;
             };
-            /**
-             * Executor
-             * @default server
-             * @enum {string}
-             */
-            executor: "server" | "device";
+            /** Executor */
+            executor?: ("server" | "device") | null;
             /** Source Id */
             source_id?: string | null;
         };

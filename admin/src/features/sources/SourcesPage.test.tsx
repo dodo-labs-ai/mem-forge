@@ -806,8 +806,8 @@ function onDevice(id: string, name: string, state: DeviceState, { device = "Alex
 
 test("one banner per device that needs an update, shown only to the execution owner", async () => {
   renderPage([
-    onDevice("src-a", "Payroll wiki", "update_required"),
-    onDevice("src-b", "Payroll notes", "update_required"),
+    onDevice("src-a", "Release wiki", "update_required"),
+    onDevice("src-b", "Build notes", "update_required"),
     onDevice("src-c", "Build docs", "update_required", { device: "Build box" }),
     onDevice("src-d", "Team wiki", "update_required", { owner: "user-2", viewerOwns: false }),
   ]);
@@ -824,7 +824,7 @@ test("one banner per device that needs an update, shown only to the execution ow
   expect(within(memberRow).getByText("Waiting for user-2 to update local sync")).toBeInTheDocument();
   expect(within(memberRow).queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
   expect(within(memberRow).queryByText("Alex's MacBook")).not.toBeInTheDocument();
-  const ownerRow = within(table).getByText("Payroll wiki").closest("tr")!;
+  const ownerRow = within(table).getByText("Release wiki").closest("tr")!;
   expect(within(ownerRow).getByText("Update local sync")).toBeInTheDocument();
   expect(within(ownerRow).getByRole("button", { name: "Update" })).toBeInTheDocument();
 });
@@ -840,16 +840,16 @@ test("another member's waiting source shows no banner and cannot queue a sync", 
 });
 
 test("Sync now on a waiting source opens the update dialog instead of queuing a sync", async () => {
-  const { calls } = renderPage([onDevice("src-wiki", "Payroll wiki", "update_required"), onDevice("src-b", "Payroll notes", "update_required")]);
+  const { calls } = renderPage([onDevice("src-wiki", "Release wiki", "update_required"), onDevice("src-b", "Build notes", "update_required")]);
 
   const table = await screen.findByRole("table", { name: "Sources" });
-  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Payroll wiki" }));
+  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Release wiki" }));
   await userEvent.click(await screen.findByRole("menuitem", { name: "Sync now" }));
 
   const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
   expect(within(dialog).getByText(/This computer runs MemForge 0.2.0b8. The server runs 0.2.0b7/)).toBeInTheDocument();
   const waiting = within(dialog).getByRole("list", { name: "Sources waiting for the update" });
-  expect(within(waiting).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Payroll wiki", "Payroll notes"]);
+  expect(within(waiting).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Release wiki", "Build notes"]);
   expect(within(dialog).getByText("memforge upgrade")).toBeInTheDocument();
   expect(within(dialog).getByRole("button", { name: "Copy memforge upgrade" })).toBeInTheDocument();
   expect(within(dialog).getByText("Syncs wait until the update. Nothing is removed, and they start on their own after it.")).toBeInTheDocument();
@@ -858,7 +858,7 @@ test("Sync now on a waiting source opens the update dialog instead of queuing a 
 
 test("the update dialog closes itself once the device reports a matching contract", async () => {
   let state: DeviceState = "update_required";
-  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Payroll wiki", state)] }) });
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Release wiki", state)] }) });
 
   const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
   await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
@@ -874,7 +874,7 @@ test("the update dialog closes itself once the device reports a matching contrac
 
 test("an offline device is started before it is updated", async () => {
   let state: DeviceState = "update_required";
-  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Payroll wiki", state)] }) });
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Release wiki", state)] }) });
 
   const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
   await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
@@ -888,14 +888,14 @@ test("an offline device is started before it is updated", async () => {
 
 test("Runs on names the device once its report names the source", async () => {
   renderPage([
-    onDevice("src-wiki", "Payroll wiki", "online"),
-    { ...onDevice("src-b", "Payroll notes", "online"), connection_status: { state: "action_required", reason: "authentication" } },
+    onDevice("src-wiki", "Release wiki", "online"),
+    { ...onDevice("src-b", "Build notes", "online"), connection_status: { state: "action_required", reason: "authentication" } },
   ]);
 
   const table = await screen.findByRole("table", { name: "Sources" });
-  const named = (await within(table).findByText("Payroll wiki")).closest("tr")!;
+  const named = (await within(table).findByText("Release wiki")).closest("tr")!;
   expect(within(named).getByText("Alex's MacBook")).toBeInTheDocument();
-  const unnamed = within(table).getByText("Payroll notes").closest("tr")!;
+  const unnamed = within(table).getByText("Build notes").closest("tr")!;
   expect(within(unnamed).getByText("Local sync")).toBeInTheDocument();
   expect(within(unnamed).getByText("Sign-in required")).toBeInTheDocument();
 });
