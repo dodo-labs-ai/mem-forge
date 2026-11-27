@@ -270,6 +270,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
     heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, device=DEVICE, lease_seconds=120)
     complete = client.complete_local_agent_job(
         "laj-1",
+        device_id="dev-laptop",
         attempt_count=2,
         status="succeeded",
         result={"count": 1},
@@ -298,7 +299,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/laj-1/complete",
-            {"status": "succeeded", "attempt_count": 2, "result": {"count": 1}},
+            {"status": "succeeded", "attempt_count": 2, "device_id": "dev-laptop", "result": {"count": 1}},
         ),
     ]
 

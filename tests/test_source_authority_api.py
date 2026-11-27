@@ -19,7 +19,7 @@ from memforge.models import (
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.storage.database import Database
-from tests.device_report_fixture import DAEMON_DEVICE, device_report
+from tests.device_report_fixture import DAEMON_DEVICE, DEVICE_ID, connect_device, device_report
 from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_sync_bookkeeping import (
@@ -152,6 +152,7 @@ def _device_jira_payload() -> dict:
         "name": "Payroll Jira",
         "access_policy": "workspace",
         "executor": "device",
+        "execution_device_id": DEVICE_ID,
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
@@ -1029,6 +1030,7 @@ def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicali
     try:
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(_app(tmp_path, database)) as client:
+            connect_device(database, headers["x-test-user"])
             source_id = client.post(
                 "/api/v1/sources", headers=headers, json=_device_jira_payload()
             ).json()["id"]
@@ -1223,6 +1225,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
             completion_body = {
                 "attempt_count": leased["attempt_count"],
+                "device_id": "dev-laptop",
                 "status": "succeeded",
                 "result": {"ok": True},
             }
@@ -1291,6 +1294,7 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
     try:
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        connect_device(database, "owner-a")
         with TestClient(app) as client:
             teams_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload()).json()["id"]
             jira_id = client.post(
@@ -1436,7 +1440,9 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
             "source_type": "local_markdown",
             "operation": "local_markdown_pick_root",
             "payload": {"title": "Choose folder"},
+            "device_id": DEVICE_ID,
         }
+        connect_device(database, "member-a")
         with TestClient(app) as client:
             accepted = client.post(
                 "/api/cloud/local-agent/jobs",

@@ -36,6 +36,7 @@ from memforge.pipeline.package_migration import (
 from tests.contracts.document_fakes import ProviderListing
 from tests.contracts.document_fakes import github_repo as github_repo_fakes
 from tests.contracts.document_fakes import jira as jira_fakes
+from tests.device_report_fixture import DEVICE_ID, connect_device
 from tests.test_device_acquisition import DAEMON_SERVER
 from tests.test_device_executor_move import OWNER, TEST_SOURCE_KEY, Deployment, DeviceType, _Runtime, _sync_now_on_the_device
 
@@ -405,6 +406,7 @@ def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_
     memory_id = _support_on(jira, old_pay_1)
     cursor = asyncio.run(jira.db.get_sync_state(source_id)).last_sync_at
     jira.extractor.fragment_calls.clear()
+    connect_device(jira.db, OWNER)
 
     result = _apply(jira, source_id)
 
@@ -414,6 +416,8 @@ def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_
     assert [source.doc_id for source in asyncio.run(jira.db.get_memory_sources(memory_id))] == ["jira-PAY-1"]
     moved = asyncio.run(jira.db.get_source(source_id))
     assert moved["executor"] == "device"
+    # The owner's only device runs it from now on.
+    assert moved["execution_device_id"] == DEVICE_ID
     assert "sync_mode" not in moved["config"] and "local_agent_documents_dir" not in moved["config"]
     # The replay kept the cursor and the Source is no longer on a package path.
     assert asyncio.run(jira.db.get_sync_state(source_id)).last_sync_at == cursor
@@ -464,6 +468,7 @@ def test_a_moved_github_local_push_source_extracts_only_the_file_that_changed(gi
     source_id = _on_the_package_path(github, monkeypatch)
     held = github.documents(source_id)
     github.extractor.fragment_calls.clear()
+    connect_device(github.db, OWNER)
 
     result = _apply(github, source_id)
 

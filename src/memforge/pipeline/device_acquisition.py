@@ -215,11 +215,12 @@ async def enqueue_document_acquisition_job(
     ``next_attempt_at`` the earliest time a daemon may lease it. The job
     coalesces with one already queued or leased, as every local-agent job
     does. Returns its id and whether a new job was created, or ``None`` for a
-    Source without an execution owner, whose runs no device takes.
+    Source without an execution owner or execution device, whose runs no
+    device takes.
     """
 
     owner = execution_owner_user_id(source)
-    if owner is None:
+    if owner is None or not source.get("execution_device_id"):
         return None
     payload = await document_acquisition_job_payload(
         db, doc_store, source, request_payload, acquisition_attempt=acquisition_attempt

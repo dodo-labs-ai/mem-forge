@@ -43,7 +43,7 @@ def _lease(client: TestClient, principal: str, **device) -> None:
     assert response.json() == {
         "jobs": [],
         "server": SERVER,
-        "released_source_ids": [],
+        "sources": [],
     }
 
 

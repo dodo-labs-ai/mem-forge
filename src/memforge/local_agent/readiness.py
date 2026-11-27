@@ -39,80 +39,98 @@ DeviceState = Literal["online", "offline", "update_required"]
 DeviceCredential = Literal["secret", "browser_session"]
 """How a device Source's credential reaches its device: a secret ``memforge source credentials set`` stores, or a
 browser session a ``credential_check`` job captures."""
-_STATE_RANK: dict[str, int] = {"online": 0, "update_required": 1, "offline": 2}
+
+
+class SourceNotReadyReason(TypedDict):
+    """Why the execution device cannot run the Source yet: a missing credential, or a missing device location."""
+
+    kind: Literal["credential", "location"]
+    field: NotRequired[str]
+    path: NotRequired[str]
 
 
 class SourceExecutionDevice(TypedDict):
-    """The device a device Source runs on, as the source API exposes it (design §10.7).
+    """The execution device of a device Source, as the source API exposes it (design §10.7).
 
-    ``name`` is shown only to the Source's execution owner, and is ``None``
-    for any other viewer or when the owner has no device. ``installed_version``
-    is the MemForge version of the device's latest report, and
-    ``required_version`` the server's, which ``memforge upgrade`` installs.
-    ``credential`` says how the Source's credential reaches the device.
+    ``name`` and ``not_ready`` are shown only to the Source's execution
+    owner, and are ``None`` and empty for any other viewer.
+    ``installed_version`` is the MemForge version of the device's latest
+    report, and ``required_version`` the server's, which ``memforge upgrade``
+    installs. ``credential`` says how the Source's credential reaches the
+    device, and ``not_ready`` what the device's latest report says it lacks.
     """
 
+    id: str
     name: str | None
     state: DeviceState
     installed_version: str | None
     required_version: str
     credential: DeviceCredential
+    not_ready: list[SourceNotReadyReason]
 
 
 def device_source_readiness(
     *,
     source_id: str,
     source_type: str,
+    execution_device_id: str | None,
     devices: Sequence[LocalAgentDevice],
     server_contracts: Mapping[str, int],
     server_version: str,
     now: datetime,
     reveal_device: bool,
     credential: DeviceCredential,
-) -> tuple[SourceExecutionDevice, SourceConnectionStatus]:
-    """Device and connection readiness of a device Source from its execution owner's device reports.
+) -> tuple[SourceExecutionDevice | None, SourceConnectionStatus | None]:
+    """Device and connection readiness of a device Source from its execution device's latest report.
 
-    The Source runs on a device whose report names it, because only such a
-    device holds its credential. Until one does, the Source needs its
-    credential stored (``action_required``, ``authentication``) and its
-    device is the owner's device that would store it. Among the candidates,
-    a device that can take the Source's job now comes first, then one that
-    needs an update, then the most recently seen; a device acquires the type
-    only under the server's contract for it.
+    A Source without an execution device, or whose device its owner no
+    longer has, has no device and needs its owner to choose one
+    (``configuration``). Otherwise the device is offline without a recent
+    report, ``update_required`` while its acquisition contract for the type
+    differs from the server's, and online else. Its report says whether it is
+    ready for the Source: a missing credential needs a sign-in
+    (``authentication``), a missing device location a finished setup
+    (``configuration``). Until its report names the Source at all, the
+    connection is not observed yet and is ``None``.
     """
 
-    naming = [device for device in devices if source_id in device.report.source_ids]
-    candidates = naming or list(devices)
-
-    def state(device: LocalAgentDevice) -> DeviceState:
-        if (now - device.last_seen_at).total_seconds() > LOCAL_AGENT_DEVICE_STALE_SECONDS:
-            return "offline"
-        if not device.report.acquires(source_type, server_contracts):
-            return "update_required"
-        return "online"
-
-    connection: SourceConnectionStatus = (
-        {"state": "ready", "reason": None} if naming else {"state": "action_required", "reason": "authentication"}
-    )
-    if not candidates:
-        return (
-            {
-                "name": None,
-                "state": "offline",
-                "installed_version": None,
-                "required_version": server_version,
-                "credential": credential,
-            },
-            connection,
-        )
-    device = min(candidates, key=lambda candidate: (_STATE_RANK[state(candidate)], -candidate.last_seen_at.timestamp()))
+    device = next((device for device in devices if device.report.device_id == execution_device_id), None)
+    if device is None:
+        return None, {"state": "action_required", "reason": "configuration"}
+    if (now - device.last_seen_at).total_seconds() > LOCAL_AGENT_DEVICE_STALE_SECONDS:
+        state: DeviceState = "offline"
+    elif not device.report.acquires(source_type, server_contracts):
+        state = "update_required"
+    else:
+        state = "online"
+    readiness = device.report.sources.get(source_id)
+    connection: SourceConnectionStatus | None
+    if readiness is None:
+        connection = None
+    elif readiness.ready:
+        connection = {"state": "ready", "reason": None}
+    elif any(reason.kind == "credential" for reason in readiness.reasons):
+        connection = {"state": "action_required", "reason": "authentication"}
+    else:
+        connection = {"state": "action_required", "reason": "configuration"}
+    not_ready: list[SourceNotReadyReason] = []
+    if reveal_device and readiness is not None:
+        for reason in readiness.reasons:
+            entry: SourceNotReadyReason = {"kind": reason.kind}
+            if reason.field is not None:
+                entry["field"] = reason.field
+            if reason.path is not None:
+                entry["path"] = reason.path
+            not_ready.append(entry)
     return (
         {
+            "id": device.report.device_id,
             "name": device.report.name if reveal_device else None,
-            "state": state(device),
+            "state": state,
             "installed_version": device.report.version,
             "required_version": server_version,
             "credential": credential,
+            "not_ready": not_ready,
         },
         connection,
     )

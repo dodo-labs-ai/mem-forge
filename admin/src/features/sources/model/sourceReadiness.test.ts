@@ -76,7 +76,7 @@ function deviceSource(state: "online" | "offline" | "update_required", connectio
       kind: "local_agent",
       operation: "document_acquisition",
       immutable_config_fields: [],
-      device: { name: "Alex's MacBook", state, installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
+      device: { id: "dev-macbook", name: "Alex's MacBook", state, not_ready: [], installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
     },
     connection_status: connection,
   });

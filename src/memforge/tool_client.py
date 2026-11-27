@@ -759,12 +759,19 @@ class ToolClient:
         self,
         job_id: str,
         *,
+        device_id: str,
         attempt_count: int,
         status: str,
         result: dict[str, Any],
         error: str | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"status": status, "attempt_count": attempt_count, "result": result}
+        """End the attempt this device, ``device_id``, holds."""
+        body: dict[str, Any] = {
+            "status": status,
+            "attempt_count": attempt_count,
+            "device_id": device_id,
+            "result": result,
+        }
         if error is not None:
             body["error"] = error
         return self._host_json(

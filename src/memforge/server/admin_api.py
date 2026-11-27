@@ -331,8 +331,13 @@ from memforge.local_agent.credential_check import (
     credential_check_job_payload,
     signs_in_with_browser_session,
 )
-from memforge.local_agent.device_lease import RELEASED_SOURCE_IDS_FIELD
-from memforge.local_agent.device_report import DeviceReport, LocalAgentDevice, declared_acquisition_contracts
+from memforge.local_agent.device_lease import EXECUTED_SOURCES_FIELD
+from memforge.local_agent.device_report import (
+    DEVICE_ID_MAX_CHARS,
+    DeviceReport,
+    LocalAgentDevice,
+    declared_acquisition_contracts,
+)
 from memforge.local_agent.source_contract import (
     ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
@@ -774,6 +779,17 @@ def _device_report(payload: Mapping[str, Any] | None) -> DeviceReport:
         return DeviceReport.from_payload(payload)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _device_source_entry(source: Mapping[str, Any]) -> dict[str, Any]:
+    """A device Source as a daemon reads it: its type, its configuration without secrets, and its execution device."""
+
+    return {
+        "id": source["id"],
+        "type": source["type"],
+        "config": acquisition_job_config(str(source["type"]), source.get("config") or {}),
+        "execution_device_id": source.get("execution_device_id"),
+    }
 
 
 def _lease_time(value: object) -> datetime | None:
@@ -2195,11 +2211,25 @@ class SourceCapabilitiesResponse(BaseModel):
     can_change_access: bool
 
 
-class SourceExecutionDeviceResponse(BaseModel):
-    """The device a device Source runs on, from its execution owner's device reports."""
+class SourceNotReadyReasonResponse(BaseModel):
+    """What the execution device lacks to run the Source, from its latest report."""
 
+    kind: Literal["credential", "location"] = Field(
+        description=(
+            "credential: no stored value for a secret field, or no browser session; location: the folder of a "
+            "device location field is missing or unreadable on the device."
+        ),
+    )
+    field: str | None = Field(default=None, description="For location: the configuration field naming the folder.")
+    path: str | None = Field(default=None, description="For location: the path the device did not find.")
+
+
+class SourceExecutionDeviceResponse(BaseModel):
+    """The execution device of a device Source, from its latest device report."""
+
+    id: str = Field(description="The device's id, which Where it runs chooses.")
     name: str | None = Field(
-        description="The device's name; null for a viewer other than the execution owner, or when the owner has no device.",
+        description="The device's name; null for a viewer other than the execution owner.",
     )
     state: DeviceState = Field(
         description=(
@@ -2207,13 +2237,19 @@ class SourceExecutionDeviceResponse(BaseModel):
             "but its acquisition contract for the type differs from the server's."
         ),
     )
-    installed_version: str | None = Field(description="The MemForge version the device runs; null without a device.")
+    installed_version: str = Field(description="The MemForge version the device runs.")
     required_version: str = Field(description="The server's MemForge version, which `memforge upgrade` installs.")
     credential: Literal["secret", "browser_session"] = Field(
         description=(
             "How the Source's credential reaches its device: secret, stored on the device with "
             "`memforge source credentials set <source-id>`; browser_session, captured from the device's browser by "
             "a credential_check job."
+        ),
+    )
+    not_ready: list[SourceNotReadyReasonResponse] = Field(
+        description=(
+            "What the device's latest report says it lacks to run the Source; empty when it is ready, not yet "
+            "reported, or the viewer is not the execution owner."
         ),
     )
 
@@ -2225,7 +2261,10 @@ class SourceExecutionResponse(BaseModel):
     immutable_config_fields: list[str] = Field(default=[], deprecated=True)
     device: SourceExecutionDeviceResponse | None = Field(
         default=None,
-        description="Present for a Source whose acquisition runs on its execution owner's device.",
+        description=(
+            "The execution device of a Source whose acquisition runs on a device; null while it has none, which "
+            "shows Finish setup until its owner chooses one."
+        ),
     )
 
 
@@ -2335,9 +2374,10 @@ class SourceResponse(BaseModel):
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
         description=(
-            "Readiness of the connection: a browser session's on the server, or, for a device Source, whether a "
-            "device report names it, which it does once its device holds the credential. Present only for "
-            "Sources with such a dependency."
+            "Readiness of the connection: a browser session's on the server, or, for a device Source, its "
+            "execution device's latest report: authentication while a credential is missing, configuration while "
+            "a device location is missing or no execution device is chosen. Absent until the device reports on the "
+            "Source, and for Sources without such a dependency."
         ),
     )
     ownership: SourceOwnershipResponse
@@ -2415,7 +2455,14 @@ class SourceExecutorChangeRequest(BaseModel):
     """Where a document Source's acquisition runs from now on (ADR 0058)."""
 
     executor: Literal["server", "device"] = Field(
-        description="server: the server reaches the provider; device: the changer's own device does.",
+        description="server: the server reaches the provider; device: one of the changer's own devices does.",
+    )
+    execution_device_id: str | None = Field(
+        default=None,
+        description=(
+            "The changer's device that runs the Source from now on, from their device reports. Required for "
+            "device, refused for server. Choosing another device moves the Source to it."
+        ),
     )
     secrets: dict[str, str] = Field(
         default_factory=dict,
@@ -2433,6 +2480,9 @@ class SourceExecutorChangeResponse(BaseModel):
     executor: Literal["server", "device"]
     execution_owner_user_id: str | None = Field(
         description="Whose device runs the Source; the person who moved it to the device.",
+    )
+    execution_device_id: str | None = Field(
+        description="The execution owner's device that runs the Source; null for a server Source.",
     )
     cancelled_job_ids: list[str] = Field(
         description="The Source's queued sync jobs, which were planned for the previous executor.",
@@ -2573,8 +2623,15 @@ class CreateSourceRequest(BaseModel):
     executor: Literal["server", "device"] = Field(
         default="server",
         description=(
-            "server: the server reaches the provider with the secrets in config; device: the creator's own device "
-            "does, with the credential stored there, so config holds no secret."
+            "server: the server reaches the provider with the secrets in config; device: one of the creator's own "
+            "devices does, with the credential stored there, so config holds no secret."
+        ),
+    )
+    execution_device_id: str | None = Field(
+        default=None,
+        description=(
+            "The creator's device that runs a device Source, from their device reports. Required for device, "
+            "refused for server."
         ),
     )
     project_binding: dict | None = None
@@ -2697,6 +2754,16 @@ class LocalAgentJobCreateRequest(BaseModel):
     operation: str
     payload: dict[str, Any] = Field(default_factory=dict)
     retry_job_id: str | None = Field(default=None, min_length=1, max_length=255)
+    device_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=DEVICE_ID_MAX_CHARS,
+        description=(
+            "The requester's device that runs a device-bound setup job: the folder picker of a type with device "
+            "locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's "
+            "setup jobs run on its execution device, which a request may name but not change."
+        ),
+    )
 
 
 class LocalAgentJobLeaseRequest(BaseModel):
@@ -2716,6 +2783,11 @@ class LocalAgentJobHeartbeatRequest(BaseModel):
 class LocalAgentJobCompleteRequest(BaseModel):
     status: Literal["succeeded", "failed"]
     attempt_count: int = Field(ge=1)
+    device_id: str = Field(
+        min_length=1,
+        max_length=DEVICE_ID_MAX_CHARS,
+        description="The device that holds the attempt; only the device that leased it completes it.",
+    )
     result: dict[str, Any] = Field(default_factory=dict)
     error: str | None = Field(default=None, max_length=2000)
 
@@ -2779,6 +2851,16 @@ class LocalAgentDeviceSource(BaseModel):
     name: str
     type: str
     config: dict[str, Any]
+    execution_device_id: str | None = Field(
+        description="The caller's device that executes the Source; null while the caller has chosen none.",
+    )
+
+
+class LocalAgentDeviceRemovedResponse(BaseModel):
+    """The removed device and the Sources that no longer have an execution device."""
+
+    device_id: str
+    source_ids: list[str]
 
 
 class LocalAgentServerContracts(BaseModel):
@@ -2974,6 +3056,46 @@ def _require_package_migration_done(source: Mapping[str, Any]) -> None:
 
 def _executor_change_refused(message: str) -> HTTPException:
     return HTTPException(status_code=400, detail={"code": "executor_change_invalid", "message": message})
+
+
+EXECUTION_DEVICE_INVALID = "execution_device_invalid"
+EXECUTION_DEVICE_REQUIRED_DETAIL = {
+    "code": "execution_device_required",
+    "message": "Choose the device that runs this source in Where it runs first.",
+}
+
+
+async def _chosen_execution_device(
+    db: Database, *, executor: str, chooser: str, device_id: str | None
+) -> str | None:
+    """The device a device Source is to run on: one of the chooser's own devices, by its id.
+
+    A server Source names none. Answers 400 ``execution_device_invalid``
+    when a device Source names none, a server Source names one, or the
+    chooser has no device with that id.
+    """
+
+    if executor != SOURCE_EXECUTOR_DEVICE:
+        if device_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": EXECUTION_DEVICE_INVALID, "message": "A server source runs on no device."},
+            )
+        return None
+    if not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": EXECUTION_DEVICE_INVALID, "message": "Choose the device that runs the source."},
+        )
+    if not any(device.report.device_id == device_id for device in await db.list_local_agent_devices(chooser)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": EXECUTION_DEVICE_INVALID,
+                "message": "Choose one of your own devices; a device appears once `memforge setup` connects it.",
+            },
+        )
+    return device_id
 
 
 async def _stop_source_sync(
@@ -7308,6 +7430,7 @@ def create_admin_app(
                 device, connection = device_source_readiness(
                     source_id=str(s["id"]),
                     source_type=str(s["type"]),
+                    execution_device_id=s.get("execution_device_id"),
                     devices=owner_devices[owner],
                     server_contracts=server_contracts,
                     server_version=installed_version(),
@@ -8644,6 +8767,9 @@ def create_admin_app(
                 )
             if is_local_agent_backed_source({"type": req.type, "config": req.config}):
                 raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
+        execution_device_id = await _chosen_execution_device(
+            db, executor=req.executor, chooser=resolve_request_principal(request), device_id=req.execution_device_id
+        )
 
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
@@ -8674,6 +8800,7 @@ def create_admin_app(
                 creator_user_id if on_device or is_local_agent_backed_source(source_for_classification) else None
             ),
             executor=req.executor,
+            execution_device_id=execution_device_id,
         )
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -8741,8 +8868,13 @@ def create_admin_app(
         ordinary incremental run. The executor must be one the type declares.
 
         - To ``device``: the server's copies of the Source's secrets are
-          deleted, and the person who changes it becomes its execution owner,
-          whose device then holds the credentials.
+          deleted, the person who changes it becomes its execution owner, and
+          ``execution_device_id``, one of their own devices, its execution
+          device, which then holds the credentials.
+        - To another device: the same, so whoever chooses the device becomes
+          the execution owner. The previous device keeps its credentials
+          until its next lease answer no longer names the Source; the new
+          device needs its own.
         - To ``server``: ``secrets`` must hold what the type's form requires.
 
         Like a scope change, it cancels the Source's pending run and queued
@@ -8771,18 +8903,27 @@ def create_admin_app(
             raise _executor_change_refused("Secrets are sent only when a source moves to the server.")
         if unknown := sorted(set(req.secrets) - set(secret_fields)):
             raise _executor_change_refused(f"Not a secret of a {source_type} source: {', '.join(unknown)}.")
-        if req.executor == source_executor(existing):
+        chooser = resolve_request_principal(request)
+        device_id = await _chosen_execution_device(
+            db, executor=req.executor, chooser=chooser, device_id=req.execution_device_id
+        )
+        unchanged = req.executor == source_executor(existing) and (
+            req.executor == SOURCE_EXECUTOR_SERVER
+            or (existing.get("execution_device_id") == device_id and execution_owner_user_id(existing) == chooser)
+        )
+        if unchanged:
             return {
                 "id": source_id,
                 "executor": req.executor,
                 "execution_owner_user_id": execution_owner_user_id(existing),
+                "execution_device_id": existing.get("execution_device_id"),
                 "cancelled_job_ids": [],
             }
 
         owner_id: str | None = None
         if req.executor == SOURCE_EXECUTOR_DEVICE:
             config = acquisition_job_config(source_type, existing["config"])
-            owner_id = resolve_request_principal(request)
+            owner_id = chooser
         else:
             config = {**existing["config"], **req.secrets}
             try:
@@ -8804,6 +8945,7 @@ def create_admin_app(
                 executor=req.executor,
                 config_json=json.dumps(config),
                 execution_owner_user_id=owner_id,
+                execution_device_id=device_id,
             )
         except SourceSyncRunActive as exc:
             raise _source_sync_running_http_error(source_id, exc.run_id) from exc
@@ -8816,6 +8958,7 @@ def create_admin_app(
             "id": source_id,
             "executor": req.executor,
             "execution_owner_user_id": execution_owner_user_id(changed or existing),
+            "execution_device_id": (changed or existing).get("execution_device_id"),
             "cancelled_job_ids": cancelled,
         }
 
@@ -9015,6 +9158,8 @@ def create_admin_app(
                 status_code=409,
                 detail="local_agent_sync_execution_owner_required",
             )
+        if operation == DOCUMENT_ACQUISITION_OPERATION and not source.get("execution_device_id"):
+            raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
         request_payload = {
             "force_full_sync": force_full_sync,
             "retry_failed_items": True,
@@ -10997,7 +11142,10 @@ def create_admin_app(
         payload = dict(req.payload)
         if req.retry_job_id is not None and req.operation not in LOCAL_AGENT_SYNC_OPERATIONS:
             raise HTTPException(status_code=400, detail="retry_target_requires_sync_operation")
+        device_id: str | None = None
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
+            if req.device_id is not None:
+                raise HTTPException(status_code=400, detail="local_agent_sync_names_no_device")
             if not source_id:
                 raise HTTPException(status_code=400, detail="local_agent_sync_requires_source_id")
             source = await db.get_source(source_id)
@@ -11017,6 +11165,10 @@ def create_admin_app(
             source = await _credential_check_source(request, db, source_id, req.source_type)
             owner = requester
             payload = credential_check_job_payload(source)
+            if source_runs_on_device(source):
+                device_id = await _setup_job_device(db, requester, source, req.device_id)
+            elif req.device_id is not None:
+                device_id = await _setup_job_device(db, requester, None, req.device_id)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:
@@ -11026,6 +11178,18 @@ def create_admin_app(
             if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
                 raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
             owner = requester
+            descriptor = source_type_descriptor(expected_type)
+            if descriptor is not None and descriptor.device_location_fields:
+                saved = await db.get_source(source_id) if source_id else None
+                if source_id and saved is None:
+                    raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+                if saved is not None:
+                    _require_source_discoverability(request, saved)
+                device_id = await _setup_job_device(
+                    db, requester, saved if saved is not None and source_runs_on_device(saved) else None, req.device_id
+                )
+            elif req.device_id is not None:
+                device_id = await _setup_job_device(db, requester, None, req.device_id)
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
@@ -11061,18 +11225,51 @@ def create_admin_app(
             payload=payload,
             created_by_user_id=requester,
             execution_owner_user_id=owner,
+            device_id=device_id,
         )
         return {"job_id": job_id, "status": "queued", "coalesced": False}
+
+    async def _setup_job_device(
+        db: Database, requester: str, device_source: Mapping[str, Any] | None, requested: str | None
+    ) -> str:
+        """The device a device-bound setup job runs on.
+
+        For a saved device Source it is the Source's execution device, which
+        the request may name but not change; 409
+        ``execution_device_required`` while the Source has none. Otherwise it
+        is the requester's device the request names, such as the device chosen
+        in Where it runs for a Source not yet saved.
+        """
+
+        if device_source is not None:
+            device_id = device_source.get("execution_device_id")
+            if not device_id:
+                raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
+            if requested is not None and requested != device_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": EXECUTION_DEVICE_INVALID,
+                        "message": "This source's setup runs on its execution device; move it there first.",
+                    },
+                )
+            return str(device_id)
+        chosen = await _chosen_execution_device(
+            db, executor=SOURCE_EXECUTOR_DEVICE, chooser=requester, device_id=requested
+        )
+        assert chosen is not None
+        return chosen
 
     async def _credential_check_source(
         request: Request, db: Database, source_id: str, source_type: str
     ) -> dict[str, Any]:
-        """The Source a ``credential_check`` job checks; the requester's own device runs the job.
+        """The Source a ``credential_check`` job checks.
 
-        A device Source's credential lives on its execution owner's device, so
-        only that owner checks it. A server Source's credential is checked on
-        the server, so a job for one only captures a browser session, which
-        any member who manages the Source may do from their own computer.
+        A device Source's credential lives on its execution device, so only
+        its execution owner checks it, and the job runs on that device. A
+        server Source's credential is checked on the server, so a job for one
+        only captures a browser session, which any member who manages the
+        Source may do from their own computer.
         """
 
         requester = resolve_request_principal(request)
@@ -11103,20 +11300,22 @@ def create_admin_app(
         """Lease the device its due jobs.
 
         The answer also names the server's version and acquisition contracts,
-        and, among the Sources the device report names, those that are no
-        longer device Sources of the caller (deleted, moved to the server or
-        handed to another execution owner), whose credentials the device
-        deletes.
+        and the Sources this device executes, each with its type and its
+        configuration without secrets. The device reports its readiness for
+        each of them, and deletes the credentials it holds for any other
+        Source: one deleted, moved to the server or moved to another device.
         """
 
         requester = resolve_request_principal(request)
         device = _device_report(req.device)
         contracts = declared_acquisition_contracts()
-        device_source_ids = {str(source["id"]) for source in await db.list_device_sources(requester)}
         answer: dict[str, Any] = {
             "jobs": [],
             "server": {"version": installed_version(), "acquisition_contracts": contracts},
-            RELEASED_SOURCE_IDS_FIELD: sorted(device.source_ids - device_source_ids),
+            EXECUTED_SOURCES_FIELD: [
+                _device_source_entry(source)
+                for source in await db.list_device_sources(requester, device_id=device.device_id)
+            ],
         }
         deadline = time.monotonic() + req.wait_seconds
         while True:
@@ -11167,6 +11366,7 @@ def create_admin_app(
         wrote = await db.complete_local_agent_job(
             job_id=job_id,
             user_id=resolve_request_principal(request),
+            device_id=req.device_id,
             attempt_count=req.attempt_count,
             status=req.status,
             result=req.result,
@@ -11222,9 +11422,10 @@ def create_admin_app(
     ):
         """Each of the caller's devices by its latest report, online while that report is recent.
 
-        It also names the caller's device Sources and the server's version
-        and acquisition contracts, from which a device tells, per Source,
-        whether it is ready, waits for a credential or waits for an update.
+        It also names the caller's device Sources with the device that
+        executes each, and the server's version and acquisition contracts,
+        from which a device tells, per Source it executes, whether it is
+        ready, waits for a credential or a folder, or waits for an update.
         """
 
         requester = resolve_request_principal(request)
@@ -11249,18 +11450,33 @@ def create_admin_app(
             "last_seen_at": devices[0]["last_seen_at"] if devices else None,
             "devices": devices,
             "sources": [
-                {
-                    "id": source["id"],
-                    "name": source["name"],
-                    "type": source["type"],
-                    "config": acquisition_job_config(str(source["type"]), source.get("config") or {}),
-                }
+                {**_device_source_entry(source), "name": source["name"]}
                 for source in await db.list_device_sources(requester)
             ],
             "server": {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()},
             "checked_at": now.isoformat(),
             "stale_after_seconds": LOCAL_AGENT_DEVICE_STALE_SECONDS,
         }
+
+    @local_agent_router.delete("/devices/{device_id}", response_model=LocalAgentDeviceRemovedResponse)
+    async def remove_local_agent_device(
+        device_id: str,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Forget one of the caller's devices.
+
+        Each Source it executed loses its execution device and shows Finish
+        setup until its owner chooses another device in Where it runs. Its
+        queued jobs are cancelled. A daemon that still runs on the device
+        appears again with its next report, without its Sources.
+        """
+
+        try:
+            source_ids = await db.remove_local_agent_device(resolve_request_principal(request), device_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="local_agent_device_not_found") from exc
+        return {"device_id": device_id, "source_ids": source_ids}
 
     app.include_router(auth_router)
     app.include_router(health_router)

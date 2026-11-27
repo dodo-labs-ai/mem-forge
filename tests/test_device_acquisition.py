@@ -68,7 +68,7 @@ from memforge.source_types import source_type_descriptor
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.database import Database
 from memforge.storage.document_store import LocalDocumentStore
-from tests.device_report_fixture import leasing_device
+from tests.device_report_fixture import DEVICE_ID, leasing_device
 from tests.gene_fixture import FakeGene
 from tests.source_type_fixture import register_test_source_type
 from tests.test_local_adapter_api import _config
@@ -978,7 +978,7 @@ def test_the_job_carries_the_configuration_without_secrets_since_and_the_due_exc
 
 
 def _own(database: Database) -> None:
-    """Make the local user the Source's execution owner, whose device runs its jobs."""
+    """Make the local user the Source's execution owner, whose laptop is its execution device."""
 
     asyncio.run(
         database.upsert_source(
@@ -989,6 +989,8 @@ def _own(database: Database) -> None:
             access_policy="workspace",
             owner_user_id=LOCAL_DEV_USER_ID,
             execution_owner_user_id=LOCAL_DEV_USER_ID,
+            executor="device",
+            execution_device_id=DEVICE_ID,
         )
     )
 
@@ -1419,6 +1421,7 @@ def _run_queued_job(device: _Side, client, lease: _Lease, config: AppConfig, *, 
             device.db.complete_local_agent_job(
                 job_id=leased["job_id"],
                 user_id=LOCAL_DEV_USER_ID,
+                device_id="dev-laptop",
                 attempt_count=leased["attempt_count"],
                 status="succeeded",
                 result={},

@@ -29,7 +29,7 @@ from memforge.derivation_work import DerivationWork
 from memforge.local_agent.snapshot_manifest import (
     validate_snapshot_manifest_values,
 )
-from memforge.local_agent.device_report import DeviceReport, LocalAgentDevice
+from memforge.local_agent.device_report import DeviceReport, DeviceSourceReadiness, LocalAgentDevice
 from memforge.local_agent.source_contract import (
     DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_SYNC_OPERATIONS,
@@ -1326,6 +1326,8 @@ CREATE TABLE IF NOT EXISTS sources (
                     CHECK (access_state IN ('active', 'changing', 'orphaned_private')),
     execution_owner_user_id TEXT,
     executor        TEXT NOT NULL DEFAULT 'server' CHECK (executor IN ('server', 'device')),
+    -- The device of the execution owner that runs a device Source's jobs; NULL while it has none.
+    execution_device_id TEXT,
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
@@ -2002,7 +2004,9 @@ CREATE TABLE IF NOT EXISTS conversation_collection_bodies (
 -- A job's uncounted_attempt_count counts the attempts that ended without
 -- counting toward its retry budget: those whose submission came under an
 -- acquisition contract the server no longer has. acquisition_contract is the
--- contract a document_acquisition attempt was leased under.
+-- contract a document_acquisition attempt was leased under. device_id names
+-- the device a device-bound setup job runs on; lease_device_id is the device
+-- that holds the current attempt.
 CREATE TABLE IF NOT EXISTS local_agent_jobs (
     job_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -2019,6 +2023,8 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     uncounted_attempt_count INTEGER NOT NULL DEFAULT 0,
     acquisition_contract INTEGER,
+    device_id TEXT,
+    lease_device_id TEXT,
     result_json TEXT,
     last_error TEXT,
     next_attempt_at TEXT,
@@ -2030,15 +2036,15 @@ CREATE INDEX IF NOT EXISTS idx_local_agent_jobs_owner_status
     ON local_agent_jobs(execution_owner_user_id, status, leased_until);
 -- Each daemon installation of a user is one device; the row keeps its latest
 -- device report (ADR 0058): its name and MemForge version, the acquisition
--- contract of each document type, the device Sources whose credentials it
--- holds, and when the report arrived.
+-- contract of each document type, the readiness of each Source it executes,
+-- and when the report arrived.
 CREATE TABLE IF NOT EXISTS local_agent_devices (
     user_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     name TEXT NOT NULL,
     version TEXT NOT NULL,
     acquisition_contracts_json TEXT NOT NULL,
-    source_ids_json TEXT NOT NULL,
+    sources_json TEXT NOT NULL DEFAULT '{}',
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY (user_id, device_id)
 );
@@ -5162,6 +5168,22 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "DROP TABLE IF EXISTS source_sync_snapshot_excluded_listings",
         ],
     ),
+    (
+        138,
+        "Run each device Source on one execution device and keep each device's readiness per Source",
+        # A device Source runs on one device of its execution owner, which
+        # leases its jobs; a device-bound setup job names its device, and an
+        # attempt is bound to the device that leased it. A device report
+        # names, per Source the device executes, whether it is ready to run
+        # it. Every existing device Source gets the owner's device whose
+        # latest report named its credentials, else the owner's only device.
+        [
+            "ALTER TABLE sources ADD COLUMN execution_device_id TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN device_id TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN lease_device_id TEXT",
+            "ALTER TABLE local_agent_devices ADD COLUMN sources_json TEXT NOT NULL DEFAULT '{}'",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -5776,6 +5798,9 @@ class Database:
             logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
         if version == 123:
             await self._drop_columns_if_present_unlocked("source_sync_snapshot_manifests", "scope_attestations_json")
+        if version == 138:
+            await self._choose_execution_devices_unlocked()
+            await self._drop_columns_if_present_unlocked("local_agent_devices", "source_ids_json")
         if version == 107:
             await self._drop_columns_if_present_unlocked("memories", "confidence")
             await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
@@ -6173,6 +6198,38 @@ class Database:
             backfilled_revision_count=backfilled,
             unresolved_revision_ids=tuple(unresolved),
         )
+
+    async def _choose_execution_devices_unlocked(self) -> None:
+        """Give every device Source without an execution device one of its execution owner's devices.
+
+        The device is the owner's most recently seen device whose latest
+        report named the Source's credentials, else the owner's only device.
+        A Source with neither keeps none and waits for its owner to choose.
+        """
+
+        async with self.db.execute("PRAGMA table_info(local_agent_devices)") as cursor:
+            device_columns = {str(row[1]) async for row in cursor}
+        async with self.db.execute(
+            """SELECT id, execution_owner_user_id FROM sources
+               WHERE executor = 'device' AND execution_device_id IS NULL AND execution_owner_user_id IS NOT NULL"""
+        ) as cursor:
+            sources = [(str(row[0]), str(row[1])) async for row in cursor]
+        named = "source_ids_json" if "source_ids_json" in device_columns else "'[]'"
+        for source_id, owner in sources:
+            async with self.db.execute(
+                f"""SELECT device_id, {named} AS named FROM local_agent_devices
+                    WHERE user_id = ? ORDER BY last_seen_at DESC, device_id""",
+                (owner,),
+            ) as cursor:
+                devices = [(str(row[0]), json.loads(row[1] or "[]")) async for row in cursor]
+            holding = [device_id for device_id, source_ids in devices if source_id in source_ids]
+            if holding:
+                chosen = holding[0]
+            elif len(devices) == 1:
+                chosen = devices[0][0]
+            else:
+                continue
+            await self.db.execute("UPDATE sources SET execution_device_id = ? WHERE id = ?", (chosen, source_id))
 
     async def _drop_columns_if_present_unlocked(self, table: str, *column_names: str) -> None:
         """Drop columns that a database created before their removal still has."""
@@ -6809,16 +6866,23 @@ class Database:
         created_by_user_id: str,
         execution_owner_user_id: str,
         workspace_id: str = "default",
+        device_id: str | None = None,
         now: datetime | None = None,
     ) -> bool:
+        """Queue a setup job; ``device_id`` names the one device of the owner that may lease it.
+
+        A job without a device goes to whichever of the owner's devices
+        leases first.
+        """
+
         now_iso = _utc_iso(now)
         async with self._write_lock:
             cursor = await self.db.execute(
                 """INSERT OR IGNORE INTO local_agent_jobs (
                     job_id, workspace_id, source_id, source_type, operation,
                     payload_json, created_by_user_id, execution_owner_user_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    device_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
                     workspace_id,
@@ -6828,6 +6892,7 @@ class Database:
                     json.dumps(dict(payload), sort_keys=True),
                     created_by_user_id,
                     execution_owner_user_id,
+                    device_id,
                     now_iso,
                     now_iso,
                 ),
@@ -7017,10 +7082,13 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Keep the device's report and lease it up to ``limit`` of its user's due jobs.
 
-        A ``document_acquisition`` job is leased only by a device whose report
-        names its Source and whose acquisition contract for its type equals
-        ``acquisition_contracts``, the server's; the attempt records that
-        contract. Any other job waits, queued, and counts no attempt.
+        A ``document_acquisition`` job is leased only by its Source's
+        execution device, while its report names the Source ready and its
+        acquisition contract for the type equals ``acquisition_contracts``,
+        the server's; the attempt records that contract. A job that names a
+        device is leased only by that device. Any other device leaves such a
+        job waiting, queued, without counting an attempt. Each leased attempt
+        records the device that holds it.
         """
 
         lease_time = now or datetime.now(timezone.utc)
@@ -7032,8 +7100,10 @@ class Database:
             if device.acquires(source_type, acquisition_contracts)
         }
         routing = (
+            device.device_id,
             DOCUMENT_ACQUISITION_OPERATION,
-            json.dumps(sorted(device.source_ids)),
+            device.device_id,
+            json.dumps(sorted(device.ready_source_ids())),
             json.dumps(sorted(acquiring_types)),
         )
         leased_ids: list[str] = []
@@ -7044,8 +7114,12 @@ class Database:
                    WHERE j.execution_owner_user_id = ?
                      AND ((j.status = 'queued' AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ?)) OR
                           (j.status = 'leased' AND j.leased_until <= ?))
+                     AND (j.device_id IS NULL OR j.device_id = ?)
                      AND (j.operation <> ?
-                          OR (j.source_id IN (SELECT value FROM json_each(?))
+                          OR (j.source_id IN (
+                                  SELECT id FROM sources
+                                  WHERE executor = 'device' AND execution_device_id = ?)
+                              AND j.source_id IN (SELECT value FROM json_each(?))
                               AND j.source_type IN (SELECT value FROM json_each(?))))
                      AND NOT EXISTS (
                          SELECT 1 FROM local_agent_jobs active
@@ -7069,7 +7143,8 @@ class Database:
                 )
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
-                       lease_owner_user_id = ?, leased_at = ?, leased_until = ?, acquisition_contract = ?,
+                       lease_owner_user_id = ?, lease_device_id = ?, leased_at = ?, leased_until = ?,
+                       acquisition_contract = ?,
                        attempt_count = attempt_count + 1, result_json = NULL,
                        last_error = NULL, next_attempt_at = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
@@ -7087,6 +7162,7 @@ class Database:
                          )""",
                     (
                         user_id,
+                        device.device_id,
                         now_iso,
                         leased_until,
                         contract,
@@ -7115,7 +7191,7 @@ class Database:
         progress: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> bool:
-        """Keep the device's report and extend the attempt's lease while the device still holds it."""
+        """Keep the device's report and extend the attempt's lease while this device still holds it."""
 
         heartbeat_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(heartbeat_at)
@@ -7133,8 +7209,8 @@ class Database:
                 """UPDATE local_agent_jobs SET leased_until = ?,
                        result_json = COALESCE(?, result_json), updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
-                     AND lease_owner_user_id = ? AND attempt_count = ?""",
-                (leased_until, result_json, now_iso, job_id, user_id, attempt_count),
+                     AND lease_owner_user_id = ? AND lease_device_id = ? AND attempt_count = ?""",
+                (leased_until, result_json, now_iso, job_id, user_id, device.device_id, attempt_count),
             )
             await self.db.commit()
         return bool(cursor.rowcount)
@@ -7144,6 +7220,7 @@ class Database:
         *,
         job_id: str,
         user_id: str,
+        device_id: str,
         attempt_count: int,
         status: str,
         result: Mapping[str, Any],
@@ -7151,13 +7228,16 @@ class Database:
         retryable: bool = False,
         now: datetime | None = None,
     ) -> bool:
+        """End the attempt ``device_id`` holds; ``False`` when that device no longer holds it."""
+
         completed_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(completed_at)
         async with self._write_lock:
             async with self.db.execute(
                 """SELECT uncounted_attempt_count FROM local_agent_jobs
-                   WHERE job_id = ? AND status = 'leased' AND lease_owner_user_id = ? AND attempt_count = ?""",
-                (job_id, user_id, attempt_count),
+                   WHERE job_id = ? AND status = 'leased' AND lease_owner_user_id = ?
+                     AND lease_device_id = ? AND attempt_count = ?""",
+                (job_id, user_id, device_id, attempt_count),
             ) as cursor:
                 leased = await cursor.fetchone()
             if leased is None:
@@ -7174,10 +7254,10 @@ class Database:
             finished_at = None if stored_status == "queued" else now_iso
             cursor = await self.db.execute(
                 """UPDATE local_agent_jobs SET status = ?, result_json = ?,
-                   last_error = ?, lease_owner_user_id = NULL,
+                   last_error = ?, lease_owner_user_id = NULL, lease_device_id = NULL,
                    leased_until = NULL, next_attempt_at = ?, finished_at = ?, updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
-                     AND lease_owner_user_id = ? AND attempt_count = ?""",
+                     AND lease_owner_user_id = ? AND lease_device_id = ? AND attempt_count = ?""",
                 (
                     stored_status,
                     json.dumps(dict(result), sort_keys=True),
@@ -7187,6 +7267,7 @@ class Database:
                     now_iso,
                     job_id,
                     user_id,
+                    device_id,
                     attempt_count,
                 ),
             )
@@ -7220,7 +7301,7 @@ class Database:
                     job_ids = [str(row["job_id"]) async for row in cursor]
                 await self.db.execute(
                     f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
-                           lease_owner_user_id = NULL, leased_until = NULL,
+                           lease_owner_user_id = NULL, lease_device_id = NULL, leased_until = NULL,
                            next_attempt_at = NULL, finished_at = ?, updated_at = ?
                        WHERE {selection}""",
                     (SOURCE_SYNC_CANCELLED_BY_USER, stopped_at, stopped_at, *params),
@@ -7251,7 +7332,7 @@ class Database:
             cursor = await self.db.execute(
                 """UPDATE local_agent_jobs SET status = 'queued',
                        uncounted_attempt_count = uncounted_attempt_count + 1,
-                       lease_owner_user_id = NULL, leased_until = NULL, acquisition_contract = NULL,
+                       lease_owner_user_id = NULL, lease_device_id = NULL, leased_until = NULL, acquisition_contract = NULL,
                        next_attempt_at = NULL, updated_at = ?
                    WHERE job_id = ? AND status = 'leased' AND attempt_count = ?""",
                 (now_iso, job_id, attempt_count),
@@ -7264,19 +7345,19 @@ class Database:
 
         await self.db.execute(
             """INSERT INTO local_agent_devices (
-                   user_id, device_id, name, version, acquisition_contracts_json, source_ids_json, last_seen_at
+                   user_id, device_id, name, version, acquisition_contracts_json, sources_json, last_seen_at
                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id, device_id) DO UPDATE SET
                    name = excluded.name, version = excluded.version,
                    acquisition_contracts_json = excluded.acquisition_contracts_json,
-                   source_ids_json = excluded.source_ids_json, last_seen_at = excluded.last_seen_at""",
+                   sources_json = excluded.sources_json, last_seen_at = excluded.last_seen_at""",
             (
                 user_id,
                 device.device_id,
                 device.name,
                 device.version,
                 json.dumps(dict(sorted(device.acquisition_contracts.items()))),
-                json.dumps(sorted(device.source_ids)),
+                json.dumps(device.to_payload()["sources"]),
                 seen_at,
             ),
         )
@@ -7298,28 +7379,87 @@ class Database:
                     name=str(row["name"]),
                     version=str(row["version"]),
                     acquisition_contracts=json.loads(row["acquisition_contracts_json"]),
-                    source_ids=frozenset(json.loads(row["source_ids_json"])),
+                    sources={
+                        str(source_id): DeviceSourceReadiness.from_payload(readiness)
+                        for source_id, readiness in json.loads(row["sources_json"]).items()
+                    },
                 ),
                 last_seen_at=datetime.fromisoformat(str(row["last_seen_at"])),
             )
             for row in rows
         ]
 
-    async def list_device_sources(self, execution_owner_user_id: str) -> list[dict[str, Any]]:
+    async def remove_local_agent_device(self, user_id: str, device_id: str) -> list[str]:
+        """Forget one of the user's devices and clear it as the execution device of its Sources; return them.
+
+        Those Sources run nothing until their owner chooses another device.
+        The device's queued jobs that name it fail as cancelled, and so do the
+        queued sync jobs of its Sources. Raises ``LookupError`` when the user
+        has no such device.
+        """
+
+        removed_at = _utc_iso(None)
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
+        async with self._write_lock:
+            try:
+                deleted = await self.db.execute(
+                    "DELETE FROM local_agent_devices WHERE user_id = ? AND device_id = ?", (user_id, device_id)
+                )
+                if not deleted.rowcount:
+                    raise LookupError("local_agent_device_not_found")
+                async with self.db.execute(
+                    """SELECT id FROM sources WHERE execution_owner_user_id = ? AND execution_device_id = ?
+                       ORDER BY id""",
+                    (user_id, device_id),
+                ) as cursor:
+                    source_ids = [str(row["id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE status = 'queued'
+                         AND ((execution_owner_user_id = ? AND device_id = ?)
+                              OR (operation IN ({placeholders}) AND source_id IN (SELECT value FROM json_each(?))))""",
+                    (
+                        SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
+                        removed_at,
+                        removed_at,
+                        user_id,
+                        device_id,
+                        *operations,
+                        json.dumps(source_ids),
+                    ),
+                )
+                await self.db.execute(
+                    """UPDATE sources SET execution_device_id = NULL
+                       WHERE execution_owner_user_id = ? AND execution_device_id = ?""",
+                    (user_id, device_id),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return source_ids
+
+    async def list_device_sources(
+        self, execution_owner_user_id: str, *, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
         """The Sources whose acquisition runs on a device of this execution owner, by id.
 
-        The list covers every Source the owner's daemon serves, which is the
-        scope the lease selects jobs from. A device deletes the credentials of
-        each Source its report names that is missing here, so a store that
-        serves one daemon across several workspaces returns the owner's device
-        Sources of all of them.
+        With ``device_id``, only the Sources that device executes. The list
+        covers every Source the owner's daemon serves, which is the scope the
+        lease selects jobs from. A device deletes the credentials it holds for
+        each Source missing from its own list, so a store that serves one
+        daemon across several workspaces returns the owner's device Sources
+        of all of them.
         """
 
         async with self.db.execute(
             """SELECT * FROM sources
                WHERE executor = 'device' AND execution_owner_user_id = ? AND status <> 'retired'
+                 AND (? IS NULL OR execution_device_id = ?)
                ORDER BY id""",
-            (execution_owner_user_id,),
+            (execution_owner_user_id, device_id, device_id),
         ) as cursor:
             rows = await cursor.fetchall()
         return [_source_from_row(row) for row in rows]
@@ -7331,16 +7471,19 @@ class Database:
         executor: str,
         config_json: str,
         execution_owner_user_id: str | None = None,
+        execution_device_id: str | None = None,
         now: datetime | None = None,
     ) -> list[str]:
         """Move where the Source's acquisition runs, keeping everything it holds; return the jobs it cancelled.
 
-        The executor is not part of the Source's scope: the change opens no
-        scope transition, and leaves its Documents, Units, Memories, cursor,
-        failure ledger and an open transition as they are. ``config_json`` is
-        the configuration with the credentials the new executor's server side
-        holds. ``execution_owner_user_id`` becomes the Source's execution
-        owner; ``None`` keeps the current one.
+        The executor and the execution device are not part of the Source's
+        scope: the change opens no scope transition, and leaves its Documents,
+        Units, Memories, cursor, failure ledger and an open transition as they
+        are. ``config_json`` is the configuration with the credentials the new
+        executor's server side holds. ``execution_owner_user_id`` becomes the
+        Source's execution owner; ``None`` keeps the current one.
+        ``execution_device_id`` is the device of that owner that runs a device
+        Source, and is cleared for a server Source.
 
         The change waits for the Source's sync: it raises
         :class:`SourceSyncRunActive` while a run is pending or running, and
@@ -7394,9 +7537,16 @@ class Database:
                 )
                 await self.db.execute(
                     """UPDATE sources SET executor = ?, config = ?,
-                           execution_owner_user_id = COALESCE(?, execution_owner_user_id)
+                           execution_owner_user_id = COALESCE(?, execution_owner_user_id),
+                           execution_device_id = ?
                        WHERE id = ?""",
-                    (executor, config_json, execution_owner_user_id, source_id),
+                    (
+                        executor,
+                        config_json,
+                        execution_owner_user_id,
+                        execution_device_id if executor == "device" else None,
+                        source_id,
+                    ),
                 )
                 await self.db.commit()
             except BaseException:
@@ -7457,7 +7607,8 @@ class Database:
                     interval = int(
                         row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
                     )
-                    if not owner:
+                    # A device Source without an execution device runs nothing until its owner chooses one.
+                    if not owner or (operation == DOCUMENT_ACQUISITION_OPERATION and not row.get("execution_device_id")):
                         await self.db.execute(
                             """UPDATE sources SET sync_schedule_next_at = ?,
                                sync_schedule_updated_at = ?
@@ -16728,12 +16879,14 @@ class Database:
         projection_scope_transition: ProjectionScopeTransition | None = None,
         expected_open_transition_id: str | None = None,
         executor: str | None = None,
+        execution_device_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
 
         `executor` is where the Source's acquisition runs, `server` or
         `device`; `None` keeps the current one, and a new Source runs on the
-        server.
+        server. `execution_device_id` is the device of the execution owner
+        that runs a device Source; `None` keeps the current one.
 
         `project_binding` is the structured rule the project resolver
         consults when memories are extracted from this source. `None`
@@ -16836,9 +16989,9 @@ class Database:
                     """INSERT INTO sources (
                        id, type, name, config, status, project_binding,
                        created_by_user_id, owner_user_id, access_policy,
-                       access_state, execution_owner_user_id, executor
+                       access_state, execution_owner_user_id, executor, execution_device_id
                    )
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?, COALESCE(?, 'server'))
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?, COALESCE(?, 'server'), ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -16859,7 +17012,8 @@ class Database:
                    executor=CASE
                        WHEN ? IS NULL THEN sources.executor
                        ELSE excluded.executor
-                   END""",
+                   END,
+                   execution_device_id=COALESCE(excluded.execution_device_id, sources.execution_device_id)""",
                     (
                         id,
                         type,
@@ -16873,6 +17027,7 @@ class Database:
                         access_state,
                         execution_owner_user_id,
                         executor,
+                        execution_device_id,
                         status,
                         executor,
                     ),

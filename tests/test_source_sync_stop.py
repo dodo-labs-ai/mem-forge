@@ -18,7 +18,7 @@ from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_activity import SOURCE_SYNC_CANCELLED_BY_USER, SourceSyncHeartbeat, SourceSyncRunActive
 from memforge.source_projection import ProjectionScopeTransition, ProjectionScopeTransitionStatus
 from memforge.storage.database import Database
-from tests.device_report_fixture import device_report
+from tests.device_report_fixture import connect_device, device_report
 from tests.test_document_absence import JIRA_CONFIG, SOURCE_ID, JiraProject, Workspace
 from tests.test_source_authority_api import _app, _confluence_payload, _connect_database, _device_jira_payload
 from tests.test_sync_bookkeeping import (
@@ -471,6 +471,7 @@ def test_whoever_can_pause_a_device_source_can_stop_its_sync(tmp_path: Path):
     owner = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
     try:
         with TestClient(_app(tmp_path, database)) as client:
+            connect_device(database, owner["x-test-user"])
             source_id = client.post(
                 "/api/v1/sources", headers=owner, json=_device_jira_payload()
             ).json()["id"]
@@ -496,6 +497,7 @@ def test_a_stopped_device_job_fences_the_daemon_that_is_collecting_it(tmp_path: 
     headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
     try:
         with TestClient(_app(tmp_path, database)) as client:
+            connect_device(database, headers["x-test-user"])
             source_id = client.post(
                 "/api/v1/sources", headers=headers, json=_device_jira_payload()
             ).json()["id"]
@@ -533,7 +535,12 @@ def test_a_stopped_device_job_fences_the_daemon_that_is_collecting_it(tmp_path: 
             completed = client.post(
                 f"/api/cloud/local-agent/jobs/{job['job_id']}/complete",
                 headers=headers,
-                json={"attempt_count": job["attempt_count"], "status": "succeeded", "result": {}},
+                json={
+                    "attempt_count": job["attempt_count"],
+                    "device_id": "dev-laptop",
+                    "status": "succeeded",
+                    "result": {},
+                },
             )
             leased_again = client.post(
                 "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": device_report([source_id]).to_payload(), "limit": 1, "lease_seconds": 60}

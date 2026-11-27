@@ -472,7 +472,7 @@ function deviceSource(credential: "secret" | "browser_session", overrides: Parti
       kind: "local_agent",
       operation: "document_acquisition",
       immutable_config_fields: [],
-      device: { name: "Alex's MacBook", state: "online", installed_version: "0.2.0b7", required_version: "0.2.0b7", credential },
+      device: { id: "dev-macbook", name: "Alex's MacBook", state: "online", not_ready: [], installed_version: "0.2.0b7", required_version: "0.2.0b7", credential },
     },
     ...overrides,
   });

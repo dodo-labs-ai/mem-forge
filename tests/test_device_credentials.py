@@ -1,4 +1,4 @@
-"""The provider credentials a device holds for its device Sources, and the report that names them (ADR 0058)."""
+"""The provider credentials a device holds for the Sources it executes, and its readiness report for them (ADR 0058)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from memforge.local_agent.device_credentials import (
 )
 from memforge.local_agent.device_lease import DeviceLeaseAnswers
 from memforge.local_agent.device_identity import DeviceIdentityStore
-from memforge.local_agent.device_report import DeviceReport, declared_acquisition_contracts
+from memforge.local_agent.device_report import DeviceReport, NotReadyReason, declared_acquisition_contracts
 from memforge.release import installed_version
 from tests.test_daemon_service import FakeKeyring
 
@@ -113,16 +113,11 @@ def test_a_daemon_leasing_from_another_server_keeps_the_first_servers_credential
     monkeypatch.setitem(sys.modules, "keyring", FakeKeyring())
     device_credentials.device_credentials(SERVER).set("src-wiki", {"token": "first-token"})
     other = device_credentials.device_credentials(OTHER_SERVER)
-    report = DeviceReport.from_payload(main._this_device_report(OTHER_SERVER))
-    assert report.source_ids == frozenset()
 
-    # The other server releases every Source the report named, and none of the first server's.
-    DeviceLeaseAnswers(other, log=lambda message: None).observe(
-        {"jobs": [], "released_source_ids": sorted(report.source_ids) + ["src-wiki"]}
-    )
+    # The other server's answer names none of the Sources this device runs for the first server.
+    DeviceLeaseAnswers(other, log=lambda message: None).observe({"jobs": [], "sources": []})
 
     assert device_credentials.device_credentials(SERVER).get("src-wiki") == {"token": "first-token"}
-    assert DeviceReport.from_payload(main._this_device_report(SERVER)).source_ids == frozenset({"src-wiki"})
 
 
 def test_a_secret_missing_from_the_keyring_is_an_error(tmp_path) -> None:
@@ -135,12 +130,22 @@ def test_a_secret_missing_from_the_keyring_is_an_error(tmp_path) -> None:
         store.get("src-wiki")
 
 
-def test_the_daemons_report_names_this_device_its_version_contracts_and_held_sources() -> None:
-    store = DeviceCredentialStore(device_credentials.device_credentials_path(), server=SERVER, keyring_store=FakeKeyring())
-    store.set("src-wiki", {"token": "secret"})
+def test_the_daemons_report_names_this_device_its_version_contracts_and_its_readiness_per_source(
+    keyring, tmp_path
+) -> None:
+    _store().set("src-token", {"pat": "secret"})
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    executed = [
+        {"id": "src-token", "type": "jira", "config": JIRA_TOKEN_CONFIG},
+        {"id": "src-unsigned", "type": "jira", "config": JIRA_TOKEN_CONFIG},
+        {"id": "src-public", "type": "github_pages", "config": PUBLIC_PAGES_CONFIG},
+        {"id": "src-notes", "type": "local_markdown", "config": {"root": str(notes)}},
+        {"id": "src-gone", "type": "local_markdown", "config": {"root": str(tmp_path / "moved")}},
+    ]
 
-    first = DeviceReport.from_payload(main._this_device_report(SERVER))
-    second = DeviceReport.from_payload(main._this_device_report(SERVER))
+    first = DeviceReport.from_payload(main._this_device_report(SERVER, executed))
+    second = DeviceReport.from_payload(main._this_device_report(SERVER, executed))
 
     identity = DeviceIdentityStore(device_identity.device_identity_path()).load()
     assert identity is not None
@@ -148,8 +153,13 @@ def test_the_daemons_report_names_this_device_its_version_contracts_and_held_sou
     assert (first.device_id, first.name) == (identity.device_id, identity.name)
     assert first.version == installed_version()
     assert dict(first.acquisition_contracts) == declared_acquisition_contracts()
-    assert first.source_ids == frozenset({"src-wiki"})
-    assert "secret" not in json.dumps(main._this_device_report(SERVER))
+    # A Source whose type needs no credential and no folder is ready with nothing stored.
+    assert first.ready_source_ids() == frozenset({"src-token", "src-public", "src-notes"})
+    assert first.sources["src-unsigned"].reasons == (NotReadyReason(kind="credential"),)
+    assert first.sources["src-gone"].reasons == (
+        NotReadyReason(kind="location", field="root", path=str(tmp_path / "moved")),
+    )
+    assert "secret" not in json.dumps(main._this_device_report(SERVER, executed))
 
 
 # -- What the device runs a Source's Gene with --
@@ -157,6 +167,7 @@ def test_the_daemons_report_names_this_device_its_version_contracts_and_held_sou
 JIRA_ORIGIN = "https://jira.example.test"
 JIRA_TOKEN_CONFIG = {"base_url": JIRA_ORIGIN, "auth_mode": "pat", "jql": "project = ACME"}
 JIRA_COOKIE_CONFIG = {"base_url": JIRA_ORIGIN, "auth_mode": "browser_cookie", "jql": "project = ACME"}
+PUBLIC_PAGES_CONFIG = {"auth_mode": "none", "sync_mode": "page", "page_url": "https://docs.example.com/guide"}
 
 
 @pytest.fixture
@@ -186,6 +197,8 @@ def test_the_device_gene_runs_with_the_sources_secrets_and_its_origins_browser_s
     }
     with pytest.raises(DeviceCredentialsMissing, match="memforge source credentials set src-other"):
         store.gene_config("src-other", "jira", JIRA_TOKEN_CONFIG)
+    # A configuration that needs no credential runs with nothing stored.
+    assert store.gene_config("src-public", "github_pages", PUBLIC_PAGES_CONFIG) == PUBLIC_PAGES_CONFIG
     keyring.values.clear()
     with pytest.raises(DeviceCredentialsMissing, match="sign in to the Source again"):
         store.gene_config("src-cookie", "jira", JIRA_COOKIE_CONFIG)
@@ -228,20 +241,22 @@ def test_the_device_deletes_released_credentials_and_logs_only_when_contract_agr
     ours = declared_acquisition_contracts()
     other = {**ours, "jira": ours["jira"] + 1}
 
-    def answer(contracts, released=()):
+    def answer(contracts):
+        # src-moved was deleted, moved to the server or moved to another device.
         return {
             "jobs": [],
             "server": {"version": "9.9.9", "acquisition_contracts": contracts},
-            "released_source_ids": list(released),
+            "sources": [{"id": "src-kept", "type": "jira", "config": JIRA_TOKEN_CONFIG}],
         }
 
-    answers.observe(answer(ours, released=["src-moved"]))
+    answers.observe(answer(ours))
     answers.observe(answer(ours))
     answers.observe(answer(other))
     answers.observe(answer(other))
     answers.observe(answer(ours))
 
     assert store.source_ids() == frozenset({"src-kept"})
+    assert [source["id"] for source in answers.sources] == ["src-kept"]
     assert (DEVICE_CREDENTIALS_KEYRING_SERVICE, f"{SERVER}#src-moved/pat") not in keyring.values
     assert len(logged) == 3
     assert "src-moved" in logged[0]
@@ -356,7 +371,13 @@ class _StatusClient:
         return self.status
 
 
-def _status(sources, contracts=None) -> dict:
+def _this_device() -> str:
+    return DeviceIdentityStore(device_identity.device_identity_path()).ensure().device_id
+
+
+def _status(sources, contracts=None, *, device_id: str | None = None) -> dict:
+    if device_id is not None:
+        sources = [{**source, "execution_device_id": device_id} for source in sources]
     return {
         "status": "online",
         "last_seen_at": None,
@@ -381,11 +402,18 @@ def daemon(monkeypatch):
 def test_credentials_set_prompts_for_the_secret_fields_and_keeps_them_in_the_keyring(daemon, keyring, tmp_path):
     from click.testing import CliRunner
 
-    daemon.status = _status([{"id": "src-token", "name": "Tracker", "type": "jira", "config": JIRA_TOKEN_CONFIG}])
+    here = _this_device()
+    daemon.status = _status(
+        [
+            {"id": "src-token", "name": "Tracker", "type": "jira", "config": JIRA_TOKEN_CONFIG, "execution_device_id": here},
+            {"id": "src-desk", "name": "Desk", "type": "jira", "config": JIRA_TOKEN_CONFIG, "execution_device_id": "dev-x"},
+        ]
+    )
     env = {"MEMFORGE_CLI_CONFIG": str(tmp_path / "cli.toml")}
 
     stored = CliRunner().invoke(main.cli, ["source", "credentials", "set", "src-token"], input="device-pat\n", env=env)
     unknown = CliRunner().invoke(main.cli, ["source", "credentials", "set", "src-server"], env=env)
+    elsewhere = CliRunner().invoke(main.cli, ["source", "credentials", "set", "src-desk"], input="pat\n", env=env)
 
     assert stored.exit_code == 0, stored.output
     assert json.loads(stored.output[stored.output.index("{") :]) == {"ok": True, "source_id": "src-token", "fields": ["pat"]}
@@ -393,12 +421,25 @@ def test_credentials_set_prompts_for_the_secret_fields_and_keeps_them_in_the_key
     assert _store().get("src-token") == {"pat": "device-pat"}
     assert unknown.exit_code == 1
     assert "not one of your Sources that run on your computer" in unknown.output
+    assert elsewhere.exit_code == 1
+    assert "runs on another of your devices" in elsewhere.output
+    assert _store().get("src-desk") is None
 
 
 def test_credentials_set_sends_a_browser_session_source_to_sign_in(daemon, keyring, tmp_path):
     from click.testing import CliRunner
 
-    daemon.status = _status([{"id": "src-cookie", "name": "Tracker", "type": "jira", "config": JIRA_COOKIE_CONFIG}])
+    daemon.status = _status(
+        [
+            {
+                "id": "src-cookie",
+                "name": "Tracker",
+                "type": "jira",
+                "config": JIRA_COOKIE_CONFIG,
+                "execution_device_id": _this_device(),
+            }
+        ]
+    )
 
     result = CliRunner().invoke(
         main.cli, ["source", "credentials", "set", "src-cookie"], env={"MEMFORGE_CLI_CONFIG": str(tmp_path / "c.toml")}
@@ -409,20 +450,30 @@ def test_credentials_set_sends_a_browser_session_source_to_sign_in(daemon, keyri
     assert _store().source_ids() == frozenset()
 
 
-def test_daemon_status_lists_each_device_source_as_ready_or_waiting_with_its_command(daemon, keyring, tmp_path):
+def test_daemon_status_lists_each_source_this_device_runs_as_ready_or_waiting_with_what_moves_it_on(
+    daemon, keyring, tmp_path
+):
     from click.testing import CliRunner
 
     _store().set("src-ready", {"pat": "device-pat"})
     _store().set("src-notion", {"token": "device-token"})
     ours = declared_acquisition_contracts()
+    here = _this_device()
+    missing_folder = str(tmp_path / "notes")
     daemon.status = _status(
         [
             {"id": "src-ready", "name": "Ready", "type": "jira", "config": JIRA_TOKEN_CONFIG},
             {"id": "src-token", "name": "Token", "type": "jira", "config": JIRA_TOKEN_CONFIG},
             {"id": "src-cookie", "name": "Cookie", "type": "jira", "config": JIRA_COOKIE_CONFIG},
             {"id": "src-notion", "name": "Notes", "type": "notion", "config": {}},
+            {"id": "src-public", "name": "Docs", "type": "github_pages", "config": PUBLIC_PAGES_CONFIG},
+            {"id": "src-folder", "name": "Folder", "type": "local_markdown", "config": {"root": missing_folder}},
         ],
         contracts={**ours, "notion": ours["notion"] + 1},
+        device_id=here,
+    )
+    daemon.status["sources"].append(
+        {"id": "src-desk", "name": "Desk", "type": "jira", "config": JIRA_TOKEN_CONFIG, "execution_device_id": "dev-x"}
     )
 
     result = CliRunner().invoke(main.cli, ["daemon", "status"], env={"MEMFORGE_CLI_CONFIG": str(tmp_path / "c.toml")})
@@ -437,3 +488,10 @@ def test_daemon_status_lists_each_device_source_as_ready_or_waiting_with_its_com
     assert states["src-cookie"]["state"] == "waits_for_credential"
     assert "Sign in" in states["src-cookie"]["instruction"]
     assert (states["src-notion"]["state"], states["src-notion"]["command"]) == ("waits_for_update", "memforge upgrade")
+    assert states["src-public"]["state"] == "ready"
+    assert (states["src-folder"]["state"], states["src-folder"]["missing"]) == (
+        "misses_location",
+        [{"field": "root", "path": missing_folder}],
+    )
+    # Another device's Source is that device's to report.
+    assert "src-desk" not in states

@@ -1629,9 +1629,21 @@
             "title": "Config",
             "type": "object"
           },
+          "execution_device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The creator's device that runs a device Source, from their device reports. Required for device, refused for server.",
+            "title": "Execution Device Id"
+          },
           "executor": {
             "default": "server",
-            "description": "server: the server reaches the provider with the secrets in config; device: the creator's own device does, with the credential stored there, so config holds no secret.",
+            "description": "server: the server reaches the provider with the secrets in config; device: one of the creator's own devices does, with the credential stored there, so config holds no secret.",
             "enum": [
               "server",
               "device"
@@ -3171,6 +3183,28 @@
         "title": "LocalAgentDaemonStatusResponse",
         "type": "object"
       },
+      "LocalAgentDeviceRemovedResponse": {
+        "description": "The removed device and the Sources that no longer have an execution device.",
+        "properties": {
+          "device_id": {
+            "title": "Device Id",
+            "type": "string"
+          },
+          "source_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "device_id",
+          "source_ids"
+        ],
+        "title": "LocalAgentDeviceRemovedResponse",
+        "type": "object"
+      },
       "LocalAgentDeviceSource": {
         "description": "A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets.",
         "properties": {
@@ -3178,6 +3212,18 @@
             "additionalProperties": true,
             "title": "Config",
             "type": "object"
+          },
+          "execution_device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The caller's device that executes the Source; null while the caller has chosen none.",
+            "title": "Execution Device Id"
           },
           "id": {
             "title": "Id",
@@ -3196,7 +3242,8 @@
           "id",
           "name",
           "type",
-          "config"
+          "config",
+          "execution_device_id"
         ],
         "title": "LocalAgentDeviceSource",
         "type": "object"
@@ -3254,6 +3301,13 @@
             "title": "Attempt Count",
             "type": "integer"
           },
+          "device_id": {
+            "description": "The device that holds the attempt; only the device that leased it completes it.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Device Id",
+            "type": "string"
+          },
           "error": {
             "anyOf": [
               {
@@ -3282,13 +3336,28 @@
         },
         "required": [
           "status",
-          "attempt_count"
+          "attempt_count",
+          "device_id"
         ],
         "title": "LocalAgentJobCompleteRequest",
         "type": "object"
       },
       "LocalAgentJobCreateRequest": {
         "properties": {
+          "device_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The requester's device that runs a device-bound setup job: the folder picker of a type with device locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's setup jobs run on its execution device, which a request may name but not change.",
+            "title": "Device Id"
+          },
           "operation": {
             "title": "Operation",
             "type": "string"
@@ -9219,7 +9288,7 @@
         "type": "object"
       },
       "SourceExecutionDeviceResponse": {
-        "description": "The device a device Source runs on, from its execution owner's device reports.",
+        "description": "The execution device of a device Source, from its latest device report.",
         "properties": {
           "credential": {
             "description": "How the Source's credential reaches its device: secret, stored on the device with `memforge source credentials set <source-id>`; browser_session, captured from the device's browser by a credential_check job.",
@@ -9230,17 +9299,15 @@
             "title": "Credential",
             "type": "string"
           },
+          "id": {
+            "description": "The device's id, which Where it runs chooses.",
+            "title": "Id",
+            "type": "string"
+          },
           "installed_version": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The MemForge version the device runs; null without a device.",
-            "title": "Installed Version"
+            "description": "The MemForge version the device runs.",
+            "title": "Installed Version",
+            "type": "string"
           },
           "name": {
             "anyOf": [
@@ -9251,8 +9318,16 @@
                 "type": "null"
               }
             ],
-            "description": "The device's name; null for a viewer other than the execution owner, or when the owner has no device.",
+            "description": "The device's name; null for a viewer other than the execution owner.",
             "title": "Name"
+          },
+          "not_ready": {
+            "description": "What the device's latest report says it lacks to run the Source; empty when it is ready, not yet reported, or the viewer is not the execution owner.",
+            "items": {
+              "$ref": "#/components/schemas/SourceNotReadyReasonResponse"
+            },
+            "title": "Not Ready",
+            "type": "array"
           },
           "required_version": {
             "description": "The server's MemForge version, which `memforge upgrade` installs.",
@@ -9271,11 +9346,13 @@
           }
         },
         "required": [
+          "id",
           "name",
           "state",
           "installed_version",
           "required_version",
-          "credential"
+          "credential",
+          "not_ready"
         ],
         "title": "SourceExecutionDeviceResponse",
         "type": "object"
@@ -9291,7 +9368,7 @@
                 "type": "null"
               }
             ],
-            "description": "Present for a Source whose acquisition runs on its execution owner's device."
+            "description": "The execution device of a Source whose acquisition runs on a device; null while it has none, which shows Finish setup until its owner chooses one."
           },
           "immutable_config_fields": {
             "default": [],
@@ -9332,8 +9409,20 @@
       "SourceExecutorChangeRequest": {
         "description": "Where a document Source's acquisition runs from now on (ADR 0058).",
         "properties": {
+          "execution_device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The changer's device that runs the Source from now on, from their device reports. Required for device, refused for server. Choosing another device moves the Source to it.",
+            "title": "Execution Device Id"
+          },
           "executor": {
-            "description": "server: the server reaches the provider; device: the changer's own device does.",
+            "description": "server: the server reaches the provider; device: one of the changer's own devices does.",
             "enum": [
               "server",
               "device"
@@ -9367,6 +9456,18 @@
             "title": "Cancelled Job Ids",
             "type": "array"
           },
+          "execution_device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The execution owner's device that runs the Source; null for a server Source.",
+            "title": "Execution Device Id"
+          },
           "execution_owner_user_id": {
             "anyOf": [
               {
@@ -9396,6 +9497,7 @@
           "id",
           "executor",
           "execution_owner_user_id",
+          "execution_device_id",
           "cancelled_job_ids"
         ],
         "title": "SourceExecutorChangeResponse",
@@ -9595,6 +9697,49 @@
           "data"
         ],
         "title": "SourceListResponse",
+        "type": "object"
+      },
+      "SourceNotReadyReasonResponse": {
+        "description": "What the execution device lacks to run the Source, from its latest report.",
+        "properties": {
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For location: the configuration field naming the folder.",
+            "title": "Field"
+          },
+          "kind": {
+            "description": "credential: no stored value for a secret field, or no browser session; location: the folder of a device location field is missing or unreadable on the device.",
+            "enum": [
+              "credential",
+              "location"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For location: the path the device did not find.",
+            "title": "Path"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "SourceNotReadyReasonResponse",
         "type": "object"
       },
       "SourceOwnershipResponse": {
@@ -9856,7 +10001,7 @@
                 "type": "null"
               }
             ],
-            "description": "Readiness of the connection: a browser session's on the server, or, for a device Source, whether a device report names it, which it does once its device holds the credential. Present only for Sources with such a dependency."
+            "description": "Readiness of the connection: a browser session's on the server, or, for a device Source, its execution device's latest report: authentication while a credential is missing, configuration while a device location is missing or no execution device is chosen. Absent until the device reports on the Source, and for Sources without such a dependency."
           },
           "created_at": {
             "anyOf": [
@@ -12047,6 +12192,49 @@
         ]
       }
     },
+    "/api/cloud/local-agent/devices/{device_id}": {
+      "delete": {
+        "description": "Forget one of the caller's devices.\n\nEach Source it executed loses its execution device and shows Finish\nsetup until its owner chooses another device in Where it runs. Its\nqueued jobs are cancelled. A daemon that still runs on the device\nappears again with its next report, without its Sources.",
+        "operationId": "remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentDeviceRemovedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Local Agent Device",
+        "tags": [
+          "local-agent"
+        ]
+      }
+    },
     "/api/cloud/local-agent/jobs": {
       "post": {
         "operationId": "create_local_agent_job_api_cloud_local_agent_jobs_post",
@@ -12111,7 +12299,7 @@
     },
     "/api/cloud/local-agent/jobs/lease": {
       "post": {
-        "description": "Lease the device its due jobs.\n\nThe answer also names the server's version and acquisition contracts,\nand, among the Sources the device report names, those that are no\nlonger device Sources of the caller (deleted, moved to the server or\nhanded to another execution owner), whose credentials the device\ndeletes.",
+        "description": "Lease the device its due jobs.\n\nThe answer also names the server's version and acquisition contracts,\nand the Sources this device executes, each with its type and its\nconfiguration without secrets. The device reports its readiness for\neach of them, and deletes the credentials it holds for any other\nSource: one deleted, moved to the server or moved to another device.",
         "operationId": "lease_local_agent_jobs_api_cloud_local_agent_jobs_lease_post",
         "requestBody": {
           "content": {
@@ -12291,7 +12479,7 @@
     },
     "/api/cloud/local-agent/status": {
       "get": {
-        "description": "Each of the caller's devices by its latest report, online while that report is recent.\n\nIt also names the caller's device Sources and the server's version\nand acquisition contracts, from which a device tells, per Source,\nwhether it is ready, waits for a credential or waits for an update.",
+        "description": "Each of the caller's devices by its latest report, online while that report is recent.\n\nIt also names the caller's device Sources with the device that\nexecutes each, and the server's version and acquisition contracts,\nfrom which a device tells, per Source it executes, whether it is\nready, waits for a credential or a folder, or waits for an update.",
         "operationId": "read_local_agent_status_api_cloud_local_agent_status_get",
         "responses": {
           "200": {
@@ -17374,7 +17562,7 @@
     },
     "/api/v1/sources/{source_id}/executor": {
       "put": {
-        "description": "Change where a document Source's acquisition runs, keeping everything the Source holds.\n\nThe executor is not part of the scope: the change opens no scope\ntransition and keeps the Source's Documents, Units, Memories, cursor,\nfailure ledger and an open transition, so its next run is an\nordinary incremental run. The executor must be one the type declares.\n\n- To ``device``: the server's copies of the Source's secrets are\n  deleted, and the person who changes it becomes its execution owner,\n  whose device then holds the credentials.\n- To ``server``: ``secrets`` must hold what the type's form requires.\n\nLike a scope change, it cancels the Source's pending run and queued\nsync jobs, and answers 409 ``source_sync_running`` while a run is\nrunning or a device holds the Source's acquisition job.",
+        "description": "Change where a document Source's acquisition runs, keeping everything the Source holds.\n\nThe executor is not part of the scope: the change opens no scope\ntransition and keeps the Source's Documents, Units, Memories, cursor,\nfailure ledger and an open transition, so its next run is an\nordinary incremental run. The executor must be one the type declares.\n\n- To ``device``: the server's copies of the Source's secrets are\n  deleted, the person who changes it becomes its execution owner, and\n  ``execution_device_id``, one of their own devices, its execution\n  device, which then holds the credentials.\n- To another device: the same, so whoever chooses the device becomes\n  the execution owner. The previous device keeps its credentials\n  until its next lease answer no longer names the Source; the new\n  device needs its own.\n- To ``server``: ``secrets`` must hold what the type's form requires.\n\nLike a scope change, it cancels the Source's pending run and queued\nsync jobs, and answers 409 ``source_sync_running`` while a run is\nrunning or a device holds the Source's acquisition job.",
         "operationId": "change_source_executor_api_v1_sources__source_id__executor_put",
         "parameters": [
           {

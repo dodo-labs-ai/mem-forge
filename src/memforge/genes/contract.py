@@ -50,7 +50,7 @@ from memforge.models import (
     ScopeListingKind,
     comparison_string,
 )
-from memforge.source_types import SOURCE_EXECUTORS, SourceTypeDescriptor, registered_source_types
+from memforge.source_types import SOURCE_EXECUTOR_DEVICE, SOURCE_EXECUTORS, SourceTypeDescriptor, registered_source_types
 
 __all__ = ["SourceTypeContractError", "validate_registered_source_types", "validate_source_type"]
 
@@ -146,6 +146,11 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: a document type's executors must be a non-empty subset of {sorted(SOURCE_EXECUTORS)}"
         )
+    config_keys = {field.key for field in gene_cls.config_schema().fields}
+    if unknown := [key for key in descriptor.device_location_fields if key not in config_keys]:
+        raise SourceTypeContractError(f"{name}: device_location_fields names no configuration field: {unknown}")
+    if descriptor.device_location_fields and SOURCE_EXECUTOR_DEVICE not in descriptor.executors:
+        raise SourceTypeContractError(f"{name}: a type with device_location_fields must run on the device")
     kinds = getattr(gene_cls, "listing_kinds", None)
     if not isinstance(kinds, frozenset) or not all(isinstance(kind, ScopeListingKind) for kind in kinds):
         raise SourceTypeContractError(

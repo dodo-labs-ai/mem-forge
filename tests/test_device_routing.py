@@ -1,11 +1,13 @@
 """Which device takes a document Source's run, and what a deploy that changes a contract does to it (ADR 0058).
 
-A ``document_acquisition`` job goes only to a device of the Source's
-execution owner whose report names the Source and whose acquisition contract
-for the type equals the server's. A device behind or ahead of the server, or
-one without the Source's credentials, leaves the job queued without counting
-an attempt. A submission made under a contract the server no longer has is
-refused, and the job is queued again without counting the attempt.
+A ``document_acquisition`` job goes only to the Source's execution device,
+while its report names the Source ready and its acquisition contract for the
+type equals the server's. Another device of the owner never takes it, even
+one that could. A device behind or ahead of the server, or one not ready for
+the Source, leaves the job queued without counting an attempt. The leased
+attempt is the leasing device's: only it extends and completes it. A
+submission made under a contract the server no longer has is refused, and
+the job is queued again without counting the attempt.
 """
 
 from __future__ import annotations
@@ -26,7 +28,8 @@ from memforge.models import ScopeListingKind
 from memforge.pipeline.device_acquisition import enqueue_document_acquisition_job
 from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
 from memforge.storage.document_store import LocalDocumentStore
-from tests.device_report_fixture import device_report
+from memforge.local_agent.device_report import DeviceSourceReadiness, NotReadyReason
+from tests.device_report_fixture import DEVICE_ID, device_report
 from tests.test_device_acquisition import SOURCE_ID, WORKSPACE, WikiGene, _connect, _own, wiki  # noqa: F401
 from tests.test_local_adapter_api import _config
 
@@ -73,7 +76,21 @@ def _lease(database, report, *, now: datetime = NOW) -> list[dict]:
 @pytest.mark.parametrize(
     "report",
     [
-        pytest.param(device_report(), id="without-the-sources-credentials"),
+        pytest.param(device_report(), id="not-naming-the-source-yet"),
+        pytest.param(
+            device_report(not_ready={SOURCE_ID: DeviceSourceReadiness(reasons=(NotReadyReason(kind="credential"),))}),
+            id="without-the-sources-credentials",
+        ),
+        pytest.param(
+            device_report(
+                not_ready={
+                    SOURCE_ID: DeviceSourceReadiness(
+                        reasons=(NotReadyReason(kind="location", field="root", path="/Users/alex/notes"),)
+                    )
+                }
+            ),
+            id="without-its-folder",
+        ),
         pytest.param(device_report([SOURCE_ID], acquisition_contracts={"wiki": 2}), id="ahead-of-the-server"),
         pytest.param(device_report([SOURCE_ID], acquisition_contracts={"wiki": 0}), id="behind-the-server"),
         pytest.param(device_report([SOURCE_ID], acquisition_contracts={}), id="without-the-type"),
@@ -99,6 +116,69 @@ def test_a_device_that_names_the_source_under_the_servers_contract_leases_its_jo
     # Either device's lease kept its report.
     devices = asyncio.run(database.list_local_agent_devices(LOCAL_DEV_USER_ID))
     assert sorted(device.report.device_id for device in devices) == ["dev-desktop", "dev-laptop"]
+
+
+def test_another_device_of_the_owner_never_leases_the_job_even_when_it_could(owned) -> None:
+    database, job_id = owned
+
+    assert _lease(database, device_report([SOURCE_ID], device_id="dev-desktop")) == []
+
+    [leased] = _lease(database, device_report([SOURCE_ID]))
+    assert leased["job_id"] == job_id
+
+
+def test_only_the_device_that_leased_an_attempt_extends_and_completes_it(owned) -> None:
+    database, job_id = owned
+    [leased] = _lease(database, device_report([SOURCE_ID]))
+
+    def heartbeat(report) -> bool:
+        return asyncio.run(
+            database.heartbeat_local_agent_job(
+                job_id=job_id, user_id=LOCAL_DEV_USER_ID, attempt_count=1, lease_seconds=60, device=report, now=NOW
+            )
+        )
+
+    def complete(device_id: str) -> bool:
+        return asyncio.run(
+            database.complete_local_agent_job(
+                job_id=job_id,
+                user_id=LOCAL_DEV_USER_ID,
+                device_id=device_id,
+                attempt_count=1,
+                status="succeeded",
+                result={},
+                error=None,
+                now=NOW,
+            )
+        )
+
+    assert leased["lease_device_id"] == DEVICE_ID
+    assert heartbeat(device_report([SOURCE_ID], device_id="dev-desktop")) is False
+    assert complete("dev-desktop") is False
+    assert heartbeat(device_report([SOURCE_ID])) is True
+    assert complete(DEVICE_ID) is True
+
+
+def test_a_setup_job_that_names_a_device_goes_to_that_device_alone(owned) -> None:
+    database, _job_id = owned
+    asyncio.run(
+        database.insert_local_agent_job(
+            job_id="laj-pick",
+            source_id="",
+            source_type="local_markdown",
+            operation="local_markdown_pick_root",
+            payload={},
+            created_by_user_id=LOCAL_DEV_USER_ID,
+            execution_owner_user_id=LOCAL_DEV_USER_ID,
+            device_id="dev-desktop",
+        )
+    )
+
+    laptop = _lease(database, device_report())
+    [desktop] = _lease(database, device_report(device_id="dev-desktop"))
+
+    assert "laj-pick" not in [job["job_id"] for job in laptop]
+    assert desktop["job_id"] == "laj-pick"
 
 
 def test_another_users_device_never_leases_the_owners_job(owned) -> None:
@@ -161,6 +241,7 @@ def test_an_attempt_requeued_under_a_changed_contract_does_not_spend_the_retry_b
             database.complete_local_agent_job(
                 job_id=job_id,
                 user_id=LOCAL_DEV_USER_ID,
+                device_id="dev-laptop",
                 attempt_count=attempt,
                 status="failed",
                 result={"retryable": True},

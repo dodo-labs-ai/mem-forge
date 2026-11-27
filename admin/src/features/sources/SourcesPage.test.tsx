@@ -794,8 +794,10 @@ function onDevice(id: string, name: string, state: DeviceState, { device = "Alex
       operation: "document_acquisition",
       immutable_config_fields: [],
       device: {
+        id: `dev-${device}`,
         name: viewerOwns ? device : null,
         state,
+        not_ready: [],
         installed_version: state === "update_required" ? "0.2.0b8" : "0.2.0b7",
         required_version: "0.2.0b7",
         credential: "secret",

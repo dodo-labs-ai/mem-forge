@@ -36,7 +36,7 @@ from tests.contracts.document_fakes import confluence as confluence_fakes
 from tests.contracts.document_fakes import github_pages as github_pages_fakes
 from tests.contracts.document_fakes import github_repo as github_repo_fakes
 from tests.contracts.document_fakes import notion as notion_fakes
-from tests.device_report_fixture import device_report
+from tests.device_report_fixture import DEVICE_ID, connect_device, device_report
 from tests.test_device_acquisition import DAEMON_SERVER, _routed_client
 from tests.test_local_adapter_api import _config
 from tests.test_sync_bookkeeping import (
@@ -292,7 +292,10 @@ def _create_and_sync_on_the_server(deployment: Deployment) -> str:
 def _move_to_the_device(deployment: Deployment, source_id: str) -> None:
     from memforge.local_agent.device_credentials import device_credentials
 
-    moved = deployment.client.put(f"/api/v1/sources/{source_id}/executor", json={"executor": "device"})
+    connect_device(deployment.db, OWNER)
+    moved = deployment.client.put(
+        f"/api/v1/sources/{source_id}/executor", json={"executor": "device", "execution_device_id": DEVICE_ID}
+    )
     assert moved.status_code == 200, moved.text
     # The owner stores the token on the device: `memforge source credentials set`.
     device_credentials(DAEMON_SERVER).set(source_id, {deployment.kind.secret: deployment.kind.token})

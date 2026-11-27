@@ -4,7 +4,10 @@ The executor is a Source property outside its scope. Changing it opens no
 scope transition and keeps what the Source holds; it cancels the Source's
 pending run and queued sync jobs and waits for one that runs. Moving to the
 device deletes the server's copies of the Source's secrets and makes the
-changer the execution owner; moving to the server requires the secrets.
+changer the execution owner and one of their devices its execution device;
+moving to another device does the same, and the previous device's next lease
+answer no longer names the Source; moving to the server requires the
+secrets.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from memforge.source_activity import SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE
 from memforge.source_item_failures import SourceItemFailure
 from memforge.source_types import source_type_descriptor
 from memforge.storage.database import Database
-from tests.device_report_fixture import device_report
+from tests.device_report_fixture import DEVICE_ID, connect_device, device_report
 
 PRINCIPAL_HEADER = "X-Test-Principal"
 CREATOR = "owner-a"
@@ -38,6 +41,7 @@ CONFLUENCE = {
     "pat": "server-held-token",
 }
 CURSOR = datetime(2026, 11, 20, 9, 0, tzinfo=timezone.utc)
+DESKTOP = "dev-desktop"
 
 
 def _principal(request: Request) -> str:
@@ -53,6 +57,9 @@ def _secret_key(monkeypatch):
 def database(tmp_path):
     database = Database(str(tmp_path / "sources.db"))
     asyncio.run(database.connect())
+    for user in (CREATOR, CHANGER):
+        connect_device(database, user)
+        connect_device(database, user, device_report(device_id=DESKTOP, name="Desktop"))
     try:
         yield database
     finally:
@@ -83,8 +90,18 @@ def _create(client, config: dict | None = None, source_type: str = "confluence")
     return created.json()["id"]
 
 
-def _change(client, source_id: str, executor: str, *, by: str = CHANGER, secrets: dict | None = None):
+def _change(
+    client,
+    source_id: str,
+    executor: str,
+    *,
+    by: str = CHANGER,
+    secrets: dict | None = None,
+    device: str | None = DEVICE_ID,
+):
     body: dict = {"executor": executor}
+    if executor == "device":
+        body["execution_device_id"] = device
     if secrets is not None:
         body["secrets"] = secrets
     return client.put(f"/api/v1/sources/{source_id}/executor", json=body, headers={PRINCIPAL_HEADER: by})
@@ -173,11 +190,13 @@ def test_moving_to_the_device_deletes_the_servers_secrets_and_makes_the_changer_
         "id": source_id,
         "executor": "device",
         "execution_owner_user_id": CHANGER,
+        "execution_device_id": DEVICE_ID,
         "cancelled_job_ids": [],
     }
     source = asyncio.run(database.get_source(source_id))
     assert source["executor"] == "device"
     assert source["execution_owner_user_id"] == CHANGER
+    assert source["execution_device_id"] == DEVICE_ID
     assert not any(key.startswith("pat") for key in source["config"])
     assert {key: source["config"][key] for key in ("base_url", "sync_mode", "spaces")} == {
         "base_url": "https://wiki.example.com",
@@ -220,6 +239,7 @@ def test_moving_to_the_server_requires_the_secrets_the_form_requires(client, dat
     assert source["executor"] == "server"
     assert source["config"]["pat_encrypted"] and source["config"]["pat_configured"] is True
     assert "new-server-token" not in json.dumps(source["config"])
+    assert source["execution_device_id"] is None
     assert asyncio.run(database.list_device_sources(CHANGER)) == []
 
 
@@ -346,6 +366,84 @@ def test_an_executor_the_type_does_not_declare_is_refused(client, database, monk
         "code": "executor_change_invalid",
         "message": "A confluence source runs on: server.",
     }
+
+
+def _executed_by(client, user: str, device_id: str) -> list[str]:
+    """The Sources the lease answer tells ``device_id`` of ``user`` that it executes."""
+
+    answer = client.post(
+        "/api/cloud/local-agent/jobs/lease",
+        headers={PRINCIPAL_HEADER: user},
+        json={"limit": 1, "device": device_report(device_id=device_id).to_payload()},
+    )
+    assert answer.status_code == 200, answer.text
+    return [source["id"] for source in answer.json()["sources"]]
+
+
+def test_moving_to_another_device_is_a_change_and_the_old_device_no_longer_runs_the_source(client, database):
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+    assert _executed_by(client, CHANGER, DEVICE_ID) == [source_id]
+    _queue_job(database, source_id, "job-queued")
+
+    moved = _change(client, source_id, "device", device=DESKTOP)
+
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["execution_device_id"] == DESKTOP
+    assert moved.json()["cancelled_job_ids"] == ["job-queued"]
+    assert _executed_by(client, CHANGER, DEVICE_ID) == []
+    assert _executed_by(client, CHANGER, DESKTOP) == [source_id]
+
+
+def test_choosing_their_own_device_makes_another_member_the_execution_owner(client, database):
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+
+    taken = _change(client, source_id, "device", by=CREATOR)
+
+    assert taken.status_code == 200, taken.text
+    assert (taken.json()["execution_owner_user_id"], taken.json()["execution_device_id"]) == (CREATOR, DEVICE_ID)
+    assert _executed_by(client, CHANGER, DEVICE_ID) == []
+    assert _executed_by(client, CREATOR, DEVICE_ID) == [source_id]
+
+
+def test_a_device_that_is_not_the_choosers_own_is_refused(client, database):
+    source_id = _create(client)
+
+    unknown = _change(client, source_id, "device", device="dev-someone-elses")
+    unchosen = _change(client, source_id, "device", device=None)
+
+    assert unknown.status_code == unchosen.status_code == 400
+    assert unknown.json()["detail"]["code"] == unchosen.json()["detail"]["code"] == "execution_device_invalid"
+    assert asyncio.run(database.get_source(source_id))["executor"] == "server"
+
+
+def test_the_same_device_for_the_same_owner_changes_nothing(client, database):
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+    _queue_job(database, source_id, "job-queued")
+
+    unchanged = _change(client, source_id, "device")
+
+    assert unchanged.status_code == 200
+    assert unchanged.json()["cancelled_job_ids"] == []
+    assert _job_status(database, "job-queued") == ("queued", None)
+
+
+def test_removing_a_device_leaves_its_sources_without_an_execution_device(client, database):
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+    _queue_job(database, source_id, "job-queued")
+
+    removed = client.delete(f"/api/cloud/local-agent/devices/{DEVICE_ID}", headers={PRINCIPAL_HEADER: CHANGER})
+    again = client.delete(f"/api/cloud/local-agent/devices/{DEVICE_ID}", headers={PRINCIPAL_HEADER: CHANGER})
+    synced = client.post(f"/api/v1/sources/{source_id}/sync", headers={PRINCIPAL_HEADER: CHANGER})
+
+    assert removed.json() == {"device_id": DEVICE_ID, "source_ids": [source_id]}
+    assert again.status_code == 404
+    assert asyncio.run(database.get_source(source_id))["execution_device_id"] is None
+    assert _job_status(database, "job-queued") == ("failed", SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE)
+    assert (synced.status_code, synced.json()["detail"]["code"]) == (409, "execution_device_required")
 
 
 def test_the_same_executor_changes_nothing(client, database):

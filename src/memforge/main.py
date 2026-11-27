@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -454,19 +454,21 @@ def _acquire_local_agent_daemon_lock(lock_path: Path | None = None) -> _LocalAge
     return _LocalAgentDaemonLock(path, fd)
 
 
-def _this_device_report(server: str) -> dict[str, Any]:
+def _this_device_report(server: str, sources: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """This installation's device report to the server at API origin ``server``, as of now.
 
-    It names the Sources this device holds credentials for on that server,
+    It names each of ``sources``, the Sources the server's latest lease answer
+    says this device executes, with whether this device is ready to run it,
     which can change at any time.
     """
     from memforge.local_agent.device_credentials import device_credentials
     from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.device_report import this_device_report
+    from memforge.local_agent.device_sources import readiness_of_sources
 
     identity = DeviceIdentityStore(device_identity_path()).ensure()
-    source_ids = device_credentials(server).source_ids()
-    return this_device_report(identity.device_id, identity.name, source_ids).to_payload()
+    readiness = readiness_of_sources(sources, device_credentials(server))
+    return this_device_report(identity.device_id, identity.name, readiness).to_payload()
 
 
 def _build_local_agent_runner(
@@ -477,15 +479,16 @@ def _build_local_agent_runner(
     from memforge.local_agent.runner import LocalAgentRunner
 
     from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.device_lease import DeviceLeaseAnswers
 
     client = _local_agent_tool_client(ctx)
     server = client.target.origin
+    device_id = DeviceIdentityStore(device_identity_path()).ensure().device_id
+    lease_answers = DeviceLeaseAnswers(device_credentials(server), log=lambda message: click.echo(message, err=True))
 
     def device() -> dict[str, Any]:
-        return _this_device_report(server)
-
-    lease_answers = DeviceLeaseAnswers(device_credentials(server), log=lambda message: click.echo(message, err=True))
+        return _this_device_report(server, lease_answers.sources)
 
     def lease(limit: int = 1, wait_seconds: int = 0, lease_seconds: int = 60) -> dict[str, Any]:
         answer = client.lease_local_agent_jobs(
@@ -506,6 +509,7 @@ def _build_local_agent_runner(
         cloud_jobs_provider=lease,
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
+            device_id=device_id,
             attempt_count=attempt_count,
             status=status,
             result=result,
@@ -1559,12 +1563,16 @@ def _daemon_client(manager) -> ToolClient:
 
 
 def _device_source_states(status: Mapping[str, Any], server: str) -> list[dict[str, Any]]:
-    """Each of the owner's device Sources on ``server``: ready, waiting for an update or for a credential on this device."""
+    """Each Source this device executes on ``server``: ready, or waiting for an update, a credential or its folder."""
     from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.device_sources import device_source_states
 
     try:
-        return device_source_states(status, device_credentials(server))
+        identity = DeviceIdentityStore(device_identity_path()).load()
+        if identity is None:
+            return []
+        return device_source_states(status, device_credentials(server), device_id=identity.device_id)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -2260,6 +2268,7 @@ def source_credentials_set(ctx, source_id: str):
     """Store a device Source's secrets in this device's keyring, prompting for each secret field of its form."""
     from memforge.local_agent.credential_check import signs_in_with_browser_session
     from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
     from memforge.local_agent.device_sources import SIGN_IN_INSTRUCTION, credential_fields
     from memforge.local_agent.service import DaemonServiceError
 
@@ -2276,6 +2285,12 @@ def source_credentials_set(ctx, source_id: str):
         raise click.ClickException(
             f"Source {source_id} is not one of your Sources that run on your computer. "
             "Choose My computer under Where it runs in its Configure page first."
+        )
+    identity = DeviceIdentityStore(device_identity_path()).load()
+    if identity is None or source.get("execution_device_id") != identity.device_id:
+        raise click.ClickException(
+            f"Source {source_id} runs on another of your devices. Store its credentials there, or choose this "
+            "device under Where it runs in its Configure page first."
         )
     source_type = str(source["type"])
     config = dict(source.get("config") or {})

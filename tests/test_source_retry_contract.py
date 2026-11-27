@@ -51,6 +51,7 @@ async def _queued_retry(db):
     assert await db.complete_local_agent_job(
         job_id=leased["job_id"],
         user_id="owner",
+        device_id="dev-laptop",
         attempt_count=leased["attempt_count"],
         status="failed",
         result={"retryable": True},

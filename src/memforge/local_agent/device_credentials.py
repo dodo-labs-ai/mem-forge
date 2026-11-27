@@ -250,34 +250,69 @@ class DeviceCredentialStore:
 
         return self.keyring.get_password(DEVICE_SESSIONS_KEYRING_SERVICE, self._session_account(provider, origin))
 
+    def holds_credentials(self, source_id: str, source_type: str, config: Mapping[str, Any]) -> bool:
+        """Whether this device holds every credential the Source's configuration needs on it.
+
+        That is a value for each required secret field the configuration
+        shows and, when it signs in with a browser session, the session of
+        its origin. A configuration that needs neither is held with nothing
+        stored. The check reads which fields the index records, not their
+        values.
+        """
+
+        held = self._index().get(source_id, _HeldSource())
+        if not set(self._required_fields(source_type, config)) <= set(held.fields):
+            return False
+        session = self._session_of(source_type, config)
+        return session is None or self.session(*session) is not None
+
     def gene_config(self, source_id: str, source_type: str, config: Mapping[str, Any]) -> dict[str, Any]:
         """The configuration the device runs the Source's Gene with: the job's, plus what this device holds.
 
         That is the Source's secrets by field and, when the configuration
         signs in with a browser session, the session of its origin under the
         key the type's Gene reads it from. Raises
-        :class:`DeviceCredentialsMissing` when this device holds neither.
+        :class:`DeviceCredentialsMissing` when this device lacks a credential
+        the configuration needs.
         """
 
-        from memforge.auth.browser_session import ensure_builtin_providers, provider_for_source_type
+        from memforge.auth.browser_session import provider_for_source_type
 
-        secrets = self.get(source_id)
-        if secrets is None:
+        secrets = self.get(source_id) or {}
+        if any(not secrets.get(key) for key in self._required_fields(source_type, config)):
             raise DeviceCredentialsMissing(
                 f"This device holds no credentials for Source {source_id}; run `{credentials_command(source_id)}`"
             )
         gene_config = {**config, **secrets}
-        ensure_builtin_providers()
-        provider = provider_for_source_type(source_type)
-        if provider is not None and provider.uses_browser_session(gene_config):
-            origin = provider.canonical_origin(str(gene_config.get("base_url") or ""))
-            cookie_header = self.session(provider.provider, origin)
+        session = self._session_of(source_type, gene_config)
+        if session is not None:
+            provider = provider_for_source_type(source_type)
+            assert provider is not None
+            cookie_header = self.session(*session)
             if cookie_header is None:
                 raise DeviceCredentialsMissing(
-                    f"This device holds no {provider.label} session for {origin}; sign in to the Source again"
+                    f"This device holds no {provider.label} session for {session[1]}; sign in to the Source again"
                 )
             gene_config[provider.cookie_config_key] = cookie_header
         return gene_config
+
+    @staticmethod
+    def _required_fields(source_type: str, config: Mapping[str, Any]) -> list[str]:
+        from memforge.local_agent.device_sources import credential_fields
+
+        return [field.key for field in credential_fields(source_type, config) if field.required]
+
+    @staticmethod
+    def _session_of(source_type: str, config: Mapping[str, Any]) -> tuple[str, str] | None:
+        """The provider and origin of the browser session the configuration signs in with, if it signs in with one."""
+
+        from memforge.auth.browser_session import ensure_builtin_providers, provider_for_source_type
+
+        ensure_builtin_providers()
+        provider = provider_for_source_type(source_type)
+        if provider is None or not provider.uses_browser_session(dict(config)):
+            return None
+        return provider.provider, provider.canonical_origin(str(config.get("base_url") or ""))
 
 
 async def check_browser_session(source_type: str, gene_config: Mapping[str, Any]) -> None:

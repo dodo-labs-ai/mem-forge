@@ -583,10 +583,16 @@ async def apply_package_migration(
             for key, value in acquisition_job_config(plan.source_type, source.get("config") or {}).items()
             if key not in path.package_fields
         }
+        # The package path ran on whichever of the owner's devices leased it; the
+        # owner's only device becomes its execution device, and with several
+        # the owner chooses one (Finish setup).
+        owner = str(source.get("execution_owner_user_id") or "")
+        devices = await db.list_local_agent_devices(owner) if owner else []
         await db.change_source_executor(
             source_id,
             executor=SOURCE_EXECUTOR_DEVICE,
             config_json=json.dumps(device_config),
+            execution_device_id=devices[0].report.device_id if len(devices) == 1 else None,
             now=datetime.now(timezone.utc),
         )
     return PackageMigrationResult(plan=plan, status="migrated")

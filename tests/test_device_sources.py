@@ -3,11 +3,12 @@
 The server holds no credential for a device Source and never reaches its
 provider: it does not run it without a device acquisition, does not preview
 it, and its browser sessions serve server Sources only. A device's lease
-answer names the Sources its report named that are no longer device Sources
-of the owner, so the device deletes their credentials, and the status answer
-names the owner's device Sources for ``memforge daemon status``. A
-``credential_check`` job checks a device Source's credential on its
-execution owner's device, or captures a server Source's browser session.
+answer names the Sources that device executes, so it reports its readiness
+for them and deletes the credentials of any other, and the status answer
+names the owner's device Sources with their execution devices for
+``memforge daemon status``. A ``credential_check`` job checks a device
+Source's credential on its execution device, or captures a server Source's
+browser session.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from memforge.local_agent.device_report import declared_acquisition_contracts
 from memforge.release import installed_version
 from memforge.runtime import SourceSyncBoundaryError, run_source_sync
 from memforge.storage.database import Database
-from tests.device_report_fixture import device_report
+from tests.device_report_fixture import DEVICE_ID, device_report
 
 PRINCIPAL_HEADER = "X-Test-Principal"
 OWNER = "owner-a"
@@ -64,6 +65,7 @@ def _source(
     owner: str = OWNER,
     config: dict | None = None,
     source_type: str = "jira",
+    device_id: str | None = DEVICE_ID,
 ) -> None:
     asyncio.run(
         database.upsert_source(
@@ -75,6 +77,7 @@ def _source(
             owner_user_id=owner,
             execution_owner_user_id=owner,
             executor=executor,
+            execution_device_id=device_id if executor == "device" else None,
         )
     )
 
@@ -98,23 +101,29 @@ def test_a_source_keeps_its_executor_until_one_is_given(database) -> None:
     assert [source["id"] for source in asyncio.run(database.list_device_sources(OWNER))] == ["src-device"]
 
 
-def test_the_lease_answer_releases_each_named_source_that_is_no_longer_the_owners_device_source(
-    tmp_path, database
-) -> None:
-    _source(database, "src-device", executor="device")
+def test_the_lease_answer_names_the_sources_the_device_executes_without_their_secrets(tmp_path, database) -> None:
+    _source(database, "src-device", executor="device", config={**JIRA_TOKEN_CONFIG, "pat": "server-never-holds"})
+    _source(database, "src-desktop", executor="device", device_id="dev-desktop")
     _source(database, "src-server", executor="server")
     _source(database, "src-other-owner", executor="device", owner="owner-b")
-    named = ["src-deleted", "src-device", "src-other-owner", "src-server"]
 
     with TestClient(_app(tmp_path, database)) as client:
-        answer = client.post(
+        laptop = client.post(
             "/api/cloud/local-agent/jobs/lease",
             headers={PRINCIPAL_HEADER: OWNER},
-            json={"limit": 1, "device": device_report(named).to_payload()},
+            json={"limit": 1, "device": device_report(["src-server", "src-desktop"]).to_payload()},
+        )
+        desktop = client.post(
+            "/api/cloud/local-agent/jobs/lease",
+            headers={PRINCIPAL_HEADER: OWNER},
+            json={"limit": 1, "device": device_report(device_id="dev-desktop").to_payload()},
         )
 
-    assert answer.status_code == 200, answer.text
-    assert answer.json()["released_source_ids"] == ["src-deleted", "src-other-owner", "src-server"]
+    assert laptop.status_code == 200, laptop.text
+    assert laptop.json()["sources"] == [
+        {"id": "src-device", "type": "jira", "config": JIRA_TOKEN_CONFIG, "execution_device_id": DEVICE_ID}
+    ]
+    assert [source["id"] for source in desktop.json()["sources"]] == ["src-desktop"]
 
 
 def test_the_status_names_the_callers_device_sources_without_their_secrets(tmp_path, database) -> None:
@@ -125,7 +134,15 @@ def test_the_status_names_the_callers_device_sources_without_their_secrets(tmp_p
     with TestClient(_app(tmp_path, database)) as client:
         body = client.get("/api/cloud/local-agent/status", headers={PRINCIPAL_HEADER: OWNER}).json()
 
-    assert body["sources"] == [{"id": "src-device", "name": "src-device", "type": "jira", "config": JIRA_TOKEN_CONFIG}]
+    assert body["sources"] == [
+        {
+            "id": "src-device",
+            "name": "src-device",
+            "type": "jira",
+            "config": JIRA_TOKEN_CONFIG,
+            "execution_device_id": DEVICE_ID,
+        }
+    ]
     assert body["server"] == {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()}
 
 
@@ -223,12 +240,19 @@ def _credential_check(client: TestClient, source_id: str, *, user: str = OWNER):
     )
 
 
-def test_a_device_sources_credential_check_runs_on_its_execution_owners_device(tmp_path, database) -> None:
+def test_a_device_sources_credential_check_runs_on_its_execution_device(tmp_path, database) -> None:
     _source(database, "src-device", executor="device", config={**JIRA_TOKEN_CONFIG, "pat": "never-sent"})
+    _source(database, "src-unplaced", executor="device", device_id=None)
 
     with TestClient(_app(tmp_path, database)) as client:
         other = _credential_check(client, "src-device", user="owner-b")
+        unplaced = _credential_check(client, "src-unplaced")
         created = _credential_check(client, "src-device")
+        desktop = client.post(
+            "/api/cloud/local-agent/jobs/lease",
+            headers={PRINCIPAL_HEADER: OWNER},
+            json={"limit": 1, "device": device_report(device_id="dev-desktop").to_payload()},
+        ).json()["jobs"]
         [job] = client.post(
             "/api/cloud/local-agent/jobs/lease",
             headers={PRINCIPAL_HEADER: OWNER},
@@ -236,7 +260,9 @@ def test_a_device_sources_credential_check_runs_on_its_execution_owners_device(t
         ).json()["jobs"]
 
     assert (other.status_code, other.json()["detail"]) == (403, "credential_check_execution_owner_forbidden")
+    assert (unplaced.status_code, unplaced.json()["detail"]["code"]) == (409, "execution_device_required")
     assert created.status_code == 201, created.text
+    assert desktop == []
     assert job["operation"] == "credential_check"
     assert job["payload"] == {
         "source_id": "src-device",

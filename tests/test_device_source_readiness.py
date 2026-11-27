@@ -1,10 +1,11 @@
 """The readiness a device Source exposes in the source list (design §10.7).
 
 ``execution.kind`` stays ``local_agent`` for the device executor, and
-``execution.device`` names the execution owner's device that runs the Source,
-its state and versions. A device Source that no device report names needs its
-credential stored: its connection is ``action_required`` for
-``authentication``.
+``execution.device`` describes the Source's execution device: its id, its
+state and versions, and, for its execution owner, its name and what its
+latest report says it lacks. A Source without an execution device has none
+and shows Finish setup (``configuration``); a missing credential shows Sign
+in required (``authentication``) and a missing device location Finish setup.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ from memforge.local_agent.readiness import LOCAL_AGENT_DEVICE_STALE_SECONDS
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION
 from memforge.release import installed_version
 from memforge.storage.database import Database
-from tests.device_report_fixture import device_report
+from memforge.local_agent.device_report import DeviceSourceReadiness, NotReadyReason
+from tests.device_report_fixture import DEVICE_ID, connect_device, device_report
 
 PRINCIPAL_HEADER = "X-Test-Principal"
 CREATOR = "owner-a"
@@ -72,16 +74,17 @@ def client(tmp_path, database):
 
 
 @pytest.fixture
-def device_source(client) -> str:
+def device_source(client, database) -> str:
     created = client.post(
         "/api/v1/sources",
         json={"type": "confluence", "name": "Team wiki", "config": CONFLUENCE, "access_policy": "workspace"},
     )
     assert created.status_code == 200, created.text
     source_id = created.json()["id"]
+    connect_device(database, EXECUTION_OWNER)
     moved = client.put(
         f"/api/v1/sources/{source_id}/executor",
-        json={"executor": "device"},
+        json={"executor": "device", "execution_device_id": DEVICE_ID},
         headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
     )
     assert moved.status_code == 200, moved.text
@@ -119,7 +122,7 @@ def test_a_server_source_has_no_device_and_no_device_connection(client):
     assert "connection_status" not in row
 
 
-def test_a_device_source_named_by_its_online_device_is_ready(client, database, device_source):
+def test_a_device_source_its_online_device_reports_ready_is_ready(client, database, device_source):
     _report(database, device_report([device_source], name="Alex's MacBook", version=installed_version()))
 
     row = _row(client, device_source)
@@ -129,37 +132,75 @@ def test_a_device_source_named_by_its_online_device_is_ready(client, database, d
         "operation": DOCUMENT_ACQUISITION_OPERATION,
         "immutable_config_fields": [],
         "device": {
+            "id": DEVICE_ID,
             "name": "Alex's MacBook",
             "state": "online",
             "installed_version": installed_version(),
             "required_version": installed_version(),
             "credential": "secret",
+            "not_ready": [],
         },
     }
     assert row["connection_status"] == {"state": "ready", "reason": None}
 
 
-def test_a_device_source_no_report_names_needs_its_credential(client, database, device_source):
-    _report(database, device_report([], name="Alex's MacBook"))
+def test_a_missing_credential_on_the_execution_device_needs_a_sign_in(client, database, device_source):
+    missing = DeviceSourceReadiness(reasons=(NotReadyReason(kind="credential"),))
+    _report(database, device_report(not_ready={device_source: missing}, name="Alex's MacBook"))
 
     row = _row(client, device_source)
 
     assert row["execution"]["device"]["state"] == "online"
-    assert row["execution"]["device"]["name"] == "Alex's MacBook"
+    assert row["execution"]["device"]["not_ready"] == [{"kind": "credential"}]
     assert row["connection_status"] == {"state": "action_required", "reason": "authentication"}
 
 
-def test_without_any_device_the_source_is_offline_and_needs_its_credential(client, device_source):
+def test_a_missing_folder_on_the_execution_device_needs_its_setup_finished_with_the_path(
+    client, database, device_source
+):
+    missing = DeviceSourceReadiness(reasons=(NotReadyReason(kind="location", field="root", path="/Users/alex/notes"),))
+    _report(database, device_report(not_ready={device_source: missing}))
+
+    owner_row = _row(client, device_source)
+    member_row = _row(client, device_source, viewer=CREATOR)
+
+    assert owner_row["connection_status"] == {"state": "action_required", "reason": "configuration"}
+    assert owner_row["execution"]["device"]["not_ready"] == [
+        {"kind": "location", "field": "root", "path": "/Users/alex/notes"}
+    ]
+    # Another member sees Finish setup, without the owner's path or device name.
+    assert member_row["connection_status"] == {"state": "action_required", "reason": "configuration"}
+    assert member_row["execution"]["device"]["not_ready"] == []
+    assert member_row["execution"]["device"]["name"] is None
+
+
+def test_a_device_source_without_an_execution_device_needs_its_setup_finished(client, database):
+    created = client.post(
+        "/api/v1/sources",
+        json={"type": "confluence", "name": "Team wiki", "config": CONFLUENCE, "access_policy": "workspace"},
+    )
+    source_id = created.json()["id"]
+    connect_device(database, EXECUTION_OWNER)
+    client.put(
+        f"/api/v1/sources/{source_id}/executor",
+        json={"executor": "device", "execution_device_id": DEVICE_ID},
+        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+    )
+    asyncio.run(database.remove_local_agent_device(EXECUTION_OWNER, DEVICE_ID))
+
+    row = _row(client, source_id)
+
+    assert row["execution"]["device"] is None
+    assert row["connection_status"] == {"state": "action_required", "reason": "configuration"}
+
+
+def test_a_device_whose_report_does_not_name_the_source_yet_shows_no_connection(client, database, device_source):
+    _report(database, device_report([]))
+
     row = _row(client, device_source)
 
-    assert row["execution"]["device"] == {
-        "name": None,
-        "state": "offline",
-        "installed_version": None,
-        "required_version": installed_version(),
-        "credential": "secret",
-    }
-    assert row["connection_status"] == {"state": "action_required", "reason": "authentication"}
+    assert row["execution"]["device"]["state"] == "online"
+    assert "connection_status" not in row or row["connection_status"] is None
 
 
 @pytest.mark.parametrize("difference", [-1, 1], ids=["behind", "ahead"])
@@ -171,11 +212,13 @@ def test_a_device_whose_contract_for_the_type_differs_needs_an_update(client, da
     row = _row(client, device_source)
 
     assert row["execution"]["device"] == {
+        "id": DEVICE_ID,
         "name": "Laptop",
         "state": "update_required",
         "installed_version": "0.2.0b8",
         "required_version": installed_version(),
         "credential": "secret",
+        "not_ready": [],
     }
     assert row["connection_status"] == {"state": "ready", "reason": None}
 
@@ -187,33 +230,16 @@ def test_a_device_without_a_recent_report_is_offline(client, database, device_so
     assert _row(client, device_source)["execution"]["device"]["state"] == "offline"
 
 
-def test_the_device_that_holds_the_credential_runs_the_source_over_another_online_device(
+def test_the_execution_device_stands_for_the_source_whatever_the_owners_other_devices_report(
     client, database, device_source
 ):
     stale = datetime.now(timezone.utc) - timedelta(seconds=LOCAL_AGENT_DEVICE_STALE_SECONDS + 5)
-    _report(database, device_report([device_source], device_id="dev-laptop", name="Laptop"), seen=stale)
-    _report(database, device_report([], device_id="dev-desktop", name="Desktop"))
-
-    row = _row(client, device_source)
-
-    assert (row["execution"]["device"]["name"], row["execution"]["device"]["state"]) == ("Laptop", "offline")
-    assert row["connection_status"] == {"state": "ready", "reason": None}
-
-
-def test_an_online_device_that_can_take_the_job_comes_before_one_that_needs_an_update(
-    client, database, device_source
-):
-    contracts = declared_acquisition_contracts()
-    contracts["confluence"] += 1
-    _report(database, device_report([device_source], device_id="dev-laptop", name="Laptop"))
-    _report(
-        database,
-        device_report([device_source], device_id="dev-desktop", name="Desktop", acquisition_contracts=contracts),
-    )
+    _report(database, device_report([device_source], name="Laptop"), seen=stale)
+    _report(database, device_report([device_source], device_id="dev-desktop", name="Desktop"))
 
     device = _row(client, device_source)["execution"]["device"]
 
-    assert (device["name"], device["state"]) == ("Laptop", "online")
+    assert (device["id"], device["name"], device["state"]) == (DEVICE_ID, "Laptop", "offline")
 
 
 def test_another_member_sees_the_state_without_the_devices_name(client, database, device_source):
@@ -236,7 +262,7 @@ def test_a_token_source_tells_its_owner_to_store_the_secret_on_the_device(client
     assert member_row["ownership"]["viewer_is_execution_owner"] is False
 
 
-def test_a_browser_session_source_signs_in_on_the_device(client):
+def test_a_browser_session_source_signs_in_on_the_device(client, database):
     created = client.post(
         "/api/v1/sources",
         json={
@@ -253,9 +279,10 @@ def test_a_browser_session_source_signs_in_on_the_device(client):
     )
     assert created.status_code == 200, created.text
     source_id = created.json()["id"]
+    connect_device(database, EXECUTION_OWNER)
     moved = client.put(
         f"/api/v1/sources/{source_id}/executor",
-        json={"executor": "device"},
+        json={"executor": "device", "execution_device_id": DEVICE_ID},
         headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
     )
     assert moved.status_code == 200, moved.text
@@ -263,7 +290,7 @@ def test_a_browser_session_source_signs_in_on_the_device(client):
     assert _row(client, source_id)["execution"]["device"]["credential"] == "browser_session"
 
 
-def test_a_source_created_on_my_computer_needs_no_secret_and_waits_for_its_credential(client):
+def test_a_source_created_on_my_computer_needs_no_secret_and_runs_on_the_chosen_device(client, database):
     config = {key: value for key, value in CONFLUENCE.items() if key != "pat"}
     checked = client.post(
         "/api/v1/genes/confluence/config-check",
@@ -273,24 +300,37 @@ def test_a_source_created_on_my_computer_needs_no_secret_and_waits_for_its_crede
     assert checked.status_code == 200, checked.text
     assert checked.json()["issues"] == []
 
+    body = {"type": "confluence", "name": "Wiki", "config": config, "access_policy": "workspace", "executor": "device"}
+    unchosen = client.post("/api/v1/sources", json=body, headers={PRINCIPAL_HEADER: EXECUTION_OWNER})
+    not_theirs = client.post(
+        "/api/v1/sources", json={**body, "execution_device_id": DEVICE_ID}, headers={PRINCIPAL_HEADER: EXECUTION_OWNER}
+    )
+    connect_device(database, EXECUTION_OWNER)
     created = client.post(
-        "/api/v1/sources",
-        json={"type": "confluence", "name": "Wiki", "config": config, "access_policy": "workspace", "executor": "device"},
-        headers={PRINCIPAL_HEADER: EXECUTION_OWNER},
+        "/api/v1/sources", json={**body, "execution_device_id": DEVICE_ID}, headers={PRINCIPAL_HEADER: EXECUTION_OWNER}
     )
     assert created.status_code == 200, created.text
 
+    assert unchosen.status_code == not_theirs.status_code == 400
+    assert unchosen.json()["detail"]["code"] == not_theirs.json()["detail"]["code"] == "execution_device_invalid"
     row = _row(client, created.json()["id"])
     assert row["execution"]["operation"] == DOCUMENT_ACQUISITION_OPERATION
+    assert row["execution"]["device"]["id"] == DEVICE_ID
     assert row["ownership"]["execution_owner_user_id"] == EXECUTION_OWNER
     assert row["ownership"]["viewer_is_execution_owner"] is True
-    assert row["connection_status"] == {"state": "action_required", "reason": "authentication"}
 
 
 def test_a_source_created_on_my_computer_refuses_a_secret(client):
     created = client.post(
         "/api/v1/sources",
-        json={"type": "confluence", "name": "Wiki", "config": CONFLUENCE, "access_policy": "workspace", "executor": "device"},
+        json={
+            "type": "confluence",
+            "name": "Wiki",
+            "config": CONFLUENCE,
+            "access_policy": "workspace",
+            "executor": "device",
+            "execution_device_id": DEVICE_ID,
+        },
     )
 
     assert created.status_code == 400, created.text

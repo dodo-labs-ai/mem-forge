@@ -24,6 +24,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/cloud/local-agent/devices/{device_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove Local Agent Device
+         * @description Forget one of the caller's devices.
+         *
+         *     Each Source it executed loses its execution device and shows Finish
+         *     setup until its owner chooses another device in Where it runs. Its
+         *     queued jobs are cancelled. A daemon that still runs on the device
+         *     appears again with its next report, without its Sources.
+         */
+        delete: operations["remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/cloud/local-agent/jobs": {
         parameters: {
             query?: never;
@@ -72,10 +97,10 @@ export interface paths {
          * @description Lease the device its due jobs.
          *
          *     The answer also names the server's version and acquisition contracts,
-         *     and, among the Sources the device report names, those that are no
-         *     longer device Sources of the caller (deleted, moved to the server or
-         *     handed to another execution owner), whose credentials the device
-         *     deletes.
+         *     and the Sources this device executes, each with its type and its
+         *     configuration without secrets. The device reports its readiness for
+         *     each of them, and deletes the credentials it holds for any other
+         *     Source: one deleted, moved to the server or moved to another device.
          */
         post: operations["lease_local_agent_jobs_api_cloud_local_agent_jobs_lease_post"];
         delete?: never;
@@ -146,9 +171,10 @@ export interface paths {
          * Read Local Agent Status
          * @description Each of the caller's devices by its latest report, online while that report is recent.
          *
-         *     It also names the caller's device Sources and the server's version
-         *     and acquisition contracts, from which a device tells, per Source,
-         *     whether it is ready, waits for a credential or waits for an update.
+         *     It also names the caller's device Sources with the device that
+         *     executes each, and the server's version and acquisition contracts,
+         *     from which a device tells, per Source it executes, whether it is
+         *     ready, waits for a credential or a folder, or waits for an update.
          */
         get: operations["read_local_agent_status_api_cloud_local_agent_status_get"];
         put?: never;
@@ -2247,8 +2273,13 @@ export interface paths {
          *     ordinary incremental run. The executor must be one the type declares.
          *
          *     - To ``device``: the server's copies of the Source's secrets are
-         *       deleted, and the person who changes it becomes its execution owner,
-         *       whose device then holds the credentials.
+         *       deleted, the person who changes it becomes its execution owner, and
+         *       ``execution_device_id``, one of their own devices, its execution
+         *       device, which then holds the credentials.
+         *     - To another device: the same, so whoever chooses the device becomes
+         *       the execution owner. The previous device keeps its credentials
+         *       until its next lease answer no longer names the Source; the new
+         *       device needs its own.
          *     - To ``server``: ``secrets`` must hold what the type's form requires.
          *
          *     Like a scope change, it cancels the Source's pending run and queued
@@ -3285,8 +3316,13 @@ export interface components {
                 [key: string]: unknown;
             };
             /**
+             * Execution Device Id
+             * @description The creator's device that runs a device Source, from their device reports. Required for device, refused for server.
+             */
+            execution_device_id?: string | null;
+            /**
              * Executor
-             * @description server: the server reaches the provider with the secrets in config; device: the creator's own device does, with the credential stored there, so config holds no secret.
+             * @description server: the server reaches the provider with the secrets in config; device: one of the creator's own devices does, with the credential stored there, so config holds no secret.
              * @default server
              * @enum {string}
              */
@@ -3913,6 +3949,16 @@ export interface components {
             status: "online" | "offline";
         };
         /**
+         * LocalAgentDeviceRemovedResponse
+         * @description The removed device and the Sources that no longer have an execution device.
+         */
+        LocalAgentDeviceRemovedResponse: {
+            /** Device Id */
+            device_id: string;
+            /** Source Ids */
+            source_ids: string[];
+        };
+        /**
          * LocalAgentDeviceSource
          * @description A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets.
          */
@@ -3921,6 +3967,11 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
+            /**
+             * Execution Device Id
+             * @description The caller's device that executes the Source; null while the caller has chosen none.
+             */
+            execution_device_id: string | null;
             /** Id */
             id: string;
             /** Name */
@@ -3955,6 +4006,11 @@ export interface components {
         LocalAgentJobCompleteRequest: {
             /** Attempt Count */
             attempt_count: number;
+            /**
+             * Device Id
+             * @description The device that holds the attempt; only the device that leased it completes it.
+             */
+            device_id: string;
             /** Error */
             error?: string | null;
             /** Result */
@@ -3969,6 +4025,11 @@ export interface components {
         };
         /** LocalAgentJobCreateRequest */
         LocalAgentJobCreateRequest: {
+            /**
+             * Device Id
+             * @description The requester's device that runs a device-bound setup job: the folder picker of a type with device locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's setup jobs run on its execution device, which a request may name but not change.
+             */
+            device_id?: string | null;
             /** Operation */
             operation: string;
             /** Payload */
@@ -6168,7 +6229,7 @@ export interface components {
         };
         /**
          * SourceExecutionDeviceResponse
-         * @description The device a device Source runs on, from its execution owner's device reports.
+         * @description The execution device of a device Source, from its latest device report.
          */
         SourceExecutionDeviceResponse: {
             /**
@@ -6178,15 +6239,25 @@ export interface components {
              */
             credential: "secret" | "browser_session";
             /**
-             * Installed Version
-             * @description The MemForge version the device runs; null without a device.
+             * Id
+             * @description The device's id, which Where it runs chooses.
              */
-            installed_version: string | null;
+            id: string;
+            /**
+             * Installed Version
+             * @description The MemForge version the device runs.
+             */
+            installed_version: string;
             /**
              * Name
-             * @description The device's name; null for a viewer other than the execution owner, or when the owner has no device.
+             * @description The device's name; null for a viewer other than the execution owner.
              */
             name: string | null;
+            /**
+             * Not Ready
+             * @description What the device's latest report says it lacks to run the Source; empty when it is ready, not yet reported, or the viewer is not the execution owner.
+             */
+            not_ready: components["schemas"]["SourceNotReadyReasonResponse"][];
             /**
              * Required Version
              * @description The server's MemForge version, which `memforge upgrade` installs.
@@ -6201,7 +6272,7 @@ export interface components {
         };
         /** SourceExecutionResponse */
         SourceExecutionResponse: {
-            /** @description Present for a Source whose acquisition runs on its execution owner's device. */
+            /** @description The execution device of a Source whose acquisition runs on a device; null while it has none, which shows Finish setup until its owner chooses one. */
             device?: components["schemas"]["SourceExecutionDeviceResponse"] | null;
             /**
              * Immutable Config Fields
@@ -6223,8 +6294,13 @@ export interface components {
          */
         SourceExecutorChangeRequest: {
             /**
+             * Execution Device Id
+             * @description The changer's device that runs the Source from now on, from their device reports. Required for device, refused for server. Choosing another device moves the Source to it.
+             */
+            execution_device_id?: string | null;
+            /**
              * Executor
-             * @description server: the server reaches the provider; device: the changer's own device does.
+             * @description server: the server reaches the provider; device: one of the changer's own devices does.
              * @enum {string}
              */
             executor: "server" | "device";
@@ -6246,6 +6322,11 @@ export interface components {
              * @description The Source's queued sync jobs, which were planned for the previous executor.
              */
             cancelled_job_ids: string[];
+            /**
+             * Execution Device Id
+             * @description The execution owner's device that runs the Source; null for a server Source.
+             */
+            execution_device_id: string | null;
             /**
              * Execution Owner User Id
              * @description Whose device runs the Source; the person who moved it to the device.
@@ -6341,6 +6422,28 @@ export interface components {
         SourceListResponse: {
             /** Data */
             data: components["schemas"]["SourceResponse"][];
+        };
+        /**
+         * SourceNotReadyReasonResponse
+         * @description What the execution device lacks to run the Source, from its latest report.
+         */
+        SourceNotReadyReasonResponse: {
+            /**
+             * Field
+             * @description For location: the configuration field naming the folder.
+             */
+            field?: string | null;
+            /**
+             * Kind
+             * @description credential: no stored value for a secret field, or no browser session; location: the folder of a device location field is missing or unreadable on the device.
+             * @enum {string}
+             */
+            kind: "credential" | "location";
+            /**
+             * Path
+             * @description For location: the path the device did not find.
+             */
+            path?: string | null;
         };
         /** SourceOwnershipResponse */
         SourceOwnershipResponse: {
@@ -6457,7 +6560,7 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
-            /** @description Readiness of the connection: a browser session's on the server, or, for a device Source, whether a device report names it, which it does once its device holds the credential. Present only for Sources with such a dependency. */
+            /** @description Readiness of the connection: a browser session's on the server, or, for a device Source, its execution device's latest report: authentication while a credential is missing, configuration while a device location is missing or no execution device is chosen. Absent until the device reports on the Source, and for Sources without such a dependency. */
             connection_status?: components["schemas"]["SourceConnectionStatusResponse"] | null;
             /** Created At */
             created_at?: string | null;
@@ -7342,6 +7445,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+        };
+    };
+    remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                device_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalAgentDeviceRemovedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

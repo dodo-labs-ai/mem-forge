@@ -42,5 +42,6 @@ DESCRIPTOR = SourceTypeDescriptor(
     acquisition_contract=2,
     # Its files exist only on the owner's machine.
     executors=frozenset({SOURCE_EXECUTOR_DEVICE}),
+    device_location_fields=("root",),
     config=SourceConfigPolicy(complete=_complete_config, store=_store_config),
 )

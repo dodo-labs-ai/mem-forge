@@ -6724,6 +6724,7 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
     completed = await db.complete_local_agent_job(
         job_id="laj-retry",
         user_id="owner-a",
+        device_id="dev-laptop",
         attempt_count=first[0]["attempt_count"],
         status="failed",
         result={
@@ -6826,6 +6827,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
     await db.complete_local_agent_job(
         job_id=first_id,
         user_id="owner-a",
+        device_id="dev-laptop",
         attempt_count=leased[0]["attempt_count"],
         status="succeeded",
         result={},

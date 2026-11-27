@@ -8,7 +8,7 @@ so a field a client reads cannot disappear from the response unnoticed.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Request
@@ -17,7 +17,8 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
-from tests.device_report_fixture import DAEMON_DEVICE
+from memforge.local_agent.device_report import DeviceSourceReadiness, NotReadyReason
+from tests.device_report_fixture import DAEMON_DEVICE, DEVICE_ID, connect_device, device_report
 
 SOURCE_KEYS = {
     "id",
@@ -178,6 +179,7 @@ def _local_jira() -> dict:
         "name": "Payroll Jira",
         "access_policy": "workspace",
         "executor": "device",
+        "execution_device_id": DEVICE_ID,
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
@@ -195,6 +197,7 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
         principal_resolver=_principal,
         workspace_role_resolver=_workspace_role,
     )
+    connect_device(database, "owner-user")
     try:
         with TestClient(app) as client:
             ids = {}
@@ -211,6 +214,14 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
                 created = client.post("/api/v1/sources", json=payload)
                 assert created.status_code == 200, created.text
                 ids[key] = created.json()["id"]
+            # The laptop runs the Jira Source and has no session for it yet.
+            connect_device(
+                database,
+                "owner-user",
+                device_report(
+                    not_ready={ids["jira"]: DeviceSourceReadiness(reasons=(NotReadyReason(kind="credential"),))}
+                ),
+            )
             asyncio.run(
                 database.insert_sync_history(
                     source=ids["history"],
@@ -463,6 +474,8 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
         principal_resolver=_principal,
         workspace_role_resolver=_workspace_role,
     )
+    # The owner's laptop reported a day ago, so it is offline until its daemon leases again.
+    connect_device(database, "owner-user", seen=datetime.now(timezone.utc) - timedelta(days=1))
     try:
         with TestClient(app) as client:
             server_id = client.post("/api/v1/sources", json=_confluence("Server Wiki", "1")).json()["id"]
@@ -530,7 +543,7 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
         "stale_after_seconds",
     }
     assert offline.json()["status"] == "offline"
-    assert offline.json()["last_seen_at"] is None
+    assert offline.json()["last_seen_at"] is not None
     assert online.json()["status"] == "online"
     assert [device["device_id"] for device in online.json()["devices"]] == [DAEMON_DEVICE["device_id"]]
 
