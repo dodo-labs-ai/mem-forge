@@ -105,7 +105,8 @@ function sameJson(a: unknown, b: unknown): boolean {
  *   chooses which of their devices runs the Source (a single device is
  *   chosen already); Save waits while the chosen device is offline or needs
  *   an update. A Source that runs on a device shows its device and what that
- *   device lacks, and offers Move while it is offline. The folder picker
+ *   device lacks, and lets whoever may change where it runs choose another
+ *   computer: Move while the device is offline, Change computer otherwise. The folder picker
  *   runs on the chosen device. Save changes the executor and the execution
  *   device first, then the rest of the settings.
  */
@@ -167,7 +168,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   const changeExecutor = useChangeSourceExecutor(sourceId ?? "");
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
   // The server reads no provider for a Source that runs on a device.
-  const previewable = executor !== "device" && !runsOnlyOnDevice && offersCheckSetup(gene.name, schema, state);
+  const previewable = executor !== "device" && !runsOnlyOnDevice && offersCheckSetup(gene.name);
   const discovery = useCheckSetup(gene.name, executor, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
@@ -478,7 +479,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
     return (
       <div className="space-y-3">
         {executorOptions.length > 0 ? <WhereItRunsChoice executors={executorOptions} value={executor} onChange={setExecutor} /> : null}
-        {showsDevice ? <DeviceSetupStep source={source!} onMove={() => setMoving(true)} /> : null}
+        {showsDevice ? <DeviceSetupStep source={source!} onMove={executorOptions.length > 0 ? () => setMoving(true) : undefined} /> : null}
         {choosesDevice ? (
           <DeviceChoicePanel
             choice={deviceChoice}

@@ -385,12 +385,27 @@ def test_moving_to_another_device_is_a_change_and_the_old_device_no_longer_runs_
     assert _change(client, source_id, "device").status_code == 200
     assert _executed_by(client, CHANGER, DEVICE_ID) == [source_id]
     _queue_job(database, source_id, "job-queued")
+    for job_id, device_id in (("sign-in-on-old-device", DEVICE_ID), ("sign-in-on-new-device", DESKTOP)):
+        asyncio.run(
+            database.insert_local_agent_job(
+                job_id=job_id,
+                source_id=source_id,
+                source_type="confluence",
+                operation="credential_check",
+                payload={},
+                created_by_user_id=CHANGER,
+                execution_owner_user_id=CHANGER,
+                device_id=device_id,
+            )
+        )
 
     moved = _change(client, source_id, "device", device=DESKTOP)
 
     assert moved.status_code == 200, moved.text
     assert moved.json()["execution_device_id"] == DESKTOP
-    assert moved.json()["cancelled_job_ids"] == ["job-queued"]
+    # A sign-in queued on the old device would capture a session it no longer runs the Source with.
+    assert moved.json()["cancelled_job_ids"] == ["job-queued", "sign-in-on-old-device"]
+    assert _job_status(database, "sign-in-on-new-device") == ("queued", None)
     assert _executed_by(client, CHANGER, DEVICE_ID) == []
     assert _executed_by(client, CHANGER, DESKTOP) == [source_id]
 

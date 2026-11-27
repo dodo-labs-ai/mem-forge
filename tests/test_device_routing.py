@@ -321,6 +321,17 @@ def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in
                 headers=headers,
                 json={"source_type": "local_markdown", "operation": "local_markdown_pick_root", "payload": {}},
             )
+            # Another member picks a folder only on their own device, chosen in Where it runs.
+            by_another_member = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers={"x-test-user": "blake", "x-test-workspace-role": "member"},
+                json={
+                    "source_type": "local_markdown",
+                    "operation": "local_markdown_pick_root",
+                    "payload": {},
+                    "source_id": "src-notes",
+                },
+            )
     finally:
         asyncio.run(database.close())
 
@@ -329,3 +340,5 @@ def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in
     assert on_the_chosen_device["device_id"] == "dev-desktop"
     assert for_a_new_source["device_id"] == "dev-desktop"
     assert not_theirs.status_code == unchosen.status_code == 400
+    assert by_another_member.status_code == 403, by_another_member.text
+    assert by_another_member.json()["detail"]["code"] == "setup_job_execution_owner_forbidden"

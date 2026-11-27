@@ -3094,6 +3094,12 @@ async def _chosen_execution_device(
                 detail={"code": EXECUTION_DEVICE_INVALID, "message": "A server source runs on no device."},
             )
         return None
+    return await _choosers_device(db, chooser=chooser, device_id=device_id)
+
+
+async def _choosers_device(db: Database, *, chooser: str, device_id: str | None) -> str:
+    """One of the chooser's own devices, by its id; 400 ``execution_device_invalid`` otherwise."""
+
     if not device_id:
         raise HTTPException(
             status_code=400,
@@ -11231,9 +11237,9 @@ def create_admin_app(
             owner = requester
             payload = credential_check_job_payload(source)
             if source_runs_on_device(source):
-                device_id = await _setup_job_device(db, requester, source, req.device_id)
+                device_id = _source_execution_device(source, requester, req.device_id)
             elif req.device_id is not None:
-                device_id = await _setup_job_device(db, requester, None, req.device_id)
+                device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:
@@ -11252,11 +11258,11 @@ def create_admin_app(
                     _require_source_discoverability(request, saved)
                 if req.device_id is not None or saved is None or not source_runs_on_device(saved):
                     # A device location is picked on the device chosen in Where it runs.
-                    device_id = await _setup_job_device(db, requester, None, req.device_id)
+                    device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
                 else:
-                    device_id = await _setup_job_device(db, requester, saved, None)
+                    device_id = _source_execution_device(saved, requester, None)
             elif req.device_id is not None:
-                device_id = await _setup_job_device(db, requester, None, req.device_id)
+                device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
@@ -11296,36 +11302,37 @@ def create_admin_app(
         )
         return {"job_id": job_id, "status": "queued", "coalesced": False}
 
-    async def _setup_job_device(
-        db: Database, requester: str, device_source: Mapping[str, Any] | None, requested: str | None
-    ) -> str:
-        """The device a device-bound setup job runs on.
+    def _source_execution_device(source: Mapping[str, Any], requester: str, requested: str | None) -> str:
+        """The device a setup job for a saved device Source runs on: its execution device.
 
-        For a saved device Source it is the Source's execution device, which
-        the request may name but not change; 409
-        ``execution_device_required`` while the Source has none. Otherwise it
-        is the requester's device the request names, such as the device chosen
-        in Where it runs for a Source not yet saved.
+        Only the Source's execution owner sets it up there, since a job runs
+        only on a device of its owner (403
+        ``setup_job_execution_owner_forbidden``; another member chooses their
+        own device in Where it runs instead). The request may name the device
+        but not change it (400 ``execution_device_invalid``); 409
+        ``execution_device_required`` while the Source has none.
         """
 
-        if device_source is not None:
-            device_id = device_source.get("execution_device_id")
-            if not device_id:
-                raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
-            if requested is not None and requested != device_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": EXECUTION_DEVICE_INVALID,
-                        "message": "This source's setup runs on its execution device; move it there first.",
-                    },
-                )
-            return str(device_id)
-        chosen = await _chosen_execution_device(
-            db, executor=SOURCE_EXECUTOR_DEVICE, chooser=requester, device_id=requested
-        )
-        assert chosen is not None
-        return chosen
+        if execution_owner_user_id(source) != requester:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "setup_job_execution_owner_forbidden",
+                    "message": "This source runs on another person's computer; choose your own in Where it runs.",
+                },
+            )
+        device_id = source.get("execution_device_id")
+        if not device_id:
+            raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
+        if requested is not None and requested != device_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": EXECUTION_DEVICE_INVALID,
+                    "message": "This source's setup runs on its execution device; move it there first.",
+                },
+            )
+        return str(device_id)
 
     async def _credential_check_source(
         request: Request, db: Database, source_id: str, source_type: str

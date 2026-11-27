@@ -193,10 +193,11 @@ function missingFolders(device: SourceExecutionDevice): string[] {
  * setup, naming the folder and the device; a credential is stored on the
  * device, a token with `memforge source credentials set <source-id>` or a
  * browser session the Sign in action captures there with a
- * `credential_check` job. A Source whose device is offline offers Move,
- * which opens the device choice.
+ * `credential_check` job. Whoever may change where the Source runs
+ * (`onMove`) can choose another computer, which opens the device choice:
+ * Move while the device is offline, Change computer otherwise.
  */
-export function DeviceSetupStep({ source, onMove }: { source: Source; onMove: () => void }) {
+export function DeviceSetupStep({ source, onMove }: { source: Source; onMove?: () => void }) {
   const signIn = useCredentialCheck();
   const device = source.execution?.device;
   if (!device) return null;
@@ -241,7 +242,12 @@ export function DeviceSetupStep({ source, onMove }: { source: Source; onMove: ()
         ) : (
           <div className="space-y-1.5">
             <p className="text-sm text-muted-foreground">Sign in with the browser on that computer. MemForge keeps the session there.</p>
-            <Button type="button" size="sm" disabled={signIn.isPending} onClick={() => signIn.mutate({ id: source.id, type: source.type })}>
+            <Button
+              type="button"
+              size="sm"
+              disabled={signIn.isPending}
+              onClick={() => signIn.mutate({ id: source.id, type: source.type, deviceId: device.id })}
+            >
               {signIn.isPending ? <Loader2 aria-hidden className="animate-spin" /> : null}
               {signIn.isPending ? "Waiting for sign-in…" : "Sign in"}
             </Button>
@@ -256,10 +262,16 @@ export function DeviceSetupStep({ source, onMove }: { source: Source; onMove: ()
       {device.state === "offline" ? (
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-sm text-muted-foreground">{deviceName} is offline.</p>
-          <Button type="button" size="sm" variant="outline" onClick={onMove}>
-            Move
-          </Button>
+          {onMove ? (
+            <Button type="button" size="sm" variant="outline" onClick={onMove}>
+              Move
+            </Button>
+          ) : null}
         </div>
+      ) : onMove ? (
+        <Button type="button" size="xs" variant="ghost" onClick={onMove}>
+          Change computer
+        </Button>
       ) : null}
     </section>
   );

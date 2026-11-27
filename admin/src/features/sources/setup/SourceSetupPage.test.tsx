@@ -614,7 +614,7 @@ test("a device source with a browser session signs in through a credential check
   expect(screen.queryByRole("region", { name: "Jira browser session" })).not.toBeInTheDocument();
   await userEvent.click(within(step).getByRole("button", { name: "Sign in" }));
   await waitFor(() => expect(created).toHaveLength(1));
-  expect(created[0]).toMatchObject({ operation: "credential_check", source_id: "src-wiki" });
+  expect(created[0]).toMatchObject({ operation: "credential_check", source_id: "src-wiki", device_id: "dev-1" });
 });
 
 test("a choice of two computers waits for the person to choose one", async () => {
@@ -662,6 +662,56 @@ test("a device source whose computer is offline moves to another of the person's
     executor: "device",
     execution_device_id: "dev-desktop",
   });
+});
+
+test("a device source whose computer is online changes to another of the person's computers", async () => {
+  const source = deviceSource("secret", { connection_status: { state: "ready", reason: null } });
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice(), makeDevice({ device_id: "dev-desktop", name: "Alex's desktop" })]),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(within(step).queryByRole("button", { name: "Move" })).not.toBeInTheDocument();
+  await userEvent.click(within(step).getByRole("button", { name: "Change computer" }));
+  expect(await screen.findByRole("radio", { name: /Alex's MacBook/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("radio", { name: /Alex's desktop/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({
+    executor: "device",
+    execution_device_id: "dev-desktop",
+  });
+});
+
+test("another member takes over a device source by choosing their own computer", async () => {
+  const source = deviceSource("secret", {
+    connection_status: { state: "ready", reason: null },
+    ownership: { ...makeSource().ownership, execution_owner_user_id: "alex", viewer_is_execution_owner: false },
+  });
+  source.execution!.device!.name = null;
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus([makeDevice({ device_id: "dev-sam", name: "Sam's laptop" })]),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(step).toHaveTextContent("Runs on its owner's computer");
+  await userEvent.click(within(step).getByRole("button", { name: "Change computer" }));
+  // Their single computer is chosen already.
+  expect(await screen.findByRole("radio", { name: /Sam's laptop/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "device", execution_device_id: "dev-sam" });
 });
 
 test("a device source without a computer shows Finish setup by choosing one", async () => {

@@ -7490,7 +7490,10 @@ class Database:
         :class:`SourceAcquisitionLeased` while a daemon holds one of its
         ``document_acquisition`` jobs. The Source's queued sync jobs fail as
         cancelled by the change, because each was planned for the previous
-        executor. Raises ``LookupError`` for an unknown Source.
+        executor, and so do a device Source's queued setup jobs that name a
+        device other than its new execution device, since only that device
+        holds the Source's credentials and location. Raises ``LookupError``
+        for an unknown Source.
         """
 
         changed_at = _utc_iso(now)
@@ -7501,6 +7504,8 @@ class Database:
                 source_lock = await self.db.execute("UPDATE sources SET status = status WHERE id = ?", (source_id,))
                 if not source_lock.rowcount:
                     raise LookupError("source_not_found")
+                async with self.db.execute("SELECT executor FROM sources WHERE id = ?", (source_id,)) as cursor:
+                    previous = await cursor.fetchone()
                 async with self.db.execute(
                     """SELECT run_id FROM source_sync_runs
                        WHERE source_id = ? AND status IN ('pending', 'running')
@@ -7523,17 +7528,21 @@ class Database:
                     raise SourceAcquisitionLeased(
                         f"source acquisition job is leased: {leased_job['job_id']}", job_id=str(leased_job["job_id"])
                     )
-                queued = f"source_id = ? AND operation IN ({placeholders}) AND status = 'queued'"
+                new_device = execution_device_id if executor == "device" else None
+                queued = f"""source_id = ? AND status = 'queued'
+                    AND (operation IN ({placeholders})
+                         OR (? = 'device' AND device_id IS NOT NULL AND device_id IS NOT ?))"""
+                queued_args = (source_id, *operations, str(previous["executor"] or ""), new_device)
                 async with self.db.execute(
                     f"SELECT job_id FROM local_agent_jobs WHERE {queued} ORDER BY created_at, job_id",
-                    (source_id, *operations),
+                    queued_args,
                 ) as cursor:
                     cancelled = [str(row["job_id"]) async for row in cursor]
                 await self.db.execute(
                     f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
                            next_attempt_at = NULL, finished_at = ?, updated_at = ?
                        WHERE {queued}""",
-                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, changed_at, changed_at, source_id, *operations),
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, changed_at, changed_at, *queued_args),
                 )
                 await self.db.execute(
                     """UPDATE sources SET executor = ?, config = ?,
@@ -7544,7 +7553,7 @@ class Database:
                         executor,
                         config_json,
                         execution_owner_user_id,
-                        execution_device_id if executor == "device" else None,
+                        new_device,
                         source_id,
                     ),
                 )

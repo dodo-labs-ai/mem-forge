@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Literal, NotRequired, TypedDict
 
-from memforge.local_agent.device_report import LocalAgentDevice
+from memforge.local_agent.device_report import NOT_READY_CREDENTIAL, LocalAgentDevice
 
 
 class BrowserSessionStatus(TypedDict, total=False):
@@ -63,7 +63,7 @@ class SourceExecutionDevice(TypedDict):
     id: str
     name: str | None
     state: DeviceState
-    installed_version: str | None
+    installed_version: str
     required_version: str
     credential: DeviceCredential
     not_ready: list[SourceNotReadyReason]
@@ -109,7 +109,7 @@ def device_source_readiness(
         connection = None
     elif readiness.ready:
         connection = {"state": "ready", "reason": None}
-    elif any(reason.kind == "credential" for reason in readiness.reasons):
+    elif any(reason.kind == NOT_READY_CREDENTIAL for reason in readiness.reasons):
         connection = {"state": "action_required", "reason": "authentication"}
     else:
         connection = {"state": "action_required", "reason": "configuration"}

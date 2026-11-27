@@ -8,19 +8,17 @@
   opens there. Choosing another of your computers moves the Source; its
   credential stays on the old computer until that computer stops being told
   about it, and the new one needs its own. A Source whose computer is offline
-  offers Move in Configure. Existing device Sources get the computer whose
-  last report held their credentials, else your only computer; otherwise they
-  show Finish setup until you choose one. Removing a computer in Where it runs
-  sends its Sources to Finish setup.
+  offers Move in Configure. A Source without a computer shows Finish setup
+  until you choose one; removing a computer in Where it runs sends its Sources
+  there.
 - Each computer reports, per Source it runs, whether it is ready, or what it
   lacks: a credential, shown as Sign in required, or a folder, shown as Finish
   setup with the path. `memforge daemon status` lists the same reasons. A
   Source whose type needs neither, such as a public GitHub Pages site, is
   ready without `memforge source credentials set`.
 - Device protocol: the lease answer names the Sources the device runs
-  (`sources`, without secrets) in place of `released_source_ids`, and the
-  device report carries each Source's readiness (`sources`) in place of the
-  Sources it holds credentials for. A job completion names the device. An
+  (`sources`, without secrets), and the device report carries each Source's
+  readiness (`sources`). A job completion names the device. An
   acquired input names its body by `body_sha256`, and the device first asks
   `POST /sources/{id}/acquisition/held-bodies` and uploads only bodies the
   server does not hold for the Source. Devices and the server must run this

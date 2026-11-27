@@ -3,10 +3,14 @@ import { localSyncKeys } from "@/features/local-sync";
 import { sourceKeys } from "./api";
 import { useLocalSetupJob, type LocalSetupJobOptions } from "./useLocalSetupJob";
 
-/** The Source whose credential is checked, by its id and type. */
+/**
+ * The Source whose credential is checked, by its id and type, and for a
+ * device Source its execution device, so that an offline device fails fast.
+ */
 export interface CredentialCheckTarget {
   id: string;
   type: string;
+  deviceId?: string;
 }
 
 const SIGN_IN: LocalSetupJobOptions = {
@@ -35,7 +39,8 @@ export function useCredentialCheck() {
   const queryClient = useQueryClient();
   const check = useLocalSetupJob("credential_check", SIGN_IN);
   return useMutation({
-    mutationFn: (source: CredentialCheckTarget) => check({ sourceId: source.id, sourceType: source.type, payload: {} }),
+    mutationFn: (source: CredentialCheckTarget) =>
+      check({ sourceId: source.id, sourceType: source.type, deviceId: source.deviceId, payload: {} }),
     onSettled: () =>
       Promise.all([
         queryClient.invalidateQueries({ queryKey: sourceKeys.all }),
