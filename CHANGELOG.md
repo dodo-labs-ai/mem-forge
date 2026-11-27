@@ -26,6 +26,24 @@
 - The `local_markdown_preview_tree` local-agent operation is removed: a local
   folder has no Check setup, because only its computer reads it.
 
+- Local Repository Sources run on their computer like every other Source on My
+  computer: the daemon walks the whole folder on every run, uploads only file
+  text the server does not hold, and the server extracts only files whose
+  content changed. A renamed folder's files are read under their new paths and
+  the old ones leave the Source. A file that is too large, not UTF-8 or
+  unreadable fails as its own Document and keeps what it held, instead of
+  stopping the folder's run; a missing folder or a directory the daemon cannot
+  list fails the run and removes nothing. The `local_markdown_sync` operation,
+  `POST /sources/{id}/adapter/packages`, `POST /sources/{id}/adapter/manifest`
+  and the server-side `documents_dir` inbox are removed.
+
+- Upgrading a self-hosted installation with Local Repository Sources: they hold
+  what the old upload path stored and do not sync until they move. Run
+  `memforge maintenance migrate-device-packages` as for Jira and GitHub
+  repository Sources below; each file keeps its Document, Memories and Support,
+  and nothing is extracted again. A file whose stored upload records no file
+  time is refused and named.
+
 - Jira and GitHub repository Sources that collect on your own computer run the
   type's own connector on the device: choose Where it runs: My computer, and
   store the device's credential with `memforge source credentials set <id>`.

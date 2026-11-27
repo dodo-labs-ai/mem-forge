@@ -104,7 +104,7 @@ def test_local_agent_runner_retries_unclassified_handler_exceptions(tmp_path):
                 {
                     "job_id": "laj-transient",
                     "attempt_count": 1,
-                    "operation": "local_markdown_sync",
+                    "operation": "teams_sync",
                     "source_id": "src-local",
                 }
             ]

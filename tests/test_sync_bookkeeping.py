@@ -1844,9 +1844,7 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
         raw_sha256="sha-old",
         raw_content_type="application/json",
         sync_snapshot_id="snapshot-old",
-        metadata={
-            "manifest_entry": {"doc_id": "doc-old", "package_uri": "old"},
-        },
+        metadata={"doc_id": "doc-old"},
     )
     new = await db.create_source_sync_input(
         source_id="src-input-snapshot",
@@ -1855,9 +1853,7 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
         raw_sha256="sha-new",
         raw_content_type="application/json",
         sync_snapshot_id="snapshot-new",
-        metadata={
-            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
-        },
+        metadata={"doc_id": "doc-new"},
     )
     repeated = await db.create_source_sync_input(
         source_id="src-input-snapshot",
@@ -1866,9 +1862,7 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
         raw_sha256="sha-new",
         raw_content_type="application/json",
         sync_snapshot_id="snapshot-repeat",
-        metadata={
-            "manifest_entry": {"doc_id": "doc-new", "package_uri": "new"},
-        },
+        metadata={"doc_id": "doc-new"},
     )
 
     all_inputs = await db.list_source_sync_inputs(
@@ -6531,8 +6525,8 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
     await db.insert_local_agent_job(
         job_id="laj-retry",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_id": "src-local"},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6586,17 +6580,17 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
 async def test_queued_force_request_promotes_existing_local_agent_job(db: Database):
     await db.upsert_source(
         id="src-local",
-        type="local_markdown",
-        name="Local markdown",
-        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        type="teams",
+        name="Team chats",
+        config_json='{"chat_ids":["19:chat-a"]}',
         access_policy="workspace",
         owner_user_id="owner-a",
     )
     first_id, first_created = await db.enqueue_local_agent_job(
         job_id="laj-normal",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": False},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6604,8 +6598,8 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
     promoted_id, promoted_created = await db.enqueue_local_agent_job(
         job_id="laj-force",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": True},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6623,17 +6617,17 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
 async def test_leased_force_request_creates_serial_successor_job(db: Database):
     await db.upsert_source(
         id="src-local",
-        type="local_markdown",
-        name="Local markdown",
-        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        type="teams",
+        name="Team chats",
+        config_json='{"chat_ids":["19:chat-a"]}',
         access_policy="workspace",
         owner_user_id="owner-a",
     )
     first_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-leased-normal",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": False},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6642,8 +6636,8 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
     promoted_id, created = await db.enqueue_local_agent_job(
         job_id="laj-leased-force",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": True},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6674,17 +6668,17 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
     now = datetime.now(timezone.utc)
     await db.upsert_source(
         id="src-local",
-        type="local_markdown",
-        name="Local markdown",
-        config_json='{"root":"/vault","vault_id":"vault-a"}',
+        type="teams",
+        name="Team chats",
+        config_json='{"chat_ids":["19:chat-a"]}',
         access_policy="workspace",
         owner_user_id="owner-a",
     )
     first_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-expired-original",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": False},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -6693,8 +6687,8 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
     successor_id, _ = await db.enqueue_local_agent_job(
         job_id="laj-expired-successor",
         source_id="src-local",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload={"source_config_revision": "rev-a", "force_full_sync": True},
         created_by_user_id="owner-a",
         execution_owner_user_id="owner-a",
@@ -7338,10 +7332,7 @@ async def test_legacy_incremental_local_run_without_watermark_fails_closed(
         raw_uri="object://legacy-window",
         raw_sha256="sha-legacy-window",
         raw_content_type="application/json",
-        metadata={
-            "doc_id": "doc-window",
-            "manifest_entry": {"doc_id": "doc-window", "version": "v1"},
-        },
+        metadata={"doc_id": "doc-window"},
     )
     run = await db.enqueue_source_sync_run(
         source_id=source_id,
@@ -10989,13 +10980,15 @@ async def test_unchanged_document_with_complete_artifacts_does_not_rewrite_or_ex
         source_url="https://jira.example/browse/0",
         space_or_project="PAY",
     )
+    # The stored raw object holds the page the gene reads again.
     await db.db.execute(
         """UPDATE source_unit_inputs
-           SET raw_content_uri = ?, raw_content_type = ?, pdf_content_uri = ?
+           SET raw_content_uri = ?, raw_content_type = ?, raw_content_sha256 = ?, pdf_content_uri = ?
            WHERE source_id = ? AND document_id = ?""",
         (
             f"file:///tmp/{source_id}/jira-0/existing.raw",
             "text/html",
+            hashlib.sha256(MarkdownIt().render(markdown).encode()).hexdigest(),
             f"file:///tmp/{source_id}/jira-0/existing.pdf",
             source_id,
             "jira-0",

@@ -46,9 +46,7 @@ async def test_fresh_schema_has_durable_source_activity_admission(tmp_path):
     try:
         source_columns = await _columns(db, "sources")
         activity_columns = await _columns(db, "source_activity_leases")
-        manifest_columns = await _columns(db, "source_sync_snapshot_manifests")
         assert "activity_epoch" not in source_columns
-        assert "source_activity_epoch" not in manifest_columns
         assert activity_columns == [
             "id",
             "source_id",
@@ -86,9 +84,6 @@ async def test_upgrade_drops_the_source_activity_epoch_and_keeps_the_rows(tmp_pa
         # carries the Source activity epoch.
         await db.db.execute("ALTER TABLE sources ADD COLUMN activity_epoch INTEGER NOT NULL DEFAULT 0")
         await db.db.execute("ALTER TABLE source_activity_leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0")
-        await db.db.execute(
-            "ALTER TABLE source_sync_snapshot_manifests ADD COLUMN source_activity_epoch INTEGER NOT NULL DEFAULT 0"
-        )
         await db.db.execute("UPDATE sources SET activity_epoch = 3 WHERE id = 'src-epoch'")
         await db.db.execute(
             """INSERT INTO source_activity_leases (
@@ -96,15 +91,6 @@ async def test_upgrade_drops_the_source_activity_epoch_and_keeps_the_rows(tmp_pa
                ) VALUES ('lease-epoch', 'src-epoch', 'sync', 3, '1',
                          '2999-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
                          '2026-01-01T00:00:00+00:00')"""
-        )
-        await db.db.execute(
-            """INSERT INTO source_sync_snapshot_manifests (
-                   workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
-                   local_agent_job_id, local_agent_attempt_count, source_activity_epoch,
-                   source_config_revision, created_at
-               ) VALUES ('default', 'src-epoch', 'snapshot-epoch', 'complete_snapshot', 0, ?,
-                         'job-epoch', 1, 3, 'config-revision', '2026-01-01T00:00:00+00:00')""",
-            ("0" * 64,),
         )
         await db.db.execute("DELETE FROM schema_migrations WHERE version = 105")
         await db.db.commit()
@@ -117,16 +103,11 @@ async def test_upgrade_drops_the_source_activity_epoch_and_keeps_the_rows(tmp_pa
         try:
             assert "activity_epoch" not in await _columns(upgraded, "sources")
             assert "epoch" not in await _columns(upgraded, "source_activity_leases")
-            assert "source_activity_epoch" not in await _columns(upgraded, "source_sync_snapshot_manifests")
             assert (await upgraded.get_source("src-epoch"))["name"] == "Epoch"
             lease_rows = await upgraded.db.execute_fetchall(
                 "SELECT id, capability FROM source_activity_leases WHERE source_id = 'src-epoch'"
             )
             assert [tuple(row) for row in lease_rows] == [("lease-epoch", "1")]
-            manifest_rows = await upgraded.db.execute_fetchall(
-                "SELECT snapshot_id, source_config_revision FROM source_sync_snapshot_manifests"
-            )
-            assert [tuple(row) for row in manifest_rows] == [("snapshot-epoch", "config-revision")]
         finally:
             await upgraded.close()
 

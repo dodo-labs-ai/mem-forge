@@ -104,7 +104,6 @@ const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
 const LOCAL_AGENT_WAITING_MESSAGE = "Waiting for local daemon to sync this source.";
 const LOCAL_AGENT_TIMEOUT_MESSAGE =
   "Local daemon did not pick up this job. Start it with `memforge adapter daemon run` and try again.";
-const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
 const JIRA_SIGN_IN_FAILED_MESSAGE = "Jira sign-in failed.";
 const SOURCE_EVALUATION_STALE_MS = 60_000;
@@ -114,7 +113,6 @@ function safeSourceErrorMessage(error: unknown): string | null {
   if (
     error.message === LOCAL_AGENT_WAITING_MESSAGE
     || error.message === LOCAL_AGENT_TIMEOUT_MESSAGE
-    || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
     || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
     || error.message.startsWith(`${LOCAL_AGENT_SYNC_FAILED_MESSAGE} `)
     || error.message.startsWith(`${JIRA_SIGN_IN_FAILED_MESSAGE} `)
@@ -140,12 +138,7 @@ async function createLocalAgentSyncJob(
   },
 ): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
-  if (!operation) {
-    if (source.type === "local_markdown") {
-      throw new Error(LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE);
-    }
-    return null;
-  }
+  if (!operation) return null;
   const created = await createLocalAgentJob({
     sourceId: source.id,
     sourceType: source.type,

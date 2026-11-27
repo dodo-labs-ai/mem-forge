@@ -2612,8 +2612,6 @@ def adapter_status(ctx):
             "status": "available",
             "capabilities": [
                 "jira.browser_session",
-                "kb.markdown_preview",
-                "kb.markdown_push",
                 "teams.auth",
                 "teams.browse",
                 "teams.sync",
@@ -4211,10 +4209,11 @@ def maintenance_reindex(ctx, mode: str):
 @click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
 @click.pass_context
 def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, ...], as_json: bool):
-    """Move Jira and GitHub repository Sources off their device package path onto device acquisition.
+    """Move Jira, GitHub repository and local Markdown Sources off their device package path onto device acquisition.
 
-    A Jira Source set to local agent sync, or a GitHub repository Source set
-    to local push, holds what the device submitted as packages. Each such
+    A Jira Source set to local agent sync, a GitHub repository Source set to
+    local push, or a local Markdown Source whose files the daemon uploaded to
+    a server inbox, holds what the device submitted as packages. Each such
     Source moves once: every package its Units hold is rewritten to the input
     the type's Gene reads, replayed without forced extraction, so only Units
     whose content the rewrite changes are extracted, and the Source then runs

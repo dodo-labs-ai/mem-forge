@@ -724,10 +724,6 @@ def _non_empty_string(value: object) -> str | None:
     return text or None
 
 
-def _manifest_doc_id(metadata: Mapping[str, object]) -> str | None:
-    entry = metadata.get("manifest_entry")
-    nested = _non_empty_string(entry.get("doc_id")) if isinstance(entry, Mapping) else None
-    return nested or _non_empty_string(metadata.get("doc_id"))
 
 
 def _validate_replacement_kind(value: str) -> ReplacementKind:
@@ -1906,35 +1902,6 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
 
 CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
     ON source_sync_snapshot_items(input_id);
-
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    coverage            TEXT NOT NULL CHECK (coverage IN ('complete_snapshot', 'bounded_delta')),
-    item_count          INTEGER NOT NULL CHECK (item_count >= 0),
-    manifest_sha256     TEXT NOT NULL,
-    local_agent_job_id  TEXT NOT NULL,
-    local_agent_attempt_count INTEGER NOT NULL,
-    source_config_revision TEXT NOT NULL,
-    created_at          TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, source_id, snapshot_id)
-);
-
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifest_items (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    doc_id              TEXT NOT NULL,
-    revision            TEXT NOT NULL,
-    change_kind         TEXT NOT NULL CHECK (change_kind IN ('upsert', 'tombstone')),
-    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
-    ON source_sync_snapshot_manifest_items(
-        workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
-    );
 
 -- One device run's acquisition of a document Source (ADR 0058): the manifest
 -- the device submitted (its listing, the items it discovered in order and the
@@ -5178,6 +5145,18 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
             "ALTER TABLE local_agent_jobs ADD COLUMN device_id TEXT",
             "ALTER TABLE local_agent_jobs ADD COLUMN lease_device_id TEXT",
             "ALTER TABLE local_agent_devices ADD COLUMN sources_json TEXT NOT NULL DEFAULT '{}'",
+        ],
+    ),
+    (
+        139,
+        "Drop the snapshot manifests of device packages",
+        # Every document Source's device run records its acquisition manifest;
+        # a snapshot input names its Document and nothing checks it against a
+        # package manifest.
+        [
+            "DROP INDEX IF EXISTS idx_source_sync_manifest_item_attestation",
+            "DROP TABLE IF EXISTS source_sync_snapshot_manifest_items",
+            "DROP TABLE IF EXISTS source_sync_snapshot_manifests",
         ],
     ),
 ]
@@ -19839,7 +19818,7 @@ class Database:
         now = _now_iso()
         metadata_payload = dict(metadata or {})
         snapshot_id = _non_empty_string(sync_snapshot_id)
-        snapshot_doc_id = _manifest_doc_id(metadata_payload)
+        snapshot_doc_id = _non_empty_string(metadata_payload.get("doc_id"))
         if snapshot_id and not snapshot_doc_id:
             raise ValueError("snapshot input requires doc_id")
         async with self._write_lock:
@@ -19868,7 +19847,6 @@ class Database:
                             snapshot_id=snapshot_id,
                             doc_id=snapshot_doc_id,
                             input_id=str(existing["input_id"]),
-                            metadata=metadata_payload,
                             now=now,
                         )
                     await self.db.commit()
@@ -19906,7 +19884,6 @@ class Database:
                         snapshot_id=snapshot_id,
                         doc_id=snapshot_doc_id,
                         input_id=input_id,
-                        metadata=metadata_payload,
                         now=now,
                     )
                 await self.db.commit()
@@ -20439,33 +20416,8 @@ class Database:
         snapshot_id: str,
         doc_id: str,
         input_id: str,
-        metadata: Mapping[str, object],
         now: str,
     ) -> None:
-        async with self.db.execute(
-            """SELECT revision, change_kind
-               FROM source_sync_snapshot_manifest_items
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?""",
-            (workspace_id, source_id, snapshot_id, doc_id),
-        ) as cursor:
-            expected = await cursor.fetchone()
-        async with self.db.execute(
-            """SELECT 1 FROM source_sync_snapshot_manifests
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-            (workspace_id, source_id, snapshot_id),
-        ) as cursor:
-            manifest = await cursor.fetchone()
-        if expected is None:
-            if manifest is not None:
-                raise ValueError("snapshot input was not declared by the manifest")
-        else:
-            entry = metadata.get("manifest_entry")
-            if not isinstance(entry, Mapping):
-                raise ValueError("snapshot input requires manifest_entry metadata")
-            revision = str(entry.get("provider_revision") or entry.get("version") or "").strip()
-            change_kind = str(entry.get("change_kind") or "upsert").strip()
-            if str(expected["revision"]) != revision or str(expected["change_kind"]) != change_kind:
-                raise ValueError("snapshot input revision or change kind does not match manifest")
         await self.db.execute(
             """INSERT INTO source_sync_snapshot_items (
                 workspace_id, source_id, snapshot_id, doc_id, input_id, created_at

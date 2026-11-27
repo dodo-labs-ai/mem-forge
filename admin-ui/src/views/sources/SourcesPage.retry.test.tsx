@@ -23,12 +23,12 @@ vi.mock("./LocalAgentDaemonStatus", () => ({ LocalAgentDaemonStatus: () => null 
 
 const workspace = "/api/cloud/workspaces/ws-a/local-agent";
 const source: Source = {
-  id: "src-local", name: "Local fixture", type: "local_markdown", status: "active",
-  config: { root: "/fixture" }, access_policy: "workspace", memory_count: 1, doc_count: 1,
+  id: "src-local", name: "Local fixture", type: "teams", status: "active",
+  config: { chat_ids: ["19:fixture"] }, access_policy: "workspace", memory_count: 1, doc_count: 1,
   access_state: "active", last_sync: null, created_at: "2026-09-01T00:00:00Z",
   capabilities: { can_sync: true, can_configure: true, can_delete: true, can_configure_connection: true,
     can_subscribe: false, can_change_access: false, can_force_resync: true },
-  execution: { kind: "local_agent", operation: "local_markdown_sync", immutable_config_fields: [] },
+  execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] },
   sync: { run_id: "old-run", status: "success", started_at: "2026-09-01T00:00:00Z", error_message: null,
     finished_at: "2026-09-01T00:00:00Z" },
 };
@@ -62,7 +62,7 @@ it("accepts without waiting for daemon completion and keeps refreshing through C
     return { data: [{ ...source, sync }] };
   });
   vi.mocked(createLocalAgentJob).mockImplementation(async () => {
-    jobs = [{ job_id: "local-job", source_id: source.id, status: "queued", operation: "local_markdown_sync",
+    jobs = [{ job_id: "local-job", source_id: source.id, status: "queued", operation: "teams_sync",
       next_attempt_at: "2099-01-01T00:00:00Z", result: null, last_error: "VPN unavailable" }];
     return { ok: true, job_id: "local-job", status: "queued" };
   });
@@ -108,7 +108,7 @@ it("shows a query error without fabricating a failed local job", async () => {
 it("retains admitted work across a failed first refresh and recovers without user refresh", async () => {
   let admitted = false;
   let failRefresh = true;
-  const job: LocalAgentJobStatusResponse = { job_id: "admitted-job", source_id: source.id, operation: "local_markdown_sync",
+  const job: LocalAgentJobStatusResponse = { job_id: "admitted-job", source_id: source.id, operation: "teams_sync",
     status: "queued", result: null, last_error: null, next_attempt_at: "2099-01-01T00:00:00Z" };
   vi.mocked(getCurrentLocalAgentJobs).mockImplementation(async () => {
     if (!admitted) return [];
@@ -152,7 +152,7 @@ it("clears an admission when the first refresh already shows a newer terminal ru
 it("does not retain a stale exact retry receipt after the server returns terminal", async () => {
   let retried = false;
   vi.mocked(getCurrentLocalAgentJobs).mockImplementation(async () => [{
-    job_id: retried ? "new-job" : "old-job", source_id: source.id, operation: "local_markdown_sync",
+    job_id: retried ? "new-job" : "old-job", source_id: source.id, operation: "teams_sync",
     status: retried ? "succeeded" : "queued", result: null, last_error: null,
     created_at: "2026-09-03T00:00:00Z", finished_at: retried ? "2026-09-03T00:01:00Z" : null,
   }]);
@@ -171,7 +171,7 @@ it("resolves equal-timestamp local successors by exact ID instead of guessing or
   let retried = false;
   const created_at = "2026-09-03T00:00:00Z";
   vi.mocked(getCurrentLocalAgentJobs).mockImplementation(async () => [{
-    job_id: retried ? "j2" : "j1", source_id: source.id, operation: "local_markdown_sync",
+    job_id: retried ? "j2" : "j1", source_id: source.id, operation: "teams_sync",
     status: retried ? "succeeded" : "queued", result: null, last_error: null, created_at,
   }]);
   vi.mocked(resourceClient.get).mockImplementation(async (path) => ({ data: path === "/sources" ? [source] : otherResponse(path) }));

@@ -24,10 +24,6 @@ async def _database_before_the_conversation_layer(path: str) -> None:
 
     connection = await aiosqlite.connect(path)
     await connection.executescript(SCHEMA)
-    # Document snapshot manifests still record projection-scope attestations.
-    await connection.execute(
-        "ALTER TABLE source_sync_snapshot_manifests ADD COLUMN scope_attestations_json TEXT NOT NULL DEFAULT '[]'"
-    )
     for version, description, _statements in MIGRATIONS:
         if version >= 122:
             break
@@ -66,16 +62,12 @@ async def test_teams_units_keep_their_ids_and_keys_and_name_their_kind(tmp_path)
                 "SELECT id, unit_type, provider_key, locator_json FROM source_units ORDER BY id"
             )
         }
-        manifest_columns = {
-            str(row[1]) for row in await database.db.execute_fetchall("PRAGMA table_info(source_sync_snapshot_manifests)")
-        }
     finally:
         await database.close()
 
     thread, block, again = rows["unit-thread"], rows["unit-block"], rows["unit-again"]
     assert (again["unit_type"], again["provider_key"]) == (UnitKind.THREAD.value, REINCARNATED_KEY)
     assert json.loads(again["locator_json"])["thread_root_id"] == "root"
-    assert "scope_attestations_json" not in manifest_columns
     assert (thread["unit_type"], thread["provider_key"]) == (UnitKind.THREAD.value, THREAD_KEY)
     assert json.loads(thread["locator_json"])["thread_root_id"] == "root"
     assert (block["unit_type"], block["provider_key"]) == (UnitKind.WINDOW.value, BLOCK_KEY)

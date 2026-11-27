@@ -3120,7 +3120,10 @@ class GeneSyncOrchestrator:
         # before the revision is recorded with it, so a failed save fails the
         # Document before anything commits. A reprocess from stored input
         # reads its raw content from storage and keeps the provider exports it
-        # cannot repeat; only a changed normalization is stored again.
+        # cannot repeat; only a changed normalization is stored again. An
+        # unchanged revision keeps its stored raw object only while that
+        # object holds the bytes this run read, so the stored input is always
+        # what the Gene reads today.
         # A stored object is reused only when it is this Document's own
         # object in this Source; any other URI a stored input carries is
         # written again under this Document's keys.
@@ -3132,14 +3135,17 @@ class GeneSyncOrchestrator:
             projection.deltas[0].previous_unit_revision_id == projection.source_unit_revisions[0].id
         )
         reused_raw: SourceUnitInput | None = None
-        raw_sha256: str | None = None
+        raw_sha256 = hashlib.sha256(raw.body).hexdigest()
         if stored_document is not None:
             # A reprocess read these bytes from the stored object.
             reused_raw = stored_document.unit_input
-            raw_sha256 = hashlib.sha256(raw.body).hexdigest()
-        elif reuse_content_artifacts and unit_revision_unchanged and stored_input is not None:
+        elif (
+            reuse_content_artifacts
+            and unit_revision_unchanged
+            and stored_input is not None
+            and stored_input.raw_content_sha256 == raw_sha256
+        ):
             reused_raw = stored_input
-            raw_sha256 = stored_input.raw_content_sha256
         raw_uri = own_object(reused_raw.raw_content_uri) if reused_raw is not None else None
         raw_content_type = reused_raw.raw_content_type if raw_uri and reused_raw is not None else raw.content_type
         norm_uri = (
@@ -3149,7 +3155,6 @@ class GeneSyncOrchestrator:
         )
         stored_content_artifact = False
         if not raw_uri:
-            raw_sha256 = hashlib.sha256(raw.body).hexdigest()
             raw_uri = self.doc_store.store_raw(
                 source_id=source_id,
                 doc_id=doc_id,

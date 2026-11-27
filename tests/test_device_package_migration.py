@@ -222,8 +222,13 @@ async def _leave_on_the_package_path(db, doc_store, source_id: str, config: dict
         unit = await db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
         stored = await db.get_source_unit_input(unit.id)
         body = doc_store.read_artifact(stored.raw_content_uri)
-        packaged = package(source_id, stored, body)
-        doc_store._resolve_artifact_path(stored.raw_content_uri).write_text(json.dumps(packaged))
+        packaged = json.dumps(package(source_id, stored, body)).encode()
+        doc_store._resolve_artifact_path(stored.raw_content_uri).write_bytes(packaged)
+        await db.db.execute(
+            "UPDATE source_unit_inputs SET raw_content_sha256 = ? WHERE source_unit_id = ?",
+            (hashlib.sha256(packaged).hexdigest(), unit.id),
+        )
+        await db.db.commit()
     secret_free = {key: value for key, value in config.items() if key != "pat"}
     await db.upsert_source(
         id=source_id,
@@ -465,6 +470,20 @@ def test_the_local_markdown_dry_run_refuses_a_package_without_the_files_time(not
 # ---------------------------------------------------------------------------
 
 
+def _stored_bodies(deployment: Deployment, source_id: str) -> dict[str, bytes]:
+    """The raw bytes of each current Unit's stored input, by Document."""
+
+    async def read() -> dict[str, bytes]:
+        bodies = {}
+        for doc_id in await deployment.db.list_indexed_doc_ids(source_id):
+            unit = await deployment.db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+            stored = await deployment.db.get_source_unit_input(unit.id)
+            bodies[doc_id] = deployment.app.state.document_store.read_artifact(stored.raw_content_uri)
+        return bodies
+
+    return asyncio.run(read())
+
+
 def test_a_moved_local_markdown_source_keeps_its_documents_and_runs_on_its_device(notes, monkeypatch):
     source_id = _on_the_package_path(notes, monkeypatch)
     held = notes.documents(source_id)
@@ -484,6 +503,17 @@ def test_a_moved_local_markdown_source_keeps_its_documents_and_runs_on_its_devic
     assert "documents_dir" not in moved["config"]
     assert moved["config"]["root"] == str(Path(notes.kind.config["root"]))
     assert asyncio.run(package_path_sources(notes.db)) == []
+    # Each Unit's stored input is the file's text, as the Gene reads it, no longer its package.
+    assert sorted(_stored_bodies(notes, source_id).values()) == sorted(text.encode() for text in NOTES.values())
+
+    # The owner's daemon walks the folder; only the file edited after the migration is extracted.
+    plans = Path(notes.kind.config["root"]) / "team" / "plans.md"
+    plans.write_text("# Plans\n\nMove the queue on Monday.\n")
+    _sync_now_on_the_device(notes, source_id)
+
+    [edited] = [doc_id for doc_id, (title, _, _) in notes.documents(source_id).items() if title == "Plans"]
+    assert notes.extracted_documents(source_id) == [edited]
+    assert sorted(notes.documents(source_id)) == sorted(held)
 
 
 def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_changed(jira, monkeypatch):
@@ -612,6 +642,43 @@ def test_an_interrupted_migration_continues_where_it_stopped(jira, monkeypatch):
     assert sorted(jira.documents(source_id)) == ["jira-PAY-1", "jira-PAY-2", "jira-PAY-3", "jira-PAY-4"]
     assert jira.extracted_documents(source_id) == []
     assert asyncio.run(jira.db.get_source(source_id))["executor"] == "device"
+
+
+def test_an_interrupted_local_markdown_migration_continues_where_it_stopped(notes, monkeypatch):
+    source_id = _on_the_package_path(notes, monkeypatch)
+    held = notes.documents(source_id)
+    notes.extractor.fragment_calls.clear()
+    from memforge.pipeline import sync as sync_module
+
+    processed = sync_module.GeneSyncOrchestrator._process_item
+    calls = {"count": 0}
+
+    async def interrupted(self, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("the process stopped")
+        return await processed(self, *args, **kwargs)
+
+    monkeypatch.setattr(sync_module.GeneSyncOrchestrator, "_process_item", interrupted)
+    monkeypatch.setattr(sync_module, "MAX_RETRIES", 1)
+
+    first = _apply(notes, source_id)
+
+    assert first.status == "replay_failed"
+    # The Source keeps its package path and every Document; one file already moved.
+    assert asyncio.run(notes.db.get_source(source_id))["config"]["documents_dir"] == f"/inbox/{source_id}"
+    assert notes.documents(source_id) == held
+    remaining = _plan(notes, source_id)
+    assert not remaining.refused
+    assert len(remaining.units) == 1 and remaining.current_units == 1
+
+    monkeypatch.setattr(sync_module.GeneSyncOrchestrator, "_process_item", processed)
+    second = _apply(notes, source_id)
+
+    assert second.status == "migrated", second
+    assert notes.documents(source_id) == held
+    assert notes.extracted_documents(source_id) == []
+    assert asyncio.run(notes.db.get_source(source_id))["executor"] == "device"
 
 
 def test_a_source_left_on_the_package_path_does_not_sync_until_it_moves(jira, monkeypatch):

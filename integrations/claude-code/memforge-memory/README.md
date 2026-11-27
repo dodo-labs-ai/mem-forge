@@ -61,8 +61,9 @@ Install from GitHub (run inside an active Claude Code session):
 
 Start a new Claude Code session after install.
 
-To push a local folder as a source, open the MemForge Admin UI, choose
-**Add Source -> Local Repository**, and run the printed CLI command.
+To add a local folder as a source, open the MemForge Admin UI, choose
+**Add Source -> Local Repository**, choose your computer in **Where it runs**
+and pick the folder.
 
 Try a search:
 

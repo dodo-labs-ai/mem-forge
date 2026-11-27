@@ -115,7 +115,7 @@ test("update local sync comes after offline and checking and before every connec
 });
 
 test("a Source on its type's local path reads the viewer's own daemon", () => {
-  const source = makeSource({ execution: { kind: "local_agent", operation: "local_markdown_sync", immutable_config_fields: [] } });
+  const source = makeSource({ execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] } });
   assert.equal(sourceDeviceReadiness(source, "unavailable"), "unavailable");
   assert.equal(sourceDeviceReadiness(makeSource(), "ready"), "ready");
 });
