@@ -68,13 +68,13 @@
       "auth_method": "local_adapter",
       "data_shape": "document",
       "default_sync_interval_minutes": 0,
-      "description": "Files from a UI-configured local folder or repo uploaded by the local daemon",
+      "description": "Files from a folder on one of your computers, read by its MemForge daemon",
       "device_location_fields": [
         "root"
       ],
       "display_name": "Local Repository",
       "execution_kinds": [
-        "local_agent"
+        "server"
       ],
       "executors": [
         "device"
@@ -1023,7 +1023,7 @@
           "default": "",
           "field_type": "string",
           "group": "connection",
-          "help_text": "Folder path on the machine running the local daemon.",
+          "help_text": "Folder path on the computer that runs this Source.",
           "key": "root",
           "label": "Folder Path",
           "options": [],
@@ -1074,7 +1074,7 @@
           "default": ".obsidian/**,.trash/**,.git/**,**/.git/**",
           "field_type": "tag_list",
           "group": "scope",
-          "help_text": "Glob patterns to skip.",
+          "help_text": "Glob patterns to skip. A folder pattern ending in /** is not read at all.",
           "key": "exclude",
           "label": "Exclude Patterns",
           "options": [],

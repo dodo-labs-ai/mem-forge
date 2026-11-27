@@ -249,7 +249,7 @@ class TeamsWorkspace:
         assert await intake.missing_bodies_of(SOURCE_ID, attempt_id) == ()
         if dry_run:
             family = collection_family(gene, db=self.db, doc_store=self.documents, source_id=SOURCE_ID)
-            family.prepare(collection_attempt=CollectionAttempt(WORKSPACE_ID, attempt_id), input_snapshot=None)
+            family.prepare(collection_attempt=CollectionAttempt(WORKSPACE_ID, attempt_id))
             transition = await self.db.get_open_projection_scope_transition(SOURCE_ID)
             if transition is not None:
                 family.begin_scope_transition(transition)

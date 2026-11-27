@@ -1,12 +1,14 @@
 """Move Sources collected through a device package path onto device acquisition (ADR 0058, design §10.9).
 
-Before device acquisition, a Jira Source with ``sync_mode: local_agent`` and
-a GitHub repository Source with ``connection_mode: local_push`` were collected
-through a package path of their own: the owner's daemon submitted one package
-per item, the server stored the package as the Unit's stored input, and Jira
-named the Document ``jira-<source>-<key>-<digest>``. Device acquisition runs
-the type's own Gene on the device instead, so these Units hold inputs that
-only the package path reads, under ids the Gene does not give.
+Before device acquisition, a Jira Source with ``sync_mode: local_agent``, a
+GitHub repository Source with ``connection_mode: local_push`` and every local
+Markdown Source (which names the server-side ``documents_dir`` its packages
+were kept in) were collected through a package path of their own: the
+owner's daemon submitted one package per item, the server stored the package
+as the Unit's stored input, and Jira named the Document
+``jira-<source>-<key>-<digest>``. Device acquisition runs the type's own Gene
+on the device instead, so these Units hold inputs that only the package path
+reads, under ids the Gene does not give.
 
 This recoverable migration (ADR 0032) moves each such Source once:
 
@@ -18,10 +20,10 @@ This recoverable migration (ADR 0032) moves each such Source once:
    and the raw body unwrapped from its package. It projects that input
    against the Unit's current revision and counts the Units whose
    Observations it would change. A package the Gene's form cannot be rebuilt
-   from (a Jira issue without ``fields.updated``), two Units that map to one
-   id, and a GitHub file whose id from the configured ``repo_url`` and
-   ``ref`` differs from the stored one each refuse the Source. It writes
-   nothing.
+   from (a Jira issue without ``fields.updated``, a local file package
+   without the file's source time), two Units that map to one id, and a
+   GitHub or local file whose id the Gene gives differently from the stored
+   one each refuse the Source. It writes nothing.
 3. **Apply.** :func:`apply_package_migration` holds the Source's sync
    activity, plans again, and replays the rebuilt inputs through a REPLAY
    run of the type's recorded Gene: each is processed under the Gene's id
@@ -195,6 +197,38 @@ def _rebuild_github_repo(
     return _Rebuilt(item=item, body=markdown.encode("utf-8"), content_type=content_type)
 
 
+def _rebuild_local_markdown(
+    source_id: str, config: Mapping[str, Any], package: dict[str, Any], stored: SourceUnitInput
+) -> _Rebuilt:
+    """The file as ``LocalMarkdownGene`` discovers and fetches it: its text, with the file's own time."""
+
+    from memforge.genes.local_markdown_gene import (
+        LOCAL_FILE_CONTENT_TYPE,
+        fetched_local_file_item,
+        local_file_content_item,
+    )
+    from memforge.source_time import SOURCE_UPDATED_AT_KEY, parse_source_time
+
+    relative_path = str(package.get("relative_path") or "").strip()
+    markdown = package.get("markdown")
+    if not relative_path or not isinstance(markdown, str):
+        raise Unrebuildable("the package names no file path or text")
+    try:
+        source_time = parse_source_time(package.get(SOURCE_UPDATED_AT_KEY))
+    except ValueError as exc:
+        raise Unrebuildable(f"the package's source time is invalid: {exc}") from exc
+    if source_time is None:
+        raise Unrebuildable("the package records no source time for the file")
+    item = local_file_content_item(
+        source_id=source_id,
+        vault_id=str(config.get("vault_id") or ""),
+        relative_path=relative_path,
+        last_modified=source_time,
+    )
+    fetched_local_file_item(item, markdown)
+    return _Rebuilt(item=item, body=markdown.encode("utf-8"), content_type=LOCAL_FILE_CONTENT_TYPE)
+
+
 _PACKAGE_PATHS: Mapping[str, _PackagePath] = {
     "jira": _PackagePath(
         package_kind="jira_document",
@@ -208,6 +242,15 @@ _PACKAGE_PATHS: Mapping[str, _PackagePath] = {
         on_path=lambda config: str(config.get("connection_mode") or "").strip().lower() == "local_push",
         package_fields=("connection_mode", "documents_dir"),
         rebuild=_rebuild_github_repo,
+        keeps_document_ids=True,
+    ),
+    "local_markdown": _PackagePath(
+        package_kind="local_markdown_document",
+        # Every local Markdown Source collected through packages names the
+        # server-side inbox its packages were kept in.
+        on_path=lambda config: bool(str(config.get("documents_dir") or "").strip()),
+        package_fields=("documents_dir",),
+        rebuild=_rebuild_local_markdown,
         keeps_document_ids=True,
     ),
 }
@@ -441,7 +484,6 @@ async def _changes_content(
                     "configured_scope": dict(projection_scope),
                     "source_unit_id": unit.id,
                     "source_unit_provider_key": unit.provider_key,
-                    "authoritative_snapshot": False,
                 },
                 run_mode=ProjectionRunMode.DELTA if prior_unit_revision is not None else ProjectionRunMode.FULL_SNAPSHOT,
                 access_context=dict(access_context),
@@ -583,16 +625,20 @@ async def apply_package_migration(
             for key, value in acquisition_job_config(plan.source_type, source.get("config") or {}).items()
             if key not in path.package_fields
         }
-        # The package path ran on whichever of the owner's devices leased it; the
-        # owner's only device becomes its execution device, and with several
-        # the owner chooses one (Finish setup).
+        # The package path ran on whichever of the owner's devices leased it.
+        # A Source keeps the execution device its owner chose; otherwise the
+        # owner's only device becomes it, and with several the owner chooses
+        # one (Finish setup).
+        execution_device_id = str(source.get("execution_device_id") or "") or None
         owner = str(source.get("execution_owner_user_id") or "")
-        devices = await db.list_local_agent_devices(owner) if owner else []
+        if execution_device_id is None and owner:
+            devices = await db.list_local_agent_devices(owner)
+            execution_device_id = devices[0].report.device_id if len(devices) == 1 else None
         await db.change_source_executor(
             source_id,
             executor=SOURCE_EXECUTOR_DEVICE,
             config_json=json.dumps(device_config),
-            execution_device_id=devices[0].report.device_id if len(devices) == 1 else None,
+            execution_device_id=execution_device_id,
             now=datetime.now(timezone.utc),
         )
     return PackageMigrationResult(plan=plan, status="migrated")

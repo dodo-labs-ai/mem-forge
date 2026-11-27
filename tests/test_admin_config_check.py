@@ -6,17 +6,15 @@ import asyncio
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from memforge.genes import GENE_REGISTRY
-from memforge.local_adapter import default_local_adapter_inbox
 from memforge.models import ConfigFieldType, comparison_string
 from memforge.source_types import source_type_descriptor
 from memforge.source_types.form import effective_value
-from tests.test_source_authority_api import _app, _config, _connect_database, _teams_payload
+from tests.test_source_authority_api import _app, _connect_database, _teams_payload
 from tests.test_startup_runtime import TEST_SOURCE_KEY
 
 WIKI_PAGE = "https://wiki.example.test/wiki/spaces/PAY/pages/5695886009/Flexible+Payroll"
@@ -139,14 +137,12 @@ def test_config_check_maps_a_keyed_hook_refusal_to_its_field(client):
     ]
 
 
-def test_config_check_writes_nothing(tmp_path, client, database):
+def test_config_check_writes_nothing(client, database):
     _check(client, "local_markdown", {"root": "/Users/me/notes"})
     _check(client, "github_repo", {**SUBMITTED["github_repo"], "connection_mode": "local_push"})
     _check(client, "confluence", SUBMITTED["confluence"])
 
     assert asyncio.run(database.list_sources()) == []
-    inboxes = default_local_adapter_inbox(_config(tmp_path), "config-check").parent
-    assert not Path(inboxes).exists()
 
 
 def test_jira_fact_shows_effective_jql_with_order_by(client):

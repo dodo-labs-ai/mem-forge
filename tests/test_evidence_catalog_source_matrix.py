@@ -6,6 +6,7 @@ from html import escape
 
 import pytest
 
+from memforge.genes.local_markdown_gene import LOCAL_FILE_CONTENT_TYPE
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline.extraction_requests import plan_extraction_requests
 from memforge.pipeline.projection_context import (
@@ -177,14 +178,8 @@ def _projection_inputs(
     elif source_type == "local_markdown":
         item_id = "local-guide"
         source_url = "file:///vault/docs/guide.md"
-        extra = {"relative_path": "docs/guide.md", "file_lineage_id": "file-77"}
-        raw_value = {
-            "vault_id": "vault-a",
-            "relative_path": "docs/guide.md",
-            "file_lineage_id": "file-77",
-            "markdown": rule,
-        }
-        content_type = "application/json"
+        extra = {"vault_id": "vault-a", "relative_path": "docs/guide.md"}
+        content_type = LOCAL_FILE_CONTENT_TYPE
         target_observation_type = "file_content"
     elif source_type == "notion":
         # A database row: its body, and its properties as their own Observation.

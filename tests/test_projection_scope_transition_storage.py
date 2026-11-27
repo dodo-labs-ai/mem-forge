@@ -56,6 +56,7 @@ def _document(path: str, body: str, *, source_id: str = SOURCE) -> tuple[SourceP
         title=path,
         source_url="",
         last_modified=datetime(2026, 10, 20, tzinfo=timezone.utc),
+        extra={"vault_id": "docs", "relative_path": path},
     )
     projection = project_source_item(
         source_id=source_id,

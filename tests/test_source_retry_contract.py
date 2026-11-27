@@ -29,9 +29,9 @@ async def _queued_retry(db):
     now = datetime.now(timezone.utc)
     await db.upsert_source(
         id="src-retry",
-        type="local_markdown",
+        type="teams",
         name="Retry contract",
-        config_json='{"root":"/fixture"}',
+        config_json='{"conversation_ids":["19:standup@thread.v2"]}',
         access_policy="workspace",
         owner_user_id="owner",
         execution_owner_user_id="owner",
@@ -41,8 +41,8 @@ async def _queued_retry(db):
     await db.enqueue_local_agent_job(
         job_id="laj-retry",
         source_id="src-retry",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload=payload,
         created_by_user_id="owner",
         execution_owner_user_id="owner",
@@ -88,8 +88,8 @@ async def test_manual_advances_exact_job_without_resetting_history(db):
     common = dict(
         job_id="laj-must-not-be-created",
         source_id="src-retry",
-        source_type="local_markdown",
-        operation="local_markdown_sync",
+        source_type="teams",
+        operation="teams_sync",
         payload=payload,
         created_by_user_id="owner",
         execution_owner_user_id="owner",
@@ -210,8 +210,8 @@ async def test_two_connections_retry_one_job_without_resetting_attempts(db):
             return await database.enqueue_local_agent_job(
                 job_id="must-not-create",
                 source_id="src-retry",
-                source_type="local_markdown",
-                operation="local_markdown_sync",
+                source_type="teams",
+                operation="teams_sync",
                 payload=payload,
                 created_by_user_id="owner",
                 execution_owner_user_id="owner",
@@ -244,8 +244,8 @@ async def test_exact_local_retry_rejects_stale_payload(db):
         await db.enqueue_local_agent_job(
             job_id="must-not-create",
             source_id="src-retry",
-            source_type="local_markdown",
-            operation="local_markdown_sync",
+            source_type="teams",
+            operation="teams_sync",
             payload=payload,
             created_by_user_id="owner",
             execution_owner_user_id="owner",

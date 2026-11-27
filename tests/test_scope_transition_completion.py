@@ -36,7 +36,6 @@ from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_document_absence import (
     JIRA_CONFIG,
     SOURCE_ID,
-    DeviceManifest,
     JiraProject,
     Workspace,
     _synced,
@@ -622,15 +621,15 @@ async def test_a_document_blocked_by_a_unit_completion_cannot_remove_lists_no_ex
 
 
 @pytest.mark.asyncio
-async def test_a_device_manifest_completes_a_transition_and_removes_what_it_does_not_list(workspace):
-    repository = DeviceManifest(existing={0, 1})
-    first = await workspace.sync(repository, manifest={0, 1})
+async def test_an_existence_listing_completes_a_transition_and_removes_what_it_does_not_list(workspace):
+    repository = JiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+    first = await workspace.sync(repository)
     assert first.last_sync_status == "success"
     workspace.engine.events.clear()
     await _change_scope(workspace)
 
     repository.move_on(existing={0, 2})
-    state = await workspace.sync(repository, manifest={0, 2})
+    state = await workspace.sync(repository)
 
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == ["jira-1"]

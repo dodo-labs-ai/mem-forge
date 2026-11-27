@@ -1,4 +1,4 @@
-"""Local markdown: the files of a folder the local agent snapshots."""
+"""Local markdown: the files of a folder on the Source's execution device."""
 
 from __future__ import annotations
 
@@ -7,18 +7,13 @@ from typing import Any
 
 from memforge.source_adapters import local_markdown as adapter
 from memforge.source_adapters.contracts import FILE_ALTERNATIVE_EVIDENCE_PROFILES, MARKDOWN_STRUCTURAL_PROFILE
-from memforge.source_types.config import LocalInbox, SourceConfigPolicy
-from memforge.source_types.descriptor import SOURCE_EXECUTOR_DEVICE, LocalAgentCollection, SourceTypeDescriptor
+from memforge.source_types.config import SourceConfigPolicy
+from memforge.source_types.descriptor import SOURCE_EXECUTOR_DEVICE, SourceTypeDescriptor
 
 
 def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
     vault_id = str(config.get("vault_id") or (existing_config or {}).get("vault_id") or "").strip()
     config["vault_id"] = vault_id or f"local-{source_id}"
-    return config
-
-
-def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
-    config["documents_dir"] = local_inbox()
     return config
 
 
@@ -33,15 +28,9 @@ DESCRIPTOR = SourceTypeDescriptor(
     project_native=adapter.project_native,
     evidence_profiles={"file_content": MARKDOWN_STRUCTURAL_PROFILE},
     alternative_evidence_profiles={"file_content": FILE_ALTERNATIVE_EVIDENCE_PROFILES},
-    local_agent=LocalAgentCollection(
-        operation="local_markdown_sync",
-        job_config_fields=frozenset({"root", "vault_id", "include", "exclude"}),
-        package_submitter="memforge.local_adapter:submit_local_markdown_request",
-        replay_adapter="memforge.local_agent.replay_adapter:LocalMarkdownReplayAdapter",
-    ),
-    acquisition_contract=2,
+    acquisition_contract=3,
     # Its files exist only on the owner's machine.
     executors=frozenset({SOURCE_EXECUTOR_DEVICE}),
     device_location_fields=("root",),
-    config=SourceConfigPolicy(complete=_complete_config, store=_store_config),
+    config=SourceConfigPolicy(complete=_complete_config),
 )

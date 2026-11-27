@@ -1,4 +1,4 @@
-"""Stable document identities for local-agent package adapters."""
+"""Stable Document identities of files a device reads."""
 
 from __future__ import annotations
 

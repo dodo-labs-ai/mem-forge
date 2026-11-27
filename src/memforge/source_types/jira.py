@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import jira as adapter
-from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_replaced
+from memforge.source_types.config import SourceConfigPolicy, secret_replaced
 from memforge.source_types.descriptor import SourceTypeDescriptor
 
 _SOURCE_OWNED_COOKIE_FIELDS = (
@@ -69,7 +69,7 @@ def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
     return [("Effective query at sync", _build_jql(scoped, "updated >= '<last sync>'"))]
 
 
-def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
+def _store_config(config: dict[str, Any]) -> dict[str, Any]:
     from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 
     # Browser sessions belong to the shared auth sessions, never to one Source.

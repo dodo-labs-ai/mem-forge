@@ -13,8 +13,6 @@ you need from its module::
 - :mod:`memforge.genes.toolkit.config` reads configuration values: booleans,
   integers, lists, personal access tokens, TLS trust and HTTPS base URLs, and
   refuses a configuration field by field (``SourceConfigInvalid``).
-- :mod:`memforge.genes.toolkit.local_packages` reads the packages a device
-  submitted for a Source, from the run's manifest or the Source's inbox.
 - :mod:`memforge.genes.toolkit.paging` walks a paged provider listing to its
   end, by offset or by cursor, and raises when the pages do not fit together.
 - :mod:`memforge.genes.toolkit.pdf` holds a PDF export's material and renders

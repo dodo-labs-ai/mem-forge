@@ -7,8 +7,8 @@ projection, extraction and the Memory lifecycle, the same way for both.
 
 - :class:`DocumentFamily` reads a provider's items. It discovers changes
   since the incremental cursor, and takes one listing of the configured scope
-  per run: a device's snapshot manifest, or the connector's own listing. That
-  listing decides which failed Documents are retried and which held
+  per run from its connector, whether the connector read the provider or a
+  device's acquisition answers for it. That listing decides which failed Documents are retried and which held
   Documents are gone, and when an open scope transition completes.
 - :class:`ConversationFamily` plans each run from the collection attempt it
   is bound to. Each Unit the conversation layer removes carries its own
@@ -32,7 +32,6 @@ from memforge.genes.conversation_gene import CollectionAttempt, ConversationGene
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind, gene_family
 from memforge.genes.recorded import AcquisitionRecordMismatch
-from memforge.local_agent.source_contract import local_agent_sync_operation
 from memforge.models import (
     AbsenceAnswer,
     AbsenceCheckSkippedReason,
@@ -74,7 +73,6 @@ __all__ = [
     "DocumentFamily",
     "ExcludedScopeGeneFactory",
     "LedgerPartition",
-    "SnapshotBinding",
     "collection_family",
     "listing_partition",
 ]
@@ -92,18 +90,6 @@ class AbsenceCheckSkipped(Exception):
     def __init__(self, reason: AbsenceCheckSkippedReason) -> None:
         super().__init__(reason)
         self.reason: AbsenceCheckSkippedReason = reason
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotBinding:
-    """The complete input snapshot a device submitted for one document sync run.
-
-    ``doc_ids`` are the Documents its manifest names: everything the scope
-    holds, as the device read it.
-    """
-
-    snapshot_id: str
-    doc_ids: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,14 +213,12 @@ class CollectionFamily(ABC):
         """
         self.doc_store = doc_store
         self.source_id = source_id
-        self.input_snapshot: SnapshotBinding | None = None
 
     @abstractmethod
     def prepare(
         self,
         *,
         collection_attempt: CollectionAttempt | None,
-        input_snapshot: SnapshotBinding | None,
         excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
         """Bind the run to what it collects, before anything else runs."""
@@ -253,12 +237,12 @@ class CollectionFamily(ABC):
 
         It is the last cursor minus
         :data:`DEFAULT_INCREMENTAL_SYNC_OVERLAP`. A run that must discover
-        everything, a run bound to a complete input snapshot, a Source that
-        never synced or holds no Document, and a family-specific reason
-        (:meth:`_requires_full_discovery`) read from the start.
+        everything, a Source that never synced or holds no Document, and a
+        family-specific reason (:meth:`_requires_full_discovery`) read from
+        the start.
         """
 
-        if full_discovery or self.input_snapshot is not None:
+        if full_discovery:
             return None
         last_sync_time = existing_state.last_sync_at if existing_state else None
         if last_sync_time and await self._requires_full_discovery():
@@ -352,8 +336,7 @@ class DocumentFamily(CollectionFamily):
     after discovery and before it retries failed Documents, and keeps it for
     the rest of the run: a connector such as Confluence resets its discovery
     walk when it rediscovers one Document, so listing again later could
-    answer differently. A run bound to a device's input snapshot reads the
-    snapshot manifest as its listing, with the Gene's single listing kind.
+    answer differently.
 
     During an open scope transition, every Document that commits is recorded
     as one of the transition's members, run after run, and each run fetches
@@ -385,10 +368,8 @@ class DocumentFamily(CollectionFamily):
         self,
         *,
         collection_attempt: CollectionAttempt | None,
-        input_snapshot: SnapshotBinding | None,
         excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
-        self.input_snapshot = input_snapshot
         self._excluded_scope_gene = excluded_scope_gene
         self.gene.reset_scope_listing()
 
@@ -396,24 +377,16 @@ class DocumentFamily(CollectionFamily):
         self._transition = transition
 
     async def take_scope_listing(self) -> None:
-        """Take the run's listing: the bound snapshot manifest, or the connector's own listing.
+        """Take the run's listing from the connector.
 
-        A configuration that cannot list, and one collected on a device whose
-        run is bound to no snapshot, has no listing. A connector listing that
-        raises leaves the run without one and records ``scope_listing_failed``,
-        so nothing is removed or settled by listing in this run. A listing
-        the run's acquisition record does not hold fails the run
-        (:class:`~memforge.genes.recorded.AcquisitionRecordMismatch`).
+        A configuration that cannot list has no listing. A connector listing
+        that raises leaves the run without one and records
+        ``scope_listing_failed``, so nothing is removed or settled by listing
+        in this run. A listing the run's acquisition record does not hold
+        fails the run (:class:`~memforge.genes.recorded.AcquisitionRecordMismatch`).
         """
 
         if not self.gene.lists_scope(self.gene.config):
-            return
-        if self.input_snapshot is not None:
-            self.scope_listing = ScopeListing(
-                kind=self.gene.snapshot_listing_kind(), doc_ids=self.input_snapshot.doc_ids
-            )
-            return
-        if self._collected_on_device():
             return
         try:
             self.scope_listing = await self.gene.list_scope()
@@ -826,10 +799,6 @@ class DocumentFamily(CollectionFamily):
         )
         return absent
 
-    def _collected_on_device(self) -> bool:
-        """Whether the owner's device collects this Source, so its listing is the device's snapshot manifest."""
-        return local_agent_sync_operation(self.gene.metadata().name, self.gene.config) is not None
-
 
 class ConversationFamily(CollectionFamily):
     """A conversation Source: each run plans from its bound collection attempt."""
@@ -840,11 +809,8 @@ class ConversationFamily(CollectionFamily):
         self,
         *,
         collection_attempt: CollectionAttempt | None,
-        input_snapshot: SnapshotBinding | None,
         excluded_scope_gene: ExcludedScopeGeneFactory | None = None,
     ) -> None:
-        if input_snapshot is not None:
-            raise ValueError("a conversation Source plans from its collection attempt, not an input snapshot")
         if collection_attempt is None:
             raise ValueError("a conversation Source syncs only within a collection attempt")
         self.gene.bind_conversation_run(

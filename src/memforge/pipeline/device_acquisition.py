@@ -173,7 +173,7 @@ async def document_acquisition_job_payload(
         doc_store=doc_store,
         source_id=source_id,
     )
-    family.prepare(collection_attempt=None, input_snapshot=None)
+    family.prepare(collection_attempt=None)
     since = await family.since(
         existing_state=await db.get_sync_state(source_id),
         indexed_doc_ids=await db.list_indexed_doc_ids(source_id),

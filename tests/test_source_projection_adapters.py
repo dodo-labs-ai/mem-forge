@@ -1061,13 +1061,8 @@ async def test_claim_evidence_scope_upgrade_creates_a_new_immutable_revision(
         ),
         (
             "local_markdown",
-            {"relative_path": "design.md"},
-            {
-                "vault_id": "vault-a",
-                "relative_path": "design.md",
-                "file_lineage_id": "file-77",
-                "markdown": "Keep A7.",
-            },
+            {"vault_id": "vault-a", "relative_path": "design.md"},
+            b"Keep A7.",
             "local_file",
             "file_content",
         ),
@@ -1095,28 +1090,18 @@ def test_document_and_append_sources_use_stable_provider_units(
     assert projection.observations[0].observation_type == expected_observation_type
 
 
-@pytest.mark.parametrize("source_type", ["github_repo", "local_markdown"])
-def test_file_move_with_provider_lineage_preserves_observation_identity(source_type: str) -> None:
+def test_a_github_file_move_with_provider_lineage_preserves_observation_identity() -> None:
+    source_type = "github_repo"
     first_extra = {"relative_path": "old/design.md", "file_lineage_id": "file-77"}
     second_extra = {
         "relative_path": "new/design.md",
         "file_lineage_id": "file-77",
         "previous_filename": "old/design.md",
     }
-    if source_type == "github_repo":
-        first_extra.update({"repo_owner": "acme", "repo_name": "pay", "repo_ref": "main"})
-        second_extra.update({"repo_owner": "acme", "repo_name": "pay", "repo_ref": "main"})
+    first_extra.update({"repo_owner": "acme", "repo_name": "pay", "repo_ref": "main"})
+    second_extra.update({"repo_owner": "acme", "repo_name": "pay", "repo_ref": "main"})
     first_item = _item(item_id="file-old", extra=first_extra)
-    first_raw_value = (
-        b"# Design\nKeep A7."
-        if source_type == "github_repo"
-        else {
-            "vault_id": "vault-a",
-            "relative_path": "old/design.md",
-            "file_lineage_id": "file-77",
-            "markdown": "# Design\nKeep A7.",
-        }
-    )
+    first_raw_value = b"# Design\nKeep A7."
     first_raw, first_normalized = _inputs(first_item, first_raw_value, "# Design\nKeep A7.")
     first = project_source_item(
         source_id=f"src-{source_type}",
@@ -1127,16 +1112,7 @@ def test_file_move_with_provider_lineage_preserves_observation_identity(source_t
         normalized=first_normalized,
     )
     moved_item = _item(item_id="file-new", extra=second_extra)
-    moved_raw_value = (
-        b"# Design\nKeep A7."
-        if source_type == "github_repo"
-        else {
-            "vault_id": "vault-a",
-            "relative_path": "new/design.md",
-            "file_lineage_id": "file-77",
-            "markdown": "# Design\nKeep A7.",
-        }
-    )
+    moved_raw_value = b"# Design\nKeep A7."
     moved_raw, moved_normalized = _inputs(moved_item, moved_raw_value, "# Design\nKeep A7.")
     moved = project_source_item(
         source_id=f"src-{source_type}",

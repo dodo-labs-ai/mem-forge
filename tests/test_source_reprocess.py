@@ -601,7 +601,7 @@ async def test_the_worker_runs_a_reprocess_from_storage_once(db, status):
     [call] = provider.calls
     assert call["execution_mode"] is SourceSyncMode.REPROCESS
     assert call["reprocess_doc_ids"] == frozenset({"jira-PAY-1"})
-    assert call["force_full_sync"] is False and call["reusable_projection_doc_ids"] == frozenset()
+    assert call["force_full_sync"] is False
     finished = await db.get_source_sync_run(run.run_id)
     assert finished.status == status
     # An operator requests a failed reprocess again; it is not retried.

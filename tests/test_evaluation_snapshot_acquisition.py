@@ -175,8 +175,6 @@ async def test_an_item_stands_at_its_highest_revision_not_above_the_one_replayed
 
 
 def test_a_document_snapshot_source_runs_on_the_server_and_a_conversation_one_on_the_device() -> None:
-    # local_markdown is always collected by the agent; replaying a set, the server reads it.
-    assert local_agent_sync_operation("local_markdown", {"root": "/notes"}) == "local_markdown_sync"
     assert local_agent_sync_operation("local_markdown", _replaying("local_markdown")) is None
     assert local_agent_sync_operation("jira", _replaying("jira", sync_mode="local_agent")) is None
     assert local_agent_sync_operation("teams", _replaying("teams")) == "teams_sync"

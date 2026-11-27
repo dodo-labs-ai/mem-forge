@@ -300,7 +300,6 @@ async def project_stored_input(
                     scope={
                         "configured_scope": dict(projection_scope),
                         "document_id": document_id,
-                        "authoritative_snapshot": False,
                         "source_unit_id": committed_unit.id,
                         "source_unit_provider_key": committed_unit.provider_key,
                     },

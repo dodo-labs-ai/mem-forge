@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from importlib import metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -37,7 +37,6 @@ from memforge.auth import browser_session
 from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
-from memforge.local_agent.document_identity import build_local_markdown_doc_id
 from memforge.local_agent.setup_results import (
     CredentialCheckResult,
     LocalMarkdownPickRootResult,
@@ -47,11 +46,9 @@ from memforge.local_agent.setup_results import (
     TeamsBrowseResult,
 )
 from memforge.local_agent.source_contract import (
-    local_agent_sync_snapshot_id,
     source_processing_receipt,
 )
 from memforge.retrieval.intents import RANKED_RETRIEVAL_INTENTS
-from memforge.source_time import source_time_iso
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
@@ -81,22 +78,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
-DEFAULT_KB_INCLUDE = [
-    "*.md",
-    "**/*.md",
-    "*.markdown",
-    "**/*.markdown",
-    "*.txt",
-    "**/*.txt",
-    "*.json",
-    "**/*.json",
-    "*.html",
-    "**/*.html",
-    "*.htm",
-    "**/*.htm",
-]
-DEFAULT_KB_EXCLUDE = [".obsidian/**", ".trash/**", ".git/**", "**/.git/**"]
-LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
 # Watch defaults. The tick interval is deliberately shorter than a typical Jira
 # idle-session timeout so the stored copy is renewed while it is still valid.
 WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
@@ -524,26 +505,6 @@ def _build_local_agent_runner(
             )
         ),
     )
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item)]
-    if isinstance(value, tuple):
-        return [str(item) for item in value if str(item)]
-    return []
-
-
-def _merge_default_excludes(excludes: tuple[str, ...] | list[str]) -> list[str]:
-    merged: list[str] = []
-    for pattern in [*DEFAULT_KB_EXCLUDE, *[str(item) for item in excludes]]:
-        if pattern and pattern not in merged:
-            merged.append(pattern)
-    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -2946,7 +2907,6 @@ def _run_cloud_local_agent_job(
     operation = str(job.get("operation") or "").strip()
     handlers = {
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
-        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
         "credential_check": lambda: _run_cloud_credential_check_job(job, client, browser=browser),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
@@ -3220,39 +3180,6 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
     raise CloudJobLeaseLost(str(response["detail"]))  # type: ignore[index]
 
 
-def _plan_local_source_manifest(
-    client: ToolClient,
-    *,
-    source_id: str,
-    items: list[dict[str, str]],
-    coverage: str,
-    known_doc_ids: set[str],
-    sync_snapshot_id: str,
-    local_agent_job_id: str,
-    local_agent_attempt_count: int,
-) -> set[str]:
-    """Plan one fenced collection: the items whose bodies the agent uploads."""
-    plan = client.prepare_local_source_snapshot(
-        source_id=source_id,
-        items=items,
-        coverage=coverage,
-        sync_snapshot_id=sync_snapshot_id,
-        local_agent_job_id=local_agent_job_id,
-        local_agent_attempt_count=local_agent_attempt_count,
-    )
-    _raise_if_local_agent_lease_not_current(plan)
-    if plan.get("error"):
-        raise RuntimeError("source manifest comparison failed")
-    required_doc_ids = {
-        str(doc_id)
-        for doc_id in plan.get("required_doc_ids", [])
-        if str(doc_id)
-    }
-    if required_doc_ids - known_doc_ids:
-        raise RuntimeError("source manifest comparison returned unknown document identities")
-    return required_doc_ids
-
-
 def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
     operation = str(job.get("operation") or "").strip()
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -3266,39 +3193,6 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
     except FolderPickerUnavailable as exc:
         return _setup_result(LocalMarkdownPickRootResult(operation=operation, error=str(exc)))
     return _setup_result(LocalMarkdownPickRootResult(operation=operation, root=root))
-
-
-def _run_cloud_local_markdown_sync_job(
-    job: dict[str, Any],
-    client: ToolClient,
-    *,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
-    )
-    if error:
-        return error
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-    result = _push_kb_profile_to_source(
-        profile_name,
-        _kb_profile_from_cloud_job(job),
-        source_id=source_id,
-        limit=0,
-        force_full_sync=bool(payload.get("force_full_sync", False)),
-        submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-        client=client,
-        sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
-        local_agent_job_id=str(job["job_id"]),
-        local_agent_attempt_count=int(job["attempt_count"]),
-        report_progress=report_progress,
-    )
-    return {"operation": operation, **result}
 
 
 def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3539,25 +3433,6 @@ async def _collect_conversation_on_device(
         )
 
 
-def _kb_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    root = str(payload.get("root") or "").strip()
-    vault_id = str(payload.get("vault_id") or "").strip()
-    if not root:
-        raise click.ClickException("local_markdown root is required")
-    if not vault_id:
-        raise click.ClickException("local_markdown vault_id is required")
-    profile: dict[str, Any] = {
-        "root": root,
-        "vault_id": vault_id,
-    }
-    if "include" in payload:
-        profile["include"] = payload["include"]
-    if "exclude" in payload:
-        profile["exclude"] = payload["exclude"]
-    return profile
-
-
 def _local_agent_job_source_client(
     job: dict[str, Any],
     payload: dict[str, Any],
@@ -3622,463 +3497,12 @@ def _sync_progress_snapshot(
     return normalize_sync_progress_snapshot(snapshot)
 
 
-def _int_or_zero(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _cloud_job_limit(value: Any, *, default: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return default
     return max(parsed, 0)
-
-
-def _push_kb_profile_to_source(
-    name: str,
-    profile: dict[str, Any],
-    *,
-    source_id: str,
-    limit: int,
-    force_full_sync: bool,
-    submitted_by: str | None,
-    client: ToolClient,
-    sync_snapshot_id: str | None = None,
-    local_agent_job_id: str | None = None,
-    local_agent_attempt_count: int | None = None,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    started_at = time.perf_counter()
-    if limit and sync_snapshot_id:
-        raise ValueError("limited collection cannot finalize a fenced source snapshot")
-    root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    pushed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-
-    entries = list(_scan_kb_profile(root, include=include, exclude=exclude, counts=counts))
-    selected_entries = entries[:limit] if limit else entries
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="discovering",
-            completed=len(selected_entries),
-            unit="file",
-        ),
-    )
-
-    incomplete_reasons = {
-        key: counts[key]
-        for key in ("too_large", "invalid_utf8", "unreadable")
-        if counts[key]
-    }
-    if incomplete_reasons:
-        return {
-            "profile": name,
-            "root": str(root),
-            "vault_id": vault_id,
-            "source_id": source_id,
-            "counts": {**counts, "pushed": 0, "failed": sum(incomplete_reasons.values())},
-            "error": "local collection was incomplete",
-            "retryable": True,
-        }
-    try:
-        _attest_kb_scan_stable(
-            root,
-            include=include,
-            exclude=exclude,
-            entries=entries,
-        )
-    except ValueError as exc:
-        return {
-            "profile": name,
-            "root": str(root),
-            "vault_id": vault_id,
-            "source_id": source_id,
-            "counts": {**counts, "pushed": 0, "failed": 1},
-            "error": "local collection was incomplete",
-            "detail": str(exc),
-            "retryable": True,
-        }
-
-    entries_by_doc_id: dict[str, dict[str, Any]] = {}
-    manifest_items: list[dict[str, str]] = []
-    for entry in selected_entries:
-        doc_id = build_local_markdown_doc_id(
-            source_id=source_id,
-            vault_id=vault_id,
-            relative_path=str(entry["relative_path"]),
-        )
-        entries_by_doc_id[doc_id] = entry
-        manifest_items.append(
-            {
-                "doc_id": doc_id,
-                "revision": str(entry["raw_hash"]),
-                "change_kind": "upsert",
-            }
-        )
-
-    required_doc_ids = set(entries_by_doc_id)
-    comparison_started_at = time.perf_counter()
-    fallback_reason: str | None = None
-    if not limit and sync_snapshot_id and local_agent_job_id and local_agent_attempt_count is not None:
-        try:
-            required_doc_ids = _plan_local_source_manifest(
-                client,
-                source_id=source_id,
-                items=manifest_items,
-                coverage="complete_snapshot",
-                known_doc_ids=set(entries_by_doc_id),
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=local_agent_job_id,
-                local_agent_attempt_count=local_agent_attempt_count,
-            )
-        except RuntimeError as exc:
-            return {
-                "profile": name,
-                "root": str(root),
-                "vault_id": vault_id,
-                "source_id": source_id,
-                "counts": {**counts, "pushed": 0, "failed": 0},
-                "error": str(exc),
-                "retryable": True,
-            }
-    else:
-        fallback_reason = "missing_fenced_snapshot"
-    comparison_latency_ms = round((time.perf_counter() - comparison_started_at) * 1000, 3)
-    entries_to_upload = [
-        entry
-        for doc_id, entry in entries_by_doc_id.items()
-        if doc_id in required_doc_ids
-    ]
-
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="uploading",
-            completed=0,
-            total=len(entries_to_upload),
-            unit="file",
-        ),
-    )
-
-    uploaded_body_bytes = 0
-    worktree = _git_worktree(root) if entries_to_upload else None
-    for index, entry in enumerate(entries_to_upload, start=1):
-        uploaded_body_bytes += int(entry["bytes"])
-        response = client.push_local_markdown_document(
-            source_id=source_id,
-            vault_id=vault_id,
-            relative_path=entry["relative_path"],
-            markdown_body=entry["text"],
-            content_type=entry["content_type"],
-            title=entry["title"],
-            raw_hash=entry["raw_hash"],
-            source_updated_at=_local_file_source_time(root, entry, worktree),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-            submitted_by=submitted_by,
-        )
-        _raise_if_local_agent_lease_not_current(response)
-        if isinstance(response, dict) and response.get("error"):
-            failed.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "error": response.get("error"),
-                    "detail": response.get("detail"),
-                    "status_code": response.get("status_code"),
-                }
-            )
-        else:
-            pushed.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "doc_id": response.get("doc_id"),
-                    "document_hash": response.get("document_hash"),
-                }
-            )
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(entries_to_upload),
-                unit="file",
-                failed=len(failed),
-            ),
-        )
-
-    payload = {
-        "profile": name,
-        "root": str(root),
-        "vault_id": vault_id,
-        "source_id": source_id,
-        "counts": {
-            **counts,
-            "reused": len(selected_entries) - len(entries_to_upload),
-            "pushed": len(pushed),
-            "failed": len(failed),
-        },
-        "pushed": pushed,
-        "failed": failed,
-        "metrics": {
-            "manifest_items": len(manifest_items),
-            "full_bodies_read": len(selected_entries),
-            "full_bodies_uploaded": len(pushed),
-            "bytes_uploaded": uploaded_body_bytes,
-            "comparison_latency_ms": comparison_latency_ms,
-            "end_to_end_latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
-            "fallback_reason": fallback_reason,
-        },
-    }
-    if failed:
-        payload["error"] = "one or more documents failed to push"
-    if not failed:
-        sync_result = client.start_source_processing(
-            source_id=source_id,
-            force_full_sync=force_full_sync,
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-        )
-        payload["sync_started"] = not bool(sync_result.get("error"))
-        payload.update(source_processing_receipt(sync_result))
-        if sync_result.get("error"):
-            payload["error"] = "source processing failed to start"
-            payload["sync_error"] = sync_result
-    if payload.get("error"):
-        payload["retryable"] = True
-    return payload
-
-
-def _resolve_kb_profile(name: str, profile: dict[str, Any]) -> tuple[Path, list[str], list[str], str]:
-    root_value = str(profile.get("root") or "").strip()
-    if not root_value:
-        raise click.ClickException("Knowledge-base root is required.")
-    root = Path(root_value).expanduser().resolve()
-    if not root.exists() or not root.is_dir():
-        raise click.ClickException(f"Knowledge-base root is not a directory: {root}")
-    include = _string_list(profile.get("include")) or DEFAULT_KB_INCLUDE
-    exclude = _string_list(profile.get("exclude")) or DEFAULT_KB_EXCLUDE
-    vault_id = str(profile.get("vault_id") or name)
-    return root, include, exclude, vault_id
-
-
-def _scan_kb_profile(
-    root: Path,
-    *,
-    include: list[str],
-    exclude: list[str],
-    counts: dict[str, int],
-):
-    """Yield one entry per included file, updating ``counts`` in place.
-
-    The CLI is a thin bridge: it reads each file's raw UTF-8 text and tags it
-    with a ``content_type`` derived from the extension. All conversion to
-    markdown happens server-side during sync.
-    """
-    max_bytes = 1_000_000
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            counts["ignored"] += 1
-            continue
-        if not path.is_file():
-            continue
-        rel_path = path.relative_to(root).as_posix()
-        if _glob_match(rel_path, exclude) or not _glob_match(rel_path, include):
-            counts["ignored"] += 1
-            continue
-        try:
-            stat_before = path.stat()
-            size = stat_before.st_size
-        except OSError:
-            counts["unreadable"] += 1
-            continue
-        if size > max_bytes:
-            counts["too_large"] += 1
-            continue
-        try:
-            raw = path.read_bytes()
-            text = raw.decode("utf-8")
-            stat_after = path.stat()
-        except UnicodeDecodeError:
-            counts["invalid_utf8"] += 1
-            continue
-        except OSError:
-            counts["unreadable"] += 1
-            continue
-        fingerprint_before = (
-            stat_before.st_dev,
-            stat_before.st_ino,
-            stat_before.st_size,
-            stat_before.st_mtime_ns,
-        )
-        fingerprint_after = (
-            stat_after.st_dev,
-            stat_after.st_ino,
-            stat_after.st_size,
-            stat_after.st_mtime_ns,
-        )
-        if fingerprint_before != fingerprint_after or len(raw) != stat_after.st_size:
-            counts["unreadable"] += 1
-            continue
-        content_type = _content_type_for_path(path)
-        raw_hash = hashlib.sha256(raw).hexdigest()
-        title = (_markdown_title(text) if content_type == "text/markdown" else None) or rel_path
-        counts["included"] += 1
-        yield {
-            "relative_path": rel_path,
-            "title": title,
-            "content_type": content_type,
-            "raw_hash": raw_hash,
-            "text": text,
-            "bytes": size,
-            "stat_fingerprint": fingerprint_after,
-            "modified_at": datetime.fromtimestamp(stat_after.st_mtime, timezone.utc).isoformat(),
-        }
-
-
-@dataclass(frozen=True)
-class _GitWorktree:
-    """The Git checkout that holds a local collection root."""
-
-    # Root-relative paths Git reports as modified, staged, renamed or untracked.
-    changed_paths: frozenset[str]
-
-
-def _git_output(root: Path, *args: str) -> str | None:
-    """Run a read-only ``git`` command in ``root``; None when Git is absent or refuses."""
-
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            # Reading status must not take the index lock from the user's own Git work.
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-        )
-    except FileNotFoundError:
-        return None
-    return result.stdout if result.returncode == 0 else None
-
-
-def _git_worktree(root: Path) -> _GitWorktree | None:
-    """The Git checkout holding ``root`` and its uncommitted paths; None outside Git."""
-
-    prefix = _git_output(root, "rev-parse", "--show-prefix")
-    status = (
-        _git_output(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
-        if prefix is not None
-        else None
-    )
-    if prefix is None or status is None:
-        return None
-    prefix = prefix.strip()
-    changed: set[str] = set()
-    records = iter(status.split("\0"))
-    for record in records:
-        if not record:
-            continue
-        state, path = record[:2], record[3:]
-        changed.add(path)
-        if "R" in state or "C" in state:
-            # A rename or copy record is followed by its original path.
-            changed.add(next(records, ""))
-    return _GitWorktree(
-        changed_paths=frozenset(path.removeprefix(prefix) for path in changed if path.startswith(prefix)),
-    )
-
-
-def _local_file_source_time(root: Path, entry: dict[str, Any], worktree: _GitWorktree | None) -> str:
-    """A local file's own time for its current content.
-
-    A committed file without local changes takes its latest commit time,
-    because a checkout or clone sets the modification time to when it ran.
-    Any other file takes its modification time, the only time the file
-    system records for its content.
-    """
-
-    relative_path = str(entry["relative_path"])
-    if worktree is not None and relative_path not in worktree.changed_paths:
-        # Empty for a file Git does not track, such as an ignored one.
-        committed_at = source_time_iso((_git_output(root, "log", "-1", "--format=%cI", "--", relative_path) or "").strip())
-        if committed_at is not None:
-            return committed_at
-    return str(entry["modified_at"])
-
-
-def _attest_kb_scan_stable(
-    root: Path,
-    *,
-    include: list[str],
-    exclude: list[str],
-    entries: list[dict[str, Any]],
-) -> None:
-    """Prove that one body scan still describes the current configured scope."""
-    expected = {
-        str(entry["relative_path"]): tuple(entry["stat_fingerprint"])
-        for entry in entries
-    }
-    observed: dict[str, tuple[int, int, int, int]] = {}
-    try:
-        paths = sorted(root.rglob("*"))
-        for path in paths:
-            if path.is_symlink() or not path.is_file():
-                continue
-            relative_path = path.relative_to(root).as_posix()
-            if _glob_match(relative_path, exclude) or not _glob_match(relative_path, include):
-                continue
-            stat = path.stat()
-            observed[relative_path] = (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-            )
-    except OSError as exc:
-        raise ValueError("local collection could not be revalidated") from exc
-    if set(observed) != set(expected):
-        raise ValueError("local collection membership changed during collection")
-    changed = sorted(
-        relative_path
-        for relative_path, fingerprint in observed.items()
-        if fingerprint != expected[relative_path]
-    )
-    if changed:
-        raise ValueError(f"local file changed during collection: {changed[0]}")
-
-
-def _glob_match(relative_path: str, patterns: list[str]) -> bool:
-    path = PurePosixPath(relative_path)
-    return any(path.match(pattern) for pattern in patterns)
-
-
-_CONTENT_TYPE_BY_SUFFIX = {
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".html": "text/html",
-    ".htm": "text/html",
-}
-
-
-def _content_type_for_path(path: Path) -> str:
-    """Map a file extension to the content type the service converter expects."""
-    return _CONTENT_TYPE_BY_SUFFIX.get(path.suffix.lower(), "text/plain")
-
-
-def _markdown_title(markdown_body: str) -> str | None:
-    for line in markdown_body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            return stripped[2:].strip() or None
-    return None
 
 
 @adapter.group("auth")

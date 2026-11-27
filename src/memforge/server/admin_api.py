@@ -179,7 +179,6 @@ from memforge.models import (
     Project,
     RESERVED_PROJECT_KEYS,
     ReviewKind,
-    SourceSyncInput,
     SourceUnitInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
@@ -266,7 +265,6 @@ from memforge.source_types import (
     SOURCE_EXECUTOR_SERVER,
     LocalAgentCollection,
     SourceConfigPolicy,
-    load_reference,
     source_type_descriptor,
 )
 from memforge.source_types.form import check_config, effective_value
@@ -323,12 +321,7 @@ from memforge.local_agent.document_acquisition import (
     acquisition_job_config,
 )
 from memforge.local_agent.snapshot_manifest import (
-    COMPLETE_SNAPSHOT,
     SNAPSHOT_MANIFEST_MAX_ITEMS,
-    UPSERT,
-    SnapshotManifestItem,
-    plan_snapshot_manifest,
-    snapshot_manifest_sha256,
     validate_excluded_listings_for_job,
 )
 from memforge.local_agent.credential_check import (
@@ -351,16 +344,13 @@ from memforge.local_agent.source_contract import (
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
-    local_agent_semantic_input_sha256,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
-    local_package_requires_source_time,
     source_executor,
     source_collection_operation,
     source_runs_on_device,
-    validate_local_agent_replay_package,
 )
 from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
@@ -3157,57 +3147,6 @@ def _source_paused_http_error() -> HTTPException:
     return HTTPException(status_code=400, detail="Source is paused")
 
 
-class LocalSourcePackageRequest(BaseModel):
-    """One raw local-source package pushed by the local daemon/adapter.
-
-    ``markdown_body`` is the raw file text for the declared ``content_type``;
-    the source gene normalizes it during sync. ``source_updated_at`` is the
-    file's own time for this content (an offset-aware ISO time).
-    """
-
-    vault_id: str | None = None
-    relative_path: str | None = None
-    markdown_body: str = ""
-    content_type: str = "text/markdown"
-    title: str | None = None
-    raw_hash: str | None = None
-    source_updated_at: str | None = None
-    sync_snapshot_id: str | None = None
-    local_agent_job_id: str | None = None
-    local_agent_attempt_count: int | None = Field(default=None, ge=1)
-    submitted_by: str | None = None
-    submitted_at: str | None = None
-
-
-class LocalSourceManifestItemRequest(BaseModel):
-    """One item of a device manifest: the item as the device read it."""
-
-    doc_id: str = Field(min_length=1, max_length=512)
-    revision: str = Field(min_length=1, max_length=512)
-    change_kind: Literal["upsert"]
-
-
-LOCAL_SOURCE_MANIFEST_MAX_ITEMS = SNAPSHOT_MANIFEST_MAX_ITEMS
-
-
-class LocalSourceManifestRequest(BaseModel):
-    """One complete local collection, planned against the retained packages.
-
-    A device manifest lists the complete item set of its scope, so it declares
-    ``complete_snapshot`` coverage and every item an ``upsert``.
-    ``package_contract_version`` is the package contract the local agent
-    collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-    the numbered contract sends none.
-    """
-
-    items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
-    coverage: Literal["complete_snapshot"]
-    sync_snapshot_id: str
-    local_agent_job_id: str
-    local_agent_attempt_count: int = Field(ge=1)
-    package_contract_version: int | None = Field(default=None, ge=1)
-
-
 class AcquisitionAttemptRequest(BaseModel):
     """The ``document_acquisition`` job attempt an upload of a device run belongs to."""
 
@@ -3298,37 +3237,6 @@ class ConversationBodyRequest(BaseModel):
 
 class ConversationBodiesRequest(ConversationCollectionAttemptRequest):
     bodies: list[ConversationBodyRequest] = Field(max_length=2_000)
-
-
-async def _require_ready_snapshot_manifest(
-    db: Database,
-    *,
-    source: Mapping[str, Any],
-    source_id: str,
-    workspace_id: str,
-    input_snapshot_id: str,
-    req: Any,
-    lease_payload: Mapping[str, Any],
-) -> None:
-    """Require the document snapshot manifest of this job attempt, every declared item materialized."""
-
-    manifest_status = await db.get_source_sync_snapshot_manifest_status(
-        source_id=source_id,
-        workspace_id=workspace_id,
-        snapshot_id=input_snapshot_id,
-    )
-    if manifest_status is None:
-        raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
-    if (
-        manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
-        or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
-        or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
-    ):
-        raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
-    if manifest_status["materialized_count"] != manifest_status["item_count"]:
-        raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
-        raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
 
 
 async def _require_acquisition_lease(
@@ -3503,14 +3411,11 @@ async def _plan_config_change(
     db: Database,
     source: Mapping[str, Any],
     requested: Mapping[str, Any],
-    app_config: AppConfig,
-    *,
-    preview: bool = False,
 ) -> _ConfigChange:
     """Prepare ``requested`` as the Source would store it, and plan the scope change saving it makes.
 
-    Saving and previewing a configuration decide alike; a ``preview``
-    writes nothing, not even the Source's local inbox. A configuration the
+    Saving and previewing a configuration decide alike, and planning writes
+    nothing. A configuration the
     source type rejects answers 400. A change the Source refuses answers
     409: another execution mode or provider namespace, or a scope change it
     cannot apply (:func:`_plan_scope_change`,
@@ -3529,7 +3434,7 @@ async def _plan_config_change(
             existing_config=source["config"],
             secret_fields=_source_secret_fields(source_type),
         )
-        config = _store_source_config(source_type, config, source_id, app_config, create_inbox=not preview)
+        config = _store_source_config(source_type, config)
     except SourceConfigInvalid as exc:
         raise _config_invalid_response(exc) from exc
     except (SecretConfigurationError, ValueError) as exc:
@@ -4102,33 +4007,13 @@ def _complete_source_config(
         raise _unkeyed_refusal(exc) from exc
 
 
-def _store_source_config(
-    source_type: str,
-    config: dict[str, Any],
-    source_id: str,
-    app_config: AppConfig,
-    *,
-    create_inbox: bool = True,
-) -> dict[str, Any]:
-    """Adjust a configuration whose secrets are encrypted before it is stored.
-
-    A configuration that names the Source's local inbox creates it, unless
-    ``create_inbox`` is false, as for a preview that stores nothing.
-    """
+def _store_source_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Adjust a configuration whose secrets are encrypted before it is stored."""
 
     policy = _config_policy(source_type)
     if policy.store is None:
         return config
-
-    def local_inbox() -> str:
-        from memforge.local_adapter import default_local_adapter_inbox
-
-        inbox = default_local_adapter_inbox(app_config, source_id)
-        if create_inbox:
-            inbox.mkdir(parents=True, exist_ok=True)
-        return str(inbox)
-
-    return policy.store(dict(config), local_inbox)
+    return policy.store(dict(config))
 
 
 def _source_credentials_changed(
@@ -5245,82 +5130,6 @@ async def _erase_plaintext_model_keys(db: Database) -> None:
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
-
-
-def _validate_local_source_replay_artifact_identity(
-    *,
-    source_type: str,
-    source_id: str,
-    body: bytes,
-    expected_doc_id: str,
-    expected_version: str,
-    expected_input_sha256: str,
-    expected_package_sha256: str,
-) -> Mapping[str, Any]:
-    """Validate one immutable package and its provider-derived document identity."""
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    try:
-        package = validate_local_agent_replay_package(
-            source_type,
-            body,
-            expected_doc_id=expected_doc_id,
-            expected_version=expected_version,
-            expected_input_sha256=expected_input_sha256,
-            expected_package_sha256=expected_package_sha256,
-        )
-        derived_doc_id = get_local_source_replay_adapter(source_type).derive_document_id(
-            source_id=source_id,
-            package=package,
-        )
-    except ValueError as exc:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-    if derived_doc_id != expected_doc_id:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
-    return package
-
-
-async def _attest_retained_local_source_input(
-    *,
-    db: Any,
-    artifact_store: DocumentArtifactStore,
-    source_type: str,
-    source_id: str,
-    retained_input: SourceSyncInput,
-) -> tuple[SourceSyncInput, str]:
-    """Validate and attest a legacy retained artifact without trusting a duplicate upload."""
-    metadata = retained_input.metadata
-    manifest_entry = metadata.get("manifest_entry")
-    if not isinstance(manifest_entry, Mapping):
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
-    top_level_hash = str(metadata.get("package_sha256") or "").strip()
-    manifest_hash = str(manifest_entry.get("package_sha256") or "").strip()
-    if top_level_hash and manifest_hash and top_level_hash != manifest_hash:
-        raise ValueError(f"source sync input artifact attestation conflict: {retained_input.input_id}")
-    package_hash = top_level_hash or manifest_hash
-    if top_level_hash and manifest_hash:
-        return retained_input, package_hash
-    try:
-        body = artifact_store.read_artifact(retained_input.raw_uri)
-    except Exception as exc:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-    package_hash = hashlib.sha256(body).hexdigest()
-    expected_doc_id = str(manifest_entry.get("doc_id") or metadata.get("doc_id") or "")
-    _validate_local_source_replay_artifact_identity(
-        source_type=source_type,
-        source_id=source_id,
-        body=body,
-        expected_doc_id=expected_doc_id,
-        expected_version=str(manifest_entry.get("version") or ""),
-        expected_input_sha256=retained_input.raw_sha256,
-        expected_package_sha256=package_hash,
-    )
-    attested = await db.attest_source_sync_input_artifact(
-        source_id=source_id,
-        input_id=retained_input.input_id,
-        package_sha256=package_hash,
-    )
-    return attested, package_hash
 
 
 def create_admin_app(
@@ -8819,7 +8628,7 @@ def create_admin_app(
                 secret_fields=_source_secret_fields(req.type),
             )
             _validate_source_project_binding(req.project_binding)
-            source_config = _store_source_config(req.type, source_config, source_id, config)
+            source_config = _store_source_config(req.type, source_config)
         except SourceConfigInvalid as exc:
             raise _config_invalid_response(exc) from exc
         except (SecretConfigurationError, ValueError) as exc:
@@ -8879,7 +8688,7 @@ def create_admin_app(
         open_transition = await db.get_open_projection_scope_transition(source_id) is not None
         removes = scope_change_removes(str(existing["type"]))
         try:
-            change = await _plan_config_change(db, existing, req.config, config, preview=True)
+            change = await _plan_config_change(db, existing, req.config)
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
@@ -9022,7 +8831,7 @@ def create_admin_app(
         _validate_source_status(req.status)
         name = req.name or existing["name"]
         if req.config is not None:
-            change = await _plan_config_change(db, existing, req.config, config)
+            change = await _plan_config_change(db, existing, req.config)
         else:
             change = _ConfigChange(
                 config=existing["config"],
@@ -9417,8 +9226,8 @@ def create_admin_app(
 
         A document Source the device acquired with its type's own Gene is
         processed once its attempt is ready (:func:`ready_acquisition`), in
-        a run bound to that attempt; one collected through its type's
-        local-agent package path, once its snapshot manifest is materialized.
+        a run bound to that attempt; a conversation Source, once its
+        collection attempt is complete.
         """
         source = await db.get_source(source_id)
         if source is None:
@@ -9456,22 +9265,11 @@ def create_admin_app(
         if lease_payload.get("dry_run"):
             # A dry run reports its plan; nothing it collected is processed.
             raise HTTPException(status_code=409, detail="dry_run_job_is_not_processed")
-        if _is_conversation_source(current_source):
-            await _require_complete_collection(
-                _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
-                source_id,
-                input_snapshot_id,
-            )
-        else:
-            await _require_ready_snapshot_manifest(
-                db,
-                source=current_source,
-                source_id=source_id,
-                workspace_id=workspace_id,
-                input_snapshot_id=input_snapshot_id,
-                req=req,
-                lease_payload=lease_payload,
-            )
+        await _require_complete_collection(
+            _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
+            source_id,
+            input_snapshot_id,
+        )
         try:
             run = await sync_service.enqueue_source(
                 source_id,
@@ -9775,157 +9573,6 @@ def create_admin_app(
         finally:
             content.close()
 
-    @source_router.post("/{source_id}/adapter/packages")
-    async def push_local_source_package(
-        source_id: str,
-        req: LocalSourcePackageRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        artifact_store: DocumentArtifactStore = Depends(get_document_store),
-        workspace_id: str = Depends(get_workspace_id),
-    ):
-        """Receive one local-source package pushed by the local daemon/adapter.
-
-        The service owns the inbox layout and package format. Local clients
-        send raw file text; source genes perform canonical markdown
-        normalization during sync.
-        """
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        source_type = source.get("type")
-        collection = _local_agent_collection(source_type)
-        if collection is None or collection.package_submitter is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
-            )
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
-        if source.get("status") == SOURCE_PAUSED_STATUS:
-            raise HTTPException(status_code=400, detail="Source is paused")
-        try:
-            input_snapshot_id = local_agent_collection_attempt_id(
-                source_type,
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        submit_package = load_reference(collection.package_submitter)
-        try:
-            result = await submit_package(
-                req,
-                db=db,
-                workspace_id=workspace_id,
-                config=config,
-                source=source,
-                document_store=artifact_store,
-                sync_snapshot_id=input_snapshot_id,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        if result.get("package_uri"):
-            package_uri = str(result["package_uri"])
-
-            async def discard_unretained_package() -> None:
-                await db.enqueue_source_artifact_cleanup_task(
-                    source_id=source_id,
-                    artifact_uri=package_uri,
-                )
-
-            try:
-                current_source = await db.get_source(source_id)
-                if current_source is None:
-                    raise HTTPException(status_code=404, detail="Source not found")
-                await _require_current_local_agent_lease(
-                    request,
-                    db,
-                    source=current_source,
-                    job_id=req.local_agent_job_id,
-                    attempt_count=req.local_agent_attempt_count,
-                )
-                raw_sha256 = local_agent_semantic_input_sha256(
-                    result.get("doc_id"),
-                    result.get("semantic_hash"),
-                )
-                if not raw_sha256:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="local_agent_package_hash_missing",
-                    )
-                manifest_entry = result.get("package_manifest_entry")
-                package_sha256 = str(result.get("package_sha256") or "").strip()
-                if not package_sha256:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="local_agent_package_artifact_hash_missing",
-                    )
-                if isinstance(manifest_entry, dict):
-                    manifest_entry = {
-                        **manifest_entry,
-                        "package_sha256": package_sha256,
-                    }
-                retained_input = await db.create_source_sync_input(
-                    source_id=source_id,
-                    workspace_id=workspace_id,
-                    raw_uri=package_uri,
-                    raw_sha256=raw_sha256,
-                    raw_content_type="application/json",
-                    metadata={
-                        "doc_id": result.get("doc_id"),
-                        "source_type": source_type,
-                        "package_path": result.get("package_path"),
-                        "submitted_at": result.get("submitted_at"),
-                        "submitted_by": req.submitted_by,
-                        "package_sha256": package_sha256,
-                        "manifest_entry": (manifest_entry if isinstance(manifest_entry, dict) else {}),
-                    },
-                    sync_snapshot_id=input_snapshot_id,
-                )
-            except HTTPException:
-                await discard_unretained_package()
-                raise
-            except ValueError as exc:
-                await discard_unretained_package()
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except Exception:
-                await discard_unretained_package()
-                raise
-            if retained_input.raw_uri != package_uri:
-                try:
-                    retained_input, retained_package_hash = await _attest_retained_local_source_input(
-                        db=db,
-                        artifact_store=artifact_store,
-                        source_type=source_type,
-                        source_id=source_id,
-                        retained_input=retained_input,
-                    )
-                except ValueError as exc:
-                    await discard_unretained_package()
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-                except Exception:
-                    await discard_unretained_package()
-                    raise
-                await discard_unretained_package()
-                result["package_uri"] = retained_input.raw_uri
-                result["package_sha256"] = retained_package_hash
-
-        public_result = dict(result)
-        public_result.pop("package_manifest_entry", None)
-        return {**public_result, "sync_started": False}
-
     async def _conversation_upload(
         request: Request,
         db: Database,
@@ -10008,7 +9655,6 @@ def create_admin_app(
         family = collection_family(upload.gene, db=db, doc_store=document_store, source_id=source_id)
         family.prepare(
             collection_attempt=CollectionAttempt(workspace_id, upload.collection_attempt_id),
-            input_snapshot=None,
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
@@ -10099,81 +9745,6 @@ def create_admin_app(
         """Tell an agent that reads the projection inventory to upgrade: the server owns every conversation decision."""
 
         raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
-
-    @source_router.post("/{source_id}/adapter/manifest")
-    async def prepare_local_source_manifest(
-        source_id: str,
-        req: LocalSourceManifestRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        workspace_id: str = Depends(get_workspace_id),
-    ):
-        """Reuse unchanged immutable packages in one complete, fenced collection."""
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        if _is_conversation_source(source):
-            # A conversation Source uploads a Collection Manifest; an agent
-            # that sends it document snapshots is told to upgrade.
-            raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        lease_payload = (
-            await _require_current_local_agent_lease(
-                request,
-                db,
-                source=source,
-                job_id=req.local_agent_job_id,
-                attempt_count=req.local_agent_attempt_count,
-            )
-        ).payload
-        try:
-            snapshot_id = local_agent_collection_attempt_id(
-                source.get("type"),
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-            items = [SnapshotManifestItem(doc_id=item.doc_id, revision=item.revision) for item in req.items]
-            manifest_items = [(item.doc_id, item.revision, UPSERT) for item in items]
-            retained_inputs = await db.find_source_sync_input_attestations(
-                source_id=source_id,
-                workspace_id=workspace_id,
-                manifest_items=manifest_items,
-            )
-            plan = plan_snapshot_manifest(
-                items,
-                retained_inputs,
-                require_source_time=local_package_requires_source_time(
-                    source.get("type"),
-                    req.package_contract_version,
-                ),
-            )
-            manifest_sha256 = snapshot_manifest_sha256(items)
-            await db.attach_source_sync_inputs_to_snapshot(
-                source_id=source_id,
-                workspace_id=workspace_id,
-                snapshot_id=snapshot_id,
-                memberships=list(plan.reused_memberships),
-                coverage=COMPLETE_SNAPSHOT,
-                manifest_count=len(req.items),
-                manifest_sha256=manifest_sha256,
-                manifest_items=manifest_items,
-                local_agent_job_id=req.local_agent_job_id,
-                local_agent_attempt_count=req.local_agent_attempt_count,
-                source_config_revision=str(lease_payload["source_config_revision"]),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "source_id": source_id,
-            "snapshot_id": snapshot_id,
-            "coverage": COMPLETE_SNAPSHOT,
-            "manifest_count": len(req.items),
-            "manifest_sha256": manifest_sha256,
-            "reused_count": len(plan.reused_memberships),
-            "required_doc_ids": list(plan.required_doc_ids),
-        }
 
     async def _acquisition_source(request: Request, db: Database, source_id: str) -> dict[str, Any]:
         source = await db.get_source(source_id)

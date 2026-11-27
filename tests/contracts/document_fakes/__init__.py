@@ -38,10 +38,9 @@ What each fake must answer
     :data:`IN_THE_CURSOR_MINUTE`.
 ``non_listing_configs``
     Named configurations ``lists_scope`` answers ``False`` for.
-``device_configs``
-    Named configurations collected on a device, whose listing is the snapshot
-    manifest; ``manifest_entries`` gives the entries such a device submits,
-    one of them with ``last_modified`` at :data:`IN_THE_CURSOR_MINUTE`.
+``opens_clients``
+    Whether the Gene opens a client to its provider; ``False`` for one that
+    reads a folder on its device.
 ``connect(config, listing)``
     The Gene for one configuration, authenticated against a fake provider that
     holds a few items in the scope and at least one outside it. With
@@ -149,7 +148,7 @@ class DocumentConnectorFakes:
 
     listing_configs: Mapping[str, ListingConfig] = {}
     non_listing_configs: Mapping[str, Mapping[str, object]] = {}
-    device_configs: Mapping[str, Mapping[str, object]] = {}
+    opens_clients: bool = True
     retry_waits: Mapping[int, tuple[float, float]] = {}
 
     def connect(
@@ -158,9 +157,6 @@ class DocumentConnectorFakes:
         listing: ProviderListing = ProviderListing.COMPLETE,
     ) -> AbstractAsyncContextManager[FakeConnection]:
         raise NotImplementedError(f"{type(self).__name__} does not fake a provider")
-
-    def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
-        raise NotImplementedError(f"{type(self).__name__} does not fake a device manifest")
 
     def reading_by_id(self, status: int) -> AbstractAsyncContextManager[tuple[FakeConnection, Sequence[ContentItem]]]:
         raise NotImplementedError(f"{type(self).__name__} does not fake reads by identifier")

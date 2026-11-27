@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from memforge.conversations.time_scope import MAX_INITIAL_HISTORY_DAYS
-from memforge.local_agent.snapshot_manifest import UPSERT
 from memforge.source_types import (
     SOURCE_EXECUTOR_DEVICE,
     SOURCE_EXECUTOR_SERVER,
@@ -47,19 +46,6 @@ LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS = frozenset(
 )
 LOCAL_AGENT_JOB_MAX_ATTEMPTS = 5
 
-LOCAL_AGENT_SEMANTIC_INPUT_VERSION = "canonical-v1"
-LOCAL_PACKAGE_CONTRACT_VERSION = 3
-"""The package contract this local agent collects under, declared in its manifest.
-
-An agent that declares no version predates the numbered contract.
-"""
-LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION = 2
-"""The first contract under which a file package carries the file's source time.
-
-A collection under this contract or a later one does not reuse a retained file
-package without a source time, so the agent uploads that file once more with
-its time (design ``source-sync-to-memory.md`` 0.9).
-"""
 TEAMS_ROLLING_RETENTION_PRESETS = (365, 730, 1095)
 
 
@@ -271,72 +257,6 @@ def local_agent_collection_attempt_id(
     return canonical
 
 
-def local_agent_input_sha256(doc_id: object, document_hash: object) -> str:
-    """Hash stable document identity and semantic content version."""
-    normalized_doc_id = str(doc_id or "").strip()
-    normalized_hash = str(document_hash or "").strip()
-    if not normalized_doc_id or not normalized_hash:
-        return ""
-    identity = json.dumps(
-        {"doc_id": normalized_doc_id, "document_hash": normalized_hash},
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-
-def local_agent_semantic_input_sha256(
-    doc_id: object,
-    semantic_hash: object,
-) -> str:
-    """Version the canonical semantic identity independently of legacy raw hashes."""
-    return local_agent_input_sha256(
-        doc_id,
-        f"{LOCAL_AGENT_SEMANTIC_INPUT_VERSION}:{semantic_hash}",
-    )
-
-
-def local_file_package_semantic_hash(content_hash: str, source_updated_at: str | None) -> str:
-    """The semantic identity of a file package: its content and that content's source time.
-
-    The same content uploaded with and without its source time makes two
-    inputs, so a package that adds the time is retained and projected instead
-    of collapsing into the earlier one. A package without a time is identified
-    by its content hash alone.
-    """
-
-    if source_updated_at is None:
-        return content_hash
-    identity = json.dumps(
-        {"content_hash": content_hash, "source_updated_at": source_updated_at},
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
-
-
-def local_package_requires_source_time(
-    source_type: object,
-    package_contract_version: int | None,
-) -> bool:
-    """Whether a collection may reuse only retained packages that carry a source time.
-
-    True for a file source collected under the source-time package contract.
-    """
-
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    if package_contract_version is None or package_contract_version < LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION:
-        return False
-    try:
-        adapter = get_local_source_replay_adapter(str(source_type or "").strip().lower())
-    except ValueError:
-        return False
-    return adapter.package_source_time
-
-
 def _source_config(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
@@ -478,9 +398,7 @@ async def local_agent_sync_job_payload(
 
     Every place that enqueues a local-agent sync job builds its payload here:
     the saved collection configuration, the request's control fields, and,
-    while a document scope transition is open, that transition. A package
-    snapshot is an existence listing, so the run completes a transition from
-    the new listing alone.
+    while a scope transition is open, that transition.
     """
 
     from memforge.source_projection_config import canonical_projection_scope, canonical_scope_transition
@@ -514,11 +432,9 @@ def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
     """Fingerprint the saved configuration one daemon job collects with.
 
     It is the configuration the job hands the device: the fields of the
-    type's local-agent collection for a Source that collects through it (a
-    conversation Source, or a local Markdown Source on its package path), and
-    otherwise, for a document Source the
-    device acquires with its type's own Gene (ADR 0058), every field but the
-    secrets.
+    type's local-agent collection for a conversation Source, and, for a
+    document Source the device acquires with its type's own Gene (ADR 0058),
+    every field but the secrets.
     """
     from memforge.genes.family import CollectionFamilyKind
     from memforge.local_agent.document_acquisition import acquisition_job_config
@@ -544,123 +460,3 @@ def local_agent_source_config_revision(source: Mapping[str, Any]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def source_sync_input_metadata_with_artifact_attestation(
-    metadata: Mapping[str, Any],
-    *,
-    package_sha256: str,
-    input_id: str,
-) -> dict[str, Any]:
-    """Fill or validate the immutable package attestation for a retained input."""
-    artifact_hash = str(package_sha256 or "").strip()
-    if not artifact_hash:
-        raise ValueError("source sync input artifact attestation is required")
-    result = dict(metadata)
-    manifest_entry = result.get("manifest_entry")
-    if not isinstance(manifest_entry, Mapping):
-        raise ValueError(f"source sync input manifest is missing: {input_id}")
-    manifest = dict(manifest_entry)
-    declared_hashes = {
-        value
-        for value in (
-            str(result.get("package_sha256") or "").strip(),
-            str(manifest.get("package_sha256") or "").strip(),
-        )
-        if value
-    }
-    if declared_hashes and declared_hashes != {artifact_hash}:
-        raise ValueError(f"source sync input artifact attestation conflict: {input_id}")
-    result["package_sha256"] = artifact_hash
-    manifest["package_sha256"] = artifact_hash
-    result["manifest_entry"] = manifest
-    return result
-
-
-def _manifest_entry(source_input: Any) -> tuple[str, Mapping[str, Any]] | None:
-    """The Document id and manifest entry one raw input carries, if it names both."""
-
-    metadata = getattr(source_input, "metadata", {})
-    entry = metadata.get("manifest_entry") if isinstance(metadata, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return None
-    doc_id = str(entry.get("doc_id") or "").strip()
-    raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
-    if not doc_id or not raw_uri:
-        return None
-    return doc_id, entry
-
-
-def snapshot_document_ids(inputs: list[Any]) -> frozenset[str]:
-    """The Documents a complete input snapshot holds: every item it names.
-
-    An item stored as a tombstone, which only a manifest written before every
-    item was an upsert can hold, names a Document the snapshot does not hold.
-    """
-
-    return frozenset(
-        doc_id
-        for source_input in inputs
-        if (named := _manifest_entry(source_input)) is not None
-        for doc_id, entry in (named,)
-        if str(entry.get("change_kind") or UPSERT) == UPSERT
-    )
-
-
-def source_with_sync_inputs(
-    source: Mapping[str, Any],
-    inputs: list[Any],
-    *,
-    input_snapshot_supplied: bool = False,
-) -> dict[str, Any]:
-    """Project immutable raw inputs into the connector's runtime manifest.
-
-    A run bound to an input snapshot gets a manifest even when the snapshot
-    is empty, because an empty complete snapshot says the scope holds nothing.
-    """
-    latest_entries: dict[str, dict[str, Any]] = {}
-    for source_input in sorted(
-        inputs,
-        key=lambda item: int(getattr(item, "input_generation", 0)),
-    ):
-        named = _manifest_entry(source_input)
-        if named is None:
-            continue
-        doc_id, entry = named
-        metadata = getattr(source_input, "metadata", {})
-        raw_uri = str(getattr(source_input, "raw_uri", "") or "").strip()
-        package_sha256 = str(metadata.get("package_sha256") or "").strip()
-        projected_entry = {
-            **entry,
-            "package_uri": raw_uri,
-            "input_sha256": str(getattr(source_input, "raw_sha256", "") or "").strip(),
-            **({"package_sha256": package_sha256} if package_sha256 else {}),
-        }
-        latest_entries[doc_id] = projected_entry
-    projected = dict(source)
-    if latest_entries or input_snapshot_supplied:
-        config = dict(_source_config(source.get("config")))
-        config["local_agent_package_manifest"] = list(latest_entries.values())
-        projected["config"] = config
-    return projected
-
-
-def validate_local_agent_replay_package(
-    source_type: str,
-    body: bytes,
-    *,
-    expected_doc_id: str,
-    expected_version: str,
-    expected_input_sha256: str,
-    expected_package_sha256: str,
-) -> Mapping[str, Any]:
-    """Validate one local-agent package with its source type's replay adapter."""
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    return get_local_source_replay_adapter(source_type).validate(
-        body,
-        expected_doc_id=expected_doc_id,
-        expected_version=expected_version,
-        expected_input_sha256=expected_input_sha256,
-        expected_package_sha256=expected_package_sha256,
-    )

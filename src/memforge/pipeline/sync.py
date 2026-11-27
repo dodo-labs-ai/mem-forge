@@ -112,7 +112,6 @@ from memforge.pipeline.extraction_contract import (
 from memforge.pipeline.projection_context import CommittedSourceUnitSnapshot
 from memforge.pipeline.collection_family import (
     ExcludedScopeGeneFactory,
-    SnapshotBinding,
     collection_family,
 )
 from memforge.pipeline.stored_document import (
@@ -927,13 +926,11 @@ class GeneSyncOrchestrator:
         source_id: str,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         source_activity: SourceActivityLease | None = None,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
-        reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
@@ -958,11 +955,6 @@ class GeneSyncOrchestrator:
         force_full_sync:
             When true, ignore the incremental cursor and reprocess discovered
             documents even when their content hash is unchanged.
-        input_snapshot:
-            The complete input snapshot a device submitted for a document
-            Source's run. The run discovers all of it, while still skipping
-            Documents whose content is unchanged, and its manifest is the
-            run's scope listing.
         reprocess_doc_ids:
             The Documents a REPROCESS run processes; required by and only
             accepted with that mode.
@@ -1008,7 +1000,7 @@ class GeneSyncOrchestrator:
         replaying = execution_mode is SourceSyncMode.REPLAY
         if reprocessing != bool(reprocess_doc_ids):
             raise ValueError("reprocess_doc_ids name the Documents of a REPROCESS run")
-        if replaying and (force_full_sync or input_snapshot is not None):
+        if replaying and force_full_sync:
             raise ValueError("a REPLAY run processes only what its recorded Gene discovers")
         if source_activity is not None:
             if source_activity.source_id != source_id:
@@ -1023,10 +1015,8 @@ class GeneSyncOrchestrator:
         family = collection_family(gene, db=self.db, doc_store=self.doc_store, source_id=source_id)
         family.prepare(
             collection_attempt=collection_attempt,
-            input_snapshot=input_snapshot,
             excluded_scope_gene=excluded_scope_gene,
         )
-        complete_snapshot = family.input_snapshot is not None
 
         logger.info(
             "Sync started for %s (source_id=%s, run_id=%s)",
@@ -1065,17 +1055,12 @@ class GeneSyncOrchestrator:
             scope_transition = canonical_scope_transition(
                 configured_source_type, scope_transition, configured_projection_scope
             )
-        if force_full_sync or reprocessing or replaying or scope_transition is not None:
-            # Reuse is an ordinary incremental optimization only. Full syncs
-            # and scope transitions require the full per-document path.
-            reusable_projection_doc_ids = frozenset()
         # Each Document that commits during an open transition of a document
         # Source becomes one of the transition's members, in its commit.
         member_transition = scope_transition if family.records_transition_members else None
         member_transition_id = member_transition.id if member_transition is not None else None
         transition_started = False
         transition_completed = False
-        reused_projection_count = 0
         total_item_count = 0
         failure_retryable = True
         acquisition_failed = False
@@ -1302,16 +1287,6 @@ class GeneSyncOrchestrator:
                     if stored is not None:
                         stored_documents[doc_id] = stored
                     items.append(item)
-                discovered_doc_ids = set(crawled_doc_ids)
-                unexpected_reuse_ids = reusable_projection_doc_ids - discovered_doc_ids
-                if unexpected_reuse_ids and complete_snapshot:
-                    raise ValueError(
-                        "reusable Source Projection membership is outside provider discovery: "
-                        f"{sorted(unexpected_reuse_ids)[0]}"
-                    )
-                reusable_projection_doc_ids = (reusable_projection_doc_ids & discovered_doc_ids) - (
-                    retried_doc_ids | set(left_alone)
-                )
                 if member_transition_id is not None and not force_full_sync:
                     # A Document already committed under the transition is not
                     # fetched again; one that changed since is discovered by
@@ -1327,21 +1302,11 @@ class GeneSyncOrchestrator:
                             member_transition_id,
                         )
                 total_item_count = len(items)
-                if reusable_projection_doc_ids:
-                    items = [item for item in items if item.item_id not in reusable_projection_doc_ids]
-                    reused_projection_count = total_item_count - len(items)
-                    docs_processed += reused_projection_count
-                    logger.info(
-                        "Reused %d current Source Projections for %s without per-document materialization",
-                        reused_projection_count,
-                        source_id,
-                    )
                 self._memory_sample(
                     "after_discovery",
                     source_id=source_id,
                     run_id=run_id,
                     item_count=total_item_count,
-                    reused_projection_count=reused_projection_count,
                     indexed_doc_count=len(indexed_doc_ids),
                     full_sync=last_sync_time is None,
                 )
@@ -1354,7 +1319,7 @@ class GeneSyncOrchestrator:
                 progress_callback(
                     {
                         "phase": "processing",
-                        "current": reused_projection_count,
+                        "current": 0,
                         "total": total_item_count,
                         "title": None,
                     }
@@ -1363,7 +1328,7 @@ class GeneSyncOrchestrator:
             # ----------------------------------------------------------
             # Step 4: Process items concurrently (with retry + error isolation)
             # ----------------------------------------------------------
-            progress_counter = reused_projection_count
+            progress_counter = 0
             docs_updated_counter = 0
             memories_extracted_counter = 0
             item_semaphore = asyncio.Semaphore(self._document_parallelism_limit())
@@ -1465,7 +1430,6 @@ class GeneSyncOrchestrator:
                                     else None
                                 ),
                                 projection_access_context=configured_access_context,
-                                complete_snapshot=complete_snapshot,
                                 scope_transition_id=member_transition_id,
                                 source_activity=source_activity,
                                 lifecycle_execution_owner_id=durable_cycle_id,
@@ -2024,7 +1988,6 @@ class GeneSyncOrchestrator:
             memories_extracted=memories_extracted,
             item_count=total_item_count,
             materialized_item_count=materialized_item_count,
-            reused_projection_count=reused_projection_count,
         )
 
         logger.info(
@@ -2639,7 +2602,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        complete_snapshot: bool = False,
         scope_transition_id: str | None = None,
         source_activity: SourceActivityLease | None = None,
         lifecycle_execution_owner_id: str | None = None,
@@ -2687,7 +2649,6 @@ class GeneSyncOrchestrator:
                         projection_scope=projection_scope,
                         scope_transition=scope_transition,
                         projection_access_context=projection_access_context,
-                        complete_snapshot=complete_snapshot,
                         scope_transition_id=scope_transition_id,
                         source_activity=source_activity,
                         lifecycle_execution_owner_id=lifecycle_execution_owner_id,
@@ -2740,7 +2701,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None,
         scope_transition: dict[str, object] | None,
         projection_access_context: dict[str, object] | None,
-        complete_snapshot: bool,
     ) -> tuple[SourceProjection, tuple[StoredSourceArtifact, ...]]:
         """Project fetched content onto its Source Unit and store the Artifacts it returned.
 
@@ -2766,9 +2726,6 @@ class GeneSyncOrchestrator:
         probe_scope: dict[str, object] = {
             "configured_scope": dict(projection_scope or {}),
             "document_id": item.item_id,
-            # Part of every stored projection's identity: whether the item came
-            # from a complete input snapshot.
-            "authoritative_snapshot": complete_snapshot,
         }
         if persisted_source_unit is not None:
             # Document lineage is the durable identity bridge after an
@@ -2924,7 +2881,6 @@ class GeneSyncOrchestrator:
         projection_scope: dict[str, object] | None = None,
         scope_transition: dict[str, object] | None = None,
         projection_access_context: dict[str, object] | None = None,
-        complete_snapshot: bool = False,
         scope_transition_id: str | None = None,
         source_activity: SourceActivityLease | None = None,
         source_unit_id_callback: Callable[[str], None] | None = None,
@@ -3030,7 +2986,6 @@ class GeneSyncOrchestrator:
                 projection_scope=projection_scope,
                 scope_transition=scope_transition,
                 projection_access_context=projection_access_context,
-                complete_snapshot=complete_snapshot,
             )
         source_unit = projection_probe.source_units[0]
         markdown_body = normalized.markdown_body
@@ -3096,8 +3051,6 @@ class GeneSyncOrchestrator:
                                 "configured_scope": dict(projection_scope or {}),
                                 "source_unit_id": source_unit.id,
                                 "source_unit_provider_key": source_unit.provider_key,
-                                # Part of the projection identity; see the probe scope.
-                                "authoritative_snapshot": complete_snapshot,
                             },
                             run_mode=(
                                 ProjectionRunMode.FULL_SNAPSHOT

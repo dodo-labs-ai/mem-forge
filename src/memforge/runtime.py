@@ -33,14 +33,10 @@ from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_operation,
-    snapshot_document_ids,
     source_runs_on_device,
-    source_with_sync_inputs,
 )
 from memforge.source_projection_config import (
     excluded_scope_config,
-    projection_access_fingerprint,
-    source_access_context,
 )
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -54,7 +50,7 @@ from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.recorded import AcquisitionRecordStore, recorded_gene_class
 from memforge.local_agent.document_acquisition import ACQUISITION_ATTEMPT_PAYLOAD_FIELD, StoredAcquisition
-from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
+from memforge.pipeline.collection_family import ExcludedScopeGeneFactory
 from memforge.pipeline.device_acquisition import (
     device_excluded_scope_gene_factory,
     enqueue_document_acquisition_job,
@@ -313,12 +309,10 @@ class RuntimeProvider(Protocol):
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
-        reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
@@ -460,12 +454,10 @@ class DefaultRuntimeProvider:
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
-        reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
@@ -479,12 +471,10 @@ class DefaultRuntimeProvider:
             runtime=runtime,
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
-            input_snapshot=input_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
-            reusable_projection_doc_ids=reusable_projection_doc_ids,
             record_terminal_result=record_terminal_result,
             source_activity=source_activity,
             failed_item_retry=failed_item_retry,
@@ -1039,12 +1029,10 @@ async def run_source_sync(
     runtime: SyncRuntime | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
-    input_snapshot: SnapshotBinding | None = None,
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
-    reusable_projection_doc_ids: frozenset[str] = frozenset(),
     record_terminal_result: bool = True,
     source_activity: SourceActivityLease | None = None,
     failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
@@ -1055,9 +1043,7 @@ async def run_source_sync(
     """Run one Source sync under a Source activity lease.
 
     ``collection_attempt`` names the collection attempt a conversation Source
-    syncs within; a document Source ignores it. ``input_snapshot`` binds a
-    document Source's run to the complete snapshot its device package path
-    submitted. ``acquisition`` is what a device acquired for a document
+    syncs within; a document Source ignores it. ``acquisition`` is what a device acquired for a document
     Source's run (ADR 0058): the run interprets it with the type's recorded
     Gene, from the time the device's job attempt was leased, and reaches
     neither the provider nor its session. A device Source runs only this way.
@@ -1075,16 +1061,16 @@ async def run_source_sync(
         if source_activity.kind is not SourceActivityKind.SYNC:
             raise ValueError("durable Source activity must be a sync authority")
         return await _run_source_sync_held(
-            db, config, source, runtime, progress_callback, force_full_sync, input_snapshot, reprocess_doc_ids,
+            db, config, source, runtime, progress_callback, force_full_sync, reprocess_doc_ids,
             execution_mode, lifecycle_cycle_id or source_activity.id, scope_transition_run_id,
-            reusable_projection_doc_ids, record_terminal_result, source_activity, failed_item_retry,
+            record_terminal_result, source_activity, failed_item_retry,
             collection_attempt, acquisition, replay, heartbeat=None,
         )
     async with held_source_activity(db, str(source["id"])) as (lease, heartbeat):
         return await _run_source_sync_held(
-            db, config, source, runtime, progress_callback, force_full_sync, input_snapshot, reprocess_doc_ids,
+            db, config, source, runtime, progress_callback, force_full_sync, reprocess_doc_ids,
             execution_mode, lifecycle_cycle_id or lease.id, scope_transition_run_id,
-            reusable_projection_doc_ids, record_terminal_result, lease, failed_item_retry,
+            record_terminal_result, lease, failed_item_retry,
             collection_attempt, acquisition, replay, heartbeat=heartbeat,
         )
 
@@ -1096,12 +1082,10 @@ async def _run_source_sync_held(
     runtime: SyncRuntime | None,
     progress_callback: Callable[[dict], None] | None,
     force_full_sync: bool,
-    input_snapshot: SnapshotBinding | None,
     reprocess_doc_ids: frozenset[str] | None,
     execution_mode: SourceSyncMode,
     lifecycle_cycle_id: str,
     scope_transition_run_id: str | None,
-    reusable_projection_doc_ids: frozenset[str],
     record_terminal_result: bool,
     activity_lease: SourceActivityLease,
     failed_item_retry: FailedItemRetry,
@@ -1152,13 +1136,11 @@ async def _run_source_sync_held(
             "source_id": source["id"],
             "progress_callback": progress_callback,
             "force_full_sync": force_full_sync,
-            "input_snapshot": input_snapshot,
             "reprocess_doc_ids": reprocess_doc_ids,
             "execution_mode": execution_mode,
             "source_activity": activity_lease,
             "lifecycle_cycle_id": lifecycle_cycle_id,
             "scope_transition_run_id": scope_transition_run_id,
-            "reusable_projection_doc_ids": reusable_projection_doc_ids,
             "record_terminal_result": record_terminal_result,
             "failed_item_retry": failed_item_retry,
             "collection_attempt": collection_attempt,
@@ -1628,19 +1610,14 @@ class SourceSyncWorker:
 
             # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
-            input_snapshot: SnapshotBinding | None = None
-            reusable_projection_doc_ids: frozenset[str] = frozenset()
             descriptor = source_type_descriptor(str(source.get("type") or ""))
-            local_operation = local_agent_sync_operation(source["type"], source.get("config"))
             # A document Source's run bound to a job attempt interprets what
             # the device acquired with the type's own Gene, through the
-            # recorded Gene, unless the Source collects through its type's
-            # package path.
+            # recorded Gene.
             acquired_on_device = (
                 run.input_snapshot_id is not None
                 and descriptor is not None
                 and descriptor.family is CollectionFamilyKind.DOCUMENT
-                and local_operation is None
             )
             acquisition: StoredAcquisition | None = None
             if acquired_on_device:
@@ -1649,44 +1626,13 @@ class SourceSyncWorker:
                 )
                 if acquisition is None:
                     raise SourceSyncBoundaryError("the device acquisition of this run is not kept")
-            if not reprocessing and not acquired_on_device:
-                inputs = await self.db.list_source_sync_inputs(
-                    source_id=run.source_id,
-                    workspace_id=run.workspace_id,
-                    input_snapshot_id=run.input_snapshot_id,
-                )
-                if run.input_snapshot_id is None:
-                    if local_operation is not None and run.input_generation_watermark is None:
-                        raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
-                    if run.input_generation_watermark is not None:
-                        inputs = [
-                            source_input
-                            for source_input in inputs
-                            if source_input.input_generation <= run.input_generation_watermark
-                        ]
-                # Local Markdown's package path binds the run to the complete
-                # snapshot its daemon submitted.
-                if (
-                    run.input_snapshot_id is not None
-                    and descriptor is not None
-                    and descriptor.family is CollectionFamilyKind.DOCUMENT
-                ):
-                    input_snapshot = SnapshotBinding(
-                        snapshot_id=run.input_snapshot_id,
-                        doc_ids=snapshot_document_ids(inputs),
-                    )
-                if run.input_snapshot_id is not None and not run.force_full_sync:
-                    reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
-                        source_id=run.source_id,
-                        workspace_id=run.workspace_id,
-                        snapshot_id=run.input_snapshot_id,
-                        expected_access_hash=projection_access_fingerprint(source_access_context(source)),
-                    )
-                source = source_with_sync_inputs(
-                    source,
-                    inputs,
-                    input_snapshot_supplied=run.input_snapshot_id is not None,
-                )
+            if (
+                not reprocessing
+                and run.input_snapshot_id is None
+                and run.input_generation_watermark is None
+                and local_agent_sync_operation(source["type"], source.get("config")) is not None
+            ):
+                raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
 
             runtime = await self._build_runtime()
             self._relation_runtime = runtime
@@ -1702,12 +1648,10 @@ class SourceSyncWorker:
                 runtime=runtime,
                 progress_callback=None,
                 force_full_sync=run.force_full_sync and not reprocessing,
-                input_snapshot=input_snapshot,
                 reprocess_doc_ids=frozenset(run.reprocess_document_ids) or None,
                 execution_mode=(SourceSyncMode.REPROCESS if reprocessing else SourceSyncMode.NORMAL),
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
-                reusable_projection_doc_ids=reusable_projection_doc_ids,
                 record_terminal_result=False,
                 source_activity=run.source_activity,
                 failed_item_retry=failed_item_retry_for_run(run),

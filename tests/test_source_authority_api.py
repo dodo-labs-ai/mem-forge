@@ -1164,11 +1164,6 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
             manifest = manifest_to_payload(collection.manifest(received_at=sent_at))
             del manifest["received_at"]
-            outdated_agent = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                headers=headers,
-                json={**context, "sync_snapshot_id": attempt_id, "coverage": "complete_snapshot", "items": []},
-            )
             incomplete_process = client.post(
                 f"/api/v1/sources/{source_id}/process", headers=headers, json=context
             )
@@ -1252,8 +1247,6 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         assert [item["conversation_id"] for item in requested.json()["request"]["conversations"]] == [
             "19:conversation-a@example.test"
         ]
-        assert outdated_agent.status_code == 409, outdated_agent.text
-        assert outdated_agent.json()["detail"] == "local_agent_upgrade_required"
         assert incomplete_process.status_code == 409, incomplete_process.text
         assert incomplete_process.json()["detail"] == "conversation_manifest_required"
         assert malformed_manifest.status_code == 422, malformed_manifest.text
@@ -1349,7 +1342,7 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post("/api/v1/sources", headers=headers, json=_local_markdown_payload())
+            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
             source_id = created.json()["id"]
             first = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             leased = client.post(
@@ -1357,8 +1350,8 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
                 headers=headers,
                 json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             ).json()["jobs"][0]
-            updated_payload = _local_markdown_payload()
-            updated_payload["config"]["include"] = ["docs/**/*.md"]
+            updated_payload = _teams_payload()
+            updated_payload["config"]["conversation_ids"] = ["19:conversation-b@example.test"]
             updated = client.put(f"/api/v1/sources/{source_id}", headers=headers, json=updated_payload)
             stale = client.post(
                 f"/api/v1/sources/{source_id}/process",
@@ -1513,9 +1506,9 @@ def test_local_source_sync_without_execution_owner_returns_contract_error(tmp_pa
         asyncio.run(
             database.upsert_source(
                 id="src-ownerless-local",
-                type="local_markdown",
+                type="teams",
                 name="Ownerless Local",
-                config_json='{"vault_id":"notes"}',
+                config_json='{"conversation_ids":["19:conversation-a@example.test"]}',
                 access_policy="workspace",
                 owner_user_id="owner-a",
             )

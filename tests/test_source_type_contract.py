@@ -248,7 +248,7 @@ def test_a_subclass_of_a_built_in_gene_inherits_its_contract() -> None:
     class CustomJira(JiraGene):
         pass
 
-    validate_source_type(_descriptor(CustomJira, local_agent=DEVICE))
+    validate_source_type(_descriptor(CustomJira))
 
 
 def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
@@ -261,39 +261,8 @@ def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
     )
 
 
-class DeviceQueryGene(QueryGene):
-    @classmethod
-    def provider_key(cls, item):
-        return item.item_id
-
-    @classmethod
-    def confirmation_item(cls, document_id, provider_key):
-        raise NotImplementedError
-
-
-def test_a_device_collected_gene_declares_one_listing_kind() -> None:
-    class Both(DeviceQueryGene):
-        listing_kinds = frozenset({ScopeListingKind.QUERY, ScopeListingKind.EXISTENCE})
-
-    _refused(Both, "exactly one listing kind", local_agent=DEVICE)
-    validate_source_type(_descriptor(DeviceQueryGene, local_agent=DEVICE))
-
-
-def test_a_gene_confirmed_on_a_device_names_and_rebuilds_its_items() -> None:
-    class KeyedOnly(QueryGene):
-        @classmethod
-        def provider_key(cls, item):
-            return item.item_id
-
-    _refused(QueryGene, "must implement provider_key, confirmation_item", local_agent=DEVICE)
-    _refused(KeyedOnly, "must implement confirmation_item", local_agent=DEVICE)
-    # Only a query listed by a device is confirmed there.
-    validate_source_type(_descriptor(QueryGene))
-
-    class Existence(FakeGene):
-        listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
-
-    validate_source_type(_descriptor(Existence, local_agent=DEVICE))
+def test_a_document_type_runs_on_a_device_through_its_executor_not_a_local_agent_collection() -> None:
+    _refused(QueryGene, "runs on a device through its executor", local_agent=DEVICE)
 
 
 def _provider(provider, factory=teams_provider.open_teams_provider) -> ConversationProviderReference:

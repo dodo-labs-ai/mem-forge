@@ -1,4 +1,4 @@
-"""Every local-agent sync job carries the Source's open transition; a package snapshot lists by existence, so no excluded scope."""
+"""Every local-agent sync job of a conversation Source carries the Source's open transition, and no excluded scope."""
 
 from __future__ import annotations
 
@@ -21,28 +21,28 @@ from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.database import Database
 from tests.test_source_authority_api import _app
 
-SOURCE = "src-device-notes"
+SOURCE = "src-device-chats"
 OWNER = "owner-a"
 TRANSITION = "scope-transition-docs-only"
-BASE_CONFIG = {"root": "/notes", "vault_id": "notes"}
-OLD_INCLUDE = ["**/*.md"]
-NEW_INCLUDE = ["docs/**/*.md"]
+BASE_CONFIG = {"region": "emea"}
+OLD_CHATS = ["19:standup@thread.v2"]
+NEW_CHATS = ["19:standup@thread.v2", "19:release@thread.v2"]
 
 
 async def _no_device_source(source):
     raise AssertionError(f"no device Source is due here: {source['id']}")
 
 
-def _scope(include: list[str]) -> dict[str, object]:
-    return canonical_projection_scope("local_markdown", {**BASE_CONFIG, "include": include})
+def _scope(chats: list[str]) -> dict[str, object]:
+    return canonical_projection_scope("teams", {**BASE_CONFIG, "conversation_ids": chats})
 
 
 async def _source(db: Database) -> dict:
     await db.upsert_source(
         id=SOURCE,
-        type="local_markdown",
+        type="teams",
         name="Device Source",
-        config_json=json.dumps({**BASE_CONFIG, "include": NEW_INCLUDE}),
+        config_json=json.dumps({**BASE_CONFIG, "conversation_ids": NEW_CHATS}),
         access_policy="workspace",
         owner_user_id=OWNER,
         execution_owner_user_id=OWNER,
@@ -58,8 +58,8 @@ async def _open_transition(db: Database) -> None:
         ProjectionScopeTransition(
             id=TRANSITION,
             source_id=SOURCE,
-            previous_scope=_scope(OLD_INCLUDE),
-            target_scope=_scope(NEW_INCLUDE),
+            previous_scope=_scope(OLD_CHATS),
+            target_scope=_scope(NEW_CHATS),
             created_at="2026-10-23T09:00:00+00:00",
         )
     )
@@ -90,8 +90,8 @@ async def test_a_job_carries_the_open_transition_and_no_excluded_scope(db):
 
     assert payload[LOCAL_AGENT_TRANSITION_PAYLOAD_FIELD] == {
         "id": TRANSITION,
-        "previous_scope": _scope(OLD_INCLUDE),
-        "target_scope": _scope(NEW_INCLUDE),
+        "previous_scope": _scope(OLD_CHATS),
+        "target_scope": _scope(NEW_CHATS),
     }
     assert LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD not in payload
 
@@ -137,7 +137,7 @@ def test_every_builder_enqueues_the_same_payload_for_the_same_source(tmp_path):
             created = client.post(
                 "/api/cloud/local-agent/jobs",
                 headers=headers,
-                json={"source_id": SOURCE, "source_type": "local_markdown", "operation": "local_markdown_sync", "payload": {}},
+                json={"source_id": SOURCE, "source_type": "teams", "operation": "teams_sync", "payload": {}},
             )
             assert created.status_code == 201, created.text
         payloads["explicit"] = _job_payload(explicit)
@@ -172,10 +172,10 @@ async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source
 
     async def read_then_save(store, row, *args):
         payload = await read(store, row, *args)
-        # The owner saves a new include after the scheduler read the payload.
+        # The owner saves new conversations after the scheduler read the payload.
         await store.db.execute(
             "UPDATE sources SET config = ? WHERE id = ?",
-            (json.dumps({**BASE_CONFIG, "include": OLD_INCLUDE}), SOURCE),
+            (json.dumps({**BASE_CONFIG, "conversation_ids": OLD_CHATS}), SOURCE),
         )
         await store.db.commit()
         return payload
@@ -187,4 +187,4 @@ async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source
 
     [row] = await db.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
     assert (raced, retried) == (0, 1)
-    assert json.loads(row["payload_json"])["include"] == OLD_INCLUDE
+    assert json.loads(row["payload_json"])["conversation_ids"] == OLD_CHATS

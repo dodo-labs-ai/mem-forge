@@ -12,11 +12,12 @@
       "local_markdown"
     ],
     "extra": {
+      "vault_id": "kestrel-notes",
       "relative_path": "ops/backup-policy.txt"
     }
   },
   "raw": {
-    "file": "raw.json",
-    "content_type": "application/json"
+    "file": "raw.txt",
+    "content_type": "text/plain; charset=utf-8"
   }
 }

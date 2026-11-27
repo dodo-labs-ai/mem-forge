@@ -17,7 +17,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
-from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -199,61 +198,6 @@ class ToolClient:
             body,
         )
 
-    def push_local_markdown_document(
-        self,
-        *,
-        source_id: str,
-        vault_id: str,
-        relative_path: str,
-        markdown_body: str,
-        content_type: str = "text/markdown",
-        title: str | None = None,
-        raw_hash: str | None = None,
-        source_updated_at: str | None = None,
-        sync_snapshot_id: str | None = None,
-        local_agent_job_id: str | None = None,
-        local_agent_attempt_count: int | None = None,
-        submitted_by: str | None = None,
-        submitted_at: str | None = None,
-    ) -> dict[str, Any]:
-        """Push one file's raw text into a configured local repository source.
-
-        ``content_type`` tells the service how to convert ``markdown_body``
-        (the raw file text) during sync: Markdown/text pass through, HTML and
-        JSON are converted server-side. ``source_updated_at`` is the file's
-        own time for this content.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "vault_id": vault_id,
-            "relative_path": relative_path,
-            "markdown_body": markdown_body,
-            "content_type": content_type,
-        }
-        if title is not None:
-            body["title"] = title
-        if raw_hash is not None:
-            body["raw_hash"] = raw_hash
-        if source_updated_at is not None:
-            body["source_updated_at"] = source_updated_at
-        if sync_snapshot_id is not None:
-            body["sync_snapshot_id"] = sync_snapshot_id
-        if local_agent_job_id is not None:
-            body["local_agent_job_id"] = local_agent_job_id
-        if local_agent_attempt_count is not None:
-            body["local_agent_attempt_count"] = local_agent_attempt_count
-        if submitted_by is not None:
-            body["submitted_by"] = submitted_by
-        if submitted_at is not None:
-            body["submitted_at"] = submitted_at
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/packages",
-            body,
-        )
-
     def push_source_artifact(
         self,
         *,
@@ -303,38 +247,6 @@ class ToolClient:
                 "api_url": url,
                 "detail": str(exc),
             }
-
-    def prepare_local_source_snapshot(
-        self,
-        *,
-        source_id: str,
-        items: list[dict[str, str]],
-        coverage: str,
-        sync_snapshot_id: str,
-        local_agent_job_id: str,
-        local_agent_attempt_count: int,
-    ) -> dict[str, Any]:
-        """Declare covered membership and request only missing content bodies.
-
-        The request declares the package contract this agent collects under, so
-        the service asks again for retained packages that predate it.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "items": items,
-            "coverage": coverage,
-            "sync_snapshot_id": sync_snapshot_id,
-            "local_agent_job_id": local_agent_job_id,
-            "local_agent_attempt_count": local_agent_attempt_count,
-            "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
-        }
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/manifest",
-            body,
-        )
 
     def submit_acquisition_manifest(
         self,

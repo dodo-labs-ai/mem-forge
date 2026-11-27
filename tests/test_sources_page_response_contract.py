@@ -486,13 +486,18 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
             local_receipt = client.post(f"/api/v1/sources/{jira_id}/sync")
 
             offline = client.get("/api/cloud/local-agent/status")
-            notes_id = client.post(
+            chats_id = client.post(
                 "/api/v1/sources",
-                json={"type": "local_markdown", "name": "Notes", "access_policy": "workspace", "config": {"root": "/notes"}},
+                json={
+                    "type": "teams",
+                    "name": "Chats",
+                    "access_policy": "workspace",
+                    "config": {"region": "emea", "conversation_ids": ["19:standup@thread.v2"]},
+                },
             ).json()["id"]
             sync_job = client.post(
                 "/api/cloud/local-agent/jobs",
-                json={"source_id": notes_id, "source_type": "local_markdown", "operation": "local_markdown_sync", "payload": {}},
+                json={"source_id": chats_id, "source_type": "teams", "operation": "teams_sync", "payload": {}},
             )
             setup_job = client.post(
                 "/api/cloud/local-agent/jobs",

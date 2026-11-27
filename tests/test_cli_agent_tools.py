@@ -42,7 +42,6 @@ class FakeToolClient:
     calls: list[tuple[str, dict]] = []
     response: dict = {}
     list_response: dict = {"data": []}
-    snapshot_plan_response: dict | None = None
     def __init__(
         self,
         *,
@@ -62,7 +61,6 @@ class FakeToolClient:
         cls.calls = []
         cls.response = response
         cls.list_response = {"data": []} if list_response is None else list_response
-        cls.snapshot_plan_response = None
     def list_sources(self):
         self.calls.append(("list_sources", {"api_url": self.api_url, "api_token": self.api_token}))
         return self.list_response
@@ -105,14 +103,6 @@ class FakeToolClient:
         if self.response.get("error") or self.response.get("run_id"):
             return self.response
         return {"run_id": "run-test"}
-    def push_local_markdown_document(self, **kwargs):
-        self.calls.append(
-            (
-                "push_local_markdown_document",
-                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-            )
-        )
-        return self.response
     def push_source_artifact(self, **kwargs):
         self.calls.append(
             (
@@ -124,19 +114,6 @@ class FakeToolClient:
             "input_sha256": "a" * 64,
             "content_sha256": hashlib.sha256(kwargs["content"]).hexdigest(),
             "size_bytes": len(kwargs["content"]),
-        }
-    def prepare_local_source_snapshot(self, **kwargs):
-        self.calls.append(
-            (
-                "prepare_local_source_snapshot",
-                {"api_url": self.api_url, "api_token": self.api_token, "workspace_id": self.workspace_id, **kwargs},
-            )
-        )
-        if self.snapshot_plan_response is not None:
-            return self.snapshot_plan_response
-        return {
-            "required_doc_ids": [str(item["doc_id"]) for item in kwargs.get("items", [])],
-            "reused_count": 0,
         }
     def upload_jira_session(self, **kwargs):
         self.calls.append(
@@ -1294,215 +1271,6 @@ def test_native_folder_picker_non_macos_error_points_to_manual_path(monkeypatch)
 
     with pytest.raises(folder_picker.FolderPickerUnavailable, match="type the folder path instead"):
         folder_picker.pick_folder()
-
-
-def test_local_agent_cloud_local_markdown_sync_pushes_workspace_source(monkeypatch, tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
-    (root / "Runbook.md").write_text("# Runbook\n\nRestart safely.", encoding="utf-8")
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"doc_id": "local-doc", "document_hash": "hash"})
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-local-sync",
-            "attempt_count": 2,
-            "workspace_id": "ws-from-cloud",
-            "operation": "local_markdown_sync",
-            "source_id": "src-local",
-            "payload": {
-                "root": str(root),
-                "vault_id": "engineering",
-                "include": ["*.md", "**/*.md"],
-                "exclude": [],
-                "limit": 1,
-            },
-        },
-        _cloud_test_client(),
-    )
-
-    assert payload["operation"] == "local_markdown_sync"
-    assert payload["source_id"] == "src-local"
-    assert payload["source_sync_run_id"] == "run-test"
-    assert payload["counts"]["pushed"] == 2
-    push_calls = [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
-    assert len(push_calls) == 2
-    kwargs = push_calls[0][1]
-    assert kwargs["workspace_id"] == "ws-from-cloud"
-    assert kwargs["source_id"] == "src-local"
-    assert kwargs["vault_id"] == "engineering"
-    assert kwargs["relative_path"] == "Decision.md"
-    assert kwargs["sync_snapshot_id"] == "laj-local-sync:attempt:2"
-    assert "process_now" not in kwargs
-    process_calls = [call for call in FakeToolClient.calls if call[0] == "start_source_processing"]
-    assert len(process_calls) == 1
-    assert process_calls[0][1]["source_id"] == "src-local"
-    assert process_calls[0][1]["sync_snapshot_id"] == "laj-local-sync:attempt:2"
-
-
-def test_local_agent_cloud_local_markdown_sync_publishes_empty_snapshot(monkeypatch, tmp_path: Path):
-    root = tmp_path / "empty-notes"
-    root.mkdir()
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({"ok": True})
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-empty-snapshot",
-            "attempt_count": 1,
-            "workspace_id": "ws-from-cloud",
-            "operation": "local_markdown_sync",
-            "source_id": "src-local",
-            "payload": {
-                "root": str(root),
-                "vault_id": "engineering",
-                "include": ["*.md", "**/*.md"],
-                "exclude": [],
-            },
-        },
-        _cloud_test_client(),
-    )
-
-    assert payload["counts"]["pushed"] == 0
-    process_calls = [call[1] for call in FakeToolClient.calls if call[0] == "start_source_processing"]
-    assert process_calls == [
-        {
-            "api_url": "https://memforge-dev.example.com",
-            "api_token": "tok",
-            "workspace_id": "ws-from-cloud",
-            "source_id": "src-local",
-            "force_full_sync": False,
-            "sync_snapshot_id": "laj-empty-snapshot:attempt:1",
-            "local_agent_job_id": "laj-empty-snapshot",
-            "local_agent_attempt_count": 1,
-        }
-    ]
-
-
-def test_local_agent_cloud_local_markdown_noop_plans_complete_manifest_without_uploading_bodies(
-    monkeypatch,
-    tmp_path: Path,
-):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
-    (root / "Runbook.md").write_text("# Runbook\n\nRestart safely.", encoding="utf-8")
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({})
-    FakeToolClient.snapshot_plan_response = {"required_doc_ids": [], "reused_count": 2}
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-local-noop",
-            "attempt_count": 1,
-            "workspace_id": "ws-from-cloud",
-            "operation": "local_markdown_sync",
-            "source_id": "src-local",
-            "payload": {
-                "root": str(root),
-                "vault_id": "engineering",
-                "include": ["*.md", "**/*.md"],
-                "exclude": [],
-            },
-        },
-        _cloud_test_client(),
-    )
-
-    [plan_call] = [call for call in FakeToolClient.calls if call[0] == "prepare_local_source_snapshot"]
-    assert plan_call[1]["coverage"] == "complete_snapshot"
-    assert len(plan_call[1]["items"]) == 2
-    assert {item["change_kind"] for item in plan_call[1]["items"]} == {"upsert"}
-    assert not [call for call in FakeToolClient.calls if call[0] == "push_local_markdown_document"]
-    assert payload["counts"]["reused"] == 2
-    assert payload["counts"]["pushed"] == 0
-    assert payload["metrics"]["full_bodies_uploaded"] == 0
-
-
-def test_local_agent_cloud_local_markdown_incomplete_scan_fails_before_manifest_or_processing(
-    monkeypatch,
-    tmp_path: Path,
-):
-    root = tmp_path / "notes"
-    root.mkdir()
-    monkeypatch.setattr(main, "ToolClient", FakeToolClient)
-    FakeToolClient.reset({})
-    def incomplete_scan(_root, *, include, exclude, counts):
-        del include, exclude
-        counts["unreadable"] += 1
-        return iter(())
-
-    monkeypatch.setattr(main, "_scan_kb_profile", incomplete_scan)
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-local-incomplete",
-            "attempt_count": 1,
-            "workspace_id": "ws-from-cloud",
-            "operation": "local_markdown_sync",
-            "source_id": "src-local",
-            "payload": {"root": str(root), "vault_id": "engineering"},
-        },
-        _cloud_test_client(),
-    )
-
-    assert payload["error"] == "local collection was incomplete"
-    assert payload["retryable"] is True
-    assert not [
-        call
-        for call in FakeToolClient.calls
-        if call[0]
-        in {"prepare_local_source_snapshot", "push_local_markdown_document", "start_source_processing"}
-    ]
-
-
-def test_local_markdown_complete_scan_rejects_concurrent_file_change(tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    document = root / "Decision.md"
-    document.write_text("# Decision\n\nFirst version.", encoding="utf-8")
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    entries = list(
-        main._scan_kb_profile(
-            root,
-            include=["*.md", "**/*.md"],
-            exclude=[],
-            counts=counts,
-        )
-    )
-    document.write_text("# Decision\n\nChanged during collection.", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="changed during collection"):
-        main._attest_kb_scan_stable(
-            root,
-            include=["*.md", "**/*.md"],
-            exclude=[],
-            entries=entries,
-        )
-
-
-def test_local_markdown_complete_scan_rejects_concurrent_membership_change(tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision", encoding="utf-8")
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    entries = list(
-        main._scan_kb_profile(
-            root,
-            include=["*.md", "**/*.md"],
-            exclude=[],
-            counts=counts,
-        )
-    )
-    (root / "Runbook.md").write_text("# Runbook", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="membership changed during collection"):
-        main._attest_kb_scan_stable(
-            root,
-            include=["*.md", "**/*.md"],
-            exclude=[],
-            entries=entries,
-        )
 
 
 def test_local_agent_cloud_teams_auth_captures_session(monkeypatch):

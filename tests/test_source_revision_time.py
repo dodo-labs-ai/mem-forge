@@ -12,15 +12,13 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from memforge import main
-from memforge.config import AppConfig
 from memforge.genes.github_pages_gene import _content_item_from_url
 from memforge.genes.github_repo_gene import LAST_COMMIT_AT_KEY, GitHubRepoGene
 from memforge.genes.jira_gene import JiraGene
 from memforge.genes.teams_client import TeamsChatClient
 from memforge.genes.teams_gene import TeamsGene
 from tests.conversation_fixture import teams_unit_payload
-from memforge.local_adapter import submit_local_markdown_document
+from memforge.genes.local_markdown_gene import LocalMarkdownGene, _uncommitted_paths
 from memforge.local_agent.teams_contract import MILLISECONDS_PER_SECOND
 from memforge.memory.memory_relation import load_relation_subjects
 from memforge.models import ContentItem, Memory, NormalizedContent, RawContent
@@ -70,7 +68,7 @@ BODY_SOURCES = [
     ("confluence", "page_body", {"page_id": "123", "space_key": "ENG"}),
     ("github_repo", "file_content", {"relative_path": "docs/a.md", "repo_owner": "org", "repo_name": "repo"}),
     ("github_pages", "page_content", {"canonical_url": "https://org.github.io/docs/a"}),
-    ("local_markdown", "file_content", {"relative_path": "notes/a.md"}),
+    ("local_markdown", "file_content", {"vault_id": "notes", "relative_path": "notes/a.md"}),
     ("extension_docs", "document_content", {}),
 ]
 
@@ -335,40 +333,6 @@ async def test_migration_gives_current_confluence_bodies_their_page_version_time
         await migrated.close()
 
 
-def _local_markdown_source(tmp_path: Path) -> tuple[AppConfig, dict]:
-    config = AppConfig(base_dir=tmp_path / "mem")
-    source = {"id": "src-notes", "type": "local_markdown", "config": {"vault_id": "notes"}}
-    return config, source
-
-
-@pytest.mark.asyncio
-async def test_local_package_records_the_file_time_it_is_given(tmp_path) -> None:
-    config, source = _local_markdown_source(tmp_path)
-
-    timed = await submit_local_markdown_document(
-        db=None, config=config, source=source, vault_id="notes", relative_path="a.md",
-        markdown_body="# A", source_updated_at=SOURCE_TIME,
-    )
-    untimed = await submit_local_markdown_document(
-        db=None, config=config, source=source, vault_id="notes", relative_path="b.md", markdown_body="# B",
-    )
-
-    assert json.loads(Path(timed["package_path"]).read_text())["source_updated_at"] == SOURCE_TIME_UTC
-    # An older local agent sends no file time; the submission time never stands in for it.
-    assert "source_updated_at" not in json.loads(Path(untimed["package_path"]).read_text())
-
-
-@pytest.mark.asyncio
-async def test_local_package_rejects_a_file_time_without_offset(tmp_path) -> None:
-    config, source = _local_markdown_source(tmp_path)
-
-    with pytest.raises(ValueError, match="timezone offset"):
-        await submit_local_markdown_document(
-            db=None, config=config, source=source, vault_id="notes", relative_path="a.md",
-            markdown_body="# A", source_updated_at="2026-03-02T23:30:00",
-        )
-
-
 def _git(root: Path, *args: str, date: str | None = None) -> None:
     env = {**os.environ, "GIT_AUTHOR_DATE": date or "", "GIT_COMMITTER_DATE": date or ""}
     subprocess.run(
@@ -379,7 +343,21 @@ def _git(root: Path, *args: str, date: str | None = None) -> None:
     )
 
 
-def test_local_file_time_is_its_commit_time_unless_changed_locally(tmp_path) -> None:
+async def _file_times(root: Path, include: list[str]) -> dict[str, str]:
+    """Each file's source time, as the local Markdown Gene discovers and normalizes it."""
+
+    gene = LocalMarkdownGene(config={"root": str(root), "vault_id": "notes", "include": include}, source_id="src-notes")
+    times = {}
+    async for item in gene.discover(None):
+        raw = await gene.fetch(item)
+        normalized = await gene.normalize(raw)
+        assert normalized.source_semantics["source_updated_at"] == item.last_modified.isoformat()
+        times[item.extra["relative_path"]] = normalized.source_semantics["source_updated_at"]
+    return times
+
+
+@pytest.mark.asyncio
+async def test_local_file_time_is_its_commit_time_unless_changed_locally(tmp_path) -> None:
     root = tmp_path / "vault"
     (root / "docs").mkdir(parents=True)
     _git(root, "init", "-q")
@@ -393,16 +371,9 @@ def test_local_file_time_is_its_commit_time_unless_changed_locally(tmp_path) -> 
     for name in ("clean.md", "edited.md", "new.md"):
         # A checkout sets every file's modification time to when it ran.
         os.utime(root / "docs" / name, (modified_epoch, modified_epoch))
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    # The collection root may be a subdirectory of the checkout.
-    collection_root = root / "docs"
-    entries = {
-        entry["relative_path"]: entry
-        for entry in main._scan_kb_profile(collection_root, include=["**/*.md", "*.md"], exclude=[], counts=counts)
-    }
-    worktree = main._git_worktree(collection_root)
 
-    times = {path: main._local_file_source_time(collection_root, entry, worktree) for path, entry in entries.items()}
+    # The collection root may be a subdirectory of the checkout.
+    times = await _file_times(root / "docs", ["**/*.md", "*.md"])
 
     assert times == {
         "clean.md": "2026-01-15T12:00:00+00:00",
@@ -411,17 +382,15 @@ def test_local_file_time_is_its_commit_time_unless_changed_locally(tmp_path) -> 
     }
 
 
-def test_local_file_outside_git_takes_its_modification_time(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_local_file_outside_git_takes_its_modification_time(tmp_path) -> None:
     root = tmp_path / "plain"
     root.mkdir()
     (root / "a.md").write_text("# A\n")
     modified_epoch = datetime(2026, 5, 6, 7, 8, tzinfo=timezone.utc).timestamp()
     os.utime(root / "a.md", (modified_epoch, modified_epoch))
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    [entry] = list(main._scan_kb_profile(root, include=["*.md"], exclude=[], counts=counts))
 
-    assert main._git_worktree(root) is None
-    assert main._local_file_source_time(root, entry, None) == "2026-05-06T07:08:00+00:00"
+    assert await _file_times(root, ["*.md"]) == {"a.md": "2026-05-06T07:08:00+00:00"}
 
 
 @pytest.mark.asyncio
@@ -534,7 +503,7 @@ def test_an_edited_teams_message_takes_its_edit_time() -> None:
     assert times == {"m1": "2026-04-15T12:00:00+00:00", "m2": "2026-04-16T08:30:00+00:00"}
 
 
-def test_git_worktree_counts_both_paths_of_a_rename_as_changed(tmp_path) -> None:
+def test_a_rename_counts_both_its_paths_as_uncommitted(tmp_path) -> None:
     root = tmp_path / "vault"
     (root / "docs").mkdir(parents=True)
     _git(root, "init", "-q")
@@ -544,10 +513,7 @@ def test_git_worktree_counts_both_paths_of_a_rename_as_changed(tmp_path) -> None
     _git(root, "commit", "-q", "-m", "notes", date="2026-01-15T12:00:00+00:00")
     _git(root, "mv", "docs/old.md", "docs/new.md")
 
-    worktree = main._git_worktree(root / "docs")
-
-    assert worktree is not None
-    assert worktree.changed_paths == frozenset({"new.md", "old.md"})
+    assert _uncommitted_paths(root / "docs") == frozenset({"new.md", "old.md"})
 
 
 class _GitHubSubjectStore:

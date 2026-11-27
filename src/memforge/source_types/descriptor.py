@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from memforge.conversations.port import ConversationProvider
     from memforge.genes.base import Gene
     from memforge.genes.family import CollectionFamilyKind
-    from memforge.local_agent.replay_adapter import LocalSourceReplayAdapter
     from memforge.source_adapters.contracts import CanonicalRecordSchema
     from memforge.source_projection import EvidenceRepresentationProfile
 
@@ -35,25 +34,19 @@ def _frozen(mapping: Mapping[Any, Any]) -> Mapping[Any, Any]:
 
 @dataclass(frozen=True)
 class LocalAgentCollection:
-    """How the owner's local agent collects a Source of this type.
+    """How the owner's local agent collects a conversation Source of this type.
 
+    ``operation`` is the job the agent runs. ``job_config_fields`` are the
+    configuration fields the job hands the agent, after
+    ``job_config_defaults`` fills what an older configuration leaves out.
     ``collects`` says whether one configuration is collected by the agent.
-    ``package_submitter`` names the
-    function that accepts one package the agent uploads, and
-    ``replay_adapter`` the class that reads it back during sync.
+    A document Source runs on a device through its executor instead.
     """
 
     operation: str
     job_config_fields: frozenset[str]
     collects: Callable[[Mapping[str, Any]], bool] = lambda _config: True
-    package_submitter: str | None = None
-    replay_adapter: str | None = None
     job_config_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None
-
-    def replay_adapter_instance(self) -> LocalSourceReplayAdapter | None:
-        if self.replay_adapter is None:
-            return None
-        return load_reference(self.replay_adapter)()
 
 
 @dataclass(frozen=True)

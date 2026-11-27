@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.pipeline.revision_assessment import revision_inference_capability_hash
 
 import asyncio
@@ -117,7 +116,6 @@ from memforge.evals.agent_evaluation import (
 from memforge.storage.database import Database
 from memforge.storage.database import MIGRATIONS
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
-from memforge.storage.source_sync_manifest import SourceSyncManifestStore
 from memforge.scheduler import SOURCE_SCHEDULE_SCAN_JOB_ID, SyncScheduler
 from tests.device_report_fixture import leasing_device
 from tests.memory_store_fixture import OrchestratorMemoryStore
@@ -1795,75 +1793,6 @@ async def test_source_sync_inputs_are_idempotent_by_raw_hash(db: Database):
 
 
 @pytest.mark.asyncio
-async def test_source_sync_input_artifact_attestation_fills_legacy_metadata_idempotently(
-    db: Database,
-):
-    source_id = "src-input-attestation"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Teams",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    created = await db.create_source_sync_input(
-        source_id=source_id,
-        workspace_id="workspace-a",
-        raw_uri="object://workspace-a/src-input-attestation/legacy.json",
-        raw_sha256="semantic-sha",
-        raw_content_type="application/json",
-        metadata={
-            "doc_id": "doc-a",
-            "submitted_by": "legacy-daemon",
-            "manifest_entry": {
-                "doc_id": "doc-a",
-                "version": "v1",
-                "provider_field": "preserved",
-            },
-        },
-    )
-
-    attested = await db.attest_source_sync_input_artifact(
-        source_id=source_id,
-        input_id=created.input_id,
-        package_sha256="package-sha",
-    )
-    repeated = await db.attest_source_sync_input_artifact(
-        source_id=source_id,
-        input_id=created.input_id,
-        package_sha256="package-sha",
-    )
-
-    assert repeated == attested
-    assert attested.input_id == created.input_id
-    assert attested.input_generation == created.input_generation
-    assert attested.raw_uri == created.raw_uri
-    assert attested.raw_sha256 == created.raw_sha256
-    assert attested.metadata["submitted_by"] == "legacy-daemon"
-    assert attested.metadata["package_sha256"] == "package-sha"
-    assert attested.metadata["manifest_entry"] == {
-        "doc_id": "doc-a",
-        "version": "v1",
-        "provider_field": "preserved",
-        "package_sha256": "package-sha",
-    }
-
-    with pytest.raises(ValueError, match="artifact attestation conflict"):
-        await db.attest_source_sync_input_artifact(
-            source_id=source_id,
-            input_id=created.input_id,
-            package_sha256="different-package-sha",
-        )
-
-    listed = await db.list_source_sync_inputs(
-        source_id=source_id,
-        workspace_id="workspace-a",
-    )
-    assert listed == [attested]
-
-
-@pytest.mark.asyncio
 async def test_snapshot_input_uses_top_level_doc_id_and_rejects_missing_identity(db: Database):
     await db.upsert_source(
         id="src-snapshot-doc",
@@ -1967,87 +1896,6 @@ async def test_source_sync_inputs_filter_by_current_snapshot_membership(db: Data
     assert repeated.input_id == new.input_id
     assert [item.input_id for item in repeat_snapshot] == [new.input_id]
     assert empty_snapshot == []
-
-
-@pytest.mark.asyncio
-async def test_source_sync_input_attestation_lookup_is_exact_and_history_bounded(
-    db: Database,
-):
-    source_id = "src-manifest-attestations"
-    workspace_id = "workspace-a"
-    await db.upsert_source(
-        id=source_id,
-        type="github_repo",
-        name="Repository",
-        config_json="{}",
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    inputs = []
-    for revision in ("v1", "v2", "unrelated"):
-        inputs.append(
-            await db.create_source_sync_input(
-                source_id=source_id,
-                workspace_id=workspace_id,
-                raw_uri=f"object://{revision}.json",
-                raw_sha256=f"semantic-{revision}",
-                raw_content_type="application/json",
-                metadata={
-                    "package_sha256": f"package-{revision}",
-                    "manifest_entry": {
-                        "doc_id": "doc-a" if revision != "unrelated" else "doc-other",
-                        "provider_revision": revision,
-                        "change_kind": "upsert",
-                        "package_sha256": f"package-{revision}",
-                    },
-                },
-            )
-        )
-    for index, (revision, item) in enumerate(zip(("v1", "v2", "unrelated"), inputs)):
-        doc_id = "doc-a" if revision != "unrelated" else "doc-other"
-        snapshot_id = f"snapshot-{index}"
-        await db.db.execute(
-            """INSERT INTO source_sync_snapshot_manifests (
-                   workspace_id, source_id, snapshot_id, coverage, item_count,
-                   manifest_sha256, local_agent_job_id, local_agent_attempt_count,
-                   source_config_revision, created_at
-               ) VALUES (?, ?, ?, 'complete_snapshot', 1, ?, 'job', 1, 'cfg', ?)""",
-            (workspace_id, source_id, snapshot_id, "a" * 64, "2026-07-22T00:00:00+00:00"),
-        )
-        await db.db.execute(
-            """INSERT INTO source_sync_snapshot_manifest_items (
-                   workspace_id, source_id, snapshot_id, doc_id, revision, change_kind
-               ) VALUES (?, ?, ?, ?, ?, 'upsert')""",
-            (workspace_id, source_id, snapshot_id, doc_id, revision),
-        )
-        await db.db.execute(
-            """INSERT INTO source_sync_snapshot_items (
-                   workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                workspace_id,
-                source_id,
-                snapshot_id,
-                doc_id,
-                item.input_id,
-                "2026-07-22T00:00:00+00:00",
-            ),
-        )
-    await db.db.commit()
-
-    matched = await db.find_source_sync_input_attestations(
-        source_id=source_id,
-        workspace_id=workspace_id,
-        manifest_items=[
-            ("doc-a", "v1", "upsert"),
-            ("doc-missing", "v1", "upsert"),
-        ],
-    )
-
-    indexes = await db.db.execute_fetchall("PRAGMA index_list(source_sync_snapshot_manifest_items)")
-    assert isinstance(db, SourceSyncManifestStore)
-    assert "idx_source_sync_manifest_item_attestation" in {str(row["name"]) for row in indexes}
-    assert [item.input_id for item in matched] == [inputs[0].input_id]
 
 
 class EmptyGene(FakeGene):
@@ -4260,14 +4108,17 @@ class MovingGithubFileGene(UpdatingDocumentGene):
         )
 
 
-class PushedGithubFileGene(MovingGithubFileGene):
-    """A repository file pushed from a device, whose snapshot manifest lists the scope."""
+class ListedGithubFileGene(MovingGithubFileGene):
+    """A repository file whose existence listing names only itself."""
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
 
     @classmethod
     def lists_scope(cls, config) -> bool:
         return True
+
+    async def list_scope(self):
+        return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=frozenset({self.item_id}))
 
 
 class BlockingMemoryExtractor(NoopMemoryExtractor):
@@ -5708,6 +5559,12 @@ async def test_supported_configured_sources_reach_shared_lifecycle_execution_sea
         def metadata(cls):
             return replace(UpdatingDocumentGene.metadata(), name=source_type)
 
+        async def discover(self, since=None):
+            async for item in super().discover(since):
+                if source_type == "local_markdown":
+                    item = replace(item, extra={"vault_id": "notes", "relative_path": "design.md"})
+                yield item
+
     gene_type = (UpdatingTicketGene if source_type == "jira" else
                  LargeConfluenceGene if source_type == "confluence" else SourceTypeGene)
     engine = RecordingMemoryEngine()
@@ -5885,38 +5742,6 @@ async def test_force_full_sync_ignores_incremental_cursor(db: Database):
         source_name="Architecture",
         source_id=source_id,
         force_full_sync=True,
-    )
-
-    assert gene.seen_since is None
-
-
-@pytest.mark.asyncio
-async def test_a_run_bound_to_an_input_snapshot_ignores_cursor_without_forcing_reprocessing(db: Database):
-    source_id = "src-authoritative-snapshot"
-    await _insert_held_source_and_doc(db, source_id)
-    await db.upsert_sync_state(
-        SyncState(
-            source=source_id,
-            last_sync_at=datetime(2026, 5, 26, 14, 55, 33, tzinfo=timezone.utc),
-            last_sync_status="success",
-            docs_processed=1,
-            docs_updated=1,
-        ),
-    )
-    gene = SinceRecordingEmptyGene()
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=None,
-        memory_extractor=None,
-        memory_engine=None,
-        memory_store=OrchestratorMemoryStore(db),
-    )
-
-    await orchestrator.sync_gene(
-        gene=gene,
-        source_name="Architecture",
-        source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset()),
     )
 
     assert gene.seen_since is None
@@ -7494,420 +7319,6 @@ async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime
 
 
 @pytest.mark.asyncio
-async def test_source_sync_worker_does_not_reprocess_unchanged_complete_input_snapshot(db: Database):
-    import memforge.runtime as runtime
-
-    source_id = "src-snapshot-worker"
-    await db.upsert_source(
-        id=source_id,
-        type="local_markdown",
-        name="Snapshot Worker",
-        config_json='{"documents_dir":"/server/inbox"}',
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-
-    class CapturingRuntimeProvider:
-        def __init__(self) -> None:
-            self.force_full_sync: bool | None = None
-            self.input_snapshot: SnapshotBinding | None = None
-            self.source: dict | None = None
-            self.reusable_projection_doc_ids: frozenset[str] | None = None
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return object()
-
-        async def run_source_sync(self, **kwargs):
-            self.force_full_sync = kwargs["force_full_sync"]
-            self.input_snapshot = kwargs["input_snapshot"]
-            self.source = kwargs["source"]
-            self.reusable_projection_doc_ids = kwargs["reusable_projection_doc_ids"]
-            return SyncState(
-                source=source_id,
-                last_sync_at=datetime.now(timezone.utc),
-                last_sync_status="success",
-            )
-
-    provider = CapturingRuntimeProvider()
-
-    async def find_reusable_source_projection_memberships(**kwargs):
-        assert kwargs["source_id"] == source_id
-        assert kwargs["snapshot_id"] == "laj-empty"
-        assert kwargs["expected_access_hash"]
-        return frozenset({"doc-reused"})
-
-    db.find_reusable_source_projection_memberships = find_reusable_source_projection_memberships
-    await db.enqueue_source_sync_run(
-        source_id=source_id,
-        trigger="local_agent",
-        force_full_sync=False,
-        input_snapshot_id="laj-empty",
-    )
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-snapshot",
-    )
-
-    await worker.run_once()
-
-    assert provider.force_full_sync is False
-    assert provider.input_snapshot == SnapshotBinding("laj-empty", frozenset())
-    assert provider.source is not None
-    assert provider.source["config"]["local_agent_package_manifest"] == []
-    assert provider.reusable_projection_doc_ids == frozenset({"doc-reused"})
-
-
-@pytest.mark.asyncio
-async def test_source_sync_worker_preserves_empty_incremental_local_snapshot(db: Database):
-    import memforge.runtime as runtime
-
-    source_id = "src-empty-teams-snapshot"
-    await db.upsert_source(
-        id=source_id,
-        type="teams",
-        name="Empty Teams snapshot",
-        config_json=json.dumps(
-            {
-                "conversation_ids": ["19:conversation@example.test"],
-                "region": "emea",
-            }
-        ),
-        access_policy="private",
-        owner_user_id="dev",
-    )
-
-    class CapturingRuntimeProvider:
-        def __init__(self) -> None:
-            self.source: dict | None = None
-            self.input_snapshot: SnapshotBinding | None = None
-            self.runtime_event_trace_sink = None
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return self
-
-        async def run_source_sync(self, **kwargs):
-            self.source = kwargs["source"]
-            self.input_snapshot = kwargs["input_snapshot"]
-            return SyncState(
-                source=source_id,
-                last_sync_at=datetime.now(timezone.utc),
-                last_sync_status="success",
-            )
-
-    provider = CapturingRuntimeProvider()
-    await db.enqueue_source_sync_run(
-        source_id=source_id,
-        trigger="local_agent",
-        force_full_sync=False,
-        input_snapshot_id="laj-empty-teams:attempt:1",
-    )
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-empty-teams-snapshot",
-    )
-
-    await worker.run_once()
-
-    assert provider.input_snapshot is None
-    assert provider.source is not None
-    assert provider.source["config"]["local_agent_package_manifest"] == []
-
-
-@pytest.mark.asyncio
-async def test_source_sync_worker_binds_no_snapshot_for_direct_cloud_jira(
-    db: Database,
-):
-    import memforge.runtime as runtime
-
-    source_id = "src-cloud-jira-incremental"
-    await db.upsert_source(
-        id=source_id,
-        type="jira",
-        name="Cloud Jira",
-        config_json=json.dumps(
-            {
-                "sync_mode": "cloud",
-                "query_mode": "advanced",
-                "jql": "project = PAYR",
-            }
-        ),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-
-    class CapturingRuntimeProvider:
-        def __init__(self) -> None:
-            self.input_snapshot: SnapshotBinding | None = None
-            self.source: dict | None = None
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return object()
-
-        async def run_source_sync(self, **kwargs):
-            self.input_snapshot = kwargs["input_snapshot"]
-            self.source = kwargs["source"]
-            return SyncState(
-                source=source_id,
-                last_sync_at=datetime.now(timezone.utc),
-                last_sync_status="success",
-            )
-
-    provider = CapturingRuntimeProvider()
-    await db.enqueue_source_sync_run(
-        source_id=source_id,
-        trigger="manual",
-        force_full_sync=False,
-    )
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-cloud-jira",
-    )
-
-    await worker.run_once()
-
-    assert provider.input_snapshot is None
-    assert provider.source is not None
-    assert "local_agent_package_manifest" not in provider.source["config"]
-
-
-@pytest.mark.asyncio
-async def test_source_projection_reuse_requires_prior_manifest_and_current_lineage(
-    db: Database,
-) -> None:
-    source_id = "src-projection-reuse-plan"
-    doc_id = "jira-0"
-    revision = "0"
-    markdown = "# Jira 0\n\nBody"
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id=doc_id,
-        title="Jira 0",
-        markdown=markdown,
-        version=revision,
-        configured_source_type="jira",
-    )
-    item = ContentItem(
-        item_id=doc_id,
-        title="Jira 0",
-        source_url="https://jira.example/browse/PAY-0",
-        last_modified=datetime.now(timezone.utc),
-        content_type="application/json",
-        space_or_project="PAY",
-        version=revision,
-        extra={"issue_id": "100000", "issue_key": "PAY-0"},
-    )
-    raw = _jira_raw_content(item)
-    projection = project_source_item(
-        source_id=source_id,
-        source_type="jira",
-        run_id="projection-reuse-current",
-        item=item,
-        raw=raw,
-        normalized=NormalizedContent(item=item, markdown_body=markdown),
-        access_context={"access_policy": "workspace", "owner_user_id": "dev"},
-    )
-    await db.record_source_projection(
-        projection,
-        unit_input=_stored_input(projection, item, markdown=markdown, raw_content_type=raw.content_type),
-    )
-    access_hash = projection.source_unit_revisions[0].access_hash
-    assert access_hash is not None
-
-    package_hash = "a" * 64
-    retained = await db.create_source_sync_input(
-        source_id=source_id,
-        raw_uri="object://projection-reuse/jira-0",
-        raw_sha256="b" * 64,
-        raw_content_type="application/json",
-        metadata={
-            "package_sha256": package_hash,
-            "manifest_entry": {
-                "doc_id": doc_id,
-                "provider_revision": revision,
-                "version": revision,
-                "change_kind": "upsert",
-                "package_sha256": package_hash,
-            },
-        },
-    )
-    for snapshot_id in ("snapshot-prior", "snapshot-current"):
-        await db.attach_source_sync_inputs_to_snapshot(
-            source_id=source_id,
-            workspace_id="default",
-            snapshot_id=snapshot_id,
-            memberships=[(doc_id, retained.input_id)],
-            coverage="complete_snapshot",
-            manifest_count=1,
-            manifest_sha256=("c" if snapshot_id == "snapshot-prior" else "d") * 64,
-            manifest_items=[(doc_id, revision, "upsert")],
-            local_agent_job_id=f"job-{snapshot_id}",
-            local_agent_attempt_count=1,
-            source_config_revision="config-revision",
-        )
-
-    assert await db.find_reusable_source_projection_memberships(
-        source_id=source_id,
-        workspace_id="default",
-        snapshot_id="snapshot-current",
-        expected_access_hash=access_hash,
-    ) == frozenset({doc_id})
-    assert (
-        await db.find_reusable_source_projection_memberships(
-            source_id=source_id,
-            workspace_id="default",
-            snapshot_id="snapshot-current",
-            expected_access_hash="stale-access-hash",
-        )
-        == frozenset()
-    )
-    await db.db.execute(
-        """UPDATE source_sync_snapshot_manifests
-           SET source_config_revision = 'stale-config-revision'
-           WHERE source_id = ? AND snapshot_id = 'snapshot-prior'""",
-        (source_id,),
-    )
-    await db.db.commit()
-    assert (
-        await db.find_reusable_source_projection_memberships(
-            source_id=source_id,
-            workspace_id="default",
-            snapshot_id="snapshot-current",
-            expected_access_hash=access_hash,
-        )
-        == frozenset()
-    )
-    await db.db.execute(
-        """UPDATE source_sync_snapshot_manifests
-           SET source_config_revision = 'config-revision'
-           WHERE source_id = ? AND snapshot_id = 'snapshot-prior'""",
-        (source_id,),
-    )
-    now = datetime.now(timezone.utc).isoformat()
-    await db.db.execute(
-        """INSERT INTO projection_scope_transitions (
-               id, source_id, previous_scope_json, target_scope_json, status,
-               created_at, updated_at
-           ) VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-        (
-            "scope-transition-reuse-plan",
-            source_id,
-            '{"projects":["PAY"]}',
-            '{"projects":["OPS"]}',
-            now,
-            now,
-        ),
-    )
-    await db.db.commit()
-    # Every open transition, a failed one included, needs each listed
-    # Document to commit under it; a closed one no longer holds reuse back.
-    for status, reusable in (
-        ("pending", frozenset()),
-        ("running", frozenset()),
-        ("failed", frozenset()),
-        ("applied", frozenset({doc_id})),
-        ("superseded", frozenset({doc_id})),
-    ):
-        await db.db.execute(
-            "UPDATE projection_scope_transitions SET status = ? WHERE id = 'scope-transition-reuse-plan'",
-            (status,),
-        )
-        await db.db.commit()
-        assert (
-            await db.find_reusable_source_projection_memberships(
-                source_id=source_id,
-                workspace_id="default",
-                snapshot_id="snapshot-current",
-                expected_access_hash=access_hash,
-            )
-            == reusable
-        ), status
-
-
-@pytest.mark.asyncio
-async def test_legacy_snapshot_run_uses_snapshot_membership_without_watermark(
-    db: Database,
-):
-    import memforge.runtime as runtime
-
-    source_id = "src-legacy-snapshot"
-    snapshot_id = "snapshot-before-watermarks"
-    await db.upsert_source(
-        id=source_id,
-        type="local_markdown",
-        name="Legacy Snapshot",
-        config_json='{"root":"/vault","vault_id":"vault-a"}',
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await db.create_source_sync_input(
-        source_id=source_id,
-        raw_uri="object://legacy-snapshot-doc",
-        raw_sha256="sha-legacy-snapshot-doc",
-        raw_content_type="application/json",
-        metadata={
-            "doc_id": "doc-legacy",
-            "manifest_entry": {"doc_id": "doc-legacy", "version": "v1"},
-        },
-        sync_snapshot_id=snapshot_id,
-    )
-    run = await db.enqueue_source_sync_run(
-        source_id=source_id,
-        trigger="local_agent",
-        input_snapshot_id=snapshot_id,
-    )
-    await db.db.execute(
-        "UPDATE source_sync_runs SET input_generation_watermark = NULL WHERE run_id = ?",
-        (run.run_id,),
-    )
-    await db.db.commit()
-
-    class CapturingRuntimeProvider:
-        source: dict | None = None
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return object()
-
-        async def run_source_sync(self, **kwargs):
-            self.source = kwargs["source"]
-            return SyncState(
-                source=source_id,
-                last_sync_at=datetime.now(timezone.utc),
-                last_sync_status="success",
-            )
-
-    provider = CapturingRuntimeProvider()
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-legacy-snapshot",
-    )
-
-    await worker.run_once()
-
-    assert provider.source is not None
-    assert provider.source["config"]["local_agent_package_manifest"] == [
-        {
-            "doc_id": "doc-legacy",
-            "version": "v1",
-            "package_uri": "object://legacy-snapshot-doc",
-            "input_sha256": "sha-legacy-snapshot-doc",
-        }
-    ]
-
-
-@pytest.mark.asyncio
 async def test_legacy_incremental_local_run_without_watermark_fails_closed(
     db: Database,
 ):
@@ -7959,72 +7370,6 @@ async def test_legacy_incremental_local_run_without_watermark_fails_closed(
     assert failed is not None
     assert failed.status == "failed"
     assert failed.error_message == "local-agent sync run is missing its input generation boundary"
-
-
-@pytest.mark.asyncio
-async def test_source_sync_worker_consumes_only_inputs_at_run_watermark(db: Database):
-    import memforge.runtime as runtime
-
-    source_id = "src-worker-watermark"
-    await db.upsert_source(
-        id=source_id,
-        type="local_markdown",
-        name="Watermark Worker",
-        config_json='{"root":"/vault","vault_id":"vault-a"}',
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    first = await db.create_source_sync_input(
-        source_id=source_id,
-        raw_uri="object://first",
-        raw_sha256="sha-first",
-        raw_content_type="application/json",
-        metadata={"manifest_entry": {"doc_id": "doc-first", "version": "v1"}},
-    )
-    run = await db.enqueue_source_sync_run(source_id=source_id, trigger="local_agent")
-    await db.create_source_sync_input(
-        source_id=source_id,
-        raw_uri="object://second",
-        raw_sha256="sha-second",
-        raw_content_type="application/json",
-        metadata={"manifest_entry": {"doc_id": "doc-second", "version": "v2"}},
-    )
-
-    class CapturingRuntimeProvider:
-        source: dict | None = None
-
-        async def build_sync_runtime(self, db, config, **kwargs):
-            del db, config, kwargs
-            return object()
-
-        async def run_source_sync(self, **kwargs):
-            self.source = kwargs["source"]
-            return SyncState(
-                source=source_id,
-                last_sync_at=datetime.now(timezone.utc),
-                last_sync_status="success",
-            )
-
-    provider = CapturingRuntimeProvider()
-    worker = runtime.SourceSyncWorker(
-        db,
-        AppConfig(),
-        runtime_provider=provider,
-        worker_id="worker-watermark",
-    )
-
-    await worker.run_once()
-
-    assert run.input_generation_watermark == first.input_generation
-    assert provider.source is not None
-    assert provider.source["config"]["local_agent_package_manifest"] == [
-        {
-            "doc_id": "doc-first",
-            "version": "v1",
-            "package_uri": "object://first",
-            "input_sha256": "sha-first",
-        }
-    ]
 
 
 @pytest.mark.asyncio
@@ -9789,7 +9134,7 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
     )
     await set_scope("ref-a", "ref-b")
     second = await orchestrator.sync_gene(
-        gene=PushedGithubFileGene(
+        gene=ListedGithubFileGene(
             item_id="github-ref-b",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9797,11 +9142,10 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-b"})),
     )
     await set_scope("ref-b", "ref-a")
     third = await orchestrator.sync_gene(
-        gene=PushedGithubFileGene(
+        gene=ListedGithubFileGene(
             item_id="github-ref-a",
             relative_path="docs/design.md",
             file_lineage_id=None,
@@ -9809,7 +9153,6 @@ async def test_scope_transition_reuses_historical_document_unit_identity(db: Dat
         ),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-2", frozenset({"github-ref-a"})),
     )
 
     assert first.last_sync_status == "success"
@@ -9955,7 +9298,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         memory_store=memory_store,
         max_concurrent=1,
     )
-    gene = PushedGithubFileGene(
+    gene = ListedGithubFileGene(
         item_id="github-ref-a",
         relative_path="docs/design.md",
         file_lineage_id=None,
@@ -9966,15 +9309,7 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"github-ref-a"})),
     )
-    # A run bound to a complete snapshot records it in every projection's
-    # scope, which is part of the projection's stored identity.
-    async with db.db.execute(
-        "SELECT scope_json FROM source_projection_runs WHERE source_id = ?", (source_id,)
-    ) as cursor:
-        scopes = [json.loads(row[0]) async for row in cursor]
-    assert scopes and all(scope["authoritative_snapshot"] is True for scope in scopes)
     [memory] = await db.list_memories(source=source_id, status="active")
 
     await set_scope(["docs"], ["other"])
@@ -9982,7 +9317,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-2", frozenset()),
     )
     retired = await db.get_memory(memory.id)
     assert retired is not None and retired.status == "retired"
@@ -9992,7 +9326,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=gene,
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-3", frozenset({"github-ref-a"})),
     )
 
     original_after_reentry = await db.get_memory(memory.id)
@@ -10008,7 +9341,6 @@ async def test_scope_reentry_reextracts_exact_revision_without_reusing_retired_m
         gene=EmptyProviderGene(),
         source_name="Payroll Repo",
         source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-4", frozenset()),
     )
 
     assert first.last_sync_status == "success"
@@ -11781,193 +11113,6 @@ async def test_sync_run_keeps_success_when_vector_delivery_raises(
     assert state.last_sync_status == "success"
     assert state.docs_failed == 0
     assert len(logged_errors) == 1
-
-
-@pytest.mark.asyncio
-async def test_reused_projection_skips_per_document_work_and_drains_outbox_once(
-    db: Database,
-) -> None:
-    source_id = "src-reused-projection"
-    item_count = 20
-    for index in range(item_count):
-        await _insert_document_with_metadata(
-            db,
-            source_id=source_id,
-            doc_id=f"jira-{index}",
-            title=f"Jira {index}",
-            markdown=f"# Jira {index}\n\nBody",
-            version=str(index),
-            configured_source_type="jira",
-        )
-    release = asyncio.Event()
-    release.set()
-    memory_store = FailingLifecycleOutboxMemoryStore(db)
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=memory_store,
-        max_concurrent=4,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UnexpectedFetchGene(item_count=item_count, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-        reusable_projection_doc_ids=frozenset(f"jira-{index}" for index in range(item_count)),
-    )
-
-    assert state.last_sync_status == "success"
-    assert state.docs_processed == item_count
-    assert state.docs_updated == 0
-    assert state.docs_failed == 0
-    assert memory_store.drain_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_reused_projection_materializes_only_changed_member(
-    db: Database,
-) -> None:
-    source_id = "src-reused-projection-one-change"
-    for index in range(2):
-        await _insert_document_with_metadata(
-            db,
-            source_id=source_id,
-            doc_id=f"jira-{index}",
-            title=f"Jira {index}",
-            markdown=f"# Jira {index}\n\nBody",
-            version=str(index),
-            configured_source_type="jira",
-        )
-    release = asyncio.Event()
-    release.set()
-    gene = RecordingFetchGene(item_count=2, release=release)
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=FailingLifecycleOutboxMemoryStore(db),
-        max_concurrent=2,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=gene,
-        source_name="Jira Board",
-        source_id=source_id,
-        reusable_projection_doc_ids=frozenset({"jira-0"}),
-    )
-
-    assert state.last_sync_status == "success"
-    assert state.docs_processed == 2
-    assert gene.fetched_doc_ids == ["jira-1"]
-
-
-@pytest.mark.asyncio
-async def test_force_sync_ignores_reused_projection_plan(db: Database) -> None:
-    source_id = "src-reused-projection-force"
-    await _insert_document_with_metadata(
-        db,
-        source_id=source_id,
-        doc_id="jira-0",
-        title="Jira 0",
-        markdown="# Jira 0\n\nBody",
-        version="0",
-        configured_source_type="jira",
-    )
-    release = asyncio.Event()
-    release.set()
-    gene = RecordingFetchGene(item_count=1, release=release)
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=FailingLifecycleOutboxMemoryStore(db),
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=gene,
-        source_name="Jira Board",
-        source_id=source_id,
-        force_full_sync=True,
-        reusable_projection_doc_ids=frozenset({"jira-0"}),
-    )
-
-    assert state.last_sync_status == "success"
-    assert gene.fetched_doc_ids == ["jira-0"]
-
-
-@pytest.mark.asyncio
-async def test_reused_projection_remains_complete_snapshot_membership_for_deletions(
-    db: Database,
-) -> None:
-    source_id = "src-reused-projection-deletion-proof"
-    documents = (
-        ("jira-0", "0"),
-        ("jira-removed", "removed-v1"),
-    )
-    for index, (doc_id, version) in enumerate(documents):
-        markdown = f"# {doc_id}\n\nBody"
-        await _insert_document_with_metadata(
-            db,
-            source_id=source_id,
-            doc_id=doc_id,
-            title=doc_id,
-            markdown=markdown,
-            version=version,
-            configured_source_type="jira",
-        )
-        item = ContentItem(
-            item_id=doc_id,
-            title=doc_id,
-            source_url=f"https://jira.example/browse/{doc_id}",
-            last_modified=datetime.now(timezone.utc),
-            content_type="application/json",
-            space_or_project="PAY",
-            version=version,
-            extra={
-                "issue_id": str(200000 + index),
-                "issue_key": f"PAY-{index}",
-            },
-        )
-        await db.record_source_projection(
-            project_source_item(
-                source_id=source_id,
-                source_type="jira",
-                run_id=f"projection-{doc_id}",
-                item=item,
-                raw=_jira_raw_content(item),
-                normalized=NormalizedContent(item=item, markdown_body=markdown),
-            )
-        )
-
-    release = asyncio.Event()
-    release.set()
-    memory_store = RecordingDocumentDeleteMemoryStore(db)
-    orchestrator = GeneSyncOrchestrator(
-        db=db,
-        doc_store=StubDocumentStore(),
-        memory_extractor=NoopMemoryExtractor(),
-        memory_engine=NoopMemoryEngine(),
-        memory_store=memory_store,
-        max_concurrent=1,
-    )
-
-    state = await orchestrator.sync_gene(
-        gene=UnexpectedFetchGene(item_count=1, release=release),
-        source_name="Jira Board",
-        source_id=source_id,
-        input_snapshot=SnapshotBinding("snapshot-1", frozenset({"jira-0"})),
-        reusable_projection_doc_ids=frozenset({"jira-0"}),
-    )
-
-    assert state.last_sync_status == "success"
-    assert await db.get_document("jira-0") is not None
-    assert await db.get_document("jira-removed") is None
-    assert [doc_id for doc_id, _ in memory_store.calls] == ["jira-removed"]
 
 
 @pytest.mark.asyncio

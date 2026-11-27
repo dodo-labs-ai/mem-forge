@@ -17,7 +17,6 @@ import pytest
 
 import memforge.tool_client as tool_client
 from memforge.api_target import build_host_target, build_target
-from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.tool_client import ToolClient
 from tests.device_report_fixture import device_report
 
@@ -156,37 +155,6 @@ def test_update_source_schedule_puts_source_schedule_payload():
             {"enabled": True, "interval_minutes": 60},
         )
     ]
-
-
-def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
-    client = _RecordingClient({"required_doc_ids": []})
-
-    result = client.prepare_local_source_snapshot(
-        source_id="src-github",
-        items=[{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
-        coverage="complete_snapshot",
-        sync_snapshot_id="job-1:attempt:2",
-        local_agent_job_id="job-1",
-        local_agent_attempt_count=2,
-    )
-
-    assert result == {"required_doc_ids": []}
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-github/adapter/manifest",
-            {
-                "items": [{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
-                "coverage": "complete_snapshot",
-                "sync_snapshot_id": "job-1:attempt:2",
-                "local_agent_job_id": "job-1",
-                "local_agent_attempt_count": 2,
-                "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
-            },
-        )
-    ]
-    # The agent confirms by identifier what a query manifest leaves out.
-    assert LOCAL_PACKAGE_CONTRACT_VERSION == 3
 
 
 def test_conversation_collection_calls_use_the_source_resource():

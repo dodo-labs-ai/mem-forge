@@ -2125,50 +2125,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/sources/{source_id}/adapter/manifest": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Prepare Local Source Manifest
-         * @description Reuse unchanged immutable packages in one complete, fenced collection.
-         */
-        post: operations["prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/adapter/packages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Push Local Source Package
-         * @description Receive one local-source package pushed by the local daemon/adapter.
-         *
-         *     The service owns the inbox layout and package format. Local clients
-         *     send raw file text; source genes perform canonical markdown
-         *     normalization during sync.
-         */
-        post: operations["push_local_source_package_api_v1_sources__source_id__adapter_packages_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/sources/{source_id}/agent-evaluation": {
         parameters: {
             query?: never;
@@ -2396,8 +2352,8 @@ export interface paths {
          *
          *     A document Source the device acquired with its type's own Gene is
          *     processed once its attempt is ready (:func:`ready_acquisition`), in
-         *     a run bound to that attempt; one collected through its type's
-         *     local-agent package path, once its snapshot manifest is materialized.
+         *     a run bound to that attempt; a conversation Source, once its
+         *     collection attempt is complete.
          */
         post: operations["process_collected_local_source_api_v1_sources__source_id__process_post"];
         delete?: never;
@@ -4270,88 +4226,6 @@ export interface components {
              * @default null
              */
             root: string | null;
-        };
-        /**
-         * LocalSourceManifestItemRequest
-         * @description One item of a device manifest: the item as the device read it.
-         */
-        LocalSourceManifestItemRequest: {
-            /**
-             * Change Kind
-             * @constant
-             */
-            change_kind: "upsert";
-            /** Doc Id */
-            doc_id: string;
-            /** Revision */
-            revision: string;
-        };
-        /**
-         * LocalSourceManifestRequest
-         * @description One complete local collection, planned against the retained packages.
-         *
-         *     A device manifest lists the complete item set of its scope, so it declares
-         *     ``complete_snapshot`` coverage and every item an ``upsert``.
-         *     ``package_contract_version`` is the package contract the local agent
-         *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-         *     the numbered contract sends none.
-         */
-        LocalSourceManifestRequest: {
-            /**
-             * Coverage
-             * @constant
-             */
-            coverage: "complete_snapshot";
-            /** Items */
-            items: components["schemas"]["LocalSourceManifestItemRequest"][];
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count: number;
-            /** Local Agent Job Id */
-            local_agent_job_id: string;
-            /** Package Contract Version */
-            package_contract_version?: number | null;
-            /** Sync Snapshot Id */
-            sync_snapshot_id: string;
-        };
-        /**
-         * LocalSourcePackageRequest
-         * @description One raw local-source package pushed by the local daemon/adapter.
-         *
-         *     ``markdown_body`` is the raw file text for the declared ``content_type``;
-         *     the source gene normalizes it during sync. ``source_updated_at`` is the
-         *     file's own time for this content (an offset-aware ISO time).
-         */
-        LocalSourcePackageRequest: {
-            /**
-             * Content Type
-             * @default text/markdown
-             */
-            content_type: string;
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count?: number | null;
-            /** Local Agent Job Id */
-            local_agent_job_id?: string | null;
-            /**
-             * Markdown Body
-             * @default
-             */
-            markdown_body: string;
-            /** Raw Hash */
-            raw_hash?: string | null;
-            /** Relative Path */
-            relative_path?: string | null;
-            /** Source Updated At */
-            source_updated_at?: string | null;
-            /** Submitted At */
-            submitted_at?: string | null;
-            /** Submitted By */
-            submitted_by?: string | null;
-            /** Sync Snapshot Id */
-            sync_snapshot_id?: string | null;
-            /** Title */
-            title?: string | null;
-            /** Vault Id */
-            vault_id?: string | null;
         };
         /** MemoryCorrectionProposalRequest */
         MemoryCorrectionProposalRequest: {
@@ -10829,76 +10703,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourceManifestRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    push_local_source_package_api_v1_sources__source_id__adapter_packages_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourcePackageRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {

@@ -41,8 +41,8 @@ def test_every_builtin_source_type_has_one_complete_descriptor() -> None:
             assert descriptor.project_native is None
         else:
             assert descriptor.project_native is not None, source_type
-        if descriptor.local_agent is not None and descriptor.local_agent.replay_adapter is not None:
-            assert descriptor.local_agent.replay_adapter_instance().source_type == source_type
+        # Only a conversation type keeps a local-agent collection; a document type runs on a device through its executor.
+        assert descriptor.local_agent is None or descriptor.family is CollectionFamilyKind.CONVERSATION, source_type
 
 
 def test_a_type_exports_pdfs_exactly_when_its_gene_reads_pdf_material() -> None:

@@ -12,7 +12,6 @@ import pytest
 
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 import memforge.pipeline.collection_family as collection_family_module
-from memforge.pipeline.collection_family import SnapshotBinding
 from memforge.pipeline.stored_document import StoredDocumentUnavailable, StoredDocumentUnavailableReason
 from memforge.pipeline.sync import GeneSyncOrchestrator, SourceSyncMode
 from memforge.source_item_failures import FailedItemRetry
@@ -168,22 +167,16 @@ class Workspace:
         *,
         force_full_sync: bool = False,
         retry: FailedItemRetry = FailedItemRetry.ALL,
-        manifest: set[int] | None = None,
         extractor=None,
         excluded_scope_gene=None,
     ):
-        """Sync as a person requests it; ``manifest`` binds the run to a device snapshot listing those issues."""
+        """Sync as a person requests it."""
         return await self.orchestrator(extractor).sync_gene(
             gene=gene,
             source_name="Jira",
             source_id=SOURCE_ID,
             force_full_sync=force_full_sync,
             failed_item_retry=retry,
-            input_snapshot=(
-                SnapshotBinding("snapshot-1", frozenset(f"jira-{number}" for number in manifest))
-                if manifest is not None
-                else None
-            ),
             excluded_scope_gene=excluded_scope_gene,
         )
 
@@ -401,18 +394,6 @@ async def test_runs_where_nothing_changed_at_the_provider_remove_nothing(workspa
     assert await workspace.held() == {"jira-0", "jira-1"}
 
 
-@pytest.mark.asyncio
-async def test_a_run_without_an_input_snapshot_records_no_complete_snapshot_in_its_projections(workspace):
-    await _synced(workspace, JiraProject(existing={0, 1}))
-
-    async with workspace.db.db.execute(
-        "SELECT scope_json FROM source_projection_runs WHERE source_id = ?", (SOURCE_ID,)
-    ) as cursor:
-        scopes = [json.loads(row[0]) async for row in cursor]
-
-    assert scopes and all(scope["authoritative_snapshot"] is False for scope in scopes)
-
-
 class RaisingExtractor(ProjectionFragmentRecordingExtractor):
     async def extract_projection_fragment_memories(self, catalog, **kwargs):
         raise ValueError("extraction raised")
@@ -427,15 +408,6 @@ class FailingCommitEngine(_OrderRecordingMemoryEngine):
         if kwargs["doc_id"] == self.failing_doc_id:
             raise ValueError("lifecycle commit failed")
         return await super().prepare_and_commit_projected_lifecycle(**kwargs)
-
-
-class DeviceManifest(JiraProject):
-    """A device-collected Source whose snapshot manifest is an existence listing."""
-
-    listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
-
-    async def list_scope(self):
-        raise AssertionError("a device-collected Source is listed by its snapshot manifest")
 
 
 @pytest.mark.asyncio
@@ -569,16 +541,16 @@ async def test_a_reprocess_never_lists_its_scope(workspace):
 
 
 @pytest.mark.asyncio
-async def test_a_device_existence_manifest_removes_unlisted_units_and_settles_unlisted_rows(workspace):
-    device = DeviceManifest(existing={0, 1, 2})
-    device.broken[2] = ("fetch", ValueError("package unreadable"))
-    assert (await workspace.sync(device, manifest={0, 1, 2})).last_sync_status == "partial"
+async def test_an_existence_listing_removes_unlisted_units_and_settles_unlisted_rows(workspace):
+    folder = JiraProject(existing={0, 1, 2}, listing_kind=ScopeListingKind.EXISTENCE)
+    folder.broken[2] = ("fetch", ValueError("file unreadable"))
+    assert (await workspace.sync(folder)).last_sync_status == "partial"
     assert set(await workspace.ledger()) == {"jira-2"}
     workspace.engine.events.clear()
 
-    # jira-1 and jira-2, which never became a Unit, left the device's folder.
-    device.move_on(existing={0})
-    state = await workspace.sync(device, manifest={0}, retry=SCHEDULED)
+    # jira-1 and jira-2, which never became a Unit, left the folder.
+    folder.move_on(existing={0})
+    state = await workspace.sync(folder, retry=SCHEDULED)
 
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == ["jira-1"]
@@ -762,16 +734,3 @@ async def test_an_unlisted_document_whose_item_cannot_be_rebuilt_is_kept_and_cou
     assert state.unlisted_present_count == 1
 
 
-@pytest.mark.asyncio
-async def test_a_snapshot_bound_configuration_that_cannot_list_removes_nothing(workspace):
-    project = UnlistedJiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
-    await workspace.sync(project, manifest={0, 1})
-    workspace.engine.events.clear()
-
-    project.move_on(existing={0})
-    state = await workspace.sync(project, manifest={0})
-
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == []
-    assert await workspace.held() == {"jira-0", "jira-1"}
-    assert state.absence_check_skipped_reason is None

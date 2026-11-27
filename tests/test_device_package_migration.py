@@ -1,7 +1,8 @@
 """Sources on a device package path move onto device acquisition (ADR 0058, design §10.9, gate of A4).
 
-A Jira Source with local agent sync and a GitHub repository Source with local
-push hold the packages their owner's daemon submitted. The migration's dry
+A Jira Source with local agent sync, a GitHub repository Source with local
+push and a local Markdown Source hold the packages their owner's daemon
+submitted. The migration's dry
 run rebuilds the input the type's Gene reads from each package and refuses a
 Source it cannot move; its apply replays the rebuilt inputs without forced
 extraction and moves the Source to the device. Jira Units move to their
@@ -16,16 +17,20 @@ import hashlib
 import json
 import sys
 from collections.abc import Iterator
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from weakref import WeakValueDictionary
 
 import pytest
 from fastapi.testclient import TestClient
 
 from memforge.config import AppConfig
-from memforge.genes import github_repo_gene, jira_gene
+from memforge.genes import github_repo_gene, jira_gene, local_markdown_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.genes.jira_gene import JiraGene
+from memforge.genes.local_markdown_gene import LocalMarkdownGene
 from memforge.github_repo_utils import build_github_repo_doc_id, parse_github_repo_url
 from memforge.models import Memory, slugify
 from memforge.pipeline.package_migration import (
@@ -70,6 +75,11 @@ GITHUB = DeviceType(
 )
 
 
+# A local folder needs no provider: the Gene reads the files on the device itself.
+_NO_PROVIDER = SimpleNamespace(_Provider=lambda listing: SimpleNamespace(http=SimpleNamespace(serving=lambda module: nullcontext())))
+NOTES = {"ideas.md": "# Ideas\n\nShip smaller releases.\n", "team/plans.md": "# Plans\n\nMove the queue on Friday.\n"}
+
+
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch):
     from tests.test_daemon_service import FakeKeyring
@@ -97,6 +107,16 @@ def jira(tmp_path, monkeypatch) -> Iterator[Deployment]:
 @pytest.fixture
 def github(tmp_path) -> Iterator[Deployment]:
     yield from _deployment(tmp_path, GITHUB)
+
+
+@pytest.fixture
+def notes(tmp_path) -> Iterator[Deployment]:
+    folder = tmp_path / "notes"
+    for relative_path, text in NOTES.items():
+        (folder / relative_path).parent.mkdir(parents=True, exist_ok=True)
+        (folder / relative_path).write_text(text)
+    kind = DeviceType("local_markdown", _NO_PROVIDER, local_markdown_gene, {"root": str(folder), "vault_id": "notes"}, "")
+    yield from _deployment(tmp_path, kind)
 
 
 def _deployment(tmp_path, kind: DeviceType) -> Iterator[Deployment]:
@@ -167,9 +187,29 @@ def _github_package(source_id: str, stored, body: bytes) -> dict:
     }
 
 
+def _local_markdown_package(source_id: str, stored, body: bytes) -> dict:
+    """The package the daemon pushed for one file: its text and the time it last changed."""
+
+    item = stored.item
+    return {
+        "package_kind": "local_markdown_document",
+        "doc_id": stored.document_id,
+        "vault_id": item.extra["vault_id"],
+        "title": item.title,
+        "source_url": item.source_url,
+        "relative_path": item.extra["relative_path"],
+        "content_type": item.content_type,
+        "markdown": body.decode(),
+        "source_updated_at": item.last_modified.isoformat(),
+        "submitted_at": SUBMITTED_AT,
+        "submitted_by": OWNER,
+    }
+
+
 PACKAGE_PATHS = {
     "jira": ({"auth_mode": "browser_cookie", "sync_mode": "local_agent"}, "local_agent_documents_dir", _jira_package),
     "github_repo": ({"connection_mode": "local_push"}, "documents_dir", _github_package),
+    "local_markdown": ({}, "documents_dir", _local_markdown_package),
 }
 
 
@@ -219,7 +259,7 @@ def _on_the_package_path(deployment: Deployment, monkeypatch) -> str:
             execution_owner_user_id=OWNER,
         )
     )
-    gene_cls = JiraGene if kind.source_type == "jira" else GitHubRepoGene
+    gene_cls = {"jira": JiraGene, "github_repo": GitHubRepoGene, "local_markdown": LocalMarkdownGene}[kind.source_type]
     with monkeypatch.context() as patch:
         if kind.source_type == "jira":
             patch.setattr(jira_gene, "_issue_doc_id", lambda key: _package_path_jira_doc_id(source_id, key))
@@ -395,9 +435,55 @@ def test_the_github_dry_run_refuses_a_file_the_configured_repository_names_diffe
     assert len(plan.id_changes_refused) == len(github.documents(source_id))
 
 
+def test_the_local_markdown_dry_run_rebuilds_each_file_under_its_stored_document(notes, monkeypatch):
+    source_id = _on_the_package_path(notes, monkeypatch)
+    before = notes.documents(source_id)
+
+    plan = _plan(notes, source_id)
+
+    assert not plan.refused
+    assert plan.moved_document_ids == ()
+    assert sorted(unit.document_id for unit in plan.units) == sorted(before)
+    # The packages held each file's text and time as the Gene reads them: no Observation changes.
+    assert plan.changed_document_ids == ()
+    assert notes.documents(source_id) == before
+
+
+def test_the_local_markdown_dry_run_refuses_a_package_without_the_files_time(notes, monkeypatch):
+    source_id = _on_the_package_path(notes, monkeypatch)
+    [ideas] = [doc_id for doc_id, (title, _, _) in notes.documents(source_id).items() if title == "Ideas"]
+    _rewrite_stored_package(notes, source_id, ideas, lambda package: package.pop("source_updated_at"))
+
+    plan = _plan(notes, source_id)
+
+    assert plan.refused
+    assert plan.unrebuildable == ((ideas, "the package records no source time for the file"),)
+
+
 # ---------------------------------------------------------------------------
 # Apply, recovery and the first device run
 # ---------------------------------------------------------------------------
+
+
+def test_a_moved_local_markdown_source_keeps_its_documents_and_runs_on_its_device(notes, monkeypatch):
+    source_id = _on_the_package_path(notes, monkeypatch)
+    held = notes.documents(source_id)
+    memory_id = _support_on(notes, sorted(held)[0])
+    notes.extractor.fragment_calls.clear()
+    connect_device(notes.db, OWNER)
+
+    result = _apply(notes, source_id)
+
+    assert result.status == "migrated", result
+    assert notes.extracted_documents(source_id) == []
+    assert notes.documents(source_id) == held
+    assert [source.doc_id for source in asyncio.run(notes.db.get_memory_sources(memory_id))] == [sorted(held)[0]]
+    moved = asyncio.run(notes.db.get_source(source_id))
+    assert moved["executor"] == "device"
+    assert moved["execution_device_id"] == DEVICE_ID
+    assert "documents_dir" not in moved["config"]
+    assert moved["config"]["root"] == str(Path(notes.kind.config["root"]))
+    assert asyncio.run(package_path_sources(notes.db)) == []
 
 
 def test_a_moved_jira_source_keeps_its_support_and_extracts_only_the_issue_that_changed(jira, monkeypatch):
