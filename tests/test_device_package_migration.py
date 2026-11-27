@@ -462,19 +462,56 @@ def test_the_local_markdown_dry_run_rebuilds_each_file_under_its_stored_document
     assert notes.documents(source_id) == before
 
 
-def test_the_local_markdown_dry_run_refuses_a_package_without_the_files_time(notes, monkeypatch):
+def _forget_source_times(deployment: Deployment, source_id: str, doc_id: str) -> None:
+    """Leave a Unit's revisions without a source time, as a package path before 0.2.0b1 recorded them."""
+
+    async def forget() -> None:
+        unit = await deployment.db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        await deployment.db.db.execute(
+            """UPDATE source_observation_revisions SET observed_at = NULL
+               WHERE id IN (SELECT current_revision_id FROM source_observations WHERE source_unit_id = ?)""",
+            (unit.id,),
+        )
+        await deployment.db.db.execute("UPDATE source_unit_revisions SET observed_at = NULL WHERE source_unit_id = ?", (unit.id,))
+        await deployment.db.db.commit()
+
+    asyncio.run(forget())
+
+
+def _source_times(deployment: Deployment, source_id: str, doc_id: str) -> set[str | None]:
+    async def read() -> set[str | None]:
+        unit = await deployment.db.find_source_unit_by_document_id(source_id, doc_id, current_only=True)
+        revisions = await deployment.db.get_current_source_observation_revisions(unit.id)
+        return {revision.observed_at for revision in revisions.values()}
+
+    return asyncio.run(read())
+
+
+def test_a_local_file_uploaded_without_its_time_moves_and_takes_the_time_from_its_device(notes, monkeypatch):
     source_id = _on_the_package_path(notes, monkeypatch)
     [ideas] = [doc_id for doc_id, (title, _, _) in notes.documents(source_id).items() if title == "Ideas"]
+    # A daemon before 0.2.0b1 recorded no time, in the package or on the revisions it projected.
     _rewrite_stored_package(notes, source_id, ideas, lambda package: package.pop("source_updated_at"))
+    _forget_source_times(notes, source_id, ideas)
 
     plan = _plan(notes, source_id)
 
-    assert plan.refused
-    [(refused_id, cause)] = plan.unrebuildable
-    assert refused_id == ideas
-    assert cause.startswith("the package records no source time for the file")
-    # The cause names what the operator can do about it.
-    assert "delete the Source and add its folder again on its computer" in cause
+    assert not plan.refused
+    assert plan.changed_document_ids == ()
+
+    notes.extractor.fragment_calls.clear()
+    connect_device(notes.db, OWNER)
+    assert _apply(notes, source_id).status == "migrated"
+    assert notes.extracted_documents(source_id) == []
+    # No stand-in time was recorded: a recorded source time is never replaced.
+    assert _source_times(notes, source_id, ideas) == {None}
+
+    # The device reads every file, so its first run gives the file its time, extracting nothing.
+    _sync_now_on_the_device(notes, source_id)
+
+    assert notes.extracted_documents(source_id) == []
+    [file_time] = _source_times(notes, source_id, ideas)
+    assert file_time is not None
 
 
 # ---------------------------------------------------------------------------

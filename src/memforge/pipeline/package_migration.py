@@ -20,10 +20,9 @@ This recoverable migration (ADR 0032) moves each such Source once:
    and the raw body unwrapped from its package. It projects that input
    against the Unit's current revision and counts the Units whose
    Observations it would change. A package the Gene's form cannot be rebuilt
-   from (a Jira issue without ``fields.updated``, a local file package
-   without the file's source time), two Units that map to one id, and a
-   GitHub or local file whose id the Gene gives differently from the stored
-   one each refuse the Source. It writes nothing.
+   from (a Jira issue without ``fields.updated``), two Units that map to one
+   id, and a GitHub or local file whose id the Gene gives differently from
+   the stored one each refuse the Source. It writes nothing.
 3. **Apply.** :func:`apply_package_migration` holds the Source's sync
    activity, plans again, and replays the rebuilt inputs through a REPLAY
    run of the type's recorded Gene: each is processed under the Gene's id
@@ -201,7 +200,17 @@ def _rebuild_github_repo(
 def _rebuild_local_markdown(
     source_id: str, config: Mapping[str, Any], package: dict[str, Any], stored: SourceUnitInput
 ) -> _Rebuilt:
-    """The file as ``LocalMarkdownGene`` discovers and fetches it: its text, with the file's own time."""
+    """The file as ``LocalMarkdownGene`` discovers and fetches it: its text, with the file's own time.
+
+    A daemon before 0.2.0b1 recorded no time in a file's package, and the
+    package path never uploaded an unchanged file again, so a file unchanged
+    since then has none. Its item orders by the stored item's time and
+    reports no source time: its Observations keep the time they recorded,
+    none, until the first device run reads the file and reports its time,
+    which a revision recorded without a source time takes once. A stand-in
+    time would be recorded for good, since a recorded source time is never
+    replaced.
+    """
 
     from memforge.genes.local_markdown_gene import (
         LOCAL_FILE_CONTENT_TYPE,
@@ -218,16 +227,12 @@ def _rebuild_local_markdown(
         source_time = parse_source_time(package.get(SOURCE_UPDATED_AT_KEY))
     except ValueError as exc:
         raise Unrebuildable(f"the package's source time is invalid: {exc}") from exc
-    if source_time is None:
-        raise Unrebuildable(
-            "the package records no source time for the file, which a daemon before 0.2.0b1 uploaded; "
-            "delete the Source and add its folder again on its computer"
-        )
     item = local_file_content_item(
         source_id=source_id,
         vault_id=str(config.get("vault_id") or ""),
         relative_path=relative_path,
-        last_modified=source_time,
+        last_modified=source_time or stored.item.last_modified,
+        source_time=source_time,
     )
     fetched_local_file_item(item, markdown)
     return _Rebuilt(item=item, body=markdown.encode("utf-8"), content_type=LOCAL_FILE_CONTENT_TYPE)

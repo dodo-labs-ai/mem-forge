@@ -134,11 +134,16 @@ def local_file_content_item(
     vault_id: str,
     relative_path: str,
     last_modified: datetime,
+    source_time: datetime | None,
 ) -> ContentItem:
     """The item of one listed file, as discovery yields it, before ``fetch`` reads the file.
 
-    ``fetch`` adds the title, which a Markdown file's first heading gives,
-    and the ``version``, the hash of the file's text.
+    ``source_time`` is the file's own time, which ``normalize`` reports as the
+    content's source time. Discovery always knows it and passes
+    ``last_modified``; only a file migrated from a package that recorded no
+    time has none (``memforge.pipeline.package_migration``). ``fetch`` adds
+    the title, which a Markdown file's first heading gives, and the
+    ``version``, the hash of the file's text.
     """
 
     return ContentItem(
@@ -149,7 +154,11 @@ def local_file_content_item(
         content_type=_content_type_for_path(relative_path),
         space_or_project=vault_id,
         labels=["local_markdown"],
-        extra={"vault_id": vault_id, "relative_path": relative_path},
+        extra={
+            "vault_id": vault_id,
+            "relative_path": relative_path,
+            SOURCE_UPDATED_AT_KEY: source_time_iso(source_time),
+        },
     )
 
 
@@ -430,6 +439,7 @@ class LocalMarkdownGene(DocumentGene):
                 vault_id=vault_id,
                 relative_path=listed_file.relative_path,
                 last_modified=times[listed_file.relative_path],
+                source_time=times[listed_file.relative_path],
             )
             for listed_file in listed
         ]
@@ -474,7 +484,7 @@ class LocalMarkdownGene(DocumentGene):
                 "vault_id": raw.item.space_or_project,
                 "relative_path": raw.item.extra.get("relative_path"),
                 "content_type": content_type,
-                SOURCE_UPDATED_AT_KEY: source_time_iso(raw.item.last_modified),
+                SOURCE_UPDATED_AT_KEY: raw.item.extra.get(SOURCE_UPDATED_AT_KEY),
             },
         )
 

@@ -13,7 +13,8 @@
     ],
     "extra": {
       "vault_id": "kestrel-notes",
-      "relative_path": "ops/backup-policy.txt"
+      "relative_path": "ops/backup-policy.txt",
+      "source_updated_at": "2026-10-22T08:00:00+00:00"
     }
   },
   "raw": {
