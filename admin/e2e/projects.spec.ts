@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { appPath } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 const SOURCE = {
   id: "src-jira",
@@ -34,7 +35,7 @@ const RESPONSES: Record<string, unknown> = {
   "GET /api/v1/projects/p-payroll/deletion-impact": { memory_count: 708, source_count: 1 },
   "GET /api/v1/sources": { data: [SOURCE] },
   "GET /api/v1/genes": [{ name: "jira", display_name: "Jira" }],
-  "GET /api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+  "GET /api/cloud/local-agent/status": localSyncStatus(true),
   "DELETE /api/v1/projects/p-payroll": {
     id: "p-payroll",
     rebucketed_count: 708,

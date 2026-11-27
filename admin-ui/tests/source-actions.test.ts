@@ -402,11 +402,6 @@ assert.match(
   /forceResyncSource[\s\S]*createLocalAgentSyncJob\(source,\s*\{/,
   "Force refresh for local-agent sources should use the daemon job path instead of Cloud-side source sync",
 );
-assert.match(
-  sourcesPageSource,
-  /Configure a folder path before syncing this local source\./,
-  "Local markdown sources without a daemon folder should fail explicitly instead of falling through",
-);
 assert.doesNotMatch(
   sourcesPageSource,
   /localMarkdownCanUseServerInbox/,

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 const HANDBOOK = { source_id: "src-handbook", source_type: "confluence", name: "Payroll handbook" };
 const BOARD = { source_id: "src-board", source_type: "jira", name: "PAYR board" };
@@ -88,7 +89,7 @@ const RESPONSES: Record<string, (url: URL) => unknown> = {
     { name: "confluence", display_name: "Confluence" },
     { name: "jira", display_name: "Jira" },
   ],
-  "/api/cloud/local-agent/status": () => ({ status: "offline", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
+  "/api/cloud/local-agent/status": () => localSyncStatus(false),
   "/api/cloud/local-agent/jobs/current": () => ({ data: [] }),
 };
 

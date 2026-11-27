@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { expect, test, type Page, type Route } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 /** The server's real `GET /genes` and config-schema answers, as the unit tests read them. */
 const FORMS = JSON.parse(readFileSync(new URL("../src/test/fixtures/sourceTypeForms.json", import.meta.url), "utf8")) as {
@@ -37,7 +38,7 @@ const RESPONSES: Record<string, unknown> = {
   "GET /api/v1/genes/confluence/config-schema": FORMS.schemas.confluence,
   "GET /api/v1/projects": { data: [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal", memory_count: 1 }], can_manage: true },
   "GET /api/v1/source-list/preferences": { sort_mode: "name" },
-  "GET /api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+  "GET /api/cloud/local-agent/status": localSyncStatus(true),
   "GET /api/cloud/local-agent/jobs/current": { data: [] },
   "POST /api/v1/genes/confluence/config-check": { derived: {}, facts: [], issues: [] },
 };
@@ -85,6 +86,7 @@ test("a Confluence source is created from the type picker", async ({ page }) => 
       type: "confluence",
       access_policy: "private",
       config: { base_url: "https://wiki.example.com", pat: "token-1", spaces: ["PAY"] },
+      executor: "server",
       project_binding: null,
       sync_schedule: { enabled: false, interval_minutes: 1440 },
     },
@@ -191,6 +193,7 @@ test("a Teams source is created with the conversations its session lists", async
       type: "teams",
       access_policy: "private",
       config: { conversation_ids: ["19:planning@thread.v2"] },
+      executor: "server",
       project_binding: null,
       sync_schedule: { enabled: false, interval_minutes: 60 },
     },
@@ -243,6 +246,7 @@ test("a GitHub repository source syncs the folder chosen from its tree", async (
       type: "github_repo",
       access_policy: "private",
       config: { repo_url: "https://github.com/acme/docs", include_paths: ["docs"] },
+      executor: "server",
       project_binding: null,
       sync_schedule: { enabled: false, interval_minutes: 1440 },
     },

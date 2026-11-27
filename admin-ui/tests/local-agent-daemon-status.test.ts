@@ -168,8 +168,8 @@ assert.match(
 );
 assert.match(
   sourcesPageSource,
-  /operation:\s*"jira_auth"[\s\S]*base_url:[\s\S]*auth_mode:\s*"browser_cookie"/,
-  "Jira sign-in should use the existing target-aware local-agent job interface",
+  /operation:\s*"credential_check"/,
+  "Jira sign-in should check the device's credentials through a local-agent job",
 );
 
 // --- Configure dialog ----------------------------------------------------

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 /** The harness page that renders the app in a workspace other people use (see `vite.config.ts`). */
 function sharedWorkspacePath(page: string): string {
@@ -54,7 +55,7 @@ const RESPONSES: Record<string, unknown> = {
   "/api/v1/projects": { data: [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal" }], can_manage: true },
   "/api/v1/genes": [{ name: "confluence", display_name: "Confluence" }],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
-  "/api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+  "/api/cloud/local-agent/status": localSyncStatus(true),
   "/api/cloud/local-agent/jobs/current": { data: [] },
 };
 
