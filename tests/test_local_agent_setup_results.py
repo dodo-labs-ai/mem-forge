@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,17 +72,6 @@ def test_the_live_document_publishes_every_setup_result_model(tmp_path):
     assert schemas["TeamsBrowseResult"]["properties"]["teams"]["anyOf"][0]["items"] == {
         "$ref": "#/components/schemas/TeamsTeamOption"
     }
-
-
-def test_local_markdown_preview_tree_result(tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
-
-    result = _run("local_markdown_preview_tree", {"root": str(root), "vault_id": "engineering", "limit": 20})
-
-    _assert_described("local_markdown_preview_tree", result)
-    assert result["items"][0]["relative_path"] == "Decision.md"
 
 
 def _picker(outcome: Callable[[], str]):

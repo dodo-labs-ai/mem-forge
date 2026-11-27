@@ -66,49 +66,6 @@ class LocalMarkdownPickRootResult(LocalSetupJobResult):
     cancelled: bool | None = None
 
 
-# -- local_markdown_preview_tree --
-
-
-class LocalMarkdownPreviewItem(BaseModel):
-    """One file under the folder that the Source would read."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    relative_path: str
-    title: str
-    content_type: str
-    raw_hash: str
-    bytes: int
-
-
-class LocalMarkdownPreviewCounts(BaseModel):
-    """Files the scan read, and files it left out by reason."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    included: int
-    ignored: int
-    too_large: int
-    invalid_utf8: int
-    unreadable: int
-
-
-class LocalMarkdownPreviewTreeResult(LocalSetupJobResult):
-    """The files under a local folder that the configured patterns select.
-
-    ``root`` is the resolved folder and ``vault_id`` the identity its
-    Documents are stored under. ``items`` holds at most the requested number
-    of files, and ``counts`` counts all of them.
-    """
-
-    source_id: str
-    profile: str
-    root: str
-    vault_id: str
-    counts: LocalMarkdownPreviewCounts
-    items: list[LocalMarkdownPreviewItem]
-
-
 # -- credential_check --
 
 
@@ -222,7 +179,6 @@ class TeamsBrowseResult(LocalSetupJobResult):
 SETUP_RESULT_MODELS: dict[str, type[LocalSetupJobResult]] = {
     "credential_check": CredentialCheckResult,
     "local_markdown_pick_root": LocalMarkdownPickRootResult,
-    "local_markdown_preview_tree": LocalMarkdownPreviewTreeResult,
     "teams_auth": TeamsAuthResult,
     "teams_auth_check": TeamsAuthCheckResult,
     "teams_browse": TeamsBrowseResult,

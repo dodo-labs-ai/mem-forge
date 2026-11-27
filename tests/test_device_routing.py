@@ -265,3 +265,67 @@ def test_the_daemon_ends_an_attempt_the_server_refused_under_a_changed_contract(
         main._raise_if_local_agent_lease_not_current(
             {"error": "MemForge API request failed", "status_code": 409, "detail": ACQUISITION_CONTRACT_CHANGED}
         )
+
+
+def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in_where_it_runs(tmp_path) -> None:
+    from tests.device_report_fixture import connect_device
+    from tests.test_device_acquisition import _connect as connect_database
+    from tests.test_source_authority_api import _app
+
+    headers = {"x-test-user": "alex", "x-test-workspace-role": "member"}
+
+    database = connect_database(tmp_path / "picker.db")
+    asyncio.run(
+        database.upsert_source(
+            id="src-notes",
+            type="local_markdown",
+            name="Notes",
+            config_json='{"root": "/Users/alex/notes"}',
+            access_policy="workspace",
+            owner_user_id="alex",
+            execution_owner_user_id="alex",
+            executor="device",
+            execution_device_id=DEVICE_ID,
+        )
+    )
+    connect_device(database, "alex")
+    connect_device(database, "alex", device_report(device_id="dev-desktop"))
+    app = _app(tmp_path, database)
+
+    def pick(**request) -> dict:
+        response = client.post(
+            "/api/cloud/local-agent/jobs",
+            headers=headers,
+            json={"source_type": "local_markdown", "operation": "local_markdown_pick_root", "payload": {}, **request},
+        )
+        assert response.status_code == 201, response.text
+        return asyncio.run(database.get_local_agent_job(response.json()["job_id"]))
+
+    try:
+        with TestClient(app) as client:
+            on_execution_device = pick(source_id="src-notes")
+            on_the_chosen_device = pick(source_id="src-notes", device_id="dev-desktop")
+            for_a_new_source = pick(device_id="dev-desktop")
+            not_theirs = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers=headers,
+                json={
+                    "source_type": "local_markdown",
+                    "operation": "local_markdown_pick_root",
+                    "payload": {},
+                    "device_id": "dev-of-someone-else",
+                },
+            )
+            unchosen = client.post(
+                "/api/cloud/local-agent/jobs",
+                headers=headers,
+                json={"source_type": "local_markdown", "operation": "local_markdown_pick_root", "payload": {}},
+            )
+    finally:
+        asyncio.run(database.close())
+
+    assert on_execution_device["device_id"] == DEVICE_ID
+    # Moving the Source picks its folder on the device it moves to.
+    assert on_the_chosen_device["device_id"] == "dev-desktop"
+    assert for_a_new_source["device_id"] == "dev-desktop"
+    assert not_theirs.status_code == unchosen.status_code == 400

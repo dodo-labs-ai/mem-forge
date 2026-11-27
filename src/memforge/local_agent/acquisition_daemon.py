@@ -9,7 +9,8 @@ server. The calls are the ones a server run makes, in this order:
 1. ``discover(since)``, then ``list_scope`` when the configuration lists;
 2. ``fetch`` of each discovered item, with its PDF export when the type
    exports PDFs and the artifacts it describes, each uploaded as an acquired
-   input; an artifact that cannot be read is the item's failure, as it is in
+   input whose body travels only when the server does not hold it for the
+   Source; an artifact that cannot be read is the item's failure, as it is in
    a server run, and not the attempt's. Each item ``fetch`` reads carries the
    ``stored_extra`` a server run gives it, read from the server first;
 3. ``list_scope`` of each excluded scope the job carries;
@@ -34,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Protocol, TypeVar
@@ -47,12 +48,14 @@ from memforge.local_agent.document_acquisition import (
     REPROCESS_PAYLOAD_FIELD,
     SINCE_PAYLOAD_FIELD,
     AcquiredArtifact,
+    AcquiredBodyRequired,
     AcquiredInputPackage,
     AcquiredListing,
     AcquisitionAnswers,
     AcquisitionError,
     AcquisitionManifest,
     AcquisitionRequests,
+    body_sha256,
 )
 from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS, ExcludedScopeListing
 from memforge.local_agent.source_contract import LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD
@@ -83,8 +86,16 @@ class AcquisitionTransport(Protocol):
     async def upload_artifact(self, item: ContentItem, artifact: RawSourceArtifact, body: bytes) -> str:
         """Upload one artifact body an item's fetch described, and return the hash of the input that holds it."""
 
-    async def upload_input(self, package: AcquiredInputPackage) -> None:
-        """Upload one acquired input, before or after the manifest."""
+    async def held_bodies(self, body_sha256s: Sequence[str]) -> Collection[str]:
+        """Which of the named bodies the server already holds for the Source."""
+
+    async def upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
+        """Upload one acquired input, before or after the manifest, with its body unless the server holds it.
+
+        Raises :class:`~memforge.local_agent.document_acquisition.AcquiredBodyRequired`
+        when ``body`` is ``None`` and the server no longer holds the body the
+        package names.
+        """
 
     async def stored_extras(self, item_ids: Sequence[str]) -> Mapping[str, Mapping[str, Any]]:
         """The ``extra`` the Source stored with each named item, for the items it has stored."""
@@ -255,19 +266,29 @@ class _Acquirer:
             await self._upload(item)
 
     async def _upload(self, item: ContentItem) -> None:
-        package = await self._acquire(item)
-        await self._transport.upload_input(package)
+        """Upload the item's acquired input, and its body only when the server does not hold it."""
+
+        package, body = await self._acquire(item)
+        if package.body_sha256 is None:
+            await self._transport.upload_input(package, None)
+        elif package.body_sha256 in await self._transport.held_bodies([package.body_sha256]):
+            try:
+                await self._transport.upload_input(package, None)
+            except AcquiredBodyRequired:
+                await self._transport.upload_input(package, body)
+        else:
+            await self._transport.upload_input(package, body)
         self.uploaded += 1
         if package.failure is not None:
             self.failed += 1
 
-    async def _acquire(self, item: ContentItem) -> AcquiredInputPackage:
-        """The item's acquired input: what ``fetch`` returned, with the item as ``fetch`` left it."""
+    async def _acquire(self, item: ContentItem) -> tuple[AcquiredInputPackage, bytes]:
+        """The item's acquired input and its body: what ``fetch`` returned, with the item as ``fetch`` left it."""
 
         try:
             raw = await self._again(lambda: self._gene.fetch(item))
         except Exception as exc:
-            return AcquiredInputPackage(item=item, failure=AcquisitionError.from_exception(exc))
+            return AcquiredInputPackage(item=item, failure=AcquisitionError.from_exception(exc)), b""
         pdf_material: PdfMaterial | None = None
         pdf_failure: AcquisitionError | None = None
         if self._exports_pdf and not raw.authoritative_empty:
@@ -275,14 +296,15 @@ class _Acquirer:
                 pdf_material = await self._again(lambda: self._gene.fetch_pdf_material(item))
             except Exception as exc:
                 pdf_failure = AcquisitionError.from_exception(exc)
-        return AcquiredInputPackage(
+        package = AcquiredInputPackage(
             item=item,
-            body=raw.body,
+            body_sha256=body_sha256(raw.body),
             content_type=raw.content_type,
             pdf_material=pdf_material,
             pdf_failure=pdf_failure,
             artifacts=await self._acquire_artifacts(item, raw.artifacts),
         )
+        return package, raw.body
 
     async def _acquire_artifacts(
         self, item: ContentItem, artifacts: tuple[RawSourceArtifact, ...]

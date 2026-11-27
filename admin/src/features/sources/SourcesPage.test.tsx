@@ -888,16 +888,46 @@ test("an offline device is started before it is updated", async () => {
   expect(within(dialog).queryByText("memforge upgrade")).not.toBeInTheDocument();
 });
 
-test("Runs on names the device once its report names the source", async () => {
+test("Runs on names the execution device, and the row shows what it still lacks", async () => {
+  const noDevice = onDevice("src-c", "Team notes", "online");
   renderPage([
     onDevice("src-wiki", "Release wiki", "online"),
     { ...onDevice("src-b", "Build notes", "online"), connection_status: { state: "action_required", reason: "authentication" } },
+    {
+      ...noDevice,
+      connection_status: { state: "action_required", reason: "configuration" },
+      execution: { ...noDevice.execution!, device: null },
+    },
   ]);
 
   const table = await screen.findByRole("table", { name: "Sources" });
-  const named = (await within(table).findByText("Release wiki")).closest("tr")!;
-  expect(within(named).getByText("Alex's MacBook")).toBeInTheDocument();
-  const unnamed = within(table).getByText("Build notes").closest("tr")!;
-  expect(within(unnamed).getByText("Local sync")).toBeInTheDocument();
-  expect(within(unnamed).getByText("Sign-in required")).toBeInTheDocument();
+  const ready = (await within(table).findByText("Release wiki")).closest("tr")!;
+  expect(within(ready).getByText("Alex's MacBook")).toBeInTheDocument();
+  const signIn = within(table).getByText("Build notes").closest("tr")!;
+  expect(within(signIn).getByText("Alex's MacBook")).toBeInTheDocument();
+  expect(within(signIn).getByText("Sign-in required")).toBeInTheDocument();
+  const unchosen = within(table).getByText("Team notes").closest("tr")!;
+  expect(within(unchosen).getByText("Local sync")).toBeInTheDocument();
+  expect(within(unchosen).getByText("Finish setup")).toBeInTheDocument();
+});
+
+test("a missing folder on the execution device shows Finish setup with the path to its owner", async () => {
+  const notes = onDevice("src-notes", "Team notes", "online");
+  renderPage([
+    {
+      ...notes,
+      connection_status: { state: "action_required", reason: "configuration" },
+      execution: {
+        ...notes.execution!,
+        device: { ...notes.execution!.device!, not_ready: [{ kind: "location", field: "root", path: "/Users/alex/notes" }] },
+      },
+    },
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const row = (await within(table).findByText("Team notes")).closest("tr")!;
+  expect(within(row).getByText("Finish setup")).toBeInTheDocument();
+  await userEvent.click(within(row).getByText("Team notes"));
+  const drawer = await screen.findByRole("dialog", { name: "Team notes" });
+  expect(within(drawer).getByText("The folder /Users/alex/notes is missing on Alex's MacBook.")).toBeInTheDocument();
 });

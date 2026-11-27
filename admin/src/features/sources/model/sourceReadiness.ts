@@ -1,3 +1,4 @@
+import { sourceExecutor } from "./localAgentSources";
 import type { Source, SourceConnectionStatus } from "./types";
 
 /** Whether the viewer's own local sync daemon answers: still asking, online, or offline. */
@@ -29,12 +30,14 @@ const DEVICE_STATES: Readonly<Record<NonNullable<NonNullable<Source["execution"]
 /**
  * The device readiness of one Source. A Source whose acquisition runs on its
  * execution owner's device reads it from the source API's `execution.device`,
- * which comes from that owner's device reports; any other locally executed
- * Source runs on the viewer's own daemon.
+ * which comes from that owner's device reports; while it has no execution
+ * device, no device stands in the way and its connection shows Finish
+ * setup. Any other locally executed Source runs on the viewer's own daemon.
  */
 export function sourceDeviceReadiness(source: Source, daemon: LocalDaemonReadiness): DeviceReadiness {
   const device = source.execution?.device;
-  return device ? DEVICE_STATES[device.state] : daemon;
+  if (device) return DEVICE_STATES[device.state];
+  return sourceExecutor(source) === "device" ? "ready" : daemon;
 }
 
 /**

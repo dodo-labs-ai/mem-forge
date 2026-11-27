@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { sourceTypeSchema } from "@/test/sourceTypeForms";
-import { chooserDevices, deviceChoiceStep, deviceFormSchema, executorChoices } from "./sourceExecutor";
+import { chooserDevices, deviceChoiceStep, deviceFormSchema, executorChoices, initialChosenDevice } from "./sourceExecutor";
 
 function status(devices: { status: "online" | "offline"; contract: number }[]) {
   return {
@@ -35,13 +35,23 @@ test("the device form holds no secret and no connection panel", () => {
 });
 
 test.each([
-  [[], "set_up"],
-  [[{ status: "offline", contract: 2 }], "start"],
-  [[{ status: "online", contract: 1 }], "update"],
-  [[{ status: "online", contract: 3 }, { status: "offline", contract: 2 }], "update"],
-  [[{ status: "online", contract: 1 }, { status: "online", contract: 2 }], null],
-] as const)("devices %o need the step %s", (devices, step) => {
-  expect(deviceChoiceStep(chooserDevices(status([...devices]), "confluence"))).toBe(step);
+  [[], null, "set_up"],
+  [[{ status: "online", contract: 2 }, { status: "online", contract: 2 }], null, "choose"],
+  [[{ status: "offline", contract: 2 }], "dev-0", "start"],
+  [[{ status: "online", contract: 1 }], "dev-0", "update"],
+  [[{ status: "online", contract: 2 }, { status: "offline", contract: 2 }], "dev-1", "start"],
+  [[{ status: "online", contract: 1 }, { status: "online", contract: 2 }], "dev-1", null],
+] as const)("devices %o with %s chosen need the step %s", (devices, chosen, step) => {
+  expect(deviceChoiceStep(chooserDevices(status([...devices]), "confluence"), chosen)).toBe(step);
+});
+
+test("Where it runs starts with the execution device, else the only device, else none", () => {
+  const two = chooserDevices(status([{ status: "online", contract: 2 }, { status: "offline", contract: 2 }]), "confluence");
+  const one = chooserDevices(status([{ status: "offline", contract: 2 }]), "confluence");
+  expect(initialChosenDevice(two, "dev-1")).toBe("dev-1");
+  expect(initialChosenDevice(two, "dev-of-another-member")).toBeNull();
+  expect(initialChosenDevice(two, null)).toBeNull();
+  expect(initialChosenDevice(one, null)).toBe("dev-0");
 });
 
 test("a device whose contract differs either way needs an update", () => {

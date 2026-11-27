@@ -498,6 +498,9 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     assert genes["notion"]["executors"] == ["server", "device"]
     assert genes["local_markdown"]["executors"] == ["device"]
     assert genes["teams"]["executors"] is None
+    # The folder picker of the device chosen in Where it runs fills a device location.
+    assert genes["local_markdown"]["device_location_fields"] == ["root"]
+    assert genes["confluence"]["device_location_fields"] == []
 
 
 def test_gene_execution_kinds_define_ordinary_sync_capability():

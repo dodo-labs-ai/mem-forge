@@ -11,7 +11,10 @@ export function isLocalAgentBackedSource(source: Source): boolean {
 /** Where a Source's acquisition runs: on the server, or on its execution owner's device. */
 export type SourceExecutor = "server" | "device";
 
-/** A Source runs on a device exactly when the source API names its device. */
+/** The local-agent operation a device Source's runs go through. */
+const DOCUMENT_ACQUISITION_OPERATION = "document_acquisition";
+
+/** A Source runs on a device when its runs are document acquisitions, whether or not it has an execution device yet. */
 export function sourceExecutor(source: Source): SourceExecutor {
-  return source.execution?.device ? "device" : "server";
+  return source.execution?.operation === DOCUMENT_ACQUISITION_OPERATION ? "device" : "server";
 }

@@ -7,6 +7,8 @@ sources/genes, schedule, model settings, and system health/stats.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
@@ -24,7 +26,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, cast
+from typing import Annotated, Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -229,7 +231,9 @@ from memforge.pipeline.device_acquisition import (
     AcquisitionNotReady,
     acquisition_requests,
     document_acquisition_job_payload,
+    held_acquired_bodies,
     ready_acquisition,
+    retain_acquired_body,
     retain_acquired_input,
     stored_extras,
 )
@@ -308,6 +312,7 @@ from memforge.local_agent.readiness import (
 )
 from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
 from memforge.local_agent.document_acquisition import (
+    ACQUIRED_BODY_REQUIRED,
     DOCUMENT_ACQUISITION_OPERATION,
     REPROCESS_PAYLOAD_FIELD,
     AcquiredInputPackage,
@@ -393,7 +398,6 @@ SOURCE_PAUSED_STATUS = "paused"
 DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
     "local_markdown_pick_root": "local_markdown",
-    "local_markdown_preview_tree": "local_markdown",
     "teams_auth": "teams",
     "teams_auth_check": "teams",
     "teams_browse": "teams",
@@ -1871,6 +1875,13 @@ class GeneMetadataResponse(BaseModel):
             "null for a conversation type."
         ),
     )
+    device_location_fields: list[str] = Field(
+        default=[],
+        description=(
+            "The configuration fields that name a folder on the Source's execution device, which the folder picker "
+            "of the device chosen in Where it runs fills."
+        ),
+    )
 
 
 class ConfigConditionResponse(BaseModel):
@@ -2759,9 +2770,10 @@ class LocalAgentJobCreateRequest(BaseModel):
         min_length=1,
         max_length=DEVICE_ID_MAX_CHARS,
         description=(
-            "The requester's device that runs a device-bound setup job: the folder picker of a type with device "
-            "locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's "
-            "setup jobs run on its execution device, which a request may name but not change."
+            "The requester's device that runs a device-bound setup job: the device chosen in Where it runs, "
+            "whose folder picker picks a device location. Without one, a saved device Source's setup jobs run on "
+            "its execution device. A credential check of a saved device Source runs on its execution device, "
+            "which the request may name but not change."
         ),
     )
 
@@ -3204,9 +3216,22 @@ class AcquisitionManifestRequest(AcquisitionAttemptRequest):
 
 
 class AcquiredInputRequest(AcquisitionAttemptRequest):
-    """One acquired input of a device run, bound to its job attempt."""
+    """One acquired input of a device run, bound to its job attempt.
+
+    ``body`` is the base64 of the bytes the package names by ``body_sha256``,
+    or ``None`` when the Source holds them already.
+    """
 
     package: dict[str, Any]
+    body: str | None = None
+
+
+class HeldAcquiredBodiesRequest(AcquisitionAttemptRequest):
+    """The bodies a device run asks about before it uploads them, each by the hash of its bytes."""
+
+    body_sha256s: list[Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]] = Field(
+        max_length=SNAPSHOT_MANIFEST_MAX_ITEMS
+    )
 
 
 class AcquisitionStoredExtrasRequest(AcquisitionAttemptRequest):
@@ -4030,6 +4055,13 @@ def _type_executors(source_type: str) -> list[str] | None:
     if descriptor is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
         return None
     return sorted(descriptor.executors, key=[SOURCE_EXECUTOR_SERVER, SOURCE_EXECUTOR_DEVICE].index)
+
+
+def _type_device_location_fields(source_type: str) -> list[str]:
+    """The configuration fields of a type that name a folder on the execution device."""
+
+    descriptor = source_type_descriptor(source_type)
+    return list(descriptor.device_location_fields) if descriptor is not None else []
 
 
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
@@ -7113,6 +7145,7 @@ def create_admin_app(
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
                 executors=_type_executors(g.name),
+                device_location_fields=_type_device_location_fields(g.name),
             )
             for g in genes
         ]
@@ -10220,7 +10253,10 @@ def create_admin_app(
         digest; the run reads only the inputs of items it asks for. Each
         artifact body the input names must already be an uploaded input of
         the Source; an artifact the device could not read names its error
-        instead. The same input uploaded again is kept once.
+        instead. The input's own body travels with it unless the Source holds
+        it already; an input naming a body the Source does not hold is
+        answered 409 ``acquired_body_required``, and the device sends it
+        again with its body. The same input uploaded again is kept once.
         """
 
         source = await _acquisition_source(request, db, source_id)
@@ -10238,6 +10274,20 @@ def create_admin_app(
             )
             if {held_input.raw_sha256 for held_input in held} != set(artifact_hashes):
                 raise HTTPException(status_code=409, detail="acquired input names an artifact that was not uploaded")
+        if req.body is not None:
+            if package.body_sha256 is None:
+                raise HTTPException(status_code=422, detail="a failed fetch acquired no body")
+            try:
+                body = base64.b64decode(req.body, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="body is not base64") from exc
+            if hashlib.sha256(body).hexdigest() != package.body_sha256:
+                raise HTTPException(status_code=422, detail="body does not match body_sha256")
+            await retain_acquired_body(db, artifact_store, source_id=source_id, workspace_id=workspace_id, body=body)
+        elif package.body_sha256 is not None and not await held_acquired_bodies(
+            db, source_id=source_id, workspace_id=workspace_id, body_sha256s=(package.body_sha256,)
+        ):
+            raise HTTPException(status_code=409, detail=ACQUIRED_BODY_REQUIRED)
         input_sha256 = await retain_acquired_input(
             db,
             artifact_store,
@@ -10252,6 +10302,21 @@ def create_admin_app(
             "doc_id": package.item.item_id,
             "input_sha256": input_sha256,
         }
+
+    @source_router.post("/{source_id}/acquisition/held-bodies")
+    async def read_held_acquired_bodies(
+        source_id: str,
+        req: HeldAcquiredBodiesRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Say which of the named bodies the Source holds, so a device run uploads only the others."""
+
+        source = await _acquisition_source(request, db, source_id)
+        await _require_acquisition_lease(request, db, source=source, attempt=req)
+        held = await held_acquired_bodies(db, source_id=source_id, workspace_id=workspace_id, body_sha256s=req.body_sha256s)
+        return {"source_id": source_id, "held": sorted(held)}
 
     @source_router.post("/{source_id}/acquisition/stored-extras")
     async def read_acquisition_stored_extras(
@@ -11185,9 +11250,11 @@ def create_admin_app(
                     raise HTTPException(status_code=404, detail="local_agent_source_not_found")
                 if saved is not None:
                     _require_source_discoverability(request, saved)
-                device_id = await _setup_job_device(
-                    db, requester, saved if saved is not None and source_runs_on_device(saved) else None, req.device_id
-                )
+                if req.device_id is not None or saved is None or not source_runs_on_device(saved):
+                    # A device location is picked on the device chosen in Where it runs.
+                    device_id = await _setup_job_device(db, requester, None, req.device_id)
+                else:
+                    device_id = await _setup_job_device(db, requester, saved, None)
             elif req.device_id is not None:
                 device_id = await _setup_job_device(db, requester, None, req.device_id)
         payload.pop("created_by_user_id", None)

@@ -363,8 +363,9 @@ class ToolClient:
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         package: dict[str, Any],
+        body: bytes | None,
     ) -> dict[str, Any]:
-        """Upload one acquired input of a device run, bound to its job attempt."""
+        """Upload one acquired input of a device run, bound to its job attempt, with its body unless held."""
 
         return self._resource_json(
             "POST",
@@ -373,6 +374,27 @@ class ToolClient:
                 "local_agent_job_id": local_agent_job_id,
                 "local_agent_attempt_count": local_agent_attempt_count,
                 "package": package,
+                "body": base64.b64encode(body).decode("ascii") if body is not None else None,
+            },
+        )
+
+    def read_held_acquired_bodies(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        body_sha256s: list[str],
+    ) -> dict[str, Any]:
+        """Ask which of a device run's bodies the Source already holds, each by the hash of its bytes."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/held-bodies",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "body_sha256s": body_sha256s,
             },
         )
 

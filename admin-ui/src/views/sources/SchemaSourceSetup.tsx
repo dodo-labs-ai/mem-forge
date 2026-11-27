@@ -260,22 +260,6 @@ function SourceConfigForm({
   const previewDiscovery = useMutation<DiscoveryPreviewResponse, unknown, void>({
     mutationFn: async () => {
       const serializedConfig = serializeConfig(schema.fields, config);
-      if (sourceType === "local_markdown") {
-        const created = await createLocalAgentJob({
-          sourceId: source?.id ?? "",
-          sourceType: "local_markdown",
-          operation: "local_markdown_preview_tree",
-          payload: {
-            ...localMarkdownPreviewJobConfig(serializedConfig, source),
-            limit: DISCOVERY_PREVIEW_LIMIT,
-          },
-        });
-        const status = await pollLocalAgentPreviewJob(created.job_id);
-        if (status.status === "failed") {
-          throw new Error(status.last_error || "Local daemon could not preview this folder.");
-        }
-        return localMarkdownPreviewFromJob(status);
-      }
       return resourceClient
         .post(`/genes/${sourceType}/preview-discovery`, {
           ...(source ? { source_id: source.id } : {}),
@@ -340,7 +324,8 @@ function SourceConfigForm({
     isEdit && canConfigureConnection && previewReady ? serializeConfig(schema.fields, config) : null,
     secretFieldKeys(schema.fields),
   );
-  const showDiscoveryPreview = sourceType !== "github_repo";
+  // A local folder is read only on its device, which the server does not preview.
+  const showDiscoveryPreview = sourceType !== "github_repo" && sourceType !== "local_markdown";
   const scheduleSummary = scheduleEnabled
     ? scheduleIntervalLabel(scheduleInterval)
     : "Manual only";
@@ -1098,14 +1083,6 @@ function Field({
   );
 }
 
-function localMarkdownPreviewJobConfig(config: ConfigForm, source?: Source | null): ConfigForm {
-  const sourceVaultId = source?.config?.vault_id;
-  return {
-    ...config,
-    vault_id: (typeof sourceVaultId === "string" ? sourceVaultId.trim() : "") || "preview",
-  };
-}
-
 function parseScheduleInterval(value: string): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : 1440;
@@ -1145,28 +1122,6 @@ async function pollLocalAgentPreviewJob(jobId: string): Promise<LocalAgentJobSta
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS));
   }
   throw new Error("Timed out waiting for the local daemon.");
-}
-
-function localMarkdownPreviewFromJob(status: LocalAgentJobStatusResponse): DiscoveryPreviewResponse {
-  const result = status.result as {
-    counts?: { included?: number };
-    items?: Array<{ relative_path?: string; title?: string }>;
-  } | null;
-  const items = result?.items ?? [];
-  return {
-    source_type: "local_markdown",
-    count: Number(result?.counts?.included ?? items.length),
-    truncated: false,
-    items: items.map((item) => {
-      const path = item.relative_path ?? "";
-      return {
-        item_id: path,
-        title: item.title || path,
-        source_url: `local-agent://${path}`,
-        last_modified: null,
-      };
-    }),
-  };
 }
 
 function secretFieldKeys(fields: ConfigField[]): string[] {

@@ -58,15 +58,28 @@ export function chooserDevices(status: DaemonStatus, sourceType: string): Choose
 }
 
 /**
- * What the chooser does before a Source can run on one of their devices,
- * or null once one can: set up a device, update one that is online, or
- * start one.
+ * The device Where it runs starts with: the Source's execution device when
+ * it is one of the chooser's, else their only device, else none until they
+ * choose.
  */
-export type DeviceChoiceStep = "set_up" | "update" | "start" | null;
+export function initialChosenDevice(devices: readonly ChooserDevice[], executionDeviceId: string | null | undefined): string | null {
+  if (executionDeviceId && devices.some((device) => device.id === executionDeviceId)) return executionDeviceId;
+  return devices.length === 1 ? devices[0]!.id : null;
+}
 
-export function deviceChoiceStep(devices: readonly ChooserDevice[]): DeviceChoiceStep {
-  if (devices.some((device) => device.state === "online")) return null;
+/**
+ * What the chooser does before the Source can run on the chosen device, or
+ * null once it can: set up a device when they have none, choose one, start
+ * the chosen one when it is offline, or update it when its acquisition
+ * contract for the type differs from the server's.
+ */
+export type DeviceChoiceStep = "set_up" | "choose" | "start" | "update" | null;
+
+export function deviceChoiceStep(devices: readonly ChooserDevice[], chosenId: string | null): DeviceChoiceStep {
   if (devices.length === 0) return "set_up";
-  if (devices.some((device) => device.state === "update_required")) return "update";
-  return "start";
+  const chosen = devices.find((device) => device.id === chosenId);
+  if (!chosen) return "choose";
+  if (chosen.state === "offline") return "start";
+  if (chosen.state === "update_required") return "update";
+  return null;
 }

@@ -2002,6 +2002,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/acquisition/held-bodies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Held Acquired Bodies
+         * @description Say which of the named bodies the Source holds, so a device run uploads only the others.
+         */
+        post: operations["read_held_acquired_bodies_api_v1_sources__source_id__acquisition_held_bodies_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/acquisition/inputs": {
         parameters: {
             query?: never;
@@ -2020,7 +2040,10 @@ export interface paths {
          *     digest; the run reads only the inputs of items it asks for. Each
          *     artifact body the input names must already be an uploaded input of
          *     the Source; an artifact the device could not read names its error
-         *     instead. The same input uploaded again is kept once.
+         *     instead. The input's own body travels with it unless the Source holds
+         *     it already; an input naming a body the Source does not hold is
+         *     answered 409 ``acquired_body_required``, and the device sends it
+         *     again with its body. The same input uploaded again is kept once.
          */
         post: operations["upload_acquired_input_api_v1_sources__source_id__acquisition_inputs_post"];
         delete?: never;
@@ -2659,8 +2682,13 @@ export interface components {
         /**
          * AcquiredInputRequest
          * @description One acquired input of a device run, bound to its job attempt.
+         *
+         *     ``body`` is the base64 of the bytes the package names by ``body_sha256``,
+         *     or ``None`` when the Source holds them already.
          */
         AcquiredInputRequest: {
+            /** Body */
+            body?: string | null;
             /** Local Agent Attempt Count */
             local_agent_attempt_count: number;
             /** Local Agent Job Id */
@@ -3758,6 +3786,12 @@ export interface components {
             default_sync_interval_minutes: number;
             /** Description */
             description: string;
+            /**
+             * Device Location Fields
+             * @description The configuration fields that name a folder on the Source's execution device, which the folder picker of the device chosen in Where it runs fills.
+             * @default []
+             */
+            device_location_fields: string[];
             /** Display Name */
             display_name: string;
             /** Execution Kinds */
@@ -3837,6 +3871,18 @@ export interface components {
             /** Status */
             status: string;
             vector_store: components["schemas"]["ComponentHealth"];
+        };
+        /**
+         * HeldAcquiredBodiesRequest
+         * @description The bodies a device run asks about before it uploads them, each by the hash of its bytes.
+         */
+        HeldAcquiredBodiesRequest: {
+            /** Body Sha256S */
+            body_sha256s: string[];
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
         };
         /**
          * ImageDocumentsReprocessResponse
@@ -4027,7 +4073,7 @@ export interface components {
         LocalAgentJobCreateRequest: {
             /**
              * Device Id
-             * @description The requester's device that runs a device-bound setup job: the folder picker of a type with device locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's setup jobs run on its execution device, which a request may name but not change.
+             * @description The requester's device that runs a device-bound setup job: the device chosen in Where it runs, whose folder picker picks a device location. Without one, a saved device Source's setup jobs run on its execution device. A credential check of a saved device Source runs on its execution device, which the request may name but not change.
              */
             device_id?: string | null;
             /** Operation */
@@ -4224,76 +4270,6 @@ export interface components {
              * @default null
              */
             root: string | null;
-        };
-        /**
-         * LocalMarkdownPreviewCounts
-         * @description Files the scan read, and files it left out by reason.
-         */
-        LocalMarkdownPreviewCounts: {
-            /** Ignored */
-            ignored: number;
-            /** Included */
-            included: number;
-            /** Invalid Utf8 */
-            invalid_utf8: number;
-            /** Too Large */
-            too_large: number;
-            /** Unreadable */
-            unreadable: number;
-        };
-        /**
-         * LocalMarkdownPreviewItem
-         * @description One file under the folder that the Source would read.
-         */
-        LocalMarkdownPreviewItem: {
-            /** Bytes */
-            bytes: number;
-            /** Content Type */
-            content_type: string;
-            /** Raw Hash */
-            raw_hash: string;
-            /** Relative Path */
-            relative_path: string;
-            /** Title */
-            title: string;
-        };
-        /**
-         * LocalMarkdownPreviewTreeResult
-         * @description The files under a local folder that the configured patterns select.
-         *
-         *     ``root`` is the resolved folder and ``vault_id`` the identity its
-         *     Documents are stored under. ``items`` holds at most the requested number
-         *     of files, and ``counts`` counts all of them.
-         */
-        LocalMarkdownPreviewTreeResult: {
-            counts: components["schemas"]["LocalMarkdownPreviewCounts"];
-            /**
-             * Error
-             * @default null
-             */
-            error: string | null;
-            /**
-             * Error Type
-             * @default null
-             */
-            error_type: string | null;
-            /**
-             * Heartbeat Errors
-             * @default null
-             */
-            heartbeat_errors: string[] | null;
-            /** Items */
-            items: components["schemas"]["LocalMarkdownPreviewItem"][];
-            /** Operation */
-            operation: string;
-            /** Profile */
-            profile: string;
-            /** Root */
-            root: string;
-            /** Source Id */
-            source_id: string;
-            /** Vault Id */
-            vault_id: string;
         };
         /**
          * LocalSourceManifestItemRequest
@@ -10670,6 +10646,41 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["AcquisitionAnswersRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_held_acquired_bodies_api_v1_sources__source_id__acquisition_held_bodies_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldAcquiredBodiesRequest"];
             };
         };
         responses: {

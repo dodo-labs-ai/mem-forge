@@ -41,7 +41,6 @@ from memforge.local_agent.document_identity import build_local_markdown_doc_id
 from memforge.local_agent.setup_results import (
     CredentialCheckResult,
     LocalMarkdownPickRootResult,
-    LocalMarkdownPreviewTreeResult,
     LocalSetupJobResult,
     TeamsAuthCheckResult,
     TeamsAuthResult,
@@ -2947,7 +2946,6 @@ def _run_cloud_local_agent_job(
     operation = str(job.get("operation") or "").strip()
     handlers = {
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
-        "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
         "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
         "credential_check": lambda: _run_cloud_credential_check_job(job, client, browser=browser),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
@@ -3036,17 +3034,33 @@ class _ClientAcquisitionTransport:
         )
         return str(response["input_sha256"])
 
-    async def upload_input(self, package: AcquiredInputPackage) -> None:
-        self._checked(
+    async def held_bodies(self, body_sha256s: Sequence[str]) -> set[str]:
+        response = self._checked(
             await asyncio.to_thread(
-                self._client.upload_acquired_input,
+                self._client.read_held_acquired_bodies,
                 source_id=self._source_id,
                 local_agent_job_id=self._job_id,
                 local_agent_attempt_count=self._attempt_count,
-                package=package.to_payload(),
+                body_sha256s=list(body_sha256s),
             ),
-            f"uploading the acquired input of {package.item.item_id}",
+            "asking which bodies the server holds",
         )
+        return {str(digest) for digest in response.get("held") or ()}
+
+    async def upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
+        from memforge.local_agent.document_acquisition import ACQUIRED_BODY_REQUIRED, AcquiredBodyRequired
+
+        response = await asyncio.to_thread(
+            self._client.upload_acquired_input,
+            source_id=self._source_id,
+            local_agent_job_id=self._job_id,
+            local_agent_attempt_count=self._attempt_count,
+            package=package.to_payload(),
+            body=body,
+        )
+        if response.get("status_code") == HTTPStatus.CONFLICT and response.get("detail") == ACQUIRED_BODY_REQUIRED:
+            raise AcquiredBodyRequired(package.body_sha256)
+        self._checked(response, f"uploading the acquired input of {package.item.item_id}")
 
     async def submit_answers(self, answers: AcquisitionAnswers) -> None:
         self._checked(
@@ -3237,16 +3251,6 @@ def _plan_local_source_manifest(
     if required_doc_ids - known_doc_ids:
         raise RuntimeError("source manifest comparison returned unknown document identities")
     return required_doc_ids
-
-
-def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-    profile = _kb_profile_from_cloud_job(job)
-    preview = _preview_kb_profile(profile_name, profile, limit=_cloud_job_limit(payload.get("limit"), default=200))
-    return _setup_result(LocalMarkdownPreviewTreeResult(operation=operation, source_id=source_id, **preview))
 
 
 def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3849,30 +3853,6 @@ def _push_kb_profile_to_source(
     if payload.get("error"):
         payload["retryable"] = True
     return payload
-
-
-def _preview_kb_profile(name: str, profile: dict[str, Any], *, limit: int) -> dict[str, Any]:
-    root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    items: list[dict[str, Any]] = []
-    for entry in _scan_kb_profile(root, include=include, exclude=exclude, counts=counts):
-        if len(items) < limit:
-            items.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "title": entry["title"],
-                    "content_type": entry["content_type"],
-                    "raw_hash": entry["raw_hash"],
-                    "bytes": entry["bytes"],
-                }
-            )
-    return {
-        "profile": name,
-        "root": str(root),
-        "vault_id": vault_id,
-        "counts": counts,
-        "items": items,
-    }
 
 
 def _resolve_kb_profile(name: str, profile: dict[str, Any]) -> tuple[Path, list[str], list[str], str]:

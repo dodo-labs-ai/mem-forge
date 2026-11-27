@@ -106,7 +106,10 @@ class _CapturingTransport:
         self.handed["artifacts"].append([item.item_id, artifact.provider_key, digest])
         return digest
 
-    async def upload_input(self, package: AcquiredInputPackage) -> None:
+    async def held_bodies(self, body_sha256s) -> frozenset[str]:
+        return frozenset()
+
+    async def upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
         self.handed["inputs"].append(package.to_payload())
 
     async def stored_extras(self, item_ids) -> dict:

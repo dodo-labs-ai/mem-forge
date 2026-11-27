@@ -8,6 +8,7 @@ type SourceDevice = NonNullable<NonNullable<Source["execution"]>["device"]>;
  * `execution.device`, and those Sources.
  */
 export interface DeviceUpdate {
+  deviceId: string;
   deviceName: string;
   installedVersion: string | null;
   requiredVersion: string;
@@ -42,21 +43,22 @@ export function viewerDeviceUpdates(sources: readonly Source[]): DeviceUpdate[] 
   for (const source of sources) {
     const device = source.execution?.device;
     if (!device?.name || !viewerUpdatesDevice(source)) continue;
-    const update = byDevice.get(device.name);
+    const update = byDevice.get(device.id);
     if (update) update.sources.push(source);
-    else byDevice.set(device.name, deviceUpdate(device.name, device, [source]));
+    else byDevice.set(device.id, deviceUpdate(device.name, device, [source]));
   }
   return [...byDevice.values()];
 }
 
 /** The update of the device a waiting Source runs on, with every Source of the viewer's that the device holds back. */
 export function deviceUpdateOf(source: Source, sources: readonly Source[]): DeviceUpdate | null {
-  const name = source.execution?.device?.name;
-  return viewerDeviceUpdates(sources).find((update) => update.deviceName === name) ?? null;
+  const id = source.execution?.device?.id;
+  return viewerDeviceUpdates(sources).find((update) => update.deviceId === id) ?? null;
 }
 
 function deviceUpdate(deviceName: string, device: SourceDevice, sources: Source[]): DeviceUpdate {
   return {
+    deviceId: device.id,
     deviceName,
     installedVersion: device.installed_version,
     requiredVersion: device.required_version,

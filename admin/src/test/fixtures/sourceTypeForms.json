@@ -5,6 +5,7 @@
       "data_shape": "document",
       "default_sync_interval_minutes": 1440,
       "description": "Wiki pages and documentation",
+      "device_location_fields": [],
       "display_name": "Confluence",
       "execution_kinds": [
         "server"
@@ -20,6 +21,7 @@
       "data_shape": "document",
       "default_sync_interval_minutes": 1440,
       "description": "Rendered documentation pages from GitHub Pages sites",
+      "device_location_fields": [],
       "display_name": "GitHub Pages",
       "execution_kinds": [
         "server"
@@ -35,6 +37,7 @@
       "data_shape": "document",
       "default_sync_interval_minutes": 1440,
       "description": "Repository files from GitHub or GitHub Enterprise, scoped by folders and file types",
+      "device_location_fields": [],
       "display_name": "GitHub Repository",
       "execution_kinds": [
         "server"
@@ -50,6 +53,7 @@
       "data_shape": "ticket",
       "default_sync_interval_minutes": 360,
       "description": "Tickets, decisions, and work items",
+      "device_location_fields": [],
       "display_name": "Jira",
       "execution_kinds": [
         "server"
@@ -65,6 +69,9 @@
       "data_shape": "document",
       "default_sync_interval_minutes": 0,
       "description": "Files from a UI-configured local folder or repo uploaded by the local daemon",
+      "device_location_fields": [
+        "root"
+      ],
       "display_name": "Local Repository",
       "execution_kinds": [
         "local_agent"
@@ -79,6 +86,7 @@
       "data_shape": "document",
       "default_sync_interval_minutes": 1440,
       "description": "Pages and database rows shared with an internal connection",
+      "device_location_fields": [],
       "display_name": "Notion",
       "execution_kinds": [
         "server"
@@ -94,6 +102,7 @@
       "data_shape": "message",
       "default_sync_interval_minutes": 60,
       "description": "Channel messages, group chats, and direct messages",
+      "device_location_fields": [],
       "display_name": "Microsoft Teams",
       "execution_kinds": [
         "local_agent"

@@ -10,7 +10,6 @@ type SharedSetupJobOperation = "credential_check";
 /** The Source type each type's own setup operation belongs to, as the server's job route checks it. */
 const SETUP_JOB_SOURCE_TYPES: Readonly<Record<Exclude<SetupJobOperation, SharedSetupJobOperation>, string>> = {
   local_markdown_pick_root: "local_markdown",
-  local_markdown_preview_tree: "local_markdown",
   teams_auth: "teams",
   teams_auth_check: "teams",
   teams_browse: "teams",
@@ -30,19 +29,21 @@ const MINUTE_MS = 60_000;
 const SETUP_JOB_TIMEOUT_MS: Readonly<Record<SetupJobOperation, number>> = {
   credential_check: 60 * MINUTE_MS,
   local_markdown_pick_root: 60 * MINUTE_MS,
-  local_markdown_preview_tree: 3 * MINUTE_MS,
   teams_auth: 10 * MINUTE_MS,
   teams_auth_check: 3 * MINUTE_MS,
   teams_browse: 10 * MINUTE_MS,
 };
 
 /**
- * What a setup job is asked to do: the edited Source, when there is one, and
- * the operation's payload. `credential_check`, which every type shares, also
+ * What a setup job is asked to do: the edited Source, when there is one, the
+ * device it runs on, and the operation's payload. `deviceId` is the device
+ * chosen in Where it runs; without it a saved device Source's job runs on
+ * its execution device. `credential_check`, which every type shares, also
  * names the Source's type.
  */
 export type LocalSetupJobRequest<Op extends SetupJobOperation = SetupJobOperation> = {
   sourceId?: string;
+  deviceId?: string;
   payload: Record<string, unknown>;
 } & (Op extends SharedSetupJobOperation ? { sourceType: string } : { sourceType?: never });
 
@@ -123,9 +124,9 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
 
   return useCallback(
     async (jobRequest: LocalSetupJobRequest<Op>): Promise<SetupJobResults[Op]> => {
-      const { sourceId, payload } = jobRequest;
+      const { sourceId, deviceId, payload } = jobRequest;
       const messages = { ...DEFAULT_MESSAGES, ...options.messages };
-      const request = JSON.stringify([sourceId ?? "", payload]);
+      const request = JSON.stringify([sourceId ?? "", deviceId ?? "", payload]);
       try {
         if (admitted.current && admitted.current.request !== request) {
           const previous = await unwrap(
@@ -139,10 +140,19 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
         }
         if (!admitted.current) {
           const daemon = await queryClient.fetchQuery(localSyncStatusQuery(api)).catch(() => null);
-          if (daemon?.status !== "online") throw new Error(messages.offline);
+          const online = deviceId
+            ? daemon?.devices.some((device) => device.device_id === deviceId && device.status === "online")
+            : daemon?.status === "online";
+          if (!online) throw new Error(messages.offline);
           const created = await unwrap(
             api.POST("/api/cloud/local-agent/jobs", {
-              body: { source_id: sourceId ?? "", source_type: jobSourceType(operation, jobRequest), operation, payload },
+              body: {
+                source_id: sourceId ?? "",
+                source_type: jobSourceType(operation, jobRequest),
+                operation,
+                payload,
+                ...(deviceId ? { device_id: deviceId } : {}),
+              },
             }),
           );
           admitted.current = { jobId: created.job_id, request };

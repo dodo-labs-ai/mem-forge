@@ -1,4 +1,5 @@
 import { pluralize } from "@/lib/format";
+import { sourceExecutor } from "./localAgentSources";
 import { sourceProjectBinding } from "./projectBinding";
 import { failedItemsTitle, sourceFailedItems } from "./sourceFailedItems";
 import type { SourceReadiness } from "./sourceReadiness";
@@ -76,6 +77,20 @@ function updateLocalSyncAttention(source: Source): SourceAttention {
   };
 }
 
+/**
+ * What Finish setup asks for. A device Source names what its execution
+ * device lacks, which the device reports to the execution owner alone: the
+ * missing folder, or that no computer runs it yet.
+ */
+function finishSetupDetail(source: Source): string {
+  if (sourceExecutor(source) !== "device") return "Some required settings are missing.";
+  const device = source.execution?.device;
+  if (!device) return "Choose the computer that runs this source.";
+  const folder = device.not_ready.find((reason) => reason.kind === "location" && reason.path)?.path;
+  if (folder && device.name) return `The folder ${folder} is missing on ${device.name}.`;
+  return "Its computer is missing a folder this source reads.";
+}
+
 interface SourceAttentionInput {
   source: Source;
   readiness: SourceReadiness | null;
@@ -130,8 +145,8 @@ export function sourceAttention({ source, readiness, activity, now = new Date() 
     case "configuration_required":
       return {
         reason: "configuration_required",
-        title: "Setup incomplete",
-        detail: "Some required settings are missing.",
+        title: "Finish setup",
+        detail: finishSetupDetail(source),
         action: "configure",
         actionLabel: "Configure",
       };

@@ -161,7 +161,7 @@ export function SourcesPage() {
 
       {deviceUpdates.map((update) => (
         <Notice
-          key={update.deviceName}
+          key={update.deviceId}
           tone="warn"
           icon={Laptop}
           action={

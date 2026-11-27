@@ -4,7 +4,16 @@ import { deviceUpdateProgress, viewerDeviceUpdates, waitsForDeviceUpdate } from 
 
 type State = "online" | "offline" | "update_required";
 
-function onDevice(id: string, state: State, { device = "Alex's MacBook", viewerOwns = true, status = "active" as "active" | "paused" } = {}) {
+function onDevice(
+  id: string,
+  state: State,
+  {
+    device = "Alex's MacBook",
+    deviceId,
+    viewerOwns = true,
+    status = "active" as "active" | "paused",
+  }: { device?: string; deviceId?: string; viewerOwns?: boolean; status?: "active" | "paused" } = {},
+) {
   return makeSource({
     id,
     status,
@@ -13,7 +22,7 @@ function onDevice(id: string, state: State, { device = "Alex's MacBook", viewerO
       kind: "local_agent",
       operation: "document_acquisition",
       immutable_config_fields: [],
-      device: { id: `dev-${device}`, name: viewerOwns ? device : null, state, not_ready: [], installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
+      device: { id: deviceId ?? `dev-${device}`, name: viewerOwns ? device : null, state, not_ready: [], installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
     },
   });
 }
@@ -33,6 +42,17 @@ test("the viewer's waiting sources are grouped by device; paused, other members'
     ["Build box", ["b"]],
   ]);
   expect(updates[0]).toMatchObject({ installedVersion: "0.2.0b8", requiredVersion: "0.2.0b7" });
+});
+
+test("two computers with the same name are two devices", () => {
+  const updates = viewerDeviceUpdates([
+    onDevice("a", "update_required", { deviceId: "dev-old" }),
+    onDevice("b", "update_required", { deviceId: "dev-new" }),
+  ]);
+  expect(updates.map((update) => [update.deviceId, update.deviceName])).toEqual([
+    ["dev-old", "Alex's MacBook"],
+    ["dev-new", "Alex's MacBook"],
+  ]);
 });
 
 test("a paused source waits for nothing", () => {

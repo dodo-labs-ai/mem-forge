@@ -1228,33 +1228,6 @@ def _fake_github_remote_run(cmd, *args, **kwargs):
     return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
 
 
-def test_local_agent_cloud_local_markdown_preview_uses_job_payload(tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
-    (root / "scratch.bin").write_bytes(b"\x00\x01")
-
-    payload = main._run_cloud_local_agent_job(
-        {
-            "job_id": "laj-local-preview",
-            "operation": "local_markdown_preview_tree",
-            "payload": {
-                "root": str(root),
-                "vault_id": "engineering",
-                "include": ["*.md", "**/*.md"],
-                "exclude": [],
-                "limit": 20,
-            },
-        },
-        _cloud_test_client(),
-    )
-
-    assert payload["operation"] == "local_markdown_preview_tree"
-    assert payload["vault_id"] == "engineering"
-    assert payload["counts"]["included"] == 1
-    assert [item["relative_path"] for item in payload["items"]] == ["Decision.md"]
-
-
 def test_local_agent_cloud_local_markdown_pick_root_uses_local_picker(monkeypatch, tmp_path: Path):
     selected = tmp_path / "notes"
     selected.mkdir()

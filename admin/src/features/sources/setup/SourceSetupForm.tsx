@@ -25,7 +25,7 @@ import {
 } from "./api";
 import { CheckSetupPanel } from "./CheckSetupPanel";
 import { ConfigGroupFields } from "./ConfigGroupFields";
-import { checkSetupKind } from "./model/checkSetup";
+import { offersCheckSetup } from "./model/checkSetup";
 import {
   comparisonString,
   defaultValues,
@@ -53,8 +53,9 @@ import { configIssuesOf, issueView, type FieldIssue } from "./model/setupIssues"
 import { checkSetupGroup, groupComplete, groupSummary, issueCountsByGroup, setupSteps, type SetupStep } from "./model/setupSteps";
 import { AccessStep, BasicsStep, ProjectStep, ScheduleStep } from "./ProductSteps";
 import { useRunningSyncSave } from "./useRunningSyncSave";
+import { SetupDeviceContext } from "./setupDevice";
 import { useDeviceChoice } from "./useDeviceChoice";
-import { DeviceChoicePanel, DeviceCredentialStep, WhereItRunsChoice } from "./WhereItRuns";
+import { DeviceChoicePanel, DeviceSetupStep, WhereItRunsChoice } from "./WhereItRuns";
 
 type GeneMetadata = components["schemas"]["GeneMetadataResponse"];
 type SavePayload = CreateSourceBody | UpdateSourceBody;
@@ -100,10 +101,13 @@ function sameJson(a: unknown, b: unknown): boolean {
  * - A save while a sync runs asks to stop it first or wait.
  * - Leaving with unsaved changes asks first.
  * - A type that runs on the server or a device shows Where it runs on its
- *   connection step. On My computer the form holds no secret: a new choice
- *   saves only while one of the person's devices is ready, and a Source
- *   that runs on a device shows how to store its credential there. Save
- *   changes the executor first, then the rest of the settings.
+ *   connection step. On My computer the form holds no secret, and the person
+ *   chooses which of their devices runs the Source (a single device is
+ *   chosen already); Save waits while the chosen device is offline or needs
+ *   an update. A Source that runs on a device shows its device and what that
+ *   device lacks, and offers Move while it is offline. The folder picker
+ *   runs on the chosen device. Save changes the executor and the execution
+ *   device first, then the rest of the settings.
  */
 export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetupFormProps) {
   const navigate = useNavigate();
@@ -120,9 +124,18 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   const executorOptions = canEditConfig ? executorChoices(gene.executors) : [];
   const executorChanged = executor !== storedExecutor;
   const schema = useMemo(() => (executor === "device" ? deviceFormSchema(typeSchema) : typeSchema), [executor, typeSchema]);
-  const choosesDevice = executor === "device" && executorChanged;
-  const deviceChoice = useDeviceChoice(gene.name, choosesDevice);
-  const awaitsDevice = choosesDevice && !deviceChoice.ready;
+  const savedOnDevice = source !== undefined && storedExecutor === "device";
+  const storedDeviceId = source?.execution?.device?.id ?? null;
+  const runsOnlyOnDevice = Boolean(gene.executors && !gene.executors.includes("server"));
+  const [moving, setMoving] = useState(false);
+  // The device choice shows while a Source moves to My computer or to another device, or has no device;
+  // a type that runs only on a device and is not saved on one yet chooses the device its folder picker opens on.
+  const choosesDevice = executor === "device" ? !savedOnDevice || moving || storedDeviceId === null : runsOnlyOnDevice && !savedOnDevice;
+  const deviceChoice = useDeviceChoice(gene.name, choosesDevice, storedDeviceId);
+  const chosenDeviceId = choosesDevice ? deviceChoice.chosen?.id : undefined;
+  const sendsDevice = executor === "device" && choosesDevice;
+  const deviceChanged = sendsDevice && savedOnDevice && (chosenDeviceId ?? null) !== storedDeviceId;
+  const awaitsDevice = sendsDevice && !deviceChoice.ready;
 
   const [initial] = useState(() => {
     const values = defaultValues(typeSchema, source?.config ?? {});
@@ -154,8 +167,8 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   const changeExecutor = useChangeSourceExecutor(sourceId ?? "");
   const state: ConfigFormState = { values, derived: configCheck.result?.derived, stored };
   // The server reads no provider for a Source that runs on a device.
-  const previewKind = executor === "device" ? null : checkSetupKind(gene.name, schema, state);
-  const discovery = useCheckSetup(gene.name, previewKind, executor, source);
+  const previewable = executor !== "device" && !runsOnlyOnDevice && offersCheckSetup(gene.name, schema, state);
+  const discovery = useCheckSetup(gene.name, executor, source);
   const config = serializeConfig(schema, values);
   const steps = setupSteps(schema, { mode: source ? "edit" : "create", sharedWorkspace });
   const currentKey = steps.find((step) => step.key === searchParams.get(SOURCE_SETTINGS_STEP_PARAM))?.key ?? steps[0]!.key;
@@ -176,7 +189,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
     projectKey !== initial.projectKey ||
     !sameJson(schedule, initial.schedule) ||
     access !== null;
-  const dirty = settingsDirty || executorChanged;
+  const dirty = settingsDirty || executorChanged || deviceChanged;
   const blocker = useUnsavedChangesGuard(dirty && !saved);
 
   // Declared after the guard, so the guard has let go of the saved page before it leaves.
@@ -208,16 +221,19 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   }
 
   /**
-   * Saves an edited Source: a changed executor first, with the secrets a move
-   * to the server needs, then the other settings, whose configuration then
-   * leaves the secrets out, as the executor change already holds them.
+   * Saves an edited Source: a changed executor or execution device first,
+   * with the secrets a move to the server needs, then the other settings,
+   * whose configuration then leaves the secrets out, as the executor change
+   * already holds them.
    */
   async function saveSource(payload: UpdateSourceBody) {
-    if (!executorChanged) {
+    if (!executorChanged && !deviceChanged) {
       await updateSource.mutateAsync(payload);
       return;
     }
-    await changeExecutor.mutateAsync(executor === "server" ? { executor, secrets: typedSecrets() } : { executor });
+    await changeExecutor.mutateAsync(
+      executor === "server" ? { executor, secrets: typedSecrets() } : { executor, execution_device_id: chosenDeviceId ?? null },
+    );
     if (!settingsDirty) return;
     const config = payload.config
       ? Object.fromEntries(Object.entries(payload.config).filter(([key]) => !secretKeys.includes(key)))
@@ -318,7 +334,14 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
       ...(routedByField ? {} : { project_binding: fixedProjectBinding(projectKey) }),
     };
     if (!source) {
-      return { ...common, type: gene.name, access_policy: sharedWorkspace ? access! : PERSONAL_ACCESS_POLICY, config, executor };
+      return {
+        ...common,
+        type: gene.name,
+        access_policy: sharedWorkspace ? access! : PERSONAL_ACCESS_POLICY,
+        config,
+        executor,
+        ...(sendsDevice ? { execution_device_id: chosenDeviceId ?? null } : {}),
+      };
     }
     return {
       ...common,
@@ -424,7 +447,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
             onChange={changeField}
             onBlur={leaveField}
             checkSetup={
-              step.key === checkSetupGroup(schema) && previewKind ? (
+              step.key === checkSetupGroup(schema) && previewable ? (
                 <CheckSetupPanel
                   ready={missing.length === 0}
                   pending={discovery.isPending}
@@ -444,17 +467,25 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
   }
 
   /**
-   * Where it runs, on the connection step of a type that offers the choice,
-   * and the device's part: the chooser's devices while a move to My
-   * computer waits for one, or the credential step of a Source on a device.
+   * Where it runs, on the connection step: Server or My computer for a type
+   * that offers the choice, and the device's part, which is the device
+   * choice while the person chooses one, or else the device of a Source on
+   * a device, with what it lacks.
    */
   function executorStep(): ReactNode {
-    const onDevice = source !== undefined && storedExecutor === "device" && executor === "device";
-    if (executorOptions.length === 0 && !onDevice) return null;
+    const showsDevice = savedOnDevice && executor === "device" && !choosesDevice;
+    if (executorOptions.length === 0 && !showsDevice && !choosesDevice) return null;
     return (
       <div className="space-y-3">
         {executorOptions.length > 0 ? <WhereItRunsChoice executors={executorOptions} value={executor} onChange={setExecutor} /> : null}
-        {onDevice ? <DeviceCredentialStep source={source} /> : executor === "device" ? <DeviceChoicePanel choice={deviceChoice} /> : null}
+        {showsDevice ? <DeviceSetupStep source={source!} onMove={() => setMoving(true)} /> : null}
+        {choosesDevice ? (
+          <DeviceChoicePanel
+            choice={deviceChoice}
+            moving={savedOnDevice && storedDeviceId !== null}
+            namesDeviceFolder={gene.device_location_fields.length > 0}
+          />
+        ) : null}
       </div>
     );
   }
@@ -488,7 +519,7 @@ export function SourceSetupForm({ gene, schema: typeSchema, source }: SourceSetu
           {current.group?.description ? <p className="text-sm text-muted-foreground">{current.group.description}</p> : null}
         </div>
 
-        {stepContent(current)}
+        <SetupDeviceContext.Provider value={chosenDeviceId}>{stepContent(current)}</SetupDeviceContext.Provider>
 
         {scopeNotice ? (
           <Notice tone={scopeNotice.tone === "danger" ? "danger" : "live"} icon={scopeNotice.tone === "danger" ? AlertTriangle : Info} title={scopeNotice.title}>

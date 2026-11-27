@@ -11,6 +11,7 @@ server run against the same provider end alike.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
@@ -27,8 +28,10 @@ from memforge.genes.notion_gene import NotionGene
 from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.local_agent.acquisition_daemon import acquire_document_source
 from memforge.local_agent.document_acquisition import (
+    ACQUIRED_BODY_REQUIRED,
     ACQUISITION_ATTEMPT_PAYLOAD_FIELD,
     AcquiredArtifact,
+    AcquiredBodyRequired,
     AcquiredInputPackage,
     AcquiredListing,
     AcquisitionAnswers,
@@ -36,6 +39,7 @@ from memforge.local_agent.document_acquisition import (
     AcquisitionManifest,
     AcquisitionManifestTooLarge,
     AcquisitionRequests,
+    body_sha256,
 )
 from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.source_contract import (
@@ -363,6 +367,7 @@ class _RouteTransport:
         self._attempt = {"local_agent_job_id": job, "local_agent_attempt_count": attempt}
         self.manifest_sha256 = ""
         self.manifest_status: int | None = None
+        self.bodies_uploaded = 0
 
     def _post(self, path: str, body: dict) -> dict:
         response = self._client.post(f"/api/v1/sources/{SOURCE_ID}/acquisition/{path}", json={**self._attempt, **body})
@@ -396,8 +401,26 @@ class _RouteTransport:
     async def upload_artifact(self, item, artifact, body) -> str:
         return await asyncio.to_thread(self._upload_artifact, item, artifact, body)
 
-    async def upload_input(self, package: AcquiredInputPackage) -> None:
-        await asyncio.to_thread(self._post, "inputs", {"package": package.to_payload()})
+    async def held_bodies(self, body_sha256s) -> list[str]:
+        answer = await asyncio.to_thread(self._post, "held-bodies", {"body_sha256s": list(body_sha256s)})
+        return answer["held"]
+
+    def _upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
+        response = self._client.post(
+            f"/api/v1/sources/{SOURCE_ID}/acquisition/inputs",
+            json={
+                **self._attempt,
+                "package": package.to_payload(),
+                "body": base64.b64encode(body).decode("ascii") if body is not None else None,
+            },
+        )
+        if response.status_code == 409 and response.json()["detail"] == ACQUIRED_BODY_REQUIRED:
+            raise AcquiredBodyRequired(package.body_sha256)
+        assert response.status_code == 200, response.text
+        self.bodies_uploaded += body is not None
+
+    async def upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
+        await asyncio.to_thread(self._upload_input, package, body)
 
     async def stored_extras(self, item_ids) -> dict:
         answer = await asyncio.to_thread(self._post, "stored-extras", {"item_ids": list(item_ids)})
@@ -411,6 +434,14 @@ class _RouteTransport:
 
 async def _no_pause(_delay: float) -> None:
     return None
+
+
+def _package(item: ContentItem, body: bytes, **acquired) -> AcquiredInputPackage:
+    return AcquiredInputPackage(item=item, body_sha256=body_sha256(body), content_type="text/markdown", **acquired)
+
+
+def _base64(body: bytes) -> str:
+    return base64.b64encode(body).decode("ascii")
 
 
 def _connect(path) -> Database:
@@ -517,11 +548,12 @@ def _acquire_and_process(
     job: str,
     config: AppConfig | None = None,
     before_sync=None,
+    transport: _RouteTransport | None = None,
 ) -> AcquisitionRequests:
     """Acquire one leased job's ``payload`` on the device, process it on the server and run its sync."""
 
     lease.lease(payload, leased_at=started_at)
-    transport = _RouteTransport(client, job=job)
+    transport = transport or _RouteTransport(client, job=job)
     requests: list[AcquisitionRequests] = []
 
     async def submit_manifest(manifest):
@@ -784,11 +816,12 @@ def test_processing_waits_until_the_attempt_is_ready(deployments, wiki):
         json={
             "local_agent_job_id": "job-1",
             "local_agent_attempt_count": 1,
-            "package": AcquiredInputPackage(item=item, body=b"body of a", content_type="text/markdown").to_payload(),
+            "package": _package(item, b"body of a").to_payload(),
+            "body": _base64(b"body of a"),
         },
     )
     lease.current = True
-    asyncio.run(transport.upload_input(AcquiredInputPackage(item=item, body=b"body of a", content_type="text/markdown")))
+    asyncio.run(transport.upload_input(_package(item, b"body of a"), b"body of a"))
     ready = process()
 
     assert [entry.item_id for entry in requests.confirm] == ["wiki-b"]
@@ -855,7 +888,10 @@ def test_the_device_fails_a_listing_above_the_bound_before_it_fetches_anything(w
         async def submit_manifest(self, manifest):
             raise AssertionError("nothing is submitted")
 
-        async def upload_input(self, package):
+        async def held_bodies(self, body_sha256s):
+            return ()
+
+        async def upload_input(self, package, body):
             raise AssertionError("nothing is uploaded")
 
         async def stored_extras(self, item_ids):
@@ -888,7 +924,10 @@ def test_the_device_makes_the_server_runs_calls_in_order_with_one_gene(wiki):
             assert all("read_from" not in item.extra for item in manifest.discovered)
             return AcquisitionRequests(confirm=(wiki.item("a"),), rediscover=(wiki.item("b"),))
 
-        async def upload_input(self, package):
+        async def held_bodies(self, body_sha256s):
+            return ()
+
+        async def upload_input(self, package, body):
             events.append(f"input:{package.item.item_id}")
 
         async def stored_extras(self, item_ids):
@@ -1002,6 +1041,110 @@ def _process(client, *, job: str, attempt: int = 1):
     )
 
 
+def test_a_device_run_uploads_no_body_the_server_holds_for_the_source(deployments, wiki):
+    _server, device, client, lease = deployments
+    for page_id in ("a", "b"):
+        wiki.write(page_id, f"body of {page_id}", FIRST_RUN - timedelta(hours=1))
+    first = _RouteTransport(client, job="job-0")
+    source = asyncio.run(device.db.get_source(SOURCE_ID))
+    payload = asyncio.run(document_acquisition_job_payload(device.db, device.doc_store, source))
+    _acquire_and_process(device, client, lease, payload, FIRST_RUN, job="job-0", transport=first)
+    wiki.write("b", "body of b, edited", FIRST_RUN + timedelta(minutes=30))
+    # Every page is discovered again, as local Markdown discovers every file.
+    second = _RouteTransport(client, job="job-1")
+    _acquire_and_process(
+        device,
+        client,
+        lease,
+        {**payload, "since": None},
+        FIRST_RUN + timedelta(hours=1),
+        job="job-1",
+        transport=second,
+    )
+
+    assert first.bodies_uploaded == 2
+    # a's body is held from the first run; only b's edited body travels.
+    assert second.bodies_uploaded == 1
+    assert asyncio.run(device.last_run())["status"] == "success"
+    assert sorted(asyncio.run(device.held())) == ["wiki-a", "wiki-b"]
+
+
+def test_a_body_the_server_no_longer_holds_is_asked_for_again_and_fails_nothing(deployments, wiki):
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    _device_run(device, client, lease, FIRST_RUN, job="job-0")
+    _lease_job(device, lease, since=None, config=dict(CONFIG))
+    transport = _RouteTransport(client, job="job-1")
+    item = wiki.item("a")
+    package = _package(item, b"body of a")
+    asyncio.run(
+        transport.submit_manifest(
+            AcquisitionManifest(
+                listing=AcquiredListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset({"wiki-a"})), discovered=(item,)
+            )
+        )
+    )
+    # The probe answered that the body is held, and the input names it without sending it.
+    asyncio.run(transport.upload_input(package, None))
+
+    async def forget_body() -> None:
+        await device.db.db.execute("DELETE FROM source_sync_inputs WHERE raw_sha256 = ?", (package.body_sha256,))
+        await device.db.db.commit()
+
+    asyncio.run(forget_body())
+    while_forgotten = _process(client, job="job-1")
+    with pytest.raises(AcquiredBodyRequired):
+        asyncio.run(transport.upload_input(package, None))
+    asyncio.run(transport.upload_input(package, b"body of a"))
+    ready = _process(client, job="job-1")
+
+    assert (while_forgotten.status_code, while_forgotten.json()["detail"]) == (409, "acquisition_inputs_incomplete")
+    assert ready.status_code == 202, ready.text
+
+
+def test_the_device_sends_the_body_when_the_server_lost_it_after_the_probe(deployments, wiki):
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN - timedelta(hours=1))
+    _lease_job(device, lease, since=None, config=dict(CONFIG))
+    transport = _RouteTransport(client, job="job-1")
+
+    async def stale_probe(body_sha256s):
+        return list(body_sha256s)
+
+    transport.held_bodies = stale_probe  # type: ignore[method-assign]
+    summary = asyncio.run(
+        acquire_document_source(
+            lease.payload,
+            open_gene=lambda config: WikiGene(dict(config), SOURCE_ID),
+            transport=transport,
+            exports_pdf=False,
+            sleep=_no_pause,
+        )
+    )
+
+    assert (summary.uploaded, summary.failed) == (1, 0)
+    assert transport.bodies_uploaded == 1
+    assert _process(client, job="job-1").status_code == 202
+
+
+def test_an_acquired_body_must_match_the_hash_it_is_named_by(deployments, wiki):
+    _server, device, client, lease = deployments
+    wiki.write("a", "body of a", FIRST_RUN)
+    _lease_job(device, lease)
+
+    response = client.post(
+        f"/api/v1/sources/{SOURCE_ID}/acquisition/inputs",
+        json={
+            "local_agent_job_id": "job-1",
+            "local_agent_attempt_count": 1,
+            "package": _package(wiki.item("a"), b"body of a").to_payload(),
+            "body": _base64(b"another body"),
+        },
+    )
+
+    assert (response.status_code, response.json()["detail"]) == (422, "body does not match body_sha256")
+
+
 def test_a_lost_lease_rejects_the_attempts_later_submissions_and_the_retried_attempt_acquires_again(
     deployments, wiki
 ):
@@ -1018,7 +1161,7 @@ def test_a_lost_lease_rejects_the_attempts_later_submissions_and_the_retried_att
     asyncio.run(first.submit_manifest(manifest))
 
     lease.current = False
-    package = AcquiredInputPackage(item=item, body=b"body of a, edited", content_type="text/markdown")
+    package = _package(item, b"body of a, edited")
     attempt_one = {"local_agent_job_id": "job-1", "local_agent_attempt_count": 1}
     refused = {
         "manifest": _manifest_route(client, manifest),
@@ -1110,7 +1253,10 @@ def test_the_daemon_lists_each_excluded_scope_with_an_instance_of_its_own_after_
             )
             return AcquisitionRequests()
 
-        async def upload_input(self, package):
+        async def held_bodies(self, body_sha256s):
+            return ()
+
+        async def upload_input(self, package, body):
             events.append(f"input:{package.item.item_id}")
 
         async def stored_extras(self, item_ids):
@@ -1367,12 +1513,15 @@ def test_an_acquired_input_must_name_only_artifacts_that_were_uploaded(deploymen
     )
 
     def upload(acquired: AcquiredArtifact):
-        package = AcquiredInputPackage(
-            item=wiki.item("a"), body=b"body of a", content_type="text/markdown", artifacts=(acquired,)
-        )
+        package = _package(wiki.item("a"), b"body of a", artifacts=(acquired,))
         return client.post(
             f"/api/v1/sources/{SOURCE_ID}/acquisition/inputs",
-            json={"local_agent_job_id": "job-1", "local_agent_attempt_count": 1, "package": package.to_payload()},
+            json={
+                "local_agent_job_id": "job-1",
+                "local_agent_attempt_count": 1,
+                "package": package.to_payload(),
+                "body": _base64(b"body of a"),
+            },
         )
 
     never_uploaded = upload(AcquiredArtifact(artifact, input_sha256="0" * 64))

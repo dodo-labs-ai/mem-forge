@@ -20,8 +20,9 @@ calls from what the device handed over:
    ``rediscover``, and the failed items to ``fetch``.
 4. Each fetched item becomes one **acquired input**
    (:class:`AcquiredInputPackage`): the item as ``fetch`` left it, its bytes
-   and content type, its PDF export and the artifacts it describes, or the
-   error ``fetch`` raised. The **answers** (:class:`AcquisitionAnswers`) carry
+   named by their hash and their content type, its PDF export and the
+   artifacts it describes, or the error ``fetch`` raised. The device uploads
+   a body only when the server does not hold it for the Source. The **answers** (:class:`AcquisitionAnswers`) carry
    what ``confirm_absent`` and ``rediscover`` returned.
 
 An error the device's acquisition raised travels as an
@@ -32,7 +33,6 @@ provider itself.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -50,12 +50,14 @@ from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListi
 from memforge.source_artifacts import RawSourceArtifact
 
 __all__ = [
+    "ACQUIRED_BODY_REQUIRED",
     "ACQUISITION_ATTEMPT_PAYLOAD_FIELD",
     "CONFIG_PAYLOAD_FIELD",
     "DOCUMENT_ACQUISITION_OPERATION",
     "REPROCESS_PAYLOAD_FIELD",
     "SINCE_PAYLOAD_FIELD",
     "AcquiredArtifact",
+    "AcquiredBodyRequired",
     "AcquiredInputPackage",
     "AcquiredListing",
     "AcquisitionAnswers",
@@ -65,6 +67,7 @@ __all__ = [
     "AcquisitionRequests",
     "StoredAcquisition",
     "acquisition_job_config",
+    "body_sha256",
     "expected_input_ids",
 ]
 
@@ -473,20 +476,38 @@ class AcquiredArtifact:
         )
 
 
+def body_sha256(body: bytes) -> str:
+    """The name an acquired input gives its body: the hash of the body bytes alone."""
+
+    return hashlib.sha256(body).hexdigest()
+
+
+class AcquiredBodyRequired(Exception):
+    """The server does not hold the body an acquired input names, so the body travels with it."""
+
+
+ACQUIRED_BODY_REQUIRED = "acquired_body_required"
+"""The answer to an acquired input naming a body the server does not hold for the Source."""
+
+
 @dataclass(frozen=True, slots=True)
 class AcquiredInputPackage:
     """What ``fetch`` returned for one item on the device: the input its Unit stores when it commits.
 
     ``item`` is the item as ``fetch`` left it, or as ``fetch`` was asked for
-    it when ``failure`` holds the error ``fetch`` raised. ``body`` and
-    ``content_type`` are the bytes ``fetch`` returned. ``pdf_material`` is
-    what the item's PDF export renders from when its type exports PDFs, or
-    ``pdf_failure`` the error reading it raised; the server renders the PDF. ``artifacts`` are the bodies ``fetch`` described, in its
-    order, each uploaded before the package that names it or failed.
+    it when ``failure`` holds the error ``fetch`` raised. ``body_sha256``
+    names the bytes ``fetch`` returned by their hash (:func:`body_sha256`),
+    and ``content_type`` is their type; the body is kept once per Source
+    beside the inputs that name it, so a body the server already holds is not
+    uploaded again. ``pdf_material`` is what the item's PDF export renders
+    from when its type exports PDFs, or ``pdf_failure`` the error reading it
+    raised; the server renders the PDF. ``artifacts`` are the bodies
+    ``fetch`` described, in its order, each uploaded before the package that
+    names it or failed.
     """
 
     item: ContentItem
-    body: bytes = b""
+    body_sha256: str | None = None
     content_type: str = ""
     pdf_material: PdfMaterial | None = None
     pdf_failure: AcquisitionError | None = None
@@ -495,14 +516,16 @@ class AcquiredInputPackage:
 
     def __post_init__(self) -> None:
         if self.failure is not None and (
-            self.body or self.pdf_material is not None or self.pdf_failure or self.artifacts
+            self.body_sha256 is not None or self.pdf_material is not None or self.pdf_failure or self.artifacts
         ):
             raise ValueError("a failed fetch acquired nothing")
+        if self.failure is None and self.body_sha256 is None:
+            raise ValueError("a fetched item names its body")
 
     def to_payload(self) -> dict[str, object]:
         return {
             "item": self.item.to_payload(),
-            "body": base64.b64encode(self.body).decode("ascii"),
+            "body_sha256": self.body_sha256,
             "content_type": self.content_type,
             "pdf_material": self.pdf_material.to_payload() if self.pdf_material is not None else None,
             "pdf_failure": self.pdf_failure.to_payload() if self.pdf_failure is not None else None,
@@ -513,9 +536,10 @@ class AcquiredInputPackage:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> AcquiredInputPackage:
         pdf_material = payload.get("pdf_material")
+        body_hash = payload.get("body_sha256")
         return cls(
             item=ContentItem.from_payload(dict(payload["item"])),
-            body=base64.b64decode(str(payload.get("body") or "")),
+            body_sha256=str(body_hash) if body_hash is not None else None,
             content_type=str(payload.get("content_type") or ""),
             pdf_material=PdfMaterial.from_payload(pdf_material) if pdf_material is not None else None,
             pdf_failure=_error(payload.get("pdf_failure")),

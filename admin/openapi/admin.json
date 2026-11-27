@@ -2,8 +2,19 @@
   "components": {
     "schemas": {
       "AcquiredInputRequest": {
-        "description": "One acquired input of a device run, bound to its job attempt.",
+        "description": "One acquired input of a device run, bound to its job attempt.\n\n``body`` is the base64 of the bytes the package names by ``body_sha256``,\nor ``None`` when the Source holds them already.",
         "properties": {
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
           "local_agent_attempt_count": {
             "minimum": 1.0,
             "title": "Local Agent Attempt Count",
@@ -2679,6 +2690,15 @@
             "title": "Description",
             "type": "string"
           },
+          "device_location_fields": {
+            "default": [],
+            "description": "The configuration fields that name a folder on the Source's execution device, which the folder picker of the device chosen in Where it runs fills.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Device Location Fields",
+            "type": "array"
+          },
           "display_name": {
             "title": "Display Name",
             "type": "string"
@@ -2909,6 +2929,36 @@
           "models"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "HeldAcquiredBodiesRequest": {
+        "description": "The bodies a device run asks about before it uploads them, each by the hash of its bytes.",
+        "properties": {
+          "body_sha256s": {
+            "items": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "maxItems": 10000,
+            "title": "Body Sha256S",
+            "type": "array"
+          },
+          "local_agent_attempt_count": {
+            "minimum": 1.0,
+            "title": "Local Agent Attempt Count",
+            "type": "integer"
+          },
+          "local_agent_job_id": {
+            "title": "Local Agent Job Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "local_agent_job_id",
+          "local_agent_attempt_count",
+          "body_sha256s"
+        ],
+        "title": "HeldAcquiredBodiesRequest",
         "type": "object"
       },
       "ImageDocumentsReprocessResponse": {
@@ -3355,7 +3405,7 @@
                 "type": "null"
               }
             ],
-            "description": "The requester's device that runs a device-bound setup job: the folder picker of a type with device locations, for a Source not yet saved the device chosen in Where it runs. A saved device Source's setup jobs run on its execution device, which a request may name but not change.",
+            "description": "The requester's device that runs a device-bound setup job: the device chosen in Where it runs, whose folder picker picks a device location. Without one, a saved device Source's setup jobs run on its execution device. A credential check of a saved device Source runs on its execution device, which the request may name but not change.",
             "title": "Device Id"
           },
           "operation": {
@@ -3812,162 +3862,6 @@
           "operation"
         ],
         "title": "LocalMarkdownPickRootResult",
-        "type": "object"
-      },
-      "LocalMarkdownPreviewCounts": {
-        "additionalProperties": false,
-        "description": "Files the scan read, and files it left out by reason.",
-        "properties": {
-          "ignored": {
-            "title": "Ignored",
-            "type": "integer"
-          },
-          "included": {
-            "title": "Included",
-            "type": "integer"
-          },
-          "invalid_utf8": {
-            "title": "Invalid Utf8",
-            "type": "integer"
-          },
-          "too_large": {
-            "title": "Too Large",
-            "type": "integer"
-          },
-          "unreadable": {
-            "title": "Unreadable",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "included",
-          "ignored",
-          "too_large",
-          "invalid_utf8",
-          "unreadable"
-        ],
-        "title": "LocalMarkdownPreviewCounts",
-        "type": "object"
-      },
-      "LocalMarkdownPreviewItem": {
-        "additionalProperties": false,
-        "description": "One file under the folder that the Source would read.",
-        "properties": {
-          "bytes": {
-            "title": "Bytes",
-            "type": "integer"
-          },
-          "content_type": {
-            "title": "Content Type",
-            "type": "string"
-          },
-          "raw_hash": {
-            "title": "Raw Hash",
-            "type": "string"
-          },
-          "relative_path": {
-            "title": "Relative Path",
-            "type": "string"
-          },
-          "title": {
-            "title": "Title",
-            "type": "string"
-          }
-        },
-        "required": [
-          "relative_path",
-          "title",
-          "content_type",
-          "raw_hash",
-          "bytes"
-        ],
-        "title": "LocalMarkdownPreviewItem",
-        "type": "object"
-      },
-      "LocalMarkdownPreviewTreeResult": {
-        "additionalProperties": false,
-        "description": "The files under a local folder that the configured patterns select.\n\n``root`` is the resolved folder and ``vault_id`` the identity its\nDocuments are stored under. ``items`` holds at most the requested number\nof files, and ``counts`` counts all of them.",
-        "properties": {
-          "counts": {
-            "$ref": "#/components/schemas/LocalMarkdownPreviewCounts"
-          },
-          "error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error"
-          },
-          "error_type": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Error Type"
-          },
-          "heartbeat_errors": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Heartbeat Errors"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/LocalMarkdownPreviewItem"
-            },
-            "title": "Items",
-            "type": "array"
-          },
-          "operation": {
-            "title": "Operation",
-            "type": "string"
-          },
-          "profile": {
-            "title": "Profile",
-            "type": "string"
-          },
-          "root": {
-            "title": "Root",
-            "type": "string"
-          },
-          "source_id": {
-            "title": "Source Id",
-            "type": "string"
-          },
-          "vault_id": {
-            "title": "Vault Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "operation",
-          "source_id",
-          "profile",
-          "root",
-          "vault_id",
-          "counts",
-          "items"
-        ],
-        "title": "LocalMarkdownPreviewTreeResult",
         "type": "object"
       },
       "LocalSourceManifestItemRequest": {
@@ -16913,9 +16807,60 @@
         ]
       }
     },
+    "/api/v1/sources/{source_id}/acquisition/held-bodies": {
+      "post": {
+        "description": "Say which of the named bodies the Source holds, so a device run uploads only the others.",
+        "operationId": "read_held_acquired_bodies_api_v1_sources__source_id__acquisition_held_bodies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeldAcquiredBodiesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Held Acquired Bodies",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
     "/api/v1/sources/{source_id}/acquisition/inputs": {
       "post": {
-        "description": "Keep one acquired input of a device run for its job attempt.\n\nThe device fetches each discovered item before it submits the\nmanifest, so an input belongs to the attempt, not to a manifest\ndigest; the run reads only the inputs of items it asks for. Each\nartifact body the input names must already be an uploaded input of\nthe Source; an artifact the device could not read names its error\ninstead. The same input uploaded again is kept once.",
+        "description": "Keep one acquired input of a device run for its job attempt.\n\nThe device fetches each discovered item before it submits the\nmanifest, so an input belongs to the attempt, not to a manifest\ndigest; the run reads only the inputs of items it asks for. Each\nartifact body the input names must already be an uploaded input of\nthe Source; an artifact the device could not read names its error\ninstead. The input's own body travels with it unless the Source holds\nit already; an input naming a body the Source does not hold is\nanswered 409 ``acquired_body_required``, and the device sends it\nagain with its body. The same input uploaded again is kept once.",
         "operationId": "upload_acquired_input_api_v1_sources__source_id__acquisition_inputs_post",
         "parameters": [
           {

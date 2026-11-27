@@ -4,8 +4,6 @@ import { projectQueryKeys, unwrap, useApi, type components } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { sourceKeys } from "../api";
 import type { SourceExecutor } from "../model/localAgentSources";
-import { useLocalSetupJob } from "../useLocalSetupJob";
-import type { CheckSetupKind } from "./model/checkSetup";
 
 type Schemas = components["schemas"];
 export type ConfigCheck = Schemas["ConfigCheckResponse"];
@@ -59,46 +57,18 @@ export interface SetupPreview {
 }
 
 /**
- * The identity a local folder's preview files its Documents under. An
- * existing Source has one; a new Source is given one when it is created, so
- * its preview uses a placeholder, which changes no file it lists.
- */
-function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
-  return typeof stored.vault_id === "string" && stored.vault_id.trim() ? stored.vault_id.trim() : "preview";
-}
-
-/**
  * "Check setup": the first items the configuration would sync, read without
  * saving anything. The server reads the provider through preview-discovery,
  * with `sourceId` supplying what the form leaves out, such as a kept
- * secret; a local folder is listed by local sync on the person's computer
- * (`local_markdown_preview_tree`). `executor` is where the Source runs once
- * saved, as for config-check: the server previews only through its own
- * connection, so a configuration on My computer has no Check setup, and a
- * stored device Source moving to the server previews with the credential
- * the form carries.
+ * secret. `executor` is where the Source runs once saved, as for
+ * config-check: the server previews only through its own connection, so a
+ * configuration on My computer has no Check setup, and a stored device
+ * Source moving to the server previews with the credential the form carries.
  */
-export function useCheckSetup(
-  sourceType: string,
-  kind: CheckSetupKind | null,
-  executor: SourceExecutor,
-  source?: { id: string; config: Readonly<Record<string, unknown>> },
-) {
+export function useCheckSetup(sourceType: string, executor: SourceExecutor, source?: { id: string }) {
   const api = useApi();
-  const previewFolder = useLocalSetupJob("local_markdown_preview_tree");
   return useMutation({
     mutationFn: async (config: Record<string, unknown>): Promise<SetupPreview> => {
-      if (kind === "local_folder") {
-        const result = await previewFolder({
-          sourceId: source?.id,
-          payload: { ...config, vault_id: previewVaultId(source?.config ?? {}), limit: CHECK_SETUP_LIMIT },
-        });
-        return {
-          count: result.counts.included,
-          truncated: result.counts.included > result.items.length,
-          items: result.items.map((item) => ({ id: item.relative_path, title: item.title || item.relative_path, href: null })),
-        };
-      }
       const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },

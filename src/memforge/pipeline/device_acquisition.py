@@ -15,6 +15,9 @@ the server decides and keeps for such a run:
   server run will ask beyond discovery, by the server run's own rules.
 - :func:`stored_extras` gives the device's ``fetch`` what a server run's
   ``fetch`` reads from the Source's stored inputs.
+- :func:`held_acquired_bodies` says which bodies the server holds for the
+  Source, and :func:`retain_acquired_body` keeps one, so a device uploads a
+  body only once.
 - :func:`retain_acquired_input` keeps one acquired input for its attempt.
 - :func:`ready_acquisition` decides whether the attempt can be processed.
 - :func:`recorded_device_gene` and :func:`device_excluded_scope_gene_factory`
@@ -95,8 +98,10 @@ __all__ = [
     "device_excluded_scope_gene_factory",
     "document_acquisition_job_payload",
     "enqueue_document_acquisition_job",
+    "held_acquired_bodies",
     "ready_acquisition",
     "recorded_device_gene",
+    "retain_acquired_body",
     "retain_acquired_input",
     "stored_extras",
 ]
@@ -347,6 +352,63 @@ async def stored_extras(db: Database, source_id: str, item_ids: Collection[str])
     return extras
 
 
+async def held_acquired_bodies(
+    db: Database, *, source_id: str, workspace_id: str, body_sha256s: Collection[str]
+) -> frozenset[str]:
+    """Which of the named acquired bodies the Source holds, each named by the hash of its bytes."""
+
+    held = await db.get_source_sync_inputs_by_raw_hashes(
+        source_id=source_id, workspace_id=workspace_id, raw_sha256s=tuple(body_sha256s)
+    )
+    return frozenset(source_input.raw_sha256 for source_input in held)
+
+
+async def retain_acquired_body(
+    db: Database,
+    doc_store: DocumentStore,
+    *,
+    source_id: str,
+    workspace_id: str,
+    body: bytes,
+) -> str:
+    """Keep the body of an acquired input once for the Source, named by the hash of its bytes, and return it.
+
+    A body the Source already holds is not written again, so the acquired
+    inputs of every later run that name it share it.
+    """
+
+    digest = hashlib.sha256(body).hexdigest()
+    if await held_acquired_bodies(db, source_id=source_id, workspace_id=workspace_id, body_sha256s=(digest,)):
+        return digest
+    # This write does not hold the Source activity lease, so the attempt
+    # writes a key of its own: a cleanup task queued by an earlier failed
+    # attempt can never name the object written here.
+    raw_uri = await asyncio.to_thread(
+        doc_store.store_source_artifact,
+        source_id=source_id,
+        artifact_id=f"acquired-body-{digest[:24]}-{uuid.uuid4().hex}",
+        filename="acquired-body",
+        content=io.BytesIO(body),
+        content_type="application/octet-stream",
+        size_bytes=len(body),
+        sha256=digest,
+    )
+    try:
+        retained = await db.create_source_sync_input(
+            source_id=source_id,
+            workspace_id=workspace_id,
+            raw_uri=raw_uri,
+            raw_sha256=digest,
+            raw_content_type="application/octet-stream",
+        )
+    except Exception:
+        await db.enqueue_source_artifact_cleanup_task(source_id=source_id, artifact_uri=raw_uri)
+        raise
+    if retained.raw_uri != raw_uri:
+        await db.enqueue_source_artifact_cleanup_task(source_id=source_id, artifact_uri=raw_uri)
+    return digest
+
+
 async def retain_acquired_input(
     db: Database,
     doc_store: DocumentStore,
@@ -359,13 +421,21 @@ async def retain_acquired_input(
     """Keep one acquired input as an immutable input of the Source, held by its attempt, and return its hash.
 
     The same package uploaded again, by this attempt or a later one, is the
-    same input.
+    same input. Its metadata names the body it reads, so the attempt can tell
+    whether the Source still holds it (:func:`ready_acquisition`).
     """
 
     body = package.encode()
     digest = hashlib.sha256(body).hexdigest()
     doc_id = package.item.item_id
-    metadata = {"doc_id": doc_id, ACQUIRED_INPUT_METADATA_KEY: {"doc_id": doc_id, "version": package.item.version}}
+    metadata = {
+        "doc_id": doc_id,
+        ACQUIRED_INPUT_METADATA_KEY: {
+            "doc_id": doc_id,
+            "version": package.item.version,
+            "body_sha256": package.body_sha256,
+        },
+    }
     existing = await db.get_source_sync_inputs_by_raw_hashes(
         source_id=source_id, workspace_id=workspace_id, raw_sha256s=(digest,)
     )
@@ -428,7 +498,9 @@ async def ready_acquisition(
     the device answered what the manifest response asked, and every
     discovered item, every ``fetch`` item and every ``rediscover`` item the
     provider still returned has an acquired input or the error ``fetch``
-    raised for it. Raises :class:`AcquisitionNotReady` with what it waits for:
+    raised for it. An acquired input whose body the Source no longer holds
+    counts as not uploaded, as an input the device has not uploaded does.
+    Raises :class:`AcquisitionNotReady` with what it waits for:
     ``acquisition_manifest_required``, ``acquisition_manifest_stale``,
     ``acquisition_answers_pending`` or ``acquisition_inputs_incomplete``.
     """
@@ -444,9 +516,20 @@ async def ready_acquisition(
         raise AcquisitionNotReady("acquisition_manifest_stale")
     if stored.requests.awaits_answers and stored.answers is None:
         raise AcquisitionNotReady("acquisition_answers_pending")
+    bodies: dict[str, str] = {}
+    for source_input in await db.list_source_sync_inputs(
+        source_id=source_id, workspace_id=workspace_id, input_snapshot_id=snapshot_id
+    ):
+        acquired = source_input.metadata.get(ACQUIRED_INPUT_METADATA_KEY)
+        if isinstance(acquired, Mapping) and acquired.get("body_sha256"):
+            bodies[str(acquired["doc_id"])] = str(acquired["body_sha256"])
+    held_bodies = await held_acquired_bodies(
+        db, source_id=source_id, workspace_id=workspace_id, body_sha256s=set(bodies.values())
+    )
     held = await db.list_source_sync_snapshot_doc_ids(
         source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
     )
+    held -= {doc_id for doc_id, body_hash in bodies.items() if body_hash not in held_bodies}
     if expected_input_ids(stored.manifest, stored.requests, stored.answers) - held:
         raise AcquisitionNotReady("acquisition_inputs_incomplete")
     return stored
@@ -521,9 +604,15 @@ class DeviceAcquisitionRecord:
         package = await self._package(item_id)
         if package.failure is not None:
             raise package.failure.raised()
+        bodies = await self._db.get_source_sync_inputs_by_raw_hashes(
+            source_id=self._source_id, workspace_id=self._workspace_id, raw_sha256s=(str(package.body_sha256),)
+        )
+        if not bodies:
+            raise AcquisitionRecordMismatch(f"the body acquired for {item_id} is not kept")
+        body = await asyncio.to_thread(self._doc_store.read_artifact, bodies[0].raw_uri)
         return AcquiredInput(
             item=package.item,
-            body=package.body,
+            body=body,
             content_type=package.content_type,
             pdf_material=package.pdf_material,
             artifacts=tuple(acquired.artifact for acquired in package.artifacts),
