@@ -64,6 +64,7 @@ from memforge.genes.recorded import AcquiredInput, AcquisitionRecordMismatch
 from memforge.github_repo_utils import GITHUB_SYMLINK_MODE, build_github_repo_doc_id, parse_github_repo_url
 from memforge.local_agent.document_acquisition import acquisition_job_config
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, SourceUnitInput
+from memforge.pipeline.device_acquisition import retain_acquired_body
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
 from memforge.pipeline.stored_document import StoredDocumentUnavailable, committed_source_artifacts
 from memforge.pipeline.sync import SourceSyncMode
@@ -218,7 +219,10 @@ def _rebuild_local_markdown(
     except ValueError as exc:
         raise Unrebuildable(f"the package's source time is invalid: {exc}") from exc
     if source_time is None:
-        raise Unrebuildable("the package records no source time for the file")
+        raise Unrebuildable(
+            "the package records no source time for the file, which a daemon before 0.2.0b1 uploaded; "
+            "delete the Source and add its folder again on its computer"
+        )
     item = local_file_content_item(
         source_id=source_id,
         vault_id=str(config.get("vault_id") or ""),
@@ -584,9 +588,12 @@ async def apply_package_migration(
     source_id: str,
     *,
     runtime: SyncRuntime,
+    workspace_id: str,
 ) -> PackageMigrationResult:
     """Apply the migration to one Source on a package path (see the module docstring).
 
+    ``workspace_id`` is the namespace the server keeps the Source's acquired
+    bodies in, so its device's first run finds each rebuilt body held.
     The Source's sync activity is held from the plan to the executor change,
     so no other run of the Source interleaves. Raises
     ``SourceSyncActivityConflict`` while another activity holds the Source,
@@ -607,6 +614,14 @@ async def apply_package_migration(
         if plan.refused:
             return PackageMigrationResult(plan=plan, status="refused")
         if plan.units:
+            # Each rebuilt body is the one the Gene acquires on the device, so
+            # the device's first run uploads only what changed since. Bodies
+            # are kept before the replay, so an interrupted apply that
+            # continues holds the bodies of the Units it replayed before.
+            for unit in plan.units:
+                await retain_acquired_body(
+                    db, runtime.doc_store, source_id=source_id, workspace_id=workspace_id, body=unit.body
+                )
             state = await run_source_sync(
                 db,
                 config,

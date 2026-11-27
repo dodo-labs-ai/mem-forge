@@ -4237,6 +4237,7 @@ def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, .
             plan_package_migration,
         )
         from memforge.runtime import DefaultRuntimeProvider
+        from memforge.server.admin_api import SELF_HOSTED_WORKSPACE_ID
         from memforge.storage.document_store import LocalDocumentStore
         from memforge.storage.recovery_points import PRE_MIGRATION, UpgradeError
 
@@ -4264,7 +4265,10 @@ def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, .
                 console.print(f"Took recovery point {point.id}; `memforge backup restore {point.id}` undoes this run.")
             runtime = await DefaultRuntimeProvider().build_sync_runtime(db, config)
             results = [
-                await apply_package_migration(db, config, str(source["id"]), runtime=runtime) for source in sources
+                await apply_package_migration(
+                    db, config, str(source["id"]), runtime=runtime, workspace_id=SELF_HOSTED_WORKSPACE_ID
+                )
+                for source in sources
             ]
             _print_package_migration([result.to_payload() for result in results], as_json=as_json)
             return 0 if all(result.status == "migrated" for result in results) else 1

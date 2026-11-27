@@ -185,6 +185,19 @@ def test_the_listing_names_each_file_by_its_path_and_reads_no_file(folder, monke
     assert listing.doc_ids == frozenset(_doc_id(path) for path in NOTES)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="the superuser reads any directory")
+def test_a_folder_exclude_leaves_out_is_never_read(folder):
+    (folder / ".obsidian" / "plugins").mkdir(parents=True)
+    (folder / ".obsidian" / "plugins" / "manifest.json").write_text("{}")
+    (folder / ".obsidian" / "plugins").chmod(0)
+    gene = LocalMarkdownGene(config={"root": str(folder), "vault_id": VAULT_ID}, source_id=SOURCE_ID)
+
+    try:
+        listing = asyncio.run(gene.list_scope())
+    finally:
+        (folder / ".obsidian" / "plugins").chmod(0o755)
+
+    assert listing.doc_ids == frozenset(_doc_id(path) for path in NOTES)
 
 
 def test_an_unchanged_folder_uploads_no_body_and_extracts_nothing(notes, folder, uploaded_bodies):
@@ -289,3 +302,25 @@ def test_a_file_the_run_cannot_read_fails_only_its_document_which_stays(notes, f
     assert [failure.document_id for failure in asyncio.run(notes.db.list_source_item_failures(source_id=SOURCE_ID))] == [
         _doc_id("team/plans.md")
     ]
+
+
+def test_a_file_deleted_after_the_walk_fails_only_its_document_which_stays(notes, folder, monkeypatch):
+    _sync_now(notes)
+    held = notes.documents(SOURCE_ID)
+    walk = local_markdown_gene._walk_folder
+
+    def walk_then_delete(*args):
+        listed = walk(*args)
+        (folder / "team" / "plans.md").unlink()
+        return listed
+
+    monkeypatch.setattr(local_markdown_gene, "_walk_folder", walk_then_delete)
+    result = _sync_now(notes)
+
+    assert result["counts"] == {"discovered": 3, "uploaded": 3, "failed": 1}
+    latest = _runs(notes)[0]
+    assert latest["status"] == "partial", latest
+    assert notes.documents(SOURCE_ID) == held
+    [failure] = asyncio.run(notes.db.list_source_item_failures(source_id=SOURCE_ID))
+    assert failure.document_id == _doc_id("team/plans.md")
+    assert (failure.stage, failure.error_class) == ("fetch", "builtins.FileNotFoundError"), failure

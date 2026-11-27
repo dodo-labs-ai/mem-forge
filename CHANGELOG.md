@@ -41,8 +41,13 @@
   what the old upload path stored and do not sync until they move. Run
   `memforge maintenance migrate-device-packages` as for Jira and GitHub
   repository Sources below; each file keeps its Document, Memories and Support,
-  and nothing is extracted again. A file whose stored upload records no file
-  time is refused and named.
+  and nothing is extracted again. A file last uploaded by a daemon before
+  0.2.0b1 records no file time, so the migration refuses its Source and names
+  the file; delete that Source and add its folder again on its computer, which
+  reads and extracts its files again. On a moved Source's first run, files
+  under an excluded folder (by default `.obsidian/**`, `.trash/**` and
+  `.git/**`) that the upload path still listed, such as
+  `.obsidian/plugins/x/manifest.json`, leave the Source.
 
 - Jira and GitHub repository Sources that collect on your own computer run the
   type's own connector on the device: choose Where it runs: My computer, and

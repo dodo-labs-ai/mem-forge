@@ -257,26 +257,86 @@ def _uncommitted_paths(root: Path) -> frozenset[str] | None:
     return frozenset(path.removeprefix(prefix) for path in changed if path.startswith(prefix))
 
 
+_GIT_LOG_COMMIT = "\x01"
+"""Starts each commit's record in the commit-time log; no path starts with it."""
+
+
+def _commit_times(root: Path, paths: frozenset[str]) -> dict[str, datetime]:
+    """The time of the latest commit that changed each of ``paths``, relative to ``root``, in one ``git log``.
+
+    The log runs newest first, so a path's first appearance is its latest
+    commit; reading stops once every path has one. A path no commit names,
+    such as an ignored file, is left out.
+    """
+
+    if not paths:
+        return {}
+    try:
+        process = subprocess.Popen(
+            [
+                "git",
+                "-C",
+                str(root),
+                "log",
+                f"--format={_GIT_LOG_COMMIT}%cI",
+                "--name-only",
+                "--relative",
+                "--cc",
+                "-z",
+                "--",
+                ".",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except FileNotFoundError:
+        return {}
+    assert process.stdout is not None
+    times: dict[str, datetime] = {}
+    committed_at: datetime | None = None
+    pending = b""
+    try:
+        while len(times) < len(paths):
+            chunk = process.stdout.read(65536)
+            if not chunk:
+                break
+            *records, pending = (pending + chunk).split(b"\0")
+            for record in records:
+                # A commit's file names follow its time after a newline.
+                name = os.fsdecode(record.lstrip(b"\n"))
+                if name.startswith(_GIT_LOG_COMMIT):
+                    committed_at = datetime.fromisoformat(name[1:].strip()).astimezone(timezone.utc)
+                elif name in paths and name not in times and committed_at is not None:
+                    times[name] = committed_at
+    finally:
+        process.kill()
+        process.wait()
+        process.stdout.close()
+    return times
+
+
 def _file_times(root: Path, listed: Sequence[_ListedFile]) -> dict[str, datetime]:
     """Each listed file's own time for its current content.
 
     A committed file without local changes takes its latest commit time,
     because a checkout or clone sets the modification time to when it ran.
     Any other file takes its modification time, the only time the file
-    system records for its content.
+    system records for its content. Git runs a fixed number of times,
+    however many files the folder has.
     """
 
     uncommitted = _uncommitted_paths(root) if listed else None
-    times: dict[str, datetime] = {}
-    for listed_file in listed:
-        times[listed_file.relative_path] = listed_file.modified_at
-        if uncommitted is None or listed_file.relative_path in uncommitted:
-            continue
-        # Empty for a file Git does not track, such as an ignored one.
-        committed_at = (_git_output(root, "log", "-1", "--format=%cI", "--", listed_file.relative_path) or "").strip()
-        if committed_at:
-            times[listed_file.relative_path] = datetime.fromisoformat(committed_at).astimezone(timezone.utc)
-    return times
+    clean = (
+        frozenset(listed_file.relative_path for listed_file in listed if listed_file.relative_path not in uncommitted)
+        if uncommitted is not None
+        else frozenset()
+    )
+    committed = _commit_times(root, clean)
+    return {
+        listed_file.relative_path: committed.get(listed_file.relative_path, listed_file.modified_at)
+        for listed_file in listed
+    }
 
 
 class LocalMarkdownGene(DocumentGene):

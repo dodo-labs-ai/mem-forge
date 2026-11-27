@@ -295,7 +295,15 @@ def _plan(deployment: Deployment, source_id: str):
 
 
 def _apply(deployment: Deployment, source_id: str):
-    return asyncio.run(apply_package_migration(deployment.db, AppConfig(), source_id, runtime=_runtime(deployment)))
+    return asyncio.run(
+        apply_package_migration(
+            deployment.db,
+            AppConfig(),
+            source_id,
+            runtime=_runtime(deployment),
+            workspace_id=deployment.app.state.workspace_id,
+        )
+    )
 
 
 def _support_on(deployment: Deployment, doc_id: str) -> str:
@@ -462,7 +470,11 @@ def test_the_local_markdown_dry_run_refuses_a_package_without_the_files_time(not
     plan = _plan(notes, source_id)
 
     assert plan.refused
-    assert plan.unrebuildable == ((ideas, "the package records no source time for the file"),)
+    [(refused_id, cause)] = plan.unrebuildable
+    assert refused_id == ideas
+    assert cause.startswith("the package records no source time for the file")
+    # The cause names what the operator can do about it.
+    assert "delete the Source and add its folder again on its computer" in cause
 
 
 # ---------------------------------------------------------------------------
@@ -506,11 +518,24 @@ def test_a_moved_local_markdown_source_keeps_its_documents_and_runs_on_its_devic
     # Each Unit's stored input is the file's text, as the Gene reads it, no longer its package.
     assert sorted(_stored_bodies(notes, source_id).values()) == sorted(text.encode() for text in NOTES.values())
 
-    # The owner's daemon walks the folder; only the file edited after the migration is extracted.
+    # The owner's daemon walks the folder; it uploads and the server extracts
+    # only the file edited after the migration.
+    from memforge.tool_client import ToolClient
+
+    uploaded: list[str] = []
+    upload = ToolClient.upload_acquired_input
+
+    def recorded(self, *, package, body, **kwargs):
+        if body is not None:
+            uploaded.append(package["item"]["extra"]["relative_path"])
+        return upload(self, package=package, body=body, **kwargs)
+
+    monkeypatch.setattr(ToolClient, "upload_acquired_input", recorded)
     plans = Path(notes.kind.config["root"]) / "team" / "plans.md"
     plans.write_text("# Plans\n\nMove the queue on Monday.\n")
     _sync_now_on_the_device(notes, source_id)
 
+    assert uploaded == ["team/plans.md"]
     [edited] = [doc_id for doc_id, (title, _, _) in notes.documents(source_id).items() if title == "Plans"]
     assert notes.extracted_documents(source_id) == [edited]
     assert sorted(notes.documents(source_id)) == sorted(held)

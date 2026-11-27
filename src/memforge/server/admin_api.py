@@ -383,6 +383,8 @@ async def _run_source_access_background(
         logger.exception("Background Source access operation failed: %s", operation_id)
 
 
+SELF_HOSTED_WORKSPACE_ID = "local"
+"""The durable run namespace of a self-hosted server, which serves one workspace."""
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
 DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
@@ -5146,7 +5148,7 @@ def create_admin_app(
     local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
     local_agent_job_stopper: Callable[[str], Awaitable[list[str]]] | None = None,
     langfuse_annotation_adapter: object | None = None,
-    workspace_id: str = "local",
+    workspace_id: str = SELF_HOSTED_WORKSPACE_ID,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -8613,8 +8615,6 @@ def create_admin_app(
                         "message": f"A {req.type} source runs on: {', '.join(sorted(executors)) or 'server'}.",
                     },
                 )
-            if is_local_agent_backed_source({"type": req.type, "config": req.config}):
-                raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
         execution_device_id = await _chosen_execution_device(
             db, executor=req.executor, chooser=resolve_request_principal(request), device_id=req.execution_device_id
         )
@@ -8742,8 +8742,6 @@ def create_admin_app(
             raise _executor_change_refused(
                 f"A {source_type} source runs on: {', '.join(sorted(descriptor.executors))}."
             )
-        if is_local_agent_backed_source(existing):
-            raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
         _require_package_migration_done(existing)
         secret_fields = _source_secret_fields(source_type)
         moving_to_server = req.executor == SOURCE_EXECUTOR_SERVER and source_runs_on_device(existing)

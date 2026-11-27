@@ -394,6 +394,38 @@ async def test_local_file_outside_git_takes_its_modification_time(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_local_file_times_take_a_fixed_number_of_git_runs_however_many_files(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "vault"
+    (root / "docs" / "deep").mkdir(parents=True)
+    _git(root, "init", "-q")
+    names = [f"note-{index}.md" for index in range(20)]
+    for name in names:
+        (root / "docs" / "deep" / name).write_text(f"# {name}\n")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "notes", date="2026-01-15T12:00:00+00:00")
+    (root / "docs" / "deep" / "note-3.md").write_text("# revised\n")
+    _git(root, "commit", "-q", "-am", "revise", date="2026-03-01T09:30:00+00:00")
+    git_runs: list[list[str]] = []
+    popen = subprocess.Popen
+
+    # Every process the Gene starts, ``subprocess.run`` included, goes through Popen.
+    def counted_popen(args, *rest, **kwargs):
+        git_runs.append(args)
+        return popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", counted_popen)
+
+    times = await _file_times(root / "docs", ["**/*.md"])
+
+    # Each file takes its own latest commit, the revised one its revision's.
+    assert times == {
+        f"deep/{name}": "2026-03-01T09:30:00+00:00" if name == "note-3.md" else "2026-01-15T12:00:00+00:00"
+        for name in names
+    }
+    assert len(git_runs) <= 3
+
+
+@pytest.mark.asyncio
 async def test_jira_issue_time_is_its_updated_field() -> None:
     gene = JiraGene(config={"base_url": "https://jira.example.test"}, source_id="src-jira")
     item = _item("jira-PAY-1", issue_key="PAY-1")
