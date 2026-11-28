@@ -145,7 +145,7 @@ export function useLocalSetupJob<Op extends SetupJobOperation>(operation: Op, op
             : daemon?.status === "online";
           if (!online) throw new Error(messages.offline);
           const created = await unwrap(
-            api.POST("/api/cloud/local-agent/jobs", {
+            api.POST("/api/v1/local-agent/jobs", {
               body: {
                 source_id: sourceId ?? "",
                 source_type: jobSourceType(operation, jobRequest),

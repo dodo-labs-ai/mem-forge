@@ -8,7 +8,7 @@ import type { LocalAgentJobStatusResponse, Source } from "@/api/types";
 import { SourcesPage } from "./SourcesPage";
 
 vi.mock("@/api/client", () => ({
-  currentLocalAgentBaseUrl: () => "/api/cloud/workspaces/ws-a/local-agent",
+  currentWorkspaceKey: () => "ws-a",
   currentWorkspaceIsShared: () => true,
   subscribeWorkspaceTarget: () => () => {},
   resourceClient: { get: vi.fn(), post: vi.fn(), put: vi.fn() },
@@ -21,7 +21,7 @@ vi.mock("./SourceSetupDialog", () => ({ SourceSetupDialog: ({ open, initialFocus
 vi.mock("./SourceAccessChangeDialog", () => ({ SourceAccessChangeDialog: () => null }));
 vi.mock("./LocalAgentDaemonStatus", () => ({ LocalAgentDaemonStatus: () => null }));
 
-const workspace = "/api/cloud/workspaces/ws-a/local-agent";
+const workspace = "ws-a";
 const source: Source = {
   id: "src-local", name: "Local fixture", type: "teams", status: "active",
   config: { chat_ids: ["19:fixture"] }, access_policy: "workspace", memory_count: 1, doc_count: 1,

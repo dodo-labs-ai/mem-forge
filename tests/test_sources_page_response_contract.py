@@ -496,14 +496,14 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
                 },
             ).json()["id"]
             sync_job = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 json={"source_id": chats_id, "source_type": "teams", "operation": "teams_sync", "payload": {}},
             )
             setup_job = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 json={"source_type": "teams", "operation": "teams_auth", "payload": {}},
             )
-            current = client.get("/api/cloud/local-agent/jobs/current")
+            current = client.get("/api/v1/local-agent/jobs/current")
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease", json={"device": DAEMON_DEVICE, "limit": 5}
             ).json()["jobs"]
@@ -534,8 +534,9 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
     assert setup_job.status_code == 201, setup_job.text
     assert set(setup_job.json()) == {"job_id", "status", "coalesced"}
     assert current.status_code == 200, current.text
-    assert [set(job) for job in current.json()["data"]] == [LOCAL_AGENT_JOB_KEYS]
-    assert current.json()["data"][0]["result"] == {}
+    # Each Source's current job: the Jira Source's, which Sync now queued, and the chats'.
+    assert {job["source_id"] for job in current.json()["data"]} == {jira_id, chats_id}
+    assert all(set(job) == LOCAL_AGENT_JOB_KEYS and job["result"] == {} for job in current.json()["data"])
     assert leased
 
     assert set(offline.json()) == {
@@ -576,10 +577,10 @@ def test_openapi_types_the_sources_page_responses(tmp_path):
     assert response_schema("/api/cloud/local-agent/status", "get", "200") == {
         "$ref": "#/components/schemas/LocalAgentDaemonStatusResponse"
     }
-    assert response_schema("/api/cloud/local-agent/jobs/current", "get", "200") == {
+    assert response_schema("/api/v1/local-agent/jobs/current", "get", "200") == {
         "$ref": "#/components/schemas/LocalAgentJobListResponse"
     }
-    assert response_schema("/api/cloud/local-agent/jobs", "post", "201") == {
+    assert response_schema("/api/v1/local-agent/jobs", "post", "201") == {
         "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
     }
     source = document["components"]["schemas"]["SourceResponse"]

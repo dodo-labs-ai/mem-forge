@@ -110,7 +110,9 @@ def _ready_database(path: Path) -> Database:
 
 def _job_payload(database: Database) -> dict:
     async def read() -> dict:
-        rows = await database.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
+        rows = await database.db.execute_fetchall(
+            "SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,)
+        )
         [row] = rows
         return json.loads(row["payload_json"])
 
@@ -135,7 +137,7 @@ def test_every_builder_enqueues_the_same_payload_for_the_same_source(tmp_path):
     try:
         with TestClient(_app(tmp_path, explicit)) as client:
             created = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers=headers,
                 json={"source_id": SOURCE, "source_type": "teams", "operation": "teams_sync", "payload": {}},
             )
@@ -150,7 +152,9 @@ def test_every_builder_enqueues_the_same_payload_for_the_same_source(tmp_path):
         async def schedule() -> int:
             due = datetime.now(timezone.utc) - timedelta(minutes=1)
             await scheduled.set_source_sync_schedule(SOURCE, enabled=True, interval_minutes=60, next_run_at=due)
-            return await scheduled.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
+            return await scheduled.enqueue_due_local_agent_jobs(
+                workspace_id="default", device_acquisition_payload=_no_device_source
+            )
 
         assert asyncio.run(schedule()) == 1
         payloads["scheduled"] = _job_payload(scheduled)
@@ -181,9 +185,11 @@ async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source
         return payload
 
     monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read_then_save)
-    raced = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
+    raced = await db.enqueue_due_local_agent_jobs(workspace_id="default", device_acquisition_payload=_no_device_source)
     monkeypatch.setattr(database_module, "local_agent_sync_job_payload", read)
-    retried = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source)
+    retried = await db.enqueue_due_local_agent_jobs(
+        workspace_id="default", device_acquisition_payload=_no_device_source
+    )
 
     [row] = await db.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
     assert (raced, retried) == (0, 1)

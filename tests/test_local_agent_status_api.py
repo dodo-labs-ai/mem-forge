@@ -12,7 +12,7 @@ import pytest
 from memforge.config import AppConfig
 from memforge.local_agent.device_report import declared_acquisition_contracts
 from memforge.release import installed_version
-from memforge.server import admin_api
+from memforge.server import admin_api, local_agent_host_api
 from tests.device_report_fixture import device_report
 
 
@@ -124,7 +124,7 @@ def test_status_reports_each_device_of_the_caller_by_its_latest_report(
         monkeypatch.setattr(database, "datetime", _clock(first + timedelta(seconds=100)))
         _lease(client, "owner-a", device_id="dev-laptop", name="Laptop", version="0.2.0")
         _lease(client, "owner-a", device_id="dev-laptop", name="Work laptop", version="0.3.0")
-        monkeypatch.setattr(admin_api, "datetime", _clock(first + timedelta(seconds=150)))
+        monkeypatch.setattr(local_agent_host_api, "datetime", _clock(first + timedelta(seconds=150)))
         body = client.get(STATUS_PATH, headers={PRINCIPAL_HEADER: "owner-a"}).json()
 
     assert body["status"] == "online"
@@ -186,7 +186,7 @@ def test_self_hosted_status_expires_at_the_declared_stale_cutoff(
             def now(cls, tz=None):  # noqa: ANN001
                 return cls.current.astimezone(tz or timezone.utc)
 
-        monkeypatch.setattr(admin_api, "datetime", FrozenDateTime)
+        monkeypatch.setattr(local_agent_host_api, "datetime", FrozenDateTime)
         still_online = client.get(STATUS_PATH, headers={PRINCIPAL_HEADER: "owner-a"})
         FrozenDateTime.current = after_cutoff
         stale = client.get(STATUS_PATH, headers={PRINCIPAL_HEADER: "owner-a"})

@@ -39,7 +39,7 @@ const RESPONSES: Record<string, unknown> = {
   "GET /api/v1/projects": { data: [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal", memory_count: 1 }], can_manage: true },
   "GET /api/v1/source-list/preferences": { sort_mode: "name" },
   "GET /api/cloud/local-agent/status": localSyncStatus(true),
-  "GET /api/cloud/local-agent/jobs/current": { data: [] },
+  "GET /api/v1/local-agent/jobs/current": { data: [] },
   "POST /api/v1/genes/confluence/config-check": { derived: {}, facts: [], issues: [] },
 };
 
@@ -139,7 +139,7 @@ test("a scope edit saved during a running sync stops the sync first", async ({ p
 /** Stubs local setup jobs: each job is named for its operation and completes with what `results` gives it. */
 function setupJobs(results: Record<string, unknown>, created: unknown[]): Record<string, (route: Route) => unknown> {
   const routes: Record<string, (route: Route) => unknown> = {
-    "POST /api/cloud/local-agent/jobs": (route) => {
+    "POST /api/v1/local-agent/jobs": (route) => {
       const body = route.request().postDataJSON() as { operation: string };
       created.push(body);
       return route.fulfill({ status: 201, json: { job_id: `laj-${body.operation}`, status: "queued" } });

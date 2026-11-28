@@ -90,7 +90,7 @@ const RESPONSES: Record<string, (url: URL) => unknown> = {
     { name: "jira", display_name: "Jira" },
   ],
   "/api/cloud/local-agent/status": () => localSyncStatus(false),
-  "/api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+  "/api/v1/local-agent/jobs/current": () => ({ data: [] }),
 };
 
 async function stubApi(page: Page) {

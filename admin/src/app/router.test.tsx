@@ -26,7 +26,7 @@ afterEach(() => {
 function openApp(path: string, extension?: AdminExtension) {
   fakeFetch({
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [] }),
     "GET /api/v1/model-settings": () => makeModelSettings(),
     "GET /api/v1/model-settings/providers": () => ({ providers: PROVIDERS }),
     "GET /api/v1/memory-reviews": () => ({ data: [], total: 0, limit: 1, offset: 0 }),

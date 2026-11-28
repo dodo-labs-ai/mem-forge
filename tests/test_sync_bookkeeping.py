@@ -129,7 +129,6 @@ async def _no_device_source(source):
     raise AssertionError(f"no device Source is due here: {source['id']}")
 
 
-
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "sync-bookkeeping.db"), document_store=StubDocumentStore())
@@ -1112,9 +1111,7 @@ async def test_complete_source_sync_run_releases_active_slot_for_next_run(db: Da
     assert completed.status == "success"
     assert completed.lease_owner is None
     assert completed.completed_at == now + timedelta(seconds=10)
-    assert [(row["run_id"], row["status"]) for row in history] == [
-        (enqueued.run_id, "success")
-    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "success")]
     assert next_run.run_id != enqueued.run_id
     assert next_run.coalesced is False
 
@@ -1393,9 +1390,7 @@ async def test_durable_recovery_records_one_terminal_lifecycle_failure_per_execu
             target_unit_revision_id="sur-current",
             projection_run_id="spr-readme",
             operation_input_hash="a" * 64,
-            execution_owner_id=(
-                f"{enqueued.run_id}:attempt:{lease_attempt_count}"
-            ),
+            execution_owner_id=(f"{enqueued.run_id}:attempt:{lease_attempt_count}"),
             outcome="failed",
             reason_code="relation_ledger_incomplete",
             attempt_count=3,
@@ -2365,6 +2360,7 @@ def test_failed_document_summary_does_not_read_429_digits_in_identifiers_as_a_ra
 
     assert message == "1 document could not be synced. Review the failed document details."
 
+
 def test_failed_document_summary_preserves_mixed_failure_guidance():
     message = summarize_failed_documents(
         3,
@@ -2678,9 +2674,7 @@ class NoopMemoryEngine:
                             "derivation_reprocess_all_current_observations",
                             False,
                         ),
-                        reprocess_operation_id=kwargs.get(
-                            "derivation_reprocess_operation_id"
-                        ),
+                        reprocess_operation_id=kwargs.get("derivation_reprocess_operation_id"),
                         support_without_baseline=kwargs.get(
                             "derivation_support_without_baseline",
                             False,
@@ -2757,9 +2751,7 @@ class FailingProjectedMemoryEngine(NoopMemoryEngine):
     async def prepare_and_commit_projected_lifecycle(self, **kwargs):
         self.calls += 1
         self.lifecycle_attempt_counts.append(kwargs.get("lifecycle_attempt_count"))
-        self.lifecycle_execution_owner_ids.append(
-            kwargs.get("lifecycle_execution_owner_id")
-        )
+        self.lifecycle_execution_owner_ids.append(kwargs.get("lifecycle_execution_owner_id"))
         raise RuntimeError("lifecycle apply failed")
 
 
@@ -2810,22 +2802,14 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
             blocker_unit_ids = self.blocker_unit_ids
             if blocker_unit_ids is None:
                 assert self.committed_unit_ids
-                blocker_unit_ids = (
-                    "unit-external"
-                    if self.external_blocker
-                    else self.committed_unit_ids[0],
-                )
+                blocker_unit_ids = ("unit-external" if self.external_blocker else self.committed_unit_ids[0],)
             bundle = bind_source_lifecycle_outcome(
                 source_id=projection.source_id,
                 source_type=projection.source_type,
                 doc_id=doc_id,
                 source_unit_id=source_unit_id,
-                base_unit_revision_id=(
-                    projection.deltas[0].previous_unit_revision_id
-                ),
-                target_unit_revision_id=(
-                    projection.deltas[0].current_unit_revision_id
-                ),
+                base_unit_revision_id=(projection.deltas[0].previous_unit_revision_id),
+                target_unit_revision_id=(projection.deltas[0].current_unit_revision_id),
                 projection_run_id=projection.run_id,
                 operation_input_hash="a" * 64,
                 execution_owner_id=kwargs["lifecycle_execution_owner_id"],
@@ -2841,10 +2825,7 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
             )
             prepared = SimpleNamespace(
                 source_unit_id=source_unit_id,
-                prepared_at_attempt_count=(
-                    self.prepared_attempt_count
-                    or kwargs["lifecycle_attempt_count"]
-                ),
+                prepared_at_attempt_count=(self.prepared_attempt_count or kwargs["lifecycle_attempt_count"]),
                 retry_attempt_count=0,
                 kwargs=dict(kwargs),
             )
@@ -2869,14 +2850,10 @@ class DeferredOnceMemoryEngine(NoopMemoryEngine):
         *,
         eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocking_source_unit_ids).issubset(
-            eligible_same_run_source_unit_ids
-        )
+        assert set(handle.blocking_source_unit_ids).issubset(eligible_same_run_source_unit_ids)
         prepared = handle._prepared
         prepared.retry_attempt_count += 1
-        lifecycle_attempt_count = (
-            prepared.prepared_at_attempt_count + prepared.retry_attempt_count
-        )
+        lifecycle_attempt_count = prepared.prepared_at_attempt_count + prepared.retry_attempt_count
         self.commit_only_attempts.append(lifecycle_attempt_count)
         result = await NoopMemoryEngine.prepare_and_commit_projected_lifecycle(
             self,
@@ -3017,17 +2994,11 @@ class RoundControlledConvergenceMemoryEngine(NoopMemoryEngine):
         *,
         eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocking_source_unit_ids).issubset(
-            eligible_same_run_source_unit_ids
-        )
+        assert set(handle.blocking_source_unit_ids).issubset(eligible_same_run_source_unit_ids)
         prepared = handle._prepared
         prepared.retry_attempt_count += 1
-        lifecycle_attempt_count = (
-            prepared.prepared_at_attempt_count + prepared.retry_attempt_count
-        )
-        self.commit_only_attempts.append(
-            (prepared.source_unit_id, lifecycle_attempt_count)
-        )
+        lifecycle_attempt_count = prepared.prepared_at_attempt_count + prepared.retry_attempt_count
+        self.commit_only_attempts.append((prepared.source_unit_id, lifecycle_attempt_count))
         if self.never_converge:
             raise self._deferred(
                 prepared.kwargs["projection"],
@@ -3111,9 +3082,7 @@ class TombstoneUnlockingMemoryEngine(NoopMemoryEngine):
         *,
         eligible_same_run_source_unit_ids,
     ):
-        assert set(handle.blocking_source_unit_ids).issubset(
-            eligible_same_run_source_unit_ids
-        )
+        assert set(handle.blocking_source_unit_ids).issubset(eligible_same_run_source_unit_ids)
         prepared = handle._prepared
         assert self.events == ["tombstone"]
         self.events.append("commit")
@@ -3192,9 +3161,7 @@ class MixedBudgetConvergenceMemoryEngine(NoopMemoryEngine):
     ):
         prepared = handle._prepared
         self.retry_doc_ids.append(prepared.kwargs["doc_id"])
-        if not set(handle.blocking_source_unit_ids).issubset(
-            eligible_same_run_source_unit_ids
-        ):
+        if not set(handle.blocking_source_unit_ids).issubset(eligible_same_run_source_unit_ids):
             raise SourceUnitLifecycleExecutionError(
                 "external blocker",
                 handle._runtime_bundle,
@@ -4040,7 +4007,10 @@ MOVING_FILE_REPO_URL = "https://github.example/acme/payroll"
 def moving_file_doc_id(source_id: str, relative_path: str) -> str:
     """The Document id GitHub discovery gives a file of the moving-file repository."""
     return build_github_repo_doc_id(
-        source_id=source_id, repo_url=MOVING_FILE_REPO_URL, repo_ref="main", relative_path=relative_path,
+        source_id=source_id,
+        repo_url=MOVING_FILE_REPO_URL,
+        repo_ref="main",
+        relative_path=relative_path,
     )
 
 
@@ -4566,10 +4536,14 @@ async def _stage_completed_v9_recovery_attempt(
             metadata={"skipped_reading_group_count": skipped_reading_group_count},
         )
 
-    access_hash = lifecycle_access_context_hash(visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None)
+    access_hash = lifecycle_access_context_hash(
+        visibility="workspace", owner_user_id=None, project_key=None, repo_identifier=None
+    )
     capability = revision_inference_capability_hash(client, extraction_model="fixture")
     plan_requests = fixture_request_planner(
-        projection, access_context_hash=access_hash, extractor=ProjectionFragmentRecordingExtractor(),
+        projection,
+        access_context_hash=access_hash,
+        extractor=ProjectionFragmentRecordingExtractor(),
     )
 
     staged = await SourceUnitDeriver(db).derive(
@@ -4593,9 +4567,7 @@ async def _stage_completed_v9_recovery_attempt(
                 project_key=None,
                 repo_identifier=None,
             ),
-            inference_capability_hash=(
-                capability
-            ),
+            inference_capability_hash=(capability),
         )
     )
 
@@ -4621,11 +4593,7 @@ class V9RecoveryReplayGene(FakeGene):
     ) -> None:
         super().__init__()
         self.attempt = attempt
-        self.document_content = (
-            document_content
-            if document_content is not None
-            else attempt.context.document_content
-        )
+        self.document_content = document_content if document_content is not None else attempt.context.document_content
         self.version = version or attempt.context.document.version
 
     @classmethod
@@ -4791,9 +4759,7 @@ async def test_recovered_deferred_lifecycle_joins_commit_only_convergence(
     outcome = await recovery._resume_source_derivations(
         source_id=source_id,
         run_id="run-recovery-deferred-convergence",
-        lifecycle_execution_owner_id=(
-            "run-recovery-deferred-convergence:attempt:1"
-        ),
+        lifecycle_execution_owner_id=("run-recovery-deferred-convergence:attempt:1"),
     )
 
     assert outcome.processed == 0
@@ -4915,10 +4881,7 @@ async def test_newer_provider_target_supersedes_recovered_deferred_intent(
     state = await recovery.sync_gene(
         gene=V9RecoveryReplayGene(
             attempt,
-            document_content=(
-                attempt.context.document_content
-                + "\nThe provider now carries a newer rule.\n"
-            ),
+            document_content=(attempt.context.document_content + "\nThe provider now carries a newer rule.\n"),
             version="2",
         ),
         source_name="Recovery provider newer target",
@@ -4932,17 +4895,9 @@ async def test_newer_provider_target_supersedes_recovered_deferred_intent(
     assert state.docs_failed == 0
     assert engine.semantic_calls == 2
     assert engine.commit_only_calls == 1
-    attempts = {
-        item.id: item
-        for item in await db.list_source_derivation_attempts(
-            source_id=source_id
-        )
-    }
+    attempts = {item.id: item for item in await db.list_source_derivation_attempts(source_id=source_id)}
     assert attempts[attempt.id].status == "superseded"
-    assert (
-        attempts[attempt.id].terminal_reason_code
-        == DERIVATION_INPUT_SUPERSEDED
-    )
+    assert attempts[attempt.id].terminal_reason_code == DERIVATION_INPUT_SUPERSEDED
 
 
 @pytest.mark.asyncio
@@ -4954,16 +4909,13 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
         db,
         source_id=source_id,
     )
+
     class FailingNewerTargetEngine(RecoveryDeferredMemoryEngine):
         async def prepare_and_commit_projected_lifecycle(self, **kwargs):
             if self.semantic_calls:
                 self.semantic_calls += 1
-                raise MemoryExtractionFailure(
-                    "newer provider target failed after target resolution"
-                )
-            return await super().prepare_and_commit_projected_lifecycle(
-                **kwargs
-            )
+                raise MemoryExtractionFailure("newer provider target failed after target resolution")
+            return await super().prepare_and_commit_projected_lifecycle(**kwargs)
 
     engine = FailingNewerTargetEngine(
         blocker_source_unit_id=attempt.source_unit_id,
@@ -4981,10 +4933,7 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
     state = await recovery.sync_gene(
         gene=V9RecoveryReplayGene(
             attempt,
-            document_content=(
-                attempt.context.document_content
-                + "\nThe provider target cannot be extracted yet.\n"
-            ),
+            document_content=(attempt.context.document_content + "\nThe provider target cannot be extracted yet.\n"),
             version="2",
         ),
         source_name="Failed recovery provider target",
@@ -4996,16 +4945,10 @@ async def test_failed_newer_provider_target_still_supersedes_recovered_intent(
     assert state.docs_processed == 0
     assert state.docs_failed == 1
     assert engine.semantic_calls == 2
-    attempts = {
-        item.id: item
-        for item in await db.list_source_derivation_attempts(source_id=source_id)
-    }
+    attempts = {item.id: item for item in await db.list_source_derivation_attempts(source_id=source_id)}
     superseded = attempts[attempt.id]
     assert superseded.status == "superseded"
-    assert (
-        superseded.terminal_reason_code
-        == DERIVATION_INPUT_SUPERSEDED
-    )
+    assert superseded.terminal_reason_code == DERIVATION_INPUT_SUPERSEDED
 
 
 @pytest.mark.asyncio
@@ -5161,10 +5104,7 @@ async def test_derivation_recovery_commits_the_current_policy_identity(
         monkeypatch.setattr(
             source_derivation_module,
             "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
-            (
-                source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
-                + 1
-            ),
+            (source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION + 1),
         )
     extractor = ProjectionFragmentRecordingExtractor()
     recovery_engine = RecordingMemoryEngine()
@@ -5192,15 +5132,9 @@ async def test_derivation_recovery_commits_the_current_policy_identity(
     [lifecycle_call] = recovery_engine.projected_lifecycle_calls
     replacement_id = lifecycle_call["derivation_id"]
     assert replacement_id != attempt.id
-    attempts = {
-        item.id: item
-        for item in await db.list_source_derivation_attempts(source_id=source_id)
-    }
+    attempts = {item.id: item for item in await db.list_source_derivation_attempts(source_id=source_id)}
     assert attempts[attempt.id].status == "superseded"
-    assert (
-        attempts[attempt.id].terminal_reason_code
-        == "DERIVATION_INPUT_SUPERSEDED"
-    )
+    assert attempts[attempt.id].terminal_reason_code == "DERIVATION_INPUT_SUPERSEDED"
     assert attempts[replacement_id].status == "applied"
 
 
@@ -5217,10 +5151,7 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
     monkeypatch.setattr(
         source_derivation_module,
         "PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION",
-        (
-            source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION
-            + 1
-        ),
+        (source_derivation_module.PROJECTION_FRAGMENT_MODEL_PRESENTATION_POLICY_VERSION + 1),
     )
     recovery = GeneSyncOrchestrator(
         db=db,
@@ -5237,18 +5168,10 @@ async def test_policy_replacement_failure_preserves_recoverable_new_work(
             run_id="run-v9-policy-replacement-failure",
         )
 
-    attempts = {
-        item.id: item
-        for item in await db.list_source_derivation_attempts(source_id=source_id)
-    }
+    attempts = {item.id: item for item in await db.list_source_derivation_attempts(source_id=source_id)}
     assert attempts[attempt.id].status == "superseded"
-    assert (
-        attempts[attempt.id].terminal_reason_code
-        == "DERIVATION_INPUT_SUPERSEDED"
-    )
-    [replacement] = [
-        item for item in attempts.values() if item.id != attempt.id
-    ]
+    assert attempts[attempt.id].terminal_reason_code == "DERIVATION_INPUT_SUPERSEDED"
+    [replacement] = [item for item in attempts.values() if item.id != attempt.id]
     assert replacement.status == "completed"
     assert await db.get_current_source_unit_revision(attempt.source_unit_id) is None
 
@@ -5548,6 +5471,7 @@ async def test_supported_configured_sources_reach_shared_lifecycle_execution_sea
         access_policy="workspace",
         owner_user_id="dev",
     )
+
     class SourceTypeGene(UpdatingDocumentGene):
         @classmethod
         def metadata(cls):
@@ -5559,8 +5483,13 @@ async def test_supported_configured_sources_reach_shared_lifecycle_execution_sea
                     item = replace(item, extra={"vault_id": "notes", "relative_path": "design.md"})
                 yield item
 
-    gene_type = (UpdatingTicketGene if source_type == "jira" else
-                 LargeConfluenceGene if source_type == "confluence" else SourceTypeGene)
+    gene_type = (
+        UpdatingTicketGene
+        if source_type == "jira"
+        else LargeConfluenceGene
+        if source_type == "confluence"
+        else SourceTypeGene
+    )
     engine = RecordingMemoryEngine()
     state = await GeneSyncOrchestrator(
         db=db,
@@ -6248,18 +6177,14 @@ async def test_sync_pipeline_can_delegate_terminal_result_persistence(db: Databa
 
 @pytest.mark.asyncio
 async def test_migration_108_drops_workspace_wide_sync_schedule(db: Database):
-    await db.db.execute(
-        "CREATE TABLE schedule_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)"
-    )
+    await db.db.execute("CREATE TABLE schedule_config (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0)")
     await db.db.execute("DELETE FROM schema_migrations WHERE version = 108")
     await db.db.commit()
 
     await db._run_migrations()  # noqa: SLF001
     await db._run_migrations()  # noqa: SLF001
 
-    tables = {
-        row[0] for row in await db.db.execute_fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
-    }
+    tables = {row[0] for row in await db.db.execute_fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert "schedule_config" not in tables
 
 
@@ -6469,7 +6394,9 @@ async def test_due_local_source_enqueues_owner_daemon_job_not_server_run(db: Dat
         next_run_at=due_at,
     )
 
-    local_count = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=due_at)
+    local_count = await db.enqueue_due_local_agent_jobs(
+        workspace_id="default", device_acquisition_payload=_no_device_source, now=due_at
+    )
     server_runs = await db.enqueue_due_source_sync_runs(now=due_at)
     jobs = await db.lease_local_agent_jobs(
         **leasing_device(),
@@ -6511,7 +6438,9 @@ async def test_due_ownerless_local_source_advances_schedule_without_job(db: Data
         next_run_at=due_at,
     )
 
-    local_count = await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=due_at)
+    local_count = await db.enqueue_due_local_agent_jobs(
+        workspace_id="default", device_acquisition_payload=_no_device_source, now=due_at
+    )
 
     assert local_count == 0
     source = await db.get_source(source_id)
@@ -6523,6 +6452,7 @@ async def test_due_ownerless_local_source_advances_schedule_without_job(db: Data
 async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
     now = datetime(2026, 7, 10, tzinfo=timezone.utc)
     await db.insert_local_agent_job(
+        workspace_id="default",
         job_id="laj-retry",
         source_id="src-local",
         source_type="teams",
@@ -6558,10 +6488,16 @@ async def test_retryable_local_agent_completion_requeues_same_job(db: Database):
         retryable=True,
         now=now + timedelta(seconds=1),
     )
-    assert await db.lease_local_agent_jobs(
-        **leasing_device(),
-        user_id="owner-a", limit=1, lease_seconds=60, now=now + timedelta(seconds=2),
-    ) == []
+    assert (
+        await db.lease_local_agent_jobs(
+            **leasing_device(),
+            user_id="owner-a",
+            limit=1,
+            lease_seconds=60,
+            now=now + timedelta(seconds=2),
+        )
+        == []
+    )
     second = await db.lease_local_agent_jobs(
         **leasing_device(),
         user_id="owner-a",
@@ -6587,6 +6523,7 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
         owner_user_id="owner-a",
     )
     first_id, first_created = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-normal",
         source_id="src-local",
         source_type="teams",
@@ -6596,6 +6533,7 @@ async def test_queued_force_request_promotes_existing_local_agent_job(db: Databa
         execution_owner_user_id="owner-a",
     )
     promoted_id, promoted_created = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-force",
         source_id="src-local",
         source_type="teams",
@@ -6624,6 +6562,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
         owner_user_id="owner-a",
     )
     first_id, _ = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-leased-normal",
         source_id="src-local",
         source_type="teams",
@@ -6634,6 +6573,7 @@ async def test_leased_force_request_creates_serial_successor_job(db: Database):
     )
     leased = await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=1, lease_seconds=60)
     promoted_id, created = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-leased-force",
         source_id="src-local",
         source_type="teams",
@@ -6675,6 +6615,7 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
         owner_user_id="owner-a",
     )
     first_id, _ = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-expired-original",
         source_id="src-local",
         source_type="teams",
@@ -6685,6 +6626,7 @@ async def test_expired_original_and_successor_are_not_released_in_same_batch(db:
     )
     await db.lease_local_agent_jobs(**leasing_device(), user_id="owner-a", limit=1, lease_seconds=60, now=now)
     successor_id, _ = await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-expired-successor",
         source_id="src-local",
         source_type="teams",
@@ -6878,9 +6820,13 @@ async def test_scheduler_applies_bounded_agent_runtime_retention(monkeypatch) ->
 
     [(cutoff, limit)] = calls
     assert limit == 77
-    assert timedelta(days=29, hours=23) < datetime.now(timezone.utc) - cutoff < timedelta(
-        days=30,
-        hours=1,
+    assert (
+        timedelta(days=29, hours=23)
+        < datetime.now(timezone.utc) - cutoff
+        < timedelta(
+            days=30,
+            hours=1,
+        )
     )
 
 
@@ -6890,8 +6836,9 @@ async def test_scheduler_shutdown_waits_for_running_job() -> None:
     release = asyncio.Event()
 
     class BlockingDatabase:
-        async def enqueue_due_local_agent_jobs(self, *, device_acquisition_payload, limit: int) -> list:
-            assert limit == 50
+        async def enqueue_due_local_agent_jobs(self, *, device_acquisition_payload, limit: int, workspace_id: str) -> list:
+            # Scheduled jobs are the workspace's own, so a person's Sync now coalesces with them.
+            assert (limit, workspace_id) == (50, service.workspace_id)
             started.set()
             await release.wait()
             return []
@@ -7173,21 +7120,15 @@ async def test_source_sync_worker_executes_leased_run_and_completes_it(db: Datab
     assert completed.lease_owner is None
     assert source is not None
     assert source["last_sync"] == "2026-07-10T08:00:00+00:00"
-    assert [(row["run_id"], row["status"]) for row in history] == [
-        (enqueued.run_id, "success")
-    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "success")]
     assert provider.force_full_sync_values == [True]
     assert provider.extraction_pools == [worker._extraction_pool]
     assert provider.lifecycle_cycle_ids == [f"{enqueued.run_id}:attempt:1"]
     assert provider.vector_delivery_source_ids == [source_id]
     assert len(provider.runtime_event_trace_sink.batches) == 1
-    assert provider.runtime_event_trace_sink.batches[0][0].event_name == (
-        "source_unit_lifecycle_outcome"
-    )
+    assert provider.runtime_event_trace_sink.batches[0][0].event_name == ("source_unit_lifecycle_outcome")
     assert len(provider.runtime_event_trace_sink.assessments.batches) == 1
-    projected_assessments, projected_events = (
-        provider.runtime_event_trace_sink.assessments.batches[0]
-    )
+    projected_assessments, projected_events = provider.runtime_event_trace_sink.assessments.batches[0]
     assert projected_assessments[0].criterion == "source_unit_lifecycle_completion"
     assert projected_events == provider.runtime_event_trace_sink.batches[0]
 
@@ -7261,9 +7202,7 @@ async def test_source_sync_worker_gives_each_retry_attempt_a_new_lifecycle_cycle
         enqueued.run_id,
         enqueued.run_id,
     ]
-    assert [(row["run_id"], row["status"]) for row in history] == [
-        (enqueued.run_id, "success")
-    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "success")]
 
 
 @pytest.mark.asyncio
@@ -7307,9 +7246,7 @@ async def test_source_sync_worker_rejects_legacy_unsupported_run_without_runtime
     assert "does not support ordinary sync" in failed.error_message
     assert source is not None
     assert source["last_sync"] is None
-    assert [(row["run_id"], row["status"]) for row in history] == [
-        (enqueued.run_id, "failed")
-    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "failed")]
 
 
 @pytest.mark.asyncio
@@ -7780,9 +7717,7 @@ async def test_source_sync_worker_does_not_replay_partial_final_state(db: Databa
     assert sync_state.last_sync_status == "partial"
     assert source is not None
     assert source["last_sync"] == successful_at.isoformat()
-    assert [(row["run_id"], row["status"]) for row in history] == [
-        (enqueued.run_id, "partial")
-    ]
+    assert [(row["run_id"], row["status"]) for row in history] == [(enqueued.run_id, "partial")]
 
 
 @pytest.mark.asyncio
@@ -8943,9 +8878,7 @@ async def test_stable_github_file_move_reuses_metadata_without_reextracting(db: 
     assert ordinary_after_move.last_sync_status == "success"
     assert moved_again.last_sync_status == "success"
     assert extraction_calls_after_first > 0
-    assert (
-        len(extractor.fragment_calls)
-    ) == extraction_calls_after_first
+    assert (len(extractor.fragment_calls)) == extraction_calls_after_first
     assert await db.get_document(old_doc_id) is None
     assert await db.get_document(new_doc_id) is None
     assert await db.get_document(final_doc_id) is not None
@@ -9495,7 +9428,9 @@ async def test_sync_gene_records_source_unit_llm_summary_for_changed_and_noop_ru
     structured_client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="claude-sonnet-latest",
-            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
+            max_input_tokens=32768,
+            context_window_tokens=65536,
+            max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=1.0,
@@ -9618,7 +9553,9 @@ async def test_source_unit_llm_summary_is_recorded_when_lifecycle_execution_fail
     structured_client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="claude-sonnet-latest",
-            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
+            max_input_tokens=32768,
+            context_window_tokens=65536,
+            max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=0.02 if failure_mode == "deadline_exceeded" else 1.0,
@@ -9694,7 +9631,9 @@ async def test_recovery_records_actual_failed_calls_in_source_unit_summary(db: D
     client = LiteLlmStructuredClient(
         StructuredLlmConfig(
             model="anthropic/test",
-            max_input_tokens=32768, context_window_tokens=65536, max_output_tokens=32768,
+            max_input_tokens=32768,
+            context_window_tokens=65536,
+            max_output_tokens=32768,
             base_url=None,
             api_key=None,
             timeout_s=0.02 if failure_mode == "deadline_exceeded" else 1.0,
@@ -10166,7 +10105,8 @@ class _OrderRecordingMemoryEngine(DeferredOnceMemoryEngine):
 
     async def retry_deferred_projected_lifecycle(self, handle, *, eligible_same_run_source_unit_ids):
         result = await super().retry_deferred_projected_lifecycle(
-            handle, eligible_same_run_source_unit_ids=eligible_same_run_source_unit_ids,
+            handle,
+            eligible_same_run_source_unit_ids=eligible_same_run_source_unit_ids,
         )
         self.events.append(("commit", handle._prepared.kwargs["doc_id"]))
         return result
@@ -10181,19 +10121,32 @@ class _OrderRecordingMemoryEngine(DeferredOnceMemoryEngine):
 async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Database, defer: bool) -> None:
     source_id = "src-unit-identity-change"
     await db.upsert_source(
-        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     first = await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=OrchestratorMemoryStore(db),
+        max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     assert first.last_sync_status == "success"
     engine = _OrderRecordingMemoryEngine(defer=defer)
 
     # jira-2 lost its identity and returns as jira-1; a deferred jira-1 waits only on jira-0 of this run.
     state = await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
+        max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
@@ -10206,11 +10159,20 @@ async def test_a_new_unit_commits_before_the_unit_it_replaces_is_removed(db: Dat
 async def test_a_new_unit_that_fails_for_good_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-failed"
     await db.upsert_source(
-        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=OrchestratorMemoryStore(db),
+        max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     engine = _OrderRecordingMemoryEngine(defer=True)
 
@@ -10220,8 +10182,12 @@ async def test_a_new_unit_that_fails_for_good_does_not_keep_the_unit_the_listing
     engine.retry_deferred_projected_lifecycle = fail_retry
 
     state = await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
+        max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
@@ -10236,11 +10202,20 @@ async def test_a_new_unit_that_fails_for_good_does_not_keep_the_unit_the_listing
 async def test_a_new_unit_still_deferred_by_this_run_does_not_keep_the_unit_the_listing_left_out(db: Database) -> None:
     source_id = "src-unit-identity-change-stuck"
     await db.upsert_source(
-        id=source_id, type="jira", name="Jira", config_json="{}", access_policy="workspace", owner_user_id="dev",
+        id=source_id,
+        type="jira",
+        name="Jira",
+        config_json="{}",
+        access_policy="workspace",
+        owner_user_id="dev",
     )
     await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=NoopMemoryEngine(), memory_store=OrchestratorMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=NoopMemoryEngine(),
+        memory_store=OrchestratorMemoryStore(db),
+        max_concurrent=1,
     ).sync_gene(gene=_IssueGene(0, 2), source_name="Jira", source_id=source_id, force_full_sync=True)
     engine = _OrderRecordingMemoryEngine(defer=True)
 
@@ -10250,8 +10225,12 @@ async def test_a_new_unit_still_deferred_by_this_run_does_not_keep_the_unit_the_
     engine.retry_deferred_projected_lifecycle = defer_again
 
     state = await GeneSyncOrchestrator(
-        db=db, doc_store=StubDocumentStore(), memory_extractor=ProjectionFragmentRecordingExtractor(),
-        memory_engine=engine, memory_store=RecordingDocumentDeleteMemoryStore(db), max_concurrent=1,
+        db=db,
+        doc_store=StubDocumentStore(),
+        memory_extractor=ProjectionFragmentRecordingExtractor(),
+        memory_engine=engine,
+        memory_store=RecordingDocumentDeleteMemoryStore(db),
+        max_concurrent=1,
         retry_sleep=_skip_retry_delay,
     ).sync_gene(gene=_IssueGene(0, 1), source_name="Jira", source_id=source_id, force_full_sync=True)
 
@@ -10292,10 +10271,7 @@ async def test_external_blocker_does_not_consume_commit_attempt_budget(
         source_id=source_id,
         force_full_sync=True,
     )
-    units_by_doc = {
-        doc_id: await db.find_source_unit_by_document_id(source_id, doc_id)
-        for doc_id in item_ids
-    }
+    units_by_doc = {doc_id: await db.find_source_unit_by_document_id(source_id, doc_id) for doc_id in item_ids}
     assert first.last_sync_status == "success"
     assert all(units_by_doc.values())
     ordered = sorted(
@@ -10392,6 +10368,7 @@ async def test_new_document_lifecycle_retry_reuses_staged_document(
         access_policy="workspace",
         owner_user_id="dev",
     )
+
     async def reject_projected_delete(doc_id: str) -> None:
         raise AssertionError(f"sync retry must not delete staged Document {doc_id}")
 
@@ -10787,9 +10764,7 @@ async def test_missing_required_confluence_pdf_fails_sync_without_hiding_gap(db:
     assert state.last_sync_status == "partial"
     assert state.docs_processed == 0
     assert state.docs_failed == 1
-    assert state.error_message == (
-        "1 document could not be imported. PDF export was unavailable for 1 document."
-    )
+    assert state.error_message == ("1 document could not be imported. PDF export was unavailable for 1 document.")
     assert "Confluence PDF export did not produce a PDF" in state.failed_docs[0].error
 
 
@@ -11164,6 +11139,5 @@ async def test_unchanged_document_writes_again_the_objects_it_does_not_own(db: D
     assert doc_store.normalized_store_calls == 1
     for uri in (stored.raw_content_uri, stored.normalized_content_uri, stored.pdf_content_uri):
         assert doc_store.belongs_to_document(uri, source_id=source_id, doc_id="jira-0")
-
 
     assert await db.list_source_artifact_cleanup_tasks(source_id=source_id) == []

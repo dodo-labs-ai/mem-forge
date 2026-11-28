@@ -252,7 +252,7 @@ const RESPONSES: Record<string, unknown> = {
   "/api/v1/genes": [],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
   "/api/cloud/local-agent/status": localSyncStatus(false),
-  "/api/cloud/local-agent/jobs/current": { data: [] },
+  "/api/v1/local-agent/jobs/current": { data: [] },
 };
 
 interface CandidateBody {

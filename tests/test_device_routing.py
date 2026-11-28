@@ -163,6 +163,7 @@ def test_a_setup_job_that_names_a_device_goes_to_that_device_alone(owned) -> Non
     database, _job_id = owned
     asyncio.run(
         database.insert_local_agent_job(
+            workspace_id="default",
             job_id="laj-pick",
             source_id="",
             source_type="local_markdown",
@@ -294,7 +295,7 @@ def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in
 
     def pick(**request) -> dict:
         response = client.post(
-            "/api/cloud/local-agent/jobs",
+            "/api/v1/local-agent/jobs",
             headers=headers,
             json={"source_type": "local_markdown", "operation": "local_markdown_pick_root", "payload": {}, **request},
         )
@@ -307,7 +308,7 @@ def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in
             on_the_chosen_device = pick(source_id="src-notes", device_id="dev-desktop")
             for_a_new_source = pick(device_id="dev-desktop")
             not_theirs = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers=headers,
                 json={
                     "source_type": "local_markdown",
@@ -317,13 +318,13 @@ def test_the_folder_picker_opens_on_the_execution_device_or_the_device_chosen_in
                 },
             )
             unchosen = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers=headers,
                 json={"source_type": "local_markdown", "operation": "local_markdown_pick_root", "payload": {}},
             )
             # Another member picks a folder only on their own device, chosen in Where it runs.
             by_another_member = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "blake", "x-test-workspace-role": "member"},
                 json={
                     "source_type": "local_markdown",

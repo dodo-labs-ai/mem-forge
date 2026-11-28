@@ -113,6 +113,7 @@ def _queue_job(database: Database, source_id: str, job_id: str) -> None:
     source = asyncio.run(database.get_source(source_id))
     asyncio.run(
         database.enqueue_local_agent_job(
+            workspace_id="default",
             job_id=job_id,
             source_id=source_id,
             source_type="confluence",
@@ -130,6 +131,7 @@ def _queue_sign_in(database: Database, source_id: str, job_id: str, *, device_id
 
     asyncio.run(
         database.insert_local_agent_job(
+            workspace_id="default",
             job_id=job_id,
             source_id=source_id,
             source_type="confluence",
@@ -230,9 +232,7 @@ def test_moving_to_the_device_deletes_the_servers_secrets_and_makes_the_changer_
 def test_the_change_opens_no_transition_and_keeps_what_the_source_holds(client, database):
     source_id = _create(client)
     _hold_something(database, source_id)
-    widened = client.put(
-        f"/api/v1/sources/{source_id}", json={"config": {**CONFLUENCE, "spaces": ["ACME", "OPS"]}}
-    )
+    widened = client.put(f"/api/v1/sources/{source_id}", json={"config": {**CONFLUENCE, "spaces": ["ACME", "OPS"]}})
     assert widened.status_code == 200, widened.text
     before = _holdings(database, source_id)
     assert before[1:] == (["confluence-7"], CURSOR, before[3]) and before[3] is not None
@@ -522,9 +522,7 @@ def test_a_run_queued_after_a_move_is_its_new_devices_and_not_the_old_devices_he
     _queue_job(database, source_id, "job-on-laptop")
     assert _lease(database, CHANGER, DEVICE_ID, source_id) == ["job-on-laptop"]
     asyncio.run(
-        database.change_source_executor(
-            source_id, executor="device", config_json="{}", execution_device_id=DESKTOP
-        )
+        database.change_source_executor(source_id, executor="device", config_json="{}", execution_device_id=DESKTOP)
     )
 
     _queue_job(database, source_id, "job-on-desktop")

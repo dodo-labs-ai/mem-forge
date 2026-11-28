@@ -25,6 +25,12 @@
   release together.
 - The `local_markdown_preview_tree` local-agent operation is removed: a local
   folder has no Check setup, because only its computer reads it.
+- Local-agent jobs belong to their workspace's API: the admin UI queues them
+  with `POST /api/v1/local-agent/jobs` and lists each Source's current job
+  with `GET /api/v1/local-agent/jobs/current`. The routes a daemon calls stay
+  under `/api/cloud/local-agent`, and `GET /api/cloud/local-agent/status`
+  serves the admin UI too. A Source's Sync now job is listed with the
+  workspace's other jobs.
 
 - Local Repository Sources run on their computer like every other Source on My
   computer: the daemon walks the whole folder on every run, uploads only file

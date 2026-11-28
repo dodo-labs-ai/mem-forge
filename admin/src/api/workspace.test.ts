@@ -3,7 +3,6 @@ import { createWorkspaceController, type WorkspaceTarget } from "./workspace";
 
 const WORKSPACE_A: WorkspaceTarget = {
   resourceBaseUrl: "/api/cloud/workspaces/ws-a/v1/",
-  localAgentBaseUrl: "/api/cloud/workspaces/ws-a/local-agent",
   workspaceId: "ws-a",
   label: "Payroll",
   shared: true,
@@ -64,7 +63,6 @@ test("a target that does not say it has one user is shared", () => {
   const controller = createWorkspaceController(vi.fn());
   const unmarked = {
     resourceBaseUrl: WORKSPACE_A.resourceBaseUrl,
-    localAgentBaseUrl: WORKSPACE_A.localAgentBaseUrl,
     workspaceId: WORKSPACE_A.workspaceId,
   };
 

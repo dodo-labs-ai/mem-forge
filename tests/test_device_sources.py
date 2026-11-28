@@ -234,7 +234,7 @@ def test_the_servers_browser_sessions_serve_server_sources_only(database) -> Non
 
 def _credential_check(client: TestClient, source_id: str, *, user: str = OWNER):
     return client.post(
-        "/api/cloud/local-agent/jobs",
+        "/api/v1/local-agent/jobs",
         headers={PRINCIPAL_HEADER: user},
         json={"source_id": source_id, "source_type": "jira", "operation": "credential_check", "payload": {}},
     )

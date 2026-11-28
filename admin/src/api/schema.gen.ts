@@ -38,46 +38,13 @@ export interface paths {
          * Remove Local Agent Device
          * @description Forget one of the caller's devices.
          *
-         *     Each Source it executed loses its execution device and shows Finish
-         *     setup until its owner chooses another device in Where it runs. Its
-         *     queued jobs are cancelled. A daemon that still runs on the device
-         *     appears again with its next report, without its Sources.
+         *     Each Source it executed, in every workspace the caller's daemon
+         *     serves, loses its execution device and shows Finish setup until its
+         *     owner chooses another device in Where it runs. Its queued jobs are
+         *     cancelled. A daemon that still runs on the device appears again with
+         *     its next report, without its Sources.
          */
         delete: operations["remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/cloud/local-agent/jobs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Create Local Agent Job */
-        post: operations["create_local_agent_job_api_cloud_local_agent_jobs_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/cloud/local-agent/jobs/current": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read Current Local Agent Jobs */
-        get: operations["read_current_local_agent_jobs_api_cloud_local_agent_jobs_current_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -116,7 +83,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read Local Agent Job */
+        /**
+         * Read Local Agent Job
+         * @description A job the caller created or executes, in a workspace the caller's daemon still serves.
+         */
         get: operations["read_local_agent_job_api_cloud_local_agent_jobs__job_id__get"];
         put?: never;
         post?: never;
@@ -135,7 +105,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Complete Local Agent Job */
+        /**
+         * Complete Local Agent Job
+         * @description End the device's attempt; completing an attempt that already ended answers the job's status.
+         */
         post: operations["complete_local_agent_job_api_cloud_local_agent_jobs__job_id__complete_post"];
         delete?: never;
         options?: never;
@@ -877,6 +850,40 @@ export interface paths {
          * @description Return compact memory context for Codex/Claude lifecycle hooks.
          */
         post: operations["build_hook_context_api_v1_hooks_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/local-agent/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Local Agent Job */
+        post: operations["create_local_agent_job_api_v1_local_agent_jobs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/local-agent/jobs/current": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Current Local Agent Jobs */
+        get: operations["read_current_local_agent_jobs_api_v1_local_agent_jobs_current_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4047,8 +4054,6 @@ export interface components {
             source_id: string;
             /** Source Type */
             source_type: string;
-            /** Workspace Id */
-            workspace_id?: string | null;
         };
         /** LocalAgentJobCreateResponse */
         LocalAgentJobCreateResponse: {
@@ -7324,59 +7329,6 @@ export interface operations {
             };
         };
     };
-    create_local_agent_job_api_cloud_local_agent_jobs_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalAgentJobCreateRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LocalAgentJobCreateResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    read_current_local_agent_jobs_api_cloud_local_agent_jobs_current_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LocalAgentJobListResponse"];
-                };
-            };
-        };
-    };
     lease_local_agent_jobs_api_cloud_local_agent_jobs_lease_post: {
         parameters: {
             query?: never;
@@ -7427,7 +7379,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LocalAgentJobResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8623,6 +8575,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_local_agent_job_api_v1_local_agent_jobs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LocalAgentJobCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalAgentJobCreateResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_current_local_agent_jobs_api_v1_local_agent_jobs_current_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalAgentJobListResponse"];
                 };
             };
         };

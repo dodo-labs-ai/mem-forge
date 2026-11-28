@@ -35,7 +35,7 @@ class LocalAgentJobStore(Protocol):
         payload: Mapping[str, Any],
         created_by_user_id: str,
         execution_owner_user_id: str,
-        workspace_id: str = "default",
+        workspace_id: str,
         device_id: str | None = None,
         trigger: str = "manual",
         retry_job_id: str | None = None,
@@ -52,7 +52,31 @@ class LocalAgentJobStore(Protocol):
         """
         ...
 
+    async def insert_local_agent_job(
+        self,
+        *,
+        job_id: str,
+        source_id: str,
+        source_type: str,
+        operation: str,
+        payload: Mapping[str, Any],
+        created_by_user_id: str,
+        execution_owner_user_id: str,
+        workspace_id: str,
+        device_id: str | None = None,
+    ) -> bool:
+        """Queue a setup job; ``device_id`` names the one device of the owner that may lease it.
+
+        A job without a device goes to whichever of the owner's devices
+        leases first.
+        """
+        ...
+
     async def get_local_agent_job(self, job_id: str) -> dict[str, Any] | None: ...
+
+    async def list_current_local_agent_jobs(self, *, workspace_id: str, user_id: str) -> list[dict[str, Any]]:
+        """The current or else latest sync job of each of the workspace's Sources the user executes."""
+        ...
 
     async def current_local_agent_lease(
         self,

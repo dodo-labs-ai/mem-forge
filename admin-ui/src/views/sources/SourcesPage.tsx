@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { Files, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
-import { currentLocalAgentBaseUrl, resourceClient } from "@/api/client";
+import { currentWorkspaceKey, resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   GeneMetadata,
@@ -201,7 +201,7 @@ function awaitingSyncAdmission(
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
-  const workspaceKey = currentLocalAgentBaseUrl();
+  const workspaceKey = currentWorkspaceKey();
   const navigate = useNavigate();
   const location = useLocation();
   const [addOpen, setAddOpen] = useState(false);

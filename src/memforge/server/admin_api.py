@@ -190,7 +190,6 @@ from memforge.models import (
 from memforge.sync_progress import (
     SyncProgressPhase,
     SyncProgressUnit,
-    normalize_sync_progress_snapshot,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
@@ -301,7 +300,6 @@ from memforge.source_access_transition import (
     SourceAccessTransitionService,
 )
 from memforge.local_agent.readiness import (
-    LOCAL_AGENT_DEVICE_STALE_SECONDS,
     DeviceState,
     SourceConnectionReason,
     SourceConnectionState,
@@ -329,12 +327,18 @@ from memforge.local_agent.credential_check import (
     credential_check_job_payload,
     signs_in_with_browser_session,
 )
-from memforge.local_agent.device_lease import EXECUTED_SOURCES_FIELD
 from memforge.local_agent.executor_change import move_source_executor
+from memforge.local_agent.broker import OneWorkspace
 from memforge.local_agent.job_store import LocalAgentJobStore
+from memforge.server.local_agent_host_api import (
+    LocalAgentJobResponse,
+    LocalAgentJobStatus,
+    build_local_agent_host_router,
+    shape_local_agent_job,
+)
+from memforge.server.principal import resolve_request_principal
 from memforge.local_agent.device_report import (
     DEVICE_ID_MAX_CHARS,
-    DeviceReport,
     LocalAgentDevice,
     declared_acquisition_contracts,
 )
@@ -479,16 +483,6 @@ def _verified_artifact_chunks(
             yield chunk
     if observed_size != expected_size or digest.hexdigest() != expected_sha256:
         raise RuntimeError("Source Artifact integrity mismatch during streaming")
-
-
-def resolve_request_principal(request: Request) -> str:
-    """Resolve the request principal through the app-scoped resolver."""
-    resolver = getattr(request.app.state, "principal_resolver", None)
-    if resolver is None:
-        from memforge.server.principal import resolve_principal
-
-        resolver = resolve_principal
-    return resolver(request)
 
 
 def resolve_request_workspace_role(request: Request) -> str:
@@ -736,45 +730,6 @@ async def _require_current_acquisition_contract(
         return
     await jobs.requeue_local_agent_job_uncounted(job_id=job_id, attempt_count=attempt_count)
     raise HTTPException(status_code=409, detail=ACQUISITION_CONTRACT_CHANGED)
-
-
-DEVICE_REPORT_REQUIRED = "device_report_required"
-
-
-def _device_report(payload: Mapping[str, Any] | None) -> DeviceReport:
-    """The device report a lease or job heartbeat carries; 422 when it is missing or malformed.
-
-    A daemon that sends none predates the device report and takes no job
-    until its device installs the server's MemForge version, which the
-    answer names.
-    """
-
-    if payload is None:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": DEVICE_REPORT_REQUIRED,
-                "message": (
-                    "This MemForge daemon sends no device report, so it takes no jobs. "
-                    f"Install MemForge {installed_version()} on this device and restart its daemon."
-                ),
-            },
-        )
-    try:
-        return DeviceReport.from_payload(payload)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-def _device_source_entry(source: Mapping[str, Any]) -> dict[str, Any]:
-    """A device Source as a daemon reads it: its type, its configuration without secrets, and its execution device."""
-
-    return {
-        "id": source["id"],
-        "type": source["type"],
-        "config": acquisition_job_config(str(source["type"]), source.get("config") or {}),
-        "execution_device_id": source.get("execution_device_id"),
-    }
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -2033,7 +1988,6 @@ SourceAccessPolicyValue = Literal["private", "workspace"]
 SourceViewerRole = Literal["owner", "workspace_admin", "member", "viewer"]
 SourceSyncRunStatus = Literal["pending", "running", "success", "failed"]
 SourceSyncStatus = Literal["pending", "running", "recovering", "success", "partial", "failed"]
-LocalAgentJobStatus = Literal["queued", "leased", "succeeded", "failed"]
 
 
 class SourceSyncProgressAmountResponse(BaseModel):
@@ -2731,7 +2685,6 @@ class ImageDocumentsReprocessResponse(BaseModel):
 
 
 class LocalAgentJobCreateRequest(BaseModel):
-    workspace_id: str | None = None
     source_id: str = ""
     source_type: str
     operation: str
@@ -2750,32 +2703,6 @@ class LocalAgentJobCreateRequest(BaseModel):
     )
 
 
-class LocalAgentJobLeaseRequest(BaseModel):
-    limit: int = Field(default=5, ge=1, le=20)
-    lease_seconds: int = Field(default=60, ge=1, le=3600)
-    wait_seconds: int = Field(default=0, ge=0, le=25)
-    device: dict[str, Any] | None = None
-
-
-class LocalAgentJobHeartbeatRequest(BaseModel):
-    attempt_count: int = Field(ge=1)
-    lease_seconds: int = Field(default=60, ge=1, le=3600)
-    progress: dict[str, Any] | None = None
-    device: dict[str, Any] | None = None
-
-
-class LocalAgentJobCompleteRequest(BaseModel):
-    status: Literal["succeeded", "failed"]
-    attempt_count: int = Field(ge=1)
-    device_id: str = Field(
-        min_length=1,
-        max_length=DEVICE_ID_MAX_CHARS,
-        description="The device that holds the attempt; only the device that leased it completes it.",
-    )
-    result: dict[str, Any] = Field(default_factory=dict)
-    error: str | None = Field(default=None, max_length=2000)
-
-
 class LocalAgentJobCreateResponse(BaseModel):
     job_id: str
     status: LocalAgentJobStatus
@@ -2786,84 +2713,8 @@ class LocalAgentJobCreateResponse(BaseModel):
     )
 
 
-class LocalAgentJobResponse(BaseModel):
-    job_id: str
-    workspace_id: str
-    source_id: str
-    source_type: str
-    operation: str
-    status: LocalAgentJobStatus
-    payload: dict[str, Any]
-    execution_owner_user_id: str
-    result: dict[str, Any] = Field(
-        description=(
-            "The daemon's report: sync progress while the job runs, then its completion result. "
-            "Empty before the first report."
-        ),
-    )
-    last_error: str | None
-    next_attempt_at: str | None
-    leased_until: str | None
-    attempt_count: int
-    created_at: str
-    updated_at: str
-    finished_at: str | None
-
-
 class LocalAgentJobListResponse(BaseModel):
     data: list[LocalAgentJobResponse]
-
-
-class LocalAgentDeviceStatus(BaseModel):
-    device_id: str
-    name: str
-    version: str
-    acquisition_contracts: dict[str, int] = Field(
-        description=(
-            "The acquisition contract of each document type, as the device's latest report declares it. A device "
-            "acquires a type only while its contract equals the server's."
-        ),
-    )
-    status: Literal["online", "offline"]
-    last_seen_at: str
-
-
-class LocalAgentDeviceSource(BaseModel):
-    """A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets."""
-
-    id: str
-    name: str
-    type: str
-    config: dict[str, Any]
-    execution_device_id: str | None = Field(
-        description="The caller's device that executes the Source; null while the caller has chosen none.",
-    )
-
-
-class LocalAgentDeviceRemovedResponse(BaseModel):
-    """The removed device and the Sources that no longer have an execution device."""
-
-    device_id: str
-    source_ids: list[str]
-
-
-class LocalAgentServerContracts(BaseModel):
-    """The server's MemForge version and the acquisition contract of each document type."""
-
-    version: str
-    acquisition_contracts: dict[str, int]
-
-
-class LocalAgentDaemonStatusResponse(BaseModel):
-    """The caller's devices, whether any of them is online, the caller's device Sources and the server's contracts."""
-
-    status: Literal["online", "offline"]
-    last_seen_at: str | None
-    devices: list[LocalAgentDeviceStatus]
-    sources: list[LocalAgentDeviceSource]
-    server: LocalAgentServerContracts
-    checked_at: str
-    stale_after_seconds: int
 
 
 class SourceSubscriptionRequest(BaseModel):
@@ -5118,6 +4969,7 @@ def create_admin_app(
     maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
     local_agent_jobs: LocalAgentJobStore | None = None,
+    serves_daemons: bool = True,
     langfuse_annotation_adapter: object | None = None,
     workspace_id: str = SELF_HOSTED_WORKSPACE_ID,
 ) -> FastAPI:
@@ -5129,6 +4981,15 @@ def create_admin_app(
         Connected Database instance for all storage operations.
     config:
         Application configuration (paths, LLM settings, server settings).
+    local_agent_jobs:
+        The store of the workspace's local-agent jobs and devices; ``db``
+        itself when omitted. An app that serves daemons leases them from
+        ``db``, so a store passed with ``serves_daemons`` keeps its jobs
+        there.
+    serves_daemons:
+        Whether this app answers the routes its daemons call
+        (``/api/cloud/local-agent``) from ``db``. A deployment that answers
+        them once in front of several workspace apps passes ``False``.
 
     Returns
     -------
@@ -5184,6 +5045,9 @@ def create_admin_app(
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.maintenance_operator_resolver = maintenance_operator_resolver
         app.state.local_agent_jobs = local_agent_jobs or app.state.db
+        if serves_daemons:
+            app.state.local_agent_broker = app.state.db
+            app.state.daemon_workspaces = OneWorkspace(workspace_id, app.state.db)
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
         app.state.sync_service = SyncService(
             app.state.db,
@@ -5312,6 +5176,9 @@ def create_admin_app(
     app.state.maintenance_operator_resolver = maintenance_operator_resolver
     # A database the lifespan opens is its own job store, set there.
     app.state.local_agent_jobs = local_agent_jobs or db
+    if serves_daemons and db is not None:
+        app.state.local_agent_broker = db
+        app.state.daemon_workspaces = OneWorkspace(workspace_id, db)
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
 
     @app.middleware("http")
@@ -5500,8 +5367,10 @@ def create_admin_app(
         get_model_settings=get_model_settings,
     )
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
+    # The jobs a workspace's Sources queue for a daemon; the daemon's own
+    # routes are the host router's (memforge.server.local_agent_host_api).
     local_agent_router = APIRouter(
-        prefix="/api/cloud/local-agent",
+        prefix="/api/v1/local-agent",
         tags=["local-agent"],
     )
 
@@ -8944,7 +8813,7 @@ def create_admin_app(
         **job: Any,
     ) -> tuple[str, bool]:
         try:
-            return await _job_store(request).enqueue_local_agent_job(**job)
+            return await _job_store(request).enqueue_local_agent_job(workspace_id=get_workspace_id(request), **job)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -10709,28 +10578,6 @@ def create_admin_app(
                 )
         return _manifest_response("apply", results)
 
-    # -- Include all routers --
-    # Local tool — no auth required. All routers accessible directly.
-    def _shape_local_agent_job(job: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "job_id": job["job_id"],
-            "workspace_id": job["workspace_id"],
-            "source_id": job["source_id"],
-            "source_type": job["source_type"],
-            "operation": job["operation"],
-            "status": job["status"],
-            "payload": job.get("payload") or {},
-            "execution_owner_user_id": job["execution_owner_user_id"],
-            "result": job.get("result") or {},
-            "last_error": job.get("last_error"),
-            "next_attempt_at": job.get("next_attempt_at"),
-            "leased_until": job.get("leased_until"),
-            "attempt_count": int(job.get("attempt_count") or 0),
-            "created_at": job.get("created_at"),
-            "updated_at": job.get("updated_at"),
-            "finished_at": job.get("finished_at"),
-        }
-
     @local_agent_router.post(
         "/jobs",
         status_code=201,
@@ -10801,12 +10648,10 @@ def create_admin_app(
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
-        workspace_id = (req.workspace_id or current_workspace_id or "default").strip() or "default"
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
             job_id, created = await _enqueue_sync_local_agent_job(
                 request,
                 job_id=job_id,
-                workspace_id=workspace_id,
                 source_id=source_id,
                 source_type=req.source_type,
                 operation=req.operation,
@@ -10816,16 +10661,16 @@ def create_admin_app(
                 retry_job_id=req.retry_job_id,
                 trigger="manual",
             )
-            current_job = await db.get_local_agent_job(job_id)
+            current_job = await _job_store(request).get_local_agent_job(job_id)
             return {
                 "job_id": job_id,
                 "status": current_job["status"],
                 "created_at": current_job["created_at"],
                 "coalesced": not created,
             }
-        await db.insert_local_agent_job(
+        await _job_store(request).insert_local_agent_job(
             job_id=job_id,
-            workspace_id=workspace_id,
+            workspace_id=current_workspace_id,
             source_id=source_id,
             source_type=req.source_type,
             operation=req.operation,
@@ -10899,198 +10744,20 @@ def create_admin_app(
                 raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
         return source
 
-    @local_agent_router.post("/jobs/lease")
-    async def lease_local_agent_jobs(
-        req: LocalAgentJobLeaseRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        """Lease the device its due jobs.
-
-        The answer also names the server's version and acquisition contracts,
-        and the Sources this device executes, each with its type and its
-        configuration without secrets. The device reports its readiness for
-        each of them, and deletes the credentials it holds for any other
-        Source: one deleted, moved to the server or moved to another device.
-        """
-
-        requester = resolve_request_principal(request)
-        device = _device_report(req.device)
-        contracts = declared_acquisition_contracts()
-        answer: dict[str, Any] = {
-            "jobs": [],
-            "server": {"version": installed_version(), "acquisition_contracts": contracts},
-            EXECUTED_SOURCES_FIELD: [
-                _device_source_entry(source)
-                for source in await db.list_device_sources(requester, device_id=device.device_id)
-            ],
-        }
-        deadline = time.monotonic() + req.wait_seconds
-        while True:
-            jobs = await db.lease_local_agent_jobs(
-                user_id=requester,
-                device=device,
-                acquisition_contracts=contracts,
-                limit=req.limit,
-                lease_seconds=req.lease_seconds,
-            )
-            if jobs or req.wait_seconds <= 0 or time.monotonic() >= deadline:
-                return {**answer, "jobs": [_shape_local_agent_job(job) for job in jobs]}
-            if await request.is_disconnected():
-                return answer
-            await asyncio.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
-
-    @local_agent_router.post("/jobs/{job_id}/heartbeat")
-    async def heartbeat_local_agent_job(
-        job_id: str,
-        req: LocalAgentJobHeartbeatRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        requester = resolve_request_principal(request)
-        try:
-            progress = normalize_sync_progress_snapshot(req.progress) if req.progress is not None else None
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        wrote = await db.heartbeat_local_agent_job(
-            job_id=job_id,
-            user_id=requester,
-            attempt_count=req.attempt_count,
-            lease_seconds=req.lease_seconds,
-            device=_device_report(req.device),
-            progress=progress,
-        )
-        if not wrote:
-            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-        return {"ok": True, "job_id": job_id, "status": "leased"}
-
-    @local_agent_router.post("/jobs/{job_id}/complete")
-    async def complete_local_agent_job(
-        job_id: str,
-        req: LocalAgentJobCompleteRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        wrote = await db.complete_local_agent_job(
-            job_id=job_id,
-            user_id=resolve_request_principal(request),
-            device_id=req.device_id,
-            attempt_count=req.attempt_count,
-            status=req.status,
-            result=req.result,
-            error=req.error,
-            retryable=bool(req.result.get("retryable")),
-        )
-        if not wrote:
-            current = await db.get_local_agent_job(job_id)
-            if (
-                not current
-                or int(current.get("attempt_count") or 0) != req.attempt_count
-                or current.get("execution_owner_user_id") != resolve_request_principal(request)
-            ):
-                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-            status = str(current.get("status") or "")
-            if status not in {"queued", "succeeded", "failed"}:
-                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-        else:
-            completed = await db.get_local_agent_job(job_id)
-            if completed is None:
-                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-            status = str(completed["status"])
-        return {"ok": True, "job_id": job_id, "status": status}
-
     @local_agent_router.get("/jobs/current", response_model=LocalAgentJobListResponse)
     async def read_current_local_agent_jobs(
         request: Request,
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        jobs = await db.list_current_local_agent_jobs(
+        jobs = await _job_store(request).list_current_local_agent_jobs(
             workspace_id=workspace_id,
             user_id=resolve_request_principal(request),
         )
-        return {"data": [_shape_local_agent_job(job) for job in jobs]}
+        return {"data": [shape_local_agent_job(job) for job in jobs]}
 
-    @local_agent_router.get("/jobs/{job_id}")
-    async def read_local_agent_job(
-        job_id: str,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        job = await db.get_local_agent_job(job_id)
-        requester = resolve_request_principal(request)
-        if job is None or requester not in {job["created_by_user_id"], job["execution_owner_user_id"]}:
-            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-        return _shape_local_agent_job(job)
-
-    @local_agent_router.get("/status", response_model=LocalAgentDaemonStatusResponse)
-    async def read_local_agent_status(
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        """Each of the caller's devices by its latest report, online while that report is recent.
-
-        It also names the caller's device Sources with the device that
-        executes each, and the server's version and acquisition contracts,
-        from which a device tells, per Source it executes, whether it is
-        ready, waits for a credential or a folder, or waits for an update.
-        """
-
-        requester = resolve_request_principal(request)
-        now = datetime.now(timezone.utc)
-        devices = [
-            {
-                "device_id": device.report.device_id,
-                "name": device.report.name,
-                "version": device.report.version,
-                "acquisition_contracts": dict(sorted(device.report.acquisition_contracts.items())),
-                "status": (
-                    "online"
-                    if (now - device.last_seen_at).total_seconds() <= LOCAL_AGENT_DEVICE_STALE_SECONDS
-                    else "offline"
-                ),
-                "last_seen_at": device.last_seen_at.isoformat(),
-            }
-            for device in await db.list_local_agent_devices(requester)
-        ]
-        return {
-            "status": "online" if any(device["status"] == "online" for device in devices) else "offline",
-            "last_seen_at": devices[0]["last_seen_at"] if devices else None,
-            "devices": devices,
-            "sources": [
-                {**_device_source_entry(source), "name": source["name"]}
-                for source in await db.list_device_sources(requester)
-            ],
-            "server": {"version": installed_version(), "acquisition_contracts": declared_acquisition_contracts()},
-            "checked_at": now.isoformat(),
-            "stale_after_seconds": LOCAL_AGENT_DEVICE_STALE_SECONDS,
-        }
-
-    @local_agent_router.delete("/devices/{device_id}", response_model=LocalAgentDeviceRemovedResponse)
-    async def remove_local_agent_device(
-        device_id: str,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        """Forget one of the caller's devices.
-
-        Each Source it executed loses its execution device and shows Finish
-        setup until its owner chooses another device in Where it runs. Its
-        queued jobs are cancelled. A daemon that still runs on the device
-        appears again with its next report, without its Sources.
-        """
-
-        requester = resolve_request_principal(request)
-        if not any(device.report.device_id == device_id for device in await db.list_local_agent_devices(requester)):
-            raise HTTPException(status_code=404, detail="local_agent_device_not_found")
-        # The Sources go first: once none names the device, no new job does.
-        source_ids = await db.release_execution_device(requester, device_id)
-        try:
-            await db.remove_local_agent_device(requester, device_id)
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail="local_agent_device_not_found") from exc
-        return {"device_id": device_id, "source_ids": source_ids}
-
+    # -- Include all routers --
+    # Local tool — no auth required. All routers accessible directly.
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(document_router)
@@ -11108,6 +10775,8 @@ def create_admin_app(
     app.include_router(model_settings_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
+    if serves_daemons:
+        app.include_router(build_local_agent_host_router())
 
     return app
 

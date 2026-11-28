@@ -7,7 +7,7 @@ import type { LocalAgentJob } from "./responses";
  * leaves part of the body free-form.
  */
 interface ResponsePatches {
-  "/api/cloud/local-agent/jobs/current": { get: { data: LocalAgentJob[] } };
+  "/api/v1/local-agent/jobs/current": { get: { data: LocalAgentJob[] } };
   "/api/cloud/local-agent/jobs/{job_id}": { get: LocalAgentJob };
 }
 

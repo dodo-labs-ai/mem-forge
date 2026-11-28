@@ -17,7 +17,7 @@ afterEach(() => {
 function renderSidebar(extension?: AdminExtension, openReviews = 0) {
   const { calls } = fakeFetch({
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [] }),
     "GET /api/v1/memory-reviews": () => ({ data: [], total: openReviews, limit: 1, offset: 0 }),
   });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

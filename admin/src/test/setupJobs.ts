@@ -17,7 +17,7 @@ export function setupJobRoutes(
 ): Record<string, Route> {
   const routes: Record<string, Route> = {
     "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus(),
-    "POST /api/cloud/local-agent/jobs": async (request) => {
+    "POST /api/v1/local-agent/jobs": async (request) => {
       const body = (await request.clone().json()) as (typeof created)[number];
       created.push(body);
       return { job_id: `laj-${body.operation}`, status: "queued" };

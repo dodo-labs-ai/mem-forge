@@ -1,4 +1,4 @@
-import { LOCAL_AGENT_HOST_BASE_URL, currentLocalAgentBaseUrl, hostClient } from "./client";
+import { LOCAL_AGENT_HOST_BASE_URL, hostClient, resourceClient } from "./client";
 import type {
   LocalAgentDaemonStatusResponse,
   LocalAgentJobCreateResponse,
@@ -20,7 +20,7 @@ export async function createLocalAgentJob({
   payload = {},
   retryJobId,
 }: CreateLocalAgentJobInput): Promise<LocalAgentJobCreateResponse> {
-  const response = await hostClient.post<LocalAgentJobCreateResponse>(localAgentUrl("/jobs"), {
+  const response = await resourceClient.post<LocalAgentJobCreateResponse>("/local-agent/jobs", {
     source_id: sourceId,
     source_type: sourceType,
     operation,
@@ -38,17 +38,11 @@ export async function getLocalAgentJob(jobId: string): Promise<LocalAgentJobStat
 }
 
 export async function getCurrentLocalAgentJobs(): Promise<LocalAgentJobStatusResponse[]> {
-  const response = await hostClient.get<{ data: LocalAgentJobStatusResponse[] }>(
-    localAgentUrl("/jobs/current"),
-  );
+  const response = await resourceClient.get<{ data: LocalAgentJobStatusResponse[] }>("/local-agent/jobs/current");
   return response.data.data;
 }
 
 export async function getLocalAgentDaemonStatus(): Promise<LocalAgentDaemonStatusResponse> {
-  const response = await hostClient.get<LocalAgentDaemonStatusResponse>(localAgentUrl("/status"));
+  const response = await hostClient.get<LocalAgentDaemonStatusResponse>(`${LOCAL_AGENT_HOST_BASE_URL}/status`);
   return response.data;
-}
-
-function localAgentUrl(path: `/${string}`): string {
-  return `${currentLocalAgentBaseUrl()}${path}`;
 }

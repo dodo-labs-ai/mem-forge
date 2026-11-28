@@ -384,12 +384,12 @@ assert.match(
 assert.doesNotMatch(
   localAgentJobsSource,
   /workspace_id|requireCurrentWorkspaceId/,
-  "Local-agent jobs should select Cloud workspaces only through the configured host path",
+  "Local-agent jobs should select the workspace only through the resource client",
 );
 assert.match(
   localAgentJobsSource,
-  /hostClient\.post<LocalAgentJobCreateResponse>\(localAgentUrl\("\/jobs"\)/,
-  "Local-agent job creation should use the controller-derived host client URL",
+  /resourceClient\.post<LocalAgentJobCreateResponse>\("\/local-agent\/jobs"/,
+  "Local-agent job creation should queue the job in the selected workspace",
 );
 assert.match(
   sourcesPageSource,

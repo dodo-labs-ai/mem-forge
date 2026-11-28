@@ -159,6 +159,7 @@ class SyncScheduler:
                     self.db, self.document_store, source
                 ),
                 limit=50,
+                workspace_id=self.sync_service.workspace_id,
             )
         except Exception:
             logger.exception("Scheduled local-agent job scan failed")

@@ -504,7 +504,7 @@ async def test_a_local_agent_job_a_person_requested_keeps_its_intent_when_a_sche
     )
     job = {
         "source_id": "src-teams", "source_type": "teams", "operation": "teams_sync",
-        "created_by_user_id": "dev", "execution_owner_user_id": "dev",
+        "created_by_user_id": "dev", "execution_owner_user_id": "dev", "workspace_id": "default",
     }
     requested, created = await db.enqueue_local_agent_job(
         job_id="laj-requested", payload={"source_config_revision": "rev-a", "retry_failed_items": True}, **job,

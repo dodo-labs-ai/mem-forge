@@ -3438,17 +3438,6 @@
           "source_type": {
             "title": "Source Type",
             "type": "string"
-          },
-          "workspace_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workspace Id"
           }
         },
         "required": [
@@ -11870,7 +11859,7 @@
     },
     "/api/cloud/local-agent/devices/{device_id}": {
       "delete": {
-        "description": "Forget one of the caller's devices.\n\nEach Source it executed loses its execution device and shows Finish\nsetup until its owner chooses another device in Where it runs. Its\nqueued jobs are cancelled. A daemon that still runs on the device\nappears again with its next report, without its Sources.",
+        "description": "Forget one of the caller's devices.\n\nEach Source it executed, in every workspace the caller's daemon\nserves, loses its execution device and shows Finish setup until its\nowner chooses another device in Where it runs. Its queued jobs are\ncancelled. A daemon that still runs on the device appears again with\nits next report, without its Sources.",
         "operationId": "remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete",
         "parameters": [
           {
@@ -11906,68 +11895,6 @@
           }
         },
         "summary": "Remove Local Agent Device",
-        "tags": [
-          "local-agent"
-        ]
-      }
-    },
-    "/api/cloud/local-agent/jobs": {
-      "post": {
-        "operationId": "create_local_agent_job_api_cloud_local_agent_jobs_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/LocalAgentJobCreateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Create Local Agent Job",
-        "tags": [
-          "local-agent"
-        ]
-      }
-    },
-    "/api/cloud/local-agent/jobs/current": {
-      "get": {
-        "operationId": "read_current_local_agent_jobs_api_cloud_local_agent_jobs_current_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LocalAgentJobListResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Read Current Local Agent Jobs",
         "tags": [
           "local-agent"
         ]
@@ -12015,6 +11942,7 @@
     },
     "/api/cloud/local-agent/jobs/{job_id}": {
       "get": {
+        "description": "A job the caller created or executes, in a workspace the caller's daemon still serves.",
         "operationId": "read_local_agent_job_api_cloud_local_agent_jobs__job_id__get",
         "parameters": [
           {
@@ -12031,7 +11959,9 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentJobResponse"
+                }
               }
             },
             "description": "Successful Response"
@@ -12055,6 +11985,7 @@
     },
     "/api/cloud/local-agent/jobs/{job_id}/complete": {
       "post": {
+        "description": "End the device's attempt; completing an attempt that already ended answers the job's status.",
         "operationId": "complete_local_agent_job_api_cloud_local_agent_jobs__job_id__complete_post",
         "parameters": [
           {
@@ -13667,6 +13598,68 @@
         "summary": "Build Hook Context",
         "tags": [
           "hooks"
+        ]
+      }
+    },
+    "/api/v1/local-agent/jobs": {
+      "post": {
+        "operationId": "create_local_agent_job_api_v1_local_agent_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalAgentJobCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Local Agent Job",
+        "tags": [
+          "local-agent"
+        ]
+      }
+    },
+    "/api/v1/local-agent/jobs/current": {
+      "get": {
+        "operationId": "read_current_local_agent_jobs_api_v1_local_agent_jobs_current_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalAgentJobListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Current Local Agent Jobs",
+        "tags": [
+          "local-agent"
         ]
       }
     },

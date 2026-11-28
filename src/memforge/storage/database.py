@@ -6767,7 +6767,7 @@ class Database:
         payload: Mapping[str, Any],
         created_by_user_id: str,
         execution_owner_user_id: str,
-        workspace_id: str = "default",
+        workspace_id: str,
         device_id: str | None = None,
         now: datetime | None = None,
     ) -> bool:
@@ -6812,7 +6812,7 @@ class Database:
         payload: Mapping[str, Any],
         created_by_user_id: str,
         execution_owner_user_id: str,
-        workspace_id: str = "default",
+        workspace_id: str,
         device_id: str | None = None,
         trigger: str = "manual",
         retry_job_id: str | None = None,
@@ -7447,12 +7447,7 @@ class Database:
     ) -> list[dict[str, Any]]:
         """The Sources whose acquisition runs on a device of this execution owner, by id.
 
-        With ``device_id``, only the Sources that device executes. The list
-        covers every Source the owner's daemon serves, which is the scope the
-        lease selects jobs from. A device deletes the credentials it holds for
-        each Source missing from its own list, so a store that serves one
-        daemon across several workspaces returns the owner's device Sources
-        of all of them.
+        With ``device_id``, only the Sources that device executes.
         """
 
         async with self.db.execute(
@@ -7532,7 +7527,7 @@ class Database:
         device_acquisition_payload: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]],
         now: datetime | None = None,
         limit: int = 50,
-        workspace_id: str = "default",
+        workspace_id: str,
     ) -> int:
         """Queue the scheduled job of each due Source collected on its execution owner's device.
 

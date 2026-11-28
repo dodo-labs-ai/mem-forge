@@ -39,7 +39,7 @@ function renderPage(
     ],
     "GET /api/v1/source-list/preferences": () => ({ sort_mode: "name" }),
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [] }),
     "GET /api/v1/agent-evaluations/online-overview": () => makeOverview({ sources: [] }),
     "POST /api/v1/sources/src-wiki/sync": () => ({ status: "pending", run_id: "run-2" }),
     ...routes,
@@ -159,7 +159,7 @@ test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentica
     connection_status: { state: "action_required", reason: "authentication" },
   });
   const { calls, router } = renderPage([source], {
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => ({ job_id: "laj-auth", status: "succeeded", result: {} }),
   });
   const table = await screen.findByRole("table", { name: "Sources" });
@@ -171,7 +171,7 @@ test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentica
 
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const authCall = calls.find((request) => request.method === "POST")!;
-  expect(new URL(authCall.url).pathname).toBe("/api/cloud/local-agent/jobs");
+  expect(new URL(authCall.url).pathname).toBe("/api/v1/local-agent/jobs");
   expect(await authCall.clone().json()).toMatchObject({
     source_id: "src-jira",
     source_type: "jira",
@@ -199,13 +199,12 @@ test("waits for durable Jira authentication and refreshes readiness in the selec
     "GET /api/cloud/workspaces/team_alpha/v1/projects": () => ({ data: [], can_manage: true }),
     "GET /api/cloud/workspaces/team_alpha/v1/genes": () => [{ name: "jira", display_name: "Jira" }],
     "GET /api/cloud/workspaces/team_alpha/v1/source-list/preferences": () => ({ sort_mode: "name" }),
-    "GET /api/cloud/workspaces/team_alpha/local-agent/status": () => ({ status: "online" }),
-    "GET /api/cloud/workspaces/team_alpha/local-agent/jobs/current": () => ({ data: [] }),
-    "POST /api/cloud/workspaces/team_alpha/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "GET /api/cloud/local-agent/status": () => ({ status: "online" }),
+    "GET /api/cloud/workspaces/team_alpha/v1/local-agent/jobs/current": () => ({ data: [] }),
+    "POST /api/cloud/workspaces/team_alpha/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => new Promise((resolve) => { complete = resolve; }),
   }, {
     resourceBaseUrl: "/api/cloud/workspaces/team_alpha/v1",
-    localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
     workspaceId: "team_alpha",
     shared: true,
   });
@@ -225,7 +224,7 @@ test("waits for durable Jira authentication and refreshes readiness in the selec
 test.each(["daemon", "job", "permission", "timeout"])("reports %s failure without claiming Jira sign-in succeeded", async (failure) => {
   const { calls } = renderPage([expiredJira()], {
     "GET /api/cloud/local-agent/status": () => ({ status: failure === "daemon" ? "offline" : "online" }),
-    "POST /api/cloud/local-agent/jobs": () => failure === "permission"
+    "POST /api/v1/local-agent/jobs": () => failure === "permission"
       ? errorResponse(403, "local_agent_job_forbidden") : { job_id: "laj-auth", status: "queued" },
     "GET /api/cloud/local-agent/jobs/laj-auth": () => {
       if (failure === "timeout") throw new DOMException("Timed out", "TimeoutError");
@@ -248,7 +247,7 @@ test.each(["daemon", "job", "permission", "timeout"])("reports %s failure withou
 test("retrying a failed status request resumes the admitted sign-in job", async () => {
   let statusReads = 0;
   const { calls } = renderPage([expiredJira()], {
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => ++statusReads === 1
       ? errorResponse(503, "Service unavailable") : { job_id: "laj-auth", status: "succeeded", result: {} },
   });
@@ -329,15 +328,15 @@ test("Retry now starts the waiting local sync job on the user's device", async (
     next_attempt_at: new Date(Date.now() + RETRY_DELAY_MS).toISOString(),
   });
   const { calls } = renderPage([teams], {
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [job] }),
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-waiting", status: "queued", coalesced: true }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [job] }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-waiting", status: "queued", coalesced: true }),
   });
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByRole("button", { name: "Retry now" }));
 
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const retryCall = calls.find((request) => request.method === "POST")!;
-  expect(new URL(retryCall.url).pathname).toBe("/api/cloud/local-agent/jobs");
+  expect(new URL(retryCall.url).pathname).toBe("/api/v1/local-agent/jobs");
   expect(await retryCall.clone().json()).toMatchObject({ source_id: "src-teams", retry_job_id: "laj-waiting" });
 });
 

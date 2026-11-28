@@ -56,7 +56,7 @@ const RESPONSES: Record<string, unknown> = {
   "/api/v1/genes": [{ name: "confluence", display_name: "Confluence" }],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
   "/api/cloud/local-agent/status": localSyncStatus(true),
-  "/api/cloud/local-agent/jobs/current": { data: [] },
+  "/api/v1/local-agent/jobs/current": { data: [] },
 };
 
 test("a private source is shared with the workspace and the page follows the change until it is applied", async ({ page }) => {

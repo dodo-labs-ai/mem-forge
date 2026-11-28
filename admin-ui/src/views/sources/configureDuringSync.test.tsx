@@ -41,7 +41,7 @@ let queryClient: QueryClient;
 const workspaceApi = createWorkspaceApiController({ clear: () => queryClient?.clear() });
 
 beforeEach(() => {
-  workspaceApi.setTarget({ resourceBaseUrl: "/api/v1", localAgentBaseUrl: "/api/cloud/local-agent", workspaceId: "local", shared: false });
+  workspaceApi.setTarget({ resourceBaseUrl: "/api/v1", workspaceId: "local", shared: false });
   vi.mocked(getCurrentLocalAgentJobs).mockResolvedValue([]);
   vi.spyOn(resourceClient, "get").mockImplementation(async (path: string) => {
     if (path === "/sources") return { data: [syncingSource] };

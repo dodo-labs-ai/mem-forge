@@ -1,7 +1,7 @@
 import createClient, { type Client, type Middleware } from "openapi-fetch";
 import { ApiError, NoWorkspaceError, describeErrorBody, errorCodeOf, errorDetailOf } from "./errors";
 import type { AdminPaths } from "./paths";
-import { LOCAL_AGENT_PREFIX, RESOURCE_PREFIX, type WorkspaceController, type WorkspaceTarget } from "./workspace";
+import { RESOURCE_PREFIX, type WorkspaceController, type WorkspaceTarget } from "./workspace";
 
 export type ApiClient = Client<AdminPaths>;
 
@@ -34,22 +34,10 @@ async function withUrl(request: Request, url: URL): Promise<Request> {
 
 function workspaceMiddleware(workspace: WorkspaceController): Middleware {
   return {
-    async onRequest({ request, schemaPath }) {
-      // A job ID already identifies its workspace; the host authorizes access.
-      if (schemaPath === "/api/cloud/local-agent/jobs/{job_id}") return request;
+    async onRequest({ request }) {
       const url = new URL(request.url);
-      const isResource = url.pathname.startsWith(`${RESOURCE_PREFIX}/`) || url.pathname === RESOURCE_PREFIX;
-      const isLocalAgent = url.pathname.startsWith(LOCAL_AGENT_PREFIX);
-      if (!isResource && !isLocalAgent) return request;
-
-      const target = workspace.current();
-      if (target === null) throw new NoWorkspaceError();
-      if (isResource) {
-        return withUrl(request, new URL(workspaceResourceUrl(request.url, target, url.origin)));
-      } else {
-        url.pathname = target.localAgentBaseUrl + url.pathname.slice(LOCAL_AGENT_PREFIX.length);
-      }
-      return withUrl(request, url);
+      if (!(url.pathname.startsWith(`${RESOURCE_PREFIX}/`) || url.pathname === RESOURCE_PREFIX)) return request;
+      return withUrl(request, new URL(workspaceResourceUrl(request.url, workspace.current(), url.origin)));
     },
   };
 }

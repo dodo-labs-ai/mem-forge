@@ -138,10 +138,13 @@ def test_public_teams_config_migrates_legacy_history_and_hides_internal_knobs() 
         "rolling_retention_days": None,
     }
 
-    assert _public_source_config(
-        "teams",
-        {"conversation_ids": ["19:conversation-a@example.test"], "rolling_retention_days": 730},
-    )["rolling_retention_days"] == 730
+    assert (
+        _public_source_config(
+            "teams",
+            {"conversation_ids": ["19:conversation-a@example.test"], "rolling_retention_days": 730},
+        )["rolling_retention_days"]
+        == 730
+    )
 
 
 def _device_jira_payload() -> dict:
@@ -430,7 +433,10 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
     ],
 )
 def test_source_list_returns_the_absence_check_of_the_latest_sync(
-    tmp_path, recorded, reported, unlisted_present_count,
+    tmp_path,
+    recorded,
+    reported,
+    unlisted_present_count,
 ):
     database = _connect_database(tmp_path)
     source_id = "src-absence-check-skipped"
@@ -1030,9 +1036,7 @@ def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicali
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(_app(tmp_path, database)) as client:
             connect_device(database, headers["x-test-user"])
-            source_id = client.post(
-                "/api/v1/sources", headers=headers, json=_device_jira_payload()
-            ).json()["id"]
+            source_id = client.post("/api/v1/sources", headers=headers, json=_device_jira_payload()).json()["id"]
             asyncio.run(
                 database.create_projection_scope_transition(
                     ProjectionScopeTransition(
@@ -1163,9 +1167,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
             manifest = manifest_to_payload(collection.manifest(received_at=sent_at))
             del manifest["received_at"]
-            incomplete_process = client.post(
-                f"/api/v1/sources/{source_id}/process", headers=headers, json=context
-            )
+            incomplete_process = client.post(f"/api/v1/sources/{source_id}/process", headers=headers, json=context)
             malformed_manifest = client.post(
                 f"/api/v1/sources/{source_id}/conversation-collection/manifest",
                 headers=headers,
@@ -1221,7 +1223,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
                 "attempt_count": leased["attempt_count"],
                 "device_id": "dev-laptop",
                 "status": "succeeded",
-                "result": {"ok": True},
+                "result": {"source_sync_run_id": accepted_process.json()["run_id"]},
             }
             first_complete = client.post(
                 f"/api/cloud/local-agent/jobs/{leased['job_id']}/complete",
@@ -1289,9 +1291,7 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
         connect_device(database, "owner-a")
         with TestClient(app) as client:
             teams_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload()).json()["id"]
-            jira_id = client.post(
-                "/api/v1/sources", headers=headers, json=_device_jira_payload()
-            ).json()["id"]
+            jira_id = client.post("/api/v1/sources", headers=headers, json=_device_jira_payload()).json()["id"]
             real = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers)
             dry = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
             dry_again = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
@@ -1303,12 +1303,14 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
                 json={"dry_run": True, "retry_target": {"execution_kind": "source_sync_run", "execution_id": "run-1"}},
             )
             # A Source whose only job is a dry run, so the lease hands over that job.
-            preview_id = client.post(
-                "/api/v1/sources", headers=headers, json=_teams_payload("Teams preview")
-            ).json()["id"]
+            preview_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload("Teams preview")).json()[
+                "id"
+            ]
             client.post(f"/api/v1/sources/{preview_id}/sync", headers=headers, json={"dry_run": True})
             leased = client.post(
-                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60}
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             ).json()["jobs"]
             [dry_job] = [job for job in leased if job["source_id"] == preview_id]
             dry_processed = client.post(
@@ -1394,12 +1396,12 @@ def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp
             }
 
             forbidden = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
                 json=request_body,
             )
             accepted = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=request_body,
             )
@@ -1437,12 +1439,12 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
         connect_device(database, "member-a")
         with TestClient(app) as client:
             accepted = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
                 json=body,
             )
             forbidden = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "viewer-a", "x-test-workspace-role": "viewer"},
                 json=body,
             )
@@ -1477,7 +1479,7 @@ def test_credential_check_job_uses_the_current_workspace(tmp_path):
         body = {"source_id": "src-jira", "source_type": "jira", "operation": "credential_check", "payload": {}}
         headers = {"x-test-user": "member-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            accepted = client.post("/api/cloud/local-agent/jobs", headers=headers, json=body)
+            accepted = client.post("/api/v1/local-agent/jobs", headers=headers, json=body)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,

@@ -40,3 +40,9 @@ def resolve_maintenance_operator(request: Request) -> bool:
     """Authorize the single self-hosted owner for break-glass closure."""
 
     return resolve_workspace_role(request) == LOCAL_DEV_WORKSPACE_ROLE
+
+
+def resolve_request_principal(request: Request) -> str:
+    """Resolve the request principal through the app-scoped resolver."""
+    resolver = getattr(request.app.state, "principal_resolver", None)
+    return (resolver or resolve_principal)(request)

@@ -14,7 +14,6 @@ async def _no_device_source(source):
     raise AssertionError(f"no device Source is due here: {source['id']}")
 
 
-
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "source-retry.db"))
@@ -39,6 +38,7 @@ async def _queued_retry(db):
     )
     payload = await local_agent_sync_job_payload(db, await db.get_source("src-retry"))
     await db.enqueue_local_agent_job(
+        workspace_id="default",
         job_id="laj-retry",
         source_id="src-retry",
         source_type="teams",
@@ -68,7 +68,9 @@ async def test_local_retry_waits_for_shared_delay_before_claim(db):
     queued = await db.get_local_agent_job("laj-retry")
     assert queued["status"] == "queued"
     assert queued["next_attempt_at"] == (now + timedelta(hours=1)).isoformat()
-    assert await db.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now) == []
+    assert (
+        await db.lease_local_agent_jobs(**leasing_device(), user_id="owner", limit=1, lease_seconds=60, now=now) == []
+    )
     [leased] = await db.lease_local_agent_jobs(
         **leasing_device(),
         user_id="owner",
@@ -93,6 +95,7 @@ async def test_manual_advances_exact_job_without_resetting_history(db):
         payload=payload,
         created_by_user_id="owner",
         execution_owner_user_id="owner",
+        workspace_id="default",
     )
     assert await db.enqueue_local_agent_job(**common, trigger="scheduled") == ("laj-retry", False)
     assert (await db.get_local_agent_job("laj-retry"))["next_attempt_at"] == before["next_attempt_at"]
@@ -183,7 +186,9 @@ async def test_local_scheduler_rolls_back_schedule_when_enqueue_fails(db, monkey
 
     monkeypatch.setattr(db, "_enqueue_local_agent_job_locked", fail)
     with pytest.raises(RuntimeError, match="injected"):
-        await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=now)
+        await db.enqueue_due_local_agent_jobs(
+            workspace_id="default", device_acquisition_payload=_no_device_source, now=now
+        )
     assert not db.db.in_transaction
     assert (await db.get_source("src-retry"))["sync_schedule"] == before["sync_schedule"]
 
@@ -193,7 +198,12 @@ async def test_local_scheduler_coalesces_without_advancing_backoff(db):
     now, _ = await _queued_retry(db)
     before = await db.get_local_agent_job("laj-retry")
     await db.set_source_sync_schedule("src-retry", enabled=True, interval_minutes=60, next_run_at=now)
-    assert await db.enqueue_due_local_agent_jobs(device_acquisition_payload=_no_device_source, now=now) == 0
+    assert (
+        await db.enqueue_due_local_agent_jobs(
+            workspace_id="default", device_acquisition_payload=_no_device_source, now=now
+        )
+        == 0
+    )
     assert (await db.get_local_agent_job("laj-retry"))["next_attempt_at"] == before["next_attempt_at"]
 
 
@@ -208,6 +218,7 @@ async def test_two_connections_retry_one_job_without_resetting_attempts(db):
 
         async def retry(database):
             return await database.enqueue_local_agent_job(
+                workspace_id="default",
                 job_id="must-not-create",
                 source_id="src-retry",
                 source_type="teams",
@@ -242,6 +253,7 @@ async def test_exact_local_retry_rejects_stale_payload(db):
     before = await db.get_local_agent_job("laj-retry")
     with pytest.raises(ValueError, match="stale"):
         await db.enqueue_local_agent_job(
+            workspace_id="default",
             job_id="must-not-create",
             source_id="src-retry",
             source_type="teams",
@@ -280,6 +292,7 @@ async def test_old_local_job_schema_upgrade_preserves_history(tmp_path):
 async def test_current_sync_job_is_not_hidden_by_newer_setup_job(db):
     await _queued_retry(db)
     await db.insert_local_agent_job(
+        workspace_id="default",
         job_id="setup-newer",
         source_id="src-retry",
         source_type="local_markdown",

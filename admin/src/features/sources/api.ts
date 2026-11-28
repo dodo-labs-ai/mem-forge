@@ -54,7 +54,7 @@ export function useLocalSyncJobs() {
   const api = useApi();
   const query = useQuery({
     queryKey: localSyncKeys.jobs,
-    queryFn: () => unwrap(api.GET("/api/cloud/local-agent/jobs/current")),
+    queryFn: () => unwrap(api.GET("/api/v1/local-agent/jobs/current")),
     select: (response) => response.data,
     refetchInterval: (current) =>
       (current.state.data?.data ?? EMPTY_JOBS).some((job) => ACTIVE_JOB_STATES.has(job.status)) ? ACTIVE_POLL_MS : false,
@@ -320,7 +320,7 @@ export function useSyncSource() {
     const operation = source.execution?.kind === "local_agent" ? source.execution.operation : null;
     if (operation && retryTarget?.execution_kind !== "source_sync_run") {
       return unwrap(
-        api.POST("/api/cloud/local-agent/jobs", {
+        api.POST("/api/v1/local-agent/jobs", {
           body: {
             source_id: source.id,
             source_type: source.type,
