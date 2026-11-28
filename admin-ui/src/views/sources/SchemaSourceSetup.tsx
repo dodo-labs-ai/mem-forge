@@ -36,7 +36,6 @@ import {
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
 import type { RepoPickerItem } from "./githubRepoFolderPickerUtils";
-import { isImmutableExecutionModeField } from "./localAgentSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
 import { useRunningSyncSave } from "./runningSyncSave";
@@ -398,7 +397,6 @@ function SourceConfigForm({
           hasExistingSecret={Boolean(config[`${field.key}_configured`])}
           decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
           required={adapter.isRequired(field, config)}
-          disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
           onChange={(value) => updateField(field, value)}
         />
         {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
@@ -641,7 +639,6 @@ function ConfigFieldInput({
   hasExistingSecret,
   decryptFailed,
   required,
-  disabled,
   onChange,
 }: {
   adapter: SourceSetupAdapter;
@@ -650,7 +647,6 @@ function ConfigFieldInput({
   hasExistingSecret?: boolean;
   decryptFailed?: boolean;
   required?: boolean;
-  disabled?: boolean;
   onChange: (value: ConfigValue) => void;
 }) {
   if (field.field_type === "boolean") {
@@ -660,7 +656,6 @@ function ConfigFieldInput({
           type="checkbox"
           className="mt-0.5 size-4"
           checked={booleanValue(value)}
-          disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
         />
         <span>
@@ -680,7 +675,6 @@ function ConfigFieldInput({
       <Field label={field.label} required={required} helpText={field.help_text}>
         <Select<string>
           value={selected}
-          disabled={disabled}
           onValueChange={(next) => onChange(stringValue(next))}
         >
           <SelectTrigger>
@@ -708,7 +702,6 @@ function ConfigFieldInput({
               <input
                 type="checkbox"
                 checked={selected.has(option)}
-                disabled={disabled}
                 onChange={(event) => {
                   const next = new Set(selected);
                   if (event.target.checked) next.add(option);
@@ -731,7 +724,6 @@ function ConfigFieldInput({
           className="min-h-20 w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs shadow-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           rows={4}
           value={stringValue(value)}
-          disabled={disabled}
           placeholder={field.placeholder}
           onChange={(event) => onChange(event.target.value)}
         />
@@ -750,7 +742,6 @@ function ConfigFieldInput({
         autoComplete={isSecret ? "new-password" : "off"}
         name={`source-${field.key}`}
         value={isList ? listValue(value).join(", ") : stringValue(value)}
-        disabled={disabled}
         onChange={(event) => {
           if (isInteger) {
             onChange(event.target.value === "" ? "" : Number(event.target.value));

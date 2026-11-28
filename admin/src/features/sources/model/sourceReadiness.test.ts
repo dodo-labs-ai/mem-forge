@@ -75,7 +75,6 @@ function deviceSource(state: "online" | "offline" | "update_required", connectio
     execution: {
       kind: "local_agent",
       operation: "document_acquisition",
-      immutable_config_fields: [],
       device: { id: "dev-macbook", name: "Alex's MacBook", state, not_ready: [], installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
     },
     connection_status: connection,
@@ -115,7 +114,7 @@ test("update local sync comes after offline and checking and before every connec
 });
 
 test("a Source on its type's local path reads the viewer's own daemon", () => {
-  const source = makeSource({ execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] } });
+  const source = makeSource({ execution: { kind: "local_agent", operation: "teams_sync" } });
   assert.equal(sourceDeviceReadiness(source, "unavailable"), "unavailable");
   assert.equal(sourceDeviceReadiness(makeSource(), "ready"), "ready");
 });

@@ -6125,12 +6125,6 @@ export interface components {
             /** @description The execution device of a Source whose acquisition runs on a device; null while it has none, which shows Finish setup until its owner chooses one. */
             device?: components["schemas"]["SourceExecutionDeviceResponse"] | null;
             /**
-             * Immutable Config Fields
-             * @deprecated
-             * @default []
-             */
-            immutable_config_fields: string[];
-            /**
              * Kind
              * @enum {string}
              */

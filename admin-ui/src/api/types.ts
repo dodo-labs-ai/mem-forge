@@ -353,7 +353,6 @@ export type SourceExecutionKind = "server" | "local_agent";
 export interface SourceExecution {
   kind: SourceExecutionKind;
   operation: string | null;
-  immutable_config_fields: string[];
 }
 
 export type SourceConnectionStatusReason = "authentication" | "configuration" | "identity_conflict";

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-SNAPSHOT_MANIFEST_MAX_ITEMS = 10_000
+DEVICE_MANIFEST_MAX_ITEMS = 10_000
 """The most items one device manifest, and each of its excluded listings, may name."""
 
 
@@ -21,10 +21,10 @@ def validate_excluded_listings_for_job(
     carried = set(carried_scope_keys)
     scope_keys = [listing.scope_key for listing in listings]
     if len(set(scope_keys)) != len(scope_keys):
-        raise ValueError("snapshot excluded listings contain duplicate scope_key")
+        raise ValueError("excluded listings contain duplicate scope_key")
     unknown = sorted(set(scope_keys) - carried)
     if unknown:
-        raise ValueError(f"snapshot excluded listing names a scope the job did not carry: {unknown[0]}")
+        raise ValueError(f"an excluded listing names a scope the job did not carry: {unknown[0]}")
 
 
 @dataclass(frozen=True)

@@ -41,7 +41,7 @@ from memforge.local_agent.document_acquisition import (
     AcquisitionRequests,
     body_sha256,
 )
-from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
+from memforge.local_agent.device_manifest import DEVICE_MANIFEST_MAX_ITEMS
 from memforge.local_agent.source_contract import (
     DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
@@ -871,7 +871,7 @@ def test_answers_must_answer_exactly_what_was_asked_and_cannot_change(deployment
 def test_a_manifest_above_the_bound_is_refused_with_its_count(deployments, wiki):
     _server, device, client, lease = deployments
     _lease_job(device, lease)
-    count = SNAPSHOT_MANIFEST_MAX_ITEMS + 1
+    count = DEVICE_MANIFEST_MAX_ITEMS + 1
     listing = AcquiredListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(f"wiki-{n}" for n in range(count)))
 
     response = _manifest_route(client, AcquisitionManifest(listing=listing))
@@ -881,7 +881,7 @@ def test_a_manifest_above_the_bound_is_refused_with_its_count(deployments, wiki)
 
 
 def test_the_device_fails_a_listing_above_the_bound_before_it_fetches_anything(wiki):
-    for page_id in range(SNAPSHOT_MANIFEST_MAX_ITEMS + 1):
+    for page_id in range(DEVICE_MANIFEST_MAX_ITEMS + 1):
         wiki.write(str(page_id), "body", FIRST_RUN)
 
     class Untouched:
@@ -907,7 +907,7 @@ def test_the_device_fails_a_listing_above_the_bound_before_it_fetches_anything(w
             )
         )
 
-    assert f"holds {SNAPSHOT_MANIFEST_MAX_ITEMS + 1} items" in str(raised.value)
+    assert f"holds {DEVICE_MANIFEST_MAX_ITEMS + 1} items" in str(raised.value)
     assert "fetch" not in wiki.calls
 
 
@@ -1376,7 +1376,7 @@ def test_a_daemon_job_above_the_bound_fails_with_the_count_and_is_not_retried(wi
     from memforge.local_agent.state import LocalAgentStateStore
     from memforge.tool_client import ToolClient
 
-    count = SNAPSHOT_MANIFEST_MAX_ITEMS + 1
+    count = DEVICE_MANIFEST_MAX_ITEMS + 1
     for page_id in range(count):
         wiki.write(str(page_id), "body", FIRST_RUN)
     client = ToolClient(target=build_target(origin=DAEMON_SERVER, edition="oss"), api_token=None)

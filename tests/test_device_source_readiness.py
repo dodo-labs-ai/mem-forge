@@ -118,7 +118,7 @@ def test_a_server_source_has_no_device_and_no_device_connection(client):
     )
     row = _row(client, created.json()["id"])
 
-    assert row["execution"] == {"kind": "server", "operation": None, "immutable_config_fields": []}
+    assert row["execution"] == {"kind": "server", "operation": None}
     assert "connection_status" not in row
 
 
@@ -130,7 +130,6 @@ def test_a_device_source_its_online_device_reports_ready_is_ready(client, databa
     assert row["execution"] == {
         "kind": "local_agent",
         "operation": DOCUMENT_ACQUISITION_OPERATION,
-        "immutable_config_fields": [],
         "device": {
             "id": DEVICE_ID,
             "name": "Alex's MacBook",

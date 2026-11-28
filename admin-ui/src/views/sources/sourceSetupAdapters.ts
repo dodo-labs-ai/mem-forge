@@ -35,8 +35,8 @@ export interface SourceSetupAdapter {
 const CONNECTION_FIELDS: Record<SchemaSourceType, ReadonlySet<string>> = {
   confluence: new Set(["base_url", "pat"]),
   github_pages: new Set(["auth_mode", "pat"]),
-  github_repo: new Set(["connection_mode", "repo_url", "pat"]),
-  jira: new Set(["base_url", "auth_mode", "sync_mode", "pat"]),
+  github_repo: new Set(["repo_url", "pat"]),
+  jira: new Set(["base_url", "auth_mode", "pat"]),
   local_markdown: new Set(["root"]),
 };
 

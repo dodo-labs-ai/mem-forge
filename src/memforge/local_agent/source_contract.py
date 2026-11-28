@@ -315,8 +315,6 @@ def source_execution_descriptor(source: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "kind": "local_agent" if operation is not None else "server",
         "operation": operation,
-        # Deprecated (admin-ui-v1): V1 setup reads it; always empty, removed with V1.
-        "immutable_config_fields": [],
     }
 
 

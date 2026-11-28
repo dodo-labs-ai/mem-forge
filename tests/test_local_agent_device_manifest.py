@@ -1,6 +1,6 @@
 import pytest
 
-from memforge.local_agent.snapshot_manifest import ExcludedScopeListing, validate_excluded_listings_for_job
+from memforge.local_agent.device_manifest import ExcludedScopeListing, validate_excluded_listings_for_job
 
 
 def test_a_manifest_lists_only_the_excluded_scopes_its_job_carried() -> None:

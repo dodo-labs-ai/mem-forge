@@ -57,7 +57,7 @@ from memforge.local_agent.document_acquisition import (
     AcquisitionRequests,
     body_sha256,
 )
-from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS, ExcludedScopeListing
+from memforge.local_agent.device_manifest import DEVICE_MANIFEST_MAX_ITEMS, ExcludedScopeListing
 from memforge.local_agent.source_contract import LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD
 from memforge.models import AbsenceAnswer, ContentItem
 from memforge.pipeline.sync import MAX_RETRIES
@@ -190,7 +190,7 @@ async def _list_excluded_scope(open_gene: GeneOpener, entry: Mapping[str, Any]) 
         return None
     finally:
         await gene.close()
-    if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+    if len(listing.doc_ids) > DEVICE_MANIFEST_MAX_ITEMS:
         return ExcludedScopeListing(
             scope_key=scope_key,
             rejection=f"the scope lists {len(listing.doc_ids)} items, more than a manifest may name",

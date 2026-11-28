@@ -12,7 +12,6 @@
       "github_repo"
     ],
     "extra": {
-      "connection_mode": "cloud_pull",
       "file_identity_contract": "repository_path",
       "repo_url": "https://github.com/acme/kestrel",
       "repo_host": "github.com",

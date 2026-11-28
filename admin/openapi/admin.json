@@ -9055,15 +9055,6 @@
             ],
             "description": "The execution device of a Source whose acquisition runs on a device; null while it has none, which shows Finish setup until its owner chooses one."
           },
-          "immutable_config_fields": {
-            "default": [],
-            "deprecated": true,
-            "items": {
-              "type": "string"
-            },
-            "title": "Immutable Config Fields",
-            "type": "array"
-          },
           "kind": {
             "enum": [
               "server",

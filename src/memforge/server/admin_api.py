@@ -320,8 +320,8 @@ from memforge.local_agent.document_acquisition import (
     AcquisitionManifestTooLarge,
     acquisition_job_config,
 )
-from memforge.local_agent.snapshot_manifest import (
-    SNAPSHOT_MANIFEST_MAX_ITEMS,
+from memforge.local_agent.device_manifest import (
+    DEVICE_MANIFEST_MAX_ITEMS,
     validate_excluded_listings_for_job,
 )
 from memforge.local_agent.credential_check import (
@@ -2260,8 +2260,6 @@ class SourceExecutionDeviceResponse(BaseModel):
 class SourceExecutionResponse(BaseModel):
     kind: Literal["server", "local_agent"]
     operation: str | None
-    # Deprecated (admin-ui-v1): V1 setup reads it; always empty, removed with V1.
-    immutable_config_fields: list[str] = Field(default=[], deprecated=True)
     device: SourceExecutionDeviceResponse | None = Field(
         default=None,
         description=(
@@ -3177,14 +3175,14 @@ class HeldAcquiredBodiesRequest(AcquisitionAttemptRequest):
     """The bodies a device run asks about before it uploads them, each by the hash of its bytes."""
 
     body_sha256s: list[Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]] = Field(
-        max_length=SNAPSHOT_MANIFEST_MAX_ITEMS
+        max_length=DEVICE_MANIFEST_MAX_ITEMS
     )
 
 
 class AcquisitionStoredExtrasRequest(AcquisitionAttemptRequest):
     """The items of a device run whose ``fetch`` reads what the Source stored for them."""
 
-    item_ids: list[str] = Field(max_length=SNAPSHOT_MANIFEST_MAX_ITEMS)
+    item_ids: list[str] = Field(max_length=DEVICE_MANIFEST_MAX_ITEMS)
 
 
 class AcquisitionAnswersRequest(AcquisitionAttemptRequest):

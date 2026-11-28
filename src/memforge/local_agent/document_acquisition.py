@@ -44,7 +44,7 @@ from typing import Any
 from memforge.genes.recorded import AcquisitionFailed
 from memforge.genes.toolkit.pdf import PdfMaterial
 from memforge.llm.structured import failure_retryable
-from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS, ExcludedScopeListing
+from memforge.local_agent.device_manifest import DEVICE_MANIFEST_MAX_ITEMS, ExcludedScopeListing
 from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION
 from memforge.models import AbsenceAnswer, ContentItem, ScopeListing, ScopeListingKind
 from memforge.source_artifacts import RawSourceArtifact
@@ -191,7 +191,7 @@ class AcquisitionManifestTooLarge(ValueError):
 
     def __init__(self, what: str, count: int) -> None:
         super().__init__(
-            f"the {what} holds {count} items, more than the {SNAPSHOT_MANIFEST_MAX_ITEMS} one device manifest may name"
+            f"the {what} holds {count} items, more than the {DEVICE_MANIFEST_MAX_ITEMS} one device manifest may name"
         )
 
 
@@ -273,12 +273,12 @@ class AcquisitionManifest:
     def check_bound(self) -> None:
         """Refuse a manifest that names more items than one device manifest may."""
 
-        if len(self.listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+        if len(self.listing.doc_ids) > DEVICE_MANIFEST_MAX_ITEMS:
             raise AcquisitionManifestTooLarge("scope listing", len(self.listing.doc_ids))
-        if len(self.discovered) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+        if len(self.discovered) > DEVICE_MANIFEST_MAX_ITEMS:
             raise AcquisitionManifestTooLarge("discovery", len(self.discovered))
         for listing in self.excluded_listings:
-            if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
+            if len(listing.doc_ids) > DEVICE_MANIFEST_MAX_ITEMS:
                 raise AcquisitionManifestTooLarge(f"listing of excluded scope {listing.scope_key}", len(listing.doc_ids))
 
     def to_payload(self) -> dict[str, object]:

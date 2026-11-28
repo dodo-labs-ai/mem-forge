@@ -8,7 +8,6 @@ import {
   sourceActionLayout,
 } from "../src/views/sources/sourceActions.js";
 import {
-  isImmutableExecutionModeField,
   isLocalAgentBackedSource,
   localAgentSyncOperation,
 } from "../src/views/sources/localAgentSources.js";
@@ -363,25 +362,20 @@ assert.match(
   "enabled overflow menu actions should use a pointer cursor while disabled actions keep not-allowed",
 );
 assert.equal(
-  localAgentSyncOperation({ execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] } } as never),
+  localAgentSyncOperation({ execution: { kind: "local_agent", operation: "teams_sync" } } as never),
   "teams_sync",
   "Teams sources should be local-agent backed",
 );
 assert.equal(
-  localAgentSyncOperation({ execution: { kind: "server", operation: null, immutable_config_fields: ["sync_mode"] } } as never),
+  localAgentSyncOperation({ execution: { kind: "server", operation: null } } as never),
   null,
   "Cloud Jira sources should not be treated as local-agent backed",
 );
 assert.equal(
-  isLocalAgentBackedSource({ execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] } } as never),
+  isLocalAgentBackedSource({ execution: { kind: "local_agent", operation: "jira_sync" } } as never),
   true,
   "Jira local-agent mode should share the daemon status badge path",
 );
-const jiraExecutionSource = {
-  execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] },
-} as never;
-assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "sync_mode"), true);
-assert.equal(isImmutableExecutionModeField(jiraExecutionSource, "auth_mode"), false);
 assert.match(
   sourcesPageSource,
   /getLocalAgentJob/,
@@ -421,14 +415,6 @@ assert.match(
   /content: canConfigureConnection \? <>\{connectionFields\.map\(renderField\)\}<\/> : unavailableConnection/,
   "non-owner admins should not render local connector fields or pickers",
 );
-assert.match(
-  sourceSetupSource,
-  /disabled=\{source\s*\?\s*isImmutableExecutionModeField\(source, field\.key\)\s*:\s*false\}/,
-  "existing sources should render execution-mode selectors as read-only",
-);
-assert.match(sourceSetupSource, /type="checkbox"[\s\S]*disabled=\{disabled\}/);
-assert.match(sourceSetupSource, /<textarea[\s\S]*disabled=\{disabled\}/);
-assert.match(sourceSetupSource, /<Input[\s\S]*disabled=\{disabled\}/);
 assert.doesNotMatch(
   localAgentSourcesSource,
   /source\.type\s*===|sync_mode|connection_mode|local_markdown/,

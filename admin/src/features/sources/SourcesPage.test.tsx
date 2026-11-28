@@ -321,7 +321,7 @@ test("Retry now starts the waiting local sync job on the user's device", async (
     type: "teams",
     name: "Team chats",
     sync: null,
-    execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] },
+    execution: { kind: "local_agent", operation: "teams_sync" },
   });
   const job = makeLocalAgentJob({
     job_id: "laj-waiting",
@@ -792,7 +792,6 @@ function onDevice(id: string, name: string, state: DeviceState, { device = "Alex
     execution: {
       kind: "local_agent",
       operation: "document_acquisition",
-      immutable_config_fields: [],
       device: {
         id: `dev-${device}`,
         name: viewerOwns ? device : null,

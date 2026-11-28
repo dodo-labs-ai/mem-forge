@@ -202,7 +202,7 @@ def test_the_server_does_not_browse_a_device_sources_repository(tmp_path, databa
         "src-device-repo",
         executor="device",
         source_type="github_repo",
-        config={"repo_url": "https://github.example.com/acme/handbook", "connection_mode": "cloud_pull"},
+        config={"repo_url": "https://github.example.com/acme/handbook"},
     )
 
     with TestClient(_app(tmp_path, database)) as client:

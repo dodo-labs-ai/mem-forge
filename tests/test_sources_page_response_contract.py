@@ -290,7 +290,7 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
             "viewer_relationship",
         }
         execution_keys = {"Payroll Jira": {"device"}}
-        assert set(row["execution"]) == {"kind", "operation", "immutable_config_fields"} | execution_keys.get(name, set())
+        assert set(row["execution"]) == {"kind", "operation"} | execution_keys.get(name, set())
 
     history = rows["History Wiki"]
     assert set(history["sync"]) == HISTORY_SYNC_KEYS

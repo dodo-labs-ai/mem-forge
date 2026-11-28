@@ -157,17 +157,17 @@ def test_local_agent_sync_operation_classifies_execution_mode(
         (
             "teams",
             {"conversation_ids": ["19:chat@example.test"]},
-            {"kind": "local_agent", "operation": "teams_sync", "immutable_config_fields": []},
+            {"kind": "local_agent", "operation": "teams_sync"},
         ),
         (
             "jira",
             {"base_url": "https://jira.example.test"},
-            {"kind": "server", "operation": None, "immutable_config_fields": []},
+            {"kind": "server", "operation": None},
         ),
         (
             "confluence",
             {},
-            {"kind": "server", "operation": None, "immutable_config_fields": []},
+            {"kind": "server", "operation": None},
         ),
     ],
 )
@@ -185,7 +185,6 @@ def test_a_device_source_is_collected_by_device_acquisition() -> None:
     assert source_execution_descriptor(source) == {
         "kind": "local_agent",
         "operation": DOCUMENT_ACQUISITION_OPERATION,
-        "immutable_config_fields": [],
     }
 
 

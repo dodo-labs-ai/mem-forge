@@ -49,7 +49,7 @@ export function makeSource(overrides: Partial<Source> = {}): Source {
     created_at: "2026-09-01T00:00:00Z",
     project_binding: { mode: "fixed", project_key: "PAY" },
     capabilities: FULL_CAPABILITIES,
-    execution: { kind: "server", operation: null, immutable_config_fields: [] },
+    execution: { kind: "server", operation: null },
     enabled_for_me: true,
     pinned_for_me: false,
     sync_schedule: null,

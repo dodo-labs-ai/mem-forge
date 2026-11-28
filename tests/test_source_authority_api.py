@@ -778,7 +778,6 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         assert listed.json()["data"][0]["execution"] == {
             "kind": "local_agent",
             "operation": "teams_sync",
-            "immutable_config_fields": [],
         }
     finally:
         asyncio.run(database.close())

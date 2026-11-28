@@ -457,7 +457,6 @@ function deviceSource(credential: "secret" | "browser_session", overrides: Parti
     execution: {
       kind: "local_agent",
       operation: "document_acquisition",
-      immutable_config_fields: [],
       device: { id: "dev-1", name: "Alex's MacBook", state: "online", not_ready: [], installed_version: "0.2.0b7", required_version: "0.2.0b7", credential },
     },
     ...overrides,
@@ -743,7 +742,6 @@ test("a device source whose folder is missing shows Finish setup with the folder
     execution: {
       kind: "local_agent",
       operation: "document_acquisition",
-      immutable_config_fields: [],
       device: {
         id: "dev-1",
         name: "Alex's MacBook",

@@ -23,7 +23,7 @@ const idleSource: Source = {
   access_state: "active", last_sync: null, created_at: "2026-09-01T00:00:00Z",
   capabilities: { can_sync: true, can_configure: true, can_delete: true, can_configure_connection: true,
     can_subscribe: true, can_change_access: true, can_force_resync: true },
-  execution: { kind: "server", operation: null, immutable_config_fields: [] },
+  execution: { kind: "server", operation: null },
   sync: { run_id: "run-0", status: "success", started_at: "2026-10-22T00:00:00Z", finished_at: "2026-10-22T00:01:00Z", error_message: null },
 };
 const syncingSource: Source = {

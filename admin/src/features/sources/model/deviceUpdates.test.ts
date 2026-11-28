@@ -21,7 +21,6 @@ function onDevice(
     execution: {
       kind: "local_agent",
       operation: "document_acquisition",
-      immutable_config_fields: [],
       device: { id: deviceId ?? `dev-${device}`, name: viewerOwns ? device : null, state, not_ready: [], installed_version: "0.2.0b8", required_version: "0.2.0b7", credential: "secret" },
     },
   });

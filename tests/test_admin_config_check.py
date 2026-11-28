@@ -24,7 +24,7 @@ PAGES = "https://pages.example.test/org/site"
 SUBMITTED = {
     "confluence": {"base_url": WIKI_PAGE, "pat": "wiki-pat-secret"},
     "github_pages": {"auth_mode": "none", "page_url": f"{PAGES}/guide/start/"},
-    "github_repo": {"repo_url": "https://github.example.test/platform/cookbook.git", "connection_mode": "cloud_pull"},
+    "github_repo": {"repo_url": "https://github.example.test/platform/cookbook.git"},
     "jira": {"base_url": "https://jira.example.test", "projects": "PAY, OPS", "pat": "jira-pat-secret"},
     "local_markdown": {"root": "/Users/me/notes"},
     "notion": {
@@ -139,7 +139,7 @@ def test_config_check_maps_a_keyed_hook_refusal_to_its_field(client):
 
 def test_config_check_writes_nothing(client, database):
     _check(client, "local_markdown", {"root": "/Users/me/notes"})
-    _check(client, "github_repo", {**SUBMITTED["github_repo"], "connection_mode": "local_push"})
+    _check(client, "github_repo", SUBMITTED["github_repo"])
     _check(client, "confluence", SUBMITTED["confluence"])
 
     assert asyncio.run(database.list_sources()) == []

@@ -99,7 +99,7 @@ async def _cloud_gene(session: RepositorySession) -> GitHubRepoGene:
         return httpx.Response(200, headers=headers, stream=_Chunks(response))
 
     gene = GitHubRepoGene(
-        config={"connection_mode": "cloud_pull", "repo_url": "https://github.com/example/repo", "ref": "main"},
+        config={"repo_url": "https://github.com/example/repo", "ref": "main"},
         source_id="src-test",
     )
     with FakeConnectorHttp(handle).serving(github_repo_gene):

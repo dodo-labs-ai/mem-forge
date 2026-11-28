@@ -28,7 +28,7 @@ const source: Source = {
   access_state: "active", last_sync: null, created_at: "2026-09-01T00:00:00Z",
   capabilities: { can_sync: true, can_configure: true, can_delete: true, can_configure_connection: true,
     can_subscribe: false, can_change_access: false, can_force_resync: true },
-  execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] },
+  execution: { kind: "local_agent", operation: "teams_sync" },
   sync: { run_id: "old-run", status: "success", started_at: "2026-09-01T00:00:00Z", error_message: null,
     finished_at: "2026-09-01T00:00:00Z" },
 };
@@ -135,7 +135,7 @@ it("clears an admission when the first refresh already shows a newer terminal ru
   let admitted = false;
   vi.mocked(getCurrentLocalAgentJobs).mockResolvedValue([]);
   vi.mocked(resourceClient.get).mockImplementation(async (path) => ({ data: path === "/sources"
-    ? [{ ...source, type: "github_repo", execution: { kind: "server", operation: null, immutable_config_fields: [] },
+    ? [{ ...source, type: "github_repo", execution: { kind: "server", operation: null },
       sync: admitted ? { ...source.sync, run_id: "r2", status: "success", created_at: "2026-09-03T00:00:02Z" } : source.sync }]
     : otherResponse(path) }));
   vi.mocked(resourceClient.post).mockImplementation(async () => {
@@ -223,7 +223,7 @@ it("shows exact-record refresh failures without releasing the admitted-work guar
 it("opens content settings for a file-limit failure without starting sync", async () => {
   vi.mocked(getCurrentLocalAgentJobs).mockResolvedValue([]);
   vi.mocked(resourceClient.get).mockImplementation(async (path) => ({ data: path === "/sources"
-    ? [{ ...source, type: "github_repo", execution: { kind: "server", operation: null, immutable_config_fields: [] },
+    ? [{ ...source, type: "github_repo", execution: { kind: "server", operation: null },
       sync: { ...source.sync, status: "failed", error_message: "GitHub Repository discovery matched 571 files, exceeding max_files=500" } }]
     : otherResponse(path) }));
   mount();

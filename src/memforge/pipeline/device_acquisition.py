@@ -56,7 +56,7 @@ from memforge.local_agent.document_acquisition import (
     acquisition_job_config,
     expected_input_ids,
 )
-from memforge.local_agent.snapshot_manifest import ExcludedScopeListing
+from memforge.local_agent.device_manifest import ExcludedScopeListing
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS,
