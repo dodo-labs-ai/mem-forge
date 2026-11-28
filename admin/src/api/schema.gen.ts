@@ -40,9 +40,11 @@ export interface paths {
          *
          *     Each Source it executed, in every workspace the caller's daemon
          *     serves, loses its execution device and shows Finish setup until its
-         *     owner chooses another device in Where it runs. Its queued jobs are
-         *     cancelled. A daemon that still runs on the device appears again with
-         *     its next report, without its Sources.
+         *     owner chooses another device in Where it runs. A Source of a
+         *     workspace the caller has left keeps naming the device, and no job of
+         *     it is leased, since a daemon serves only its user's workspaces. The
+         *     device's queued jobs are cancelled. A daemon that still runs on the
+         *     device appears again with its next report, without its Sources.
          */
         delete: operations["remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete"];
         options?: never;
