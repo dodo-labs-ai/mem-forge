@@ -51,7 +51,7 @@ def owned(tmp_path, wiki):  # noqa: F811
     store = LocalDocumentStore(str(tmp_path / "docs"))
     source = asyncio.run(database.get_source(SOURCE_ID))
     job_id, created = asyncio.run(
-        enqueue_document_acquisition_job(database, store, source, workspace_id=WORKSPACE, trigger="schedule")
+        enqueue_document_acquisition_job(database, database, store, source, workspace_id=WORKSPACE, trigger="schedule")
     )
     assert created
     try:

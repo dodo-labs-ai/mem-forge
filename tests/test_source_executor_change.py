@@ -108,6 +108,9 @@ def _change(
 
 
 def _queue_job(database: Database, source_id: str, job_id: str) -> None:
+    """Queue a run of the device Source on its execution device."""
+
+    source = asyncio.run(database.get_source(source_id))
     asyncio.run(
         database.enqueue_local_agent_job(
             job_id=job_id,
@@ -115,8 +118,26 @@ def _queue_job(database: Database, source_id: str, job_id: str) -> None:
             source_type="confluence",
             operation=DOCUMENT_ACQUISITION_OPERATION,
             payload={"source_id": source_id},
-            created_by_user_id=CREATOR,
-            execution_owner_user_id=CREATOR,
+            created_by_user_id=source["execution_owner_user_id"],
+            execution_owner_user_id=source["execution_owner_user_id"],
+            device_id=source["execution_device_id"],
+        )
+    )
+
+
+def _queue_sign_in(database: Database, source_id: str, job_id: str, *, device_id: str) -> None:
+    """Queue capturing a browser session for the Source on ``device_id``."""
+
+    asyncio.run(
+        database.insert_local_agent_job(
+            job_id=job_id,
+            source_id=source_id,
+            source_type="confluence",
+            operation="credential_check",
+            payload={},
+            created_by_user_id=CHANGER,
+            execution_owner_user_id=CHANGER,
+            device_id=device_id,
         )
     )
 
@@ -295,9 +316,10 @@ def test_a_device_source_saves_its_configuration_without_secrets(client, databas
 
 def test_the_change_cancels_the_sources_queued_jobs(client, database):
     source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
     _queue_job(database, source_id, "job-queued")
 
-    moved = _change(client, source_id, "device")
+    moved = _change(client, source_id, "server", secrets={"pat": "a-token"})
 
     assert moved.status_code == 200, moved.text
     assert moved.json()["cancelled_job_ids"] == ["job-queued"]
@@ -386,18 +408,7 @@ def test_moving_to_another_device_is_a_change_and_the_old_device_no_longer_runs_
     assert _executed_by(client, CHANGER, DEVICE_ID) == [source_id]
     _queue_job(database, source_id, "job-queued")
     for job_id, device_id in (("sign-in-on-old-device", DEVICE_ID), ("sign-in-on-new-device", DESKTOP)):
-        asyncio.run(
-            database.insert_local_agent_job(
-                job_id=job_id,
-                source_id=source_id,
-                source_type="confluence",
-                operation="credential_check",
-                payload={},
-                created_by_user_id=CHANGER,
-                execution_owner_user_id=CHANGER,
-                device_id=device_id,
-            )
-        )
+        _queue_sign_in(database, source_id, job_id, device_id=device_id)
 
     moved = _change(client, source_id, "device", device=DESKTOP)
 
@@ -463,13 +474,13 @@ def test_removing_a_device_leaves_its_sources_without_an_execution_device(client
 
 def test_the_same_executor_changes_nothing(client, database):
     source_id = _create(client)
-    _queue_job(database, source_id, "job-queued")
+    _queue_sign_in(database, source_id, "sign-in-queued", device_id=DEVICE_ID)
 
     unchanged = _change(client, source_id, "server")
 
     assert unchanged.status_code == 200
     assert unchanged.json()["cancelled_job_ids"] == []
-    assert _job_status(database, "job-queued") == ("queued", None)
+    assert _job_status(database, "sign-in-queued") == ("queued", None)
     assert asyncio.run(database.get_source(source_id))["config"]["pat_encrypted"]
 
 
@@ -489,3 +500,49 @@ def test_only_a_source_manager_changes_the_executor(tmp_path, database):
 
     assert refused.status_code == 403
     assert asyncio.run(database.get_source(source_id))["executor"] == "server"
+
+
+def _lease(database: Database, user_id: str, device_id: str, source_id: str, *, lease_seconds: int = 60) -> list[str]:
+    jobs = asyncio.run(
+        database.lease_local_agent_jobs(
+            user_id=user_id,
+            device=device_report([source_id], device_id=device_id),
+            acquisition_contracts={"confluence": source_type_descriptor("confluence").acquisition_contract},
+            limit=1,
+            lease_seconds=lease_seconds,
+        )
+    )
+    return [job["job_id"] for job in jobs]
+
+
+def test_a_run_queued_after_a_move_is_its_new_devices_and_not_the_old_devices_held_attempt(client, database):
+    # The old device leased the Source's job just before the move, so the move found nothing leased.
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+    _queue_job(database, source_id, "job-on-laptop")
+    assert _lease(database, CHANGER, DEVICE_ID, source_id) == ["job-on-laptop"]
+    asyncio.run(
+        database.change_source_executor(
+            source_id, executor="device", config_json="{}", execution_device_id=DESKTOP
+        )
+    )
+
+    _queue_job(database, source_id, "job-on-desktop")
+
+    queued = asyncio.run(database.get_local_agent_job("job-on-desktop"))
+    assert (queued["status"], queued["device_id"]) == ("queued", DESKTOP)
+
+
+def test_an_expired_attempt_does_not_hold_the_source_and_a_removed_device_ends_its_attempts(client, database):
+    source_id = _create(client)
+    assert _change(client, source_id, "device").status_code == 200
+    _queue_job(database, source_id, "job-expired")
+    assert _lease(database, CHANGER, DEVICE_ID, source_id, lease_seconds=-1) == ["job-expired"]
+    assert asyncio.run(database.leased_document_acquisition_job(source_id)) is None
+
+    assert _lease(database, CHANGER, DEVICE_ID, source_id) == ["job-expired"]
+    removed = client.delete(f"/api/cloud/local-agent/devices/{DEVICE_ID}", headers={PRINCIPAL_HEADER: CHANGER})
+
+    assert removed.status_code == 200, removed.text
+    assert _job_status(database, "job-expired") == ("failed", SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE)
+    assert asyncio.run(database.leased_document_acquisition_job(source_id)) is None

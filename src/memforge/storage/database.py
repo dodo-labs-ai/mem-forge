@@ -30,6 +30,7 @@ from memforge.local_agent.device_report import DeviceReport, DeviceSourceReadine
 from memforge.local_agent.source_contract import (
     DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_SYNC_OPERATIONS,
+    LocalAgentLease,
     local_agent_completion_status,
     local_agent_retry_delay,
     local_agent_source_config_revision,
@@ -49,7 +50,6 @@ from memforge.storage.recovery_points import (
 from memforge.source_activity import (
     SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
     SOURCE_SYNC_CANCELLED_BY_USER,
-    SourceAcquisitionLeased,
     SourceActivityConflict,
     SourceActivityKind,
     SourceActivityLease,
@@ -702,6 +702,14 @@ def _utc_iso(dt: datetime | None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime values must include timezone information")
     return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_utc_iso(value: object) -> datetime | None:
+    """A stored ISO-8601 time, or ``None`` when it is missing or malformed."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
 
 
 def _lifecycle_memory_version(row: Any | None) -> str:
@@ -5060,10 +5068,16 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
     ),
     (
         134,
-        "Store device acquisition manifests and when each local-agent job attempt was leased",
-        # A device run of a document Source submits its acquisition manifest,
-        # is asked what the server run will need beyond discovery, and
-        # answers; the attempt's lease time is the run's start for the cursor.
+        "Acquire document Sources on their execution device",
+        # A document Source's acquisition runs on the server or on one device
+        # of its execution owner (ADR 0058). Each daemon installation keeps
+        # one row with its latest device report; a local-agent job names the
+        # device that runs it and records the attempt's lease, its device and
+        # the acquisition contract it was leased under, and counts the
+        # attempts that ended outside its retry budget. A device run submits
+        # its acquisition manifest, and the server answers what the run needs
+        # beyond discovery. Package snapshots and their confirmations have no
+        # writer left.
         [
             """CREATE TABLE IF NOT EXISTS source_acquisition_manifests (
                 workspace_id TEXT NOT NULL,
@@ -5081,19 +5095,6 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 answered_at TEXT,
                 PRIMARY KEY (workspace_id, source_id, snapshot_id)
             )""",
-            "ALTER TABLE local_agent_jobs ADD COLUMN leased_at TEXT",
-        ],
-    ),
-    (
-        135,
-        "Keep one row per daemon device with its latest device report",
-        # Every lease and job heartbeat carries the device report; the server
-        # keeps each device's latest report instead of one online time per
-        # user. A document_acquisition attempt records the acquisition
-        # contract it was leased under, and a job counts the attempts that
-        # ended under a contract the server no longer has outside its retry
-        # budget.
-        [
             "DROP TABLE IF EXISTS local_agent_heartbeats",
             """CREATE TABLE IF NOT EXISTS local_agent_devices (
                 user_id TEXT NOT NULL,
@@ -5101,59 +5102,20 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
                 name TEXT NOT NULL,
                 version TEXT NOT NULL,
                 acquisition_contracts_json TEXT NOT NULL,
-                source_ids_json TEXT NOT NULL,
+                sources_json TEXT NOT NULL DEFAULT '{}',
                 last_seen_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, device_id)
             )""",
-            "ALTER TABLE local_agent_jobs ADD COLUMN uncounted_attempt_count INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE local_agent_jobs ADD COLUMN acquisition_contract INTEGER",
-        ],
-    ),
-    (
-        136,
-        "Record where each Source's acquisition runs",
-        # A document Source's acquisition runs on the server or on its
-        # execution owner's device; the server reaches the provider only for
-        # the first.
-        [
-            """ALTER TABLE sources ADD COLUMN executor TEXT NOT NULL DEFAULT 'server'
-               CHECK (executor IN ('server', 'device'))""",
-        ],
-    ),
-    (
-        137,
-        "Drop the device confirmations and excluded-scope listings of package snapshots",
-        # A device acquisition records its own listing, answers and excluded
-        # listings with its manifest; a package snapshot is an existence
-        # listing, which needs neither.
-        [
-            "DROP TABLE IF EXISTS source_sync_snapshot_confirmations",
-            "DROP TABLE IF EXISTS source_sync_snapshot_excluded_listings",
-        ],
-    ),
-    (
-        138,
-        "Run each device Source on one execution device and keep each device's readiness per Source",
-        # A device Source runs on one device of its execution owner, which
-        # leases its jobs; a device-bound setup job names its device, and an
-        # attempt is bound to the device that leased it. A device report
-        # names, per Source the device executes, whether it is ready to run
-        # it. Every existing device Source gets the owner's device whose
-        # latest report named its credentials, else the owner's only device.
-        [
-            "ALTER TABLE sources ADD COLUMN execution_device_id TEXT",
             "ALTER TABLE local_agent_jobs ADD COLUMN device_id TEXT",
             "ALTER TABLE local_agent_jobs ADD COLUMN lease_device_id TEXT",
-            "ALTER TABLE local_agent_devices ADD COLUMN sources_json TEXT NOT NULL DEFAULT '{}'",
-        ],
-    ),
-    (
-        139,
-        "Drop the snapshot manifests of device packages",
-        # Every document Source's device run records its acquisition manifest;
-        # a snapshot input names its Document and nothing checks it against a
-        # package manifest.
-        [
+            "ALTER TABLE local_agent_jobs ADD COLUMN leased_at TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN acquisition_contract INTEGER",
+            "ALTER TABLE local_agent_jobs ADD COLUMN uncounted_attempt_count INTEGER NOT NULL DEFAULT 0",
+            """ALTER TABLE sources ADD COLUMN executor TEXT NOT NULL DEFAULT 'server'
+               CHECK (executor IN ('server', 'device'))""",
+            "ALTER TABLE sources ADD COLUMN execution_device_id TEXT",
+            "DROP TABLE IF EXISTS source_sync_snapshot_confirmations",
+            "DROP TABLE IF EXISTS source_sync_snapshot_excluded_listings",
             "DROP INDEX IF EXISTS idx_source_sync_manifest_item_attestation",
             "DROP TABLE IF EXISTS source_sync_snapshot_manifest_items",
             "DROP TABLE IF EXISTS source_sync_snapshot_manifests",
@@ -5773,9 +5735,6 @@ class Database:
             logger.info("Superseded %d unapplied derivations staged with a Source activity epoch", superseded)
         if version == 123:
             await self._drop_columns_if_present_unlocked("source_sync_snapshot_manifests", "scope_attestations_json")
-        if version == 138:
-            await self._choose_execution_devices_unlocked()
-            await self._drop_columns_if_present_unlocked("local_agent_devices", "source_ids_json")
         if version == 107:
             await self._drop_columns_if_present_unlocked("memories", "confidence")
             await self._drop_columns_if_present_unlocked("agent_claims", "confidence")
@@ -6173,38 +6132,6 @@ class Database:
             backfilled_revision_count=backfilled,
             unresolved_revision_ids=tuple(unresolved),
         )
-
-    async def _choose_execution_devices_unlocked(self) -> None:
-        """Give every device Source without an execution device one of its execution owner's devices.
-
-        The device is the owner's most recently seen device whose latest
-        report named the Source's credentials, else the owner's only device.
-        A Source with neither keeps none and waits for its owner to choose.
-        """
-
-        async with self.db.execute("PRAGMA table_info(local_agent_devices)") as cursor:
-            device_columns = {str(row[1]) async for row in cursor}
-        async with self.db.execute(
-            """SELECT id, execution_owner_user_id FROM sources
-               WHERE executor = 'device' AND execution_device_id IS NULL AND execution_owner_user_id IS NOT NULL"""
-        ) as cursor:
-            sources = [(str(row[0]), str(row[1])) async for row in cursor]
-        named = "source_ids_json" if "source_ids_json" in device_columns else "'[]'"
-        for source_id, owner in sources:
-            async with self.db.execute(
-                f"""SELECT device_id, {named} AS named FROM local_agent_devices
-                    WHERE user_id = ? ORDER BY last_seen_at DESC, device_id""",
-                (owner,),
-            ) as cursor:
-                devices = [(str(row[0]), json.loads(row[1] or "[]")) async for row in cursor]
-            holding = [device_id for device_id, source_ids in devices if source_id in source_ids]
-            if holding:
-                chosen = holding[0]
-            elif len(devices) == 1:
-                chosen = devices[0][0]
-            else:
-                continue
-            await self.db.execute("UPDATE sources SET execution_device_id = ? WHERE id = ?", (chosen, source_id))
 
     async def _drop_columns_if_present_unlocked(self, table: str, *column_names: str) -> None:
         """Drop columns that a database created before their removal still has."""
@@ -6886,12 +6813,16 @@ class Database:
         created_by_user_id: str,
         execution_owner_user_id: str,
         workspace_id: str = "default",
+        device_id: str | None = None,
         trigger: str = "manual",
         retry_job_id: str | None = None,
         next_attempt_at: datetime | None = None,
     ) -> tuple[str, bool]:
         """Queue a local-agent job, or coalesce it with the Source's current one.
 
+        ``device_id`` is the one device that may lease the job; a
+        ``document_acquisition`` job names its Source's execution device, and
+        coalesces only with a job that names the same device.
         ``next_attempt_at`` is the earliest time a daemon may lease a job this
         call creates; a job it coalesces with keeps its own.
         """
@@ -6906,6 +6837,7 @@ class Database:
                     created_by_user_id=created_by_user_id,
                     execution_owner_user_id=execution_owner_user_id,
                     workspace_id=workspace_id,
+                    device_id=device_id,
                     trigger=trigger,
                     retry_job_id=retry_job_id,
                     now_iso=_utc_iso(None),
@@ -6930,6 +6862,7 @@ class Database:
         workspace_id: str,
         trigger: str,
         now_iso: str,
+        device_id: str | None = None,
         retry_job_id: str | None = None,
         next_attempt_at: str | None = None,
     ) -> tuple[str, bool]:
@@ -6973,12 +6906,13 @@ class Database:
             )
             return retry_job_id, False
 
+        # A job for another device was planned for an executor the Source has left.
         async with self.db.execute(
             """SELECT * FROM local_agent_jobs
                WHERE workspace_id = ? AND source_id = ? AND operation = ?
-                 AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
+                 AND execution_owner_user_id = ? AND device_id IS ? AND status IN ('queued', 'leased')
                ORDER BY created_at""",
-            (workspace_id, source_id, operation, execution_owner_user_id),
+            (workspace_id, source_id, operation, execution_owner_user_id, device_id),
         ) as cursor:
             existing = None
             async for row in cursor:
@@ -7009,11 +6943,11 @@ class Database:
             """INSERT INTO local_agent_jobs (
                 job_id, workspace_id, source_id, source_type, operation,
                 payload_json, created_by_user_id, execution_owner_user_id,
-                next_attempt_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                device_id, next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, workspace_id, source_id, source_type, operation,
              json.dumps(dict(payload), sort_keys=True), created_by_user_id,
-             execution_owner_user_id, next_attempt_at, now_iso, now_iso),
+             execution_owner_user_id, device_id, next_attempt_at, now_iso, now_iso),
         )
         return job_id, True
 
@@ -7057,11 +6991,11 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Keep the device's report and lease it up to ``limit`` of its user's due jobs.
 
-        A ``document_acquisition`` job is leased only by its Source's
-        execution device, while its report names the Source ready and its
-        acquisition contract for the type equals ``acquisition_contracts``,
-        the server's; the attempt records that contract. A job that names a
-        device is leased only by that device. Any other device leaves such a
+        A job that names a device is leased only by that device; a
+        ``document_acquisition`` job names its Source's execution device, and
+        is leased only while that device's report names the Source ready and
+        its acquisition contract for the type equals ``acquisition_contracts``,
+        the server's. The attempt records that contract. Any other device leaves such a
         job waiting, queued, without counting an attempt. Each leased attempt
         records the device that holds it.
         """
@@ -7077,7 +7011,6 @@ class Database:
         routing = (
             device.device_id,
             DOCUMENT_ACQUISITION_OPERATION,
-            device.device_id,
             json.dumps(sorted(device.ready_source_ids())),
             json.dumps(sorted(acquiring_types)),
         )
@@ -7091,9 +7024,7 @@ class Database:
                           (j.status = 'leased' AND j.leased_until <= ?))
                      AND (j.device_id IS NULL OR j.device_id = ?)
                      AND (j.operation <> ?
-                          OR (j.source_id IN (
-                                  SELECT id FROM sources
-                                  WHERE executor = 'device' AND execution_device_id = ?)
+                          OR (j.device_id IS NOT NULL
                               AND j.source_id IN (SELECT value FROM json_each(?))
                               AND j.source_type IN (SELECT value FROM json_each(?))))
                      AND NOT EXISTS (
@@ -7315,6 +7246,91 @@ class Database:
             await self.db.commit()
         return bool(cursor.rowcount)
 
+    async def current_local_agent_lease(
+        self,
+        *,
+        job_id: str,
+        attempt_count: int,
+        source_id: str,
+        lease_owner_user_id: str,
+        source_config_revision: str,
+    ) -> LocalAgentLease | None:
+        """The attempt's lease while it is current for this Source, owner and configuration, else ``None``."""
+
+        job = await self.get_local_agent_job(job_id)
+        if job is None:
+            return None
+        leased_until = _parse_utc_iso(job.get("leased_until"))
+        leased_at = _parse_utc_iso(job.get("leased_at"))
+        if (
+            job.get("status") != "leased"
+            or job.get("source_id") != source_id
+            or job.get("lease_owner_user_id") != lease_owner_user_id
+            or int(job.get("attempt_count") or 0) != attempt_count
+            or (job.get("payload") or {}).get("source_config_revision") != source_config_revision
+            or leased_until is None
+            or leased_until <= datetime.now(timezone.utc)
+            or leased_at is None
+        ):
+            return None
+        return LocalAgentLease(
+            payload=dict(job.get("payload") or {}),
+            leased_at=leased_at,
+            device_id=job.get("lease_device_id"),
+            acquisition_contract=job.get("acquisition_contract"),
+        )
+
+    async def leased_document_acquisition_job(self, source_id: str) -> str | None:
+        """The id of a ``document_acquisition`` job of the Source a daemon holds unexpired, if any."""
+
+        async with self.db.execute(
+            """SELECT job_id FROM local_agent_jobs
+               WHERE source_id = ? AND operation = ? AND status = 'leased' AND leased_until > ?
+               ORDER BY created_at, job_id LIMIT 1""",
+            (source_id, DOCUMENT_ACQUISITION_OPERATION, _utc_iso(None)),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row["job_id"]) if row is not None else None
+
+    async def cancel_queued_source_jobs(
+        self,
+        source_id: str,
+        *,
+        execution_device_id: str | None,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Fail the Source's queued jobs planned for another executor as cancelled by a Source change; return them.
+
+        These are its queued sync jobs, and its queued setup jobs that name a
+        device other than ``execution_device_id``, the Source's execution
+        device, or any device when it has none.
+        """
+
+        cancelled_at = _utc_iso(now)
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
+        queued = f"""source_id = ? AND status = 'queued'
+            AND (operation IN ({placeholders}) OR (device_id IS NOT NULL AND device_id IS NOT ?))"""
+        queued_args = (source_id, *operations, execution_device_id)
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {queued} ORDER BY created_at, job_id",
+                    queued_args,
+                ) as cursor:
+                    cancelled = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {queued}""",
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, cancelled_at, cancelled_at, *queued_args),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return cancelled
+
     async def _record_local_agent_device(self, *, user_id: str, device: DeviceReport, seen_at: str) -> None:
         """Keep the device's latest report; the caller holds the write lock and commits."""
 
@@ -7365,17 +7381,15 @@ class Database:
         ]
 
     async def remove_local_agent_device(self, user_id: str, device_id: str) -> list[str]:
-        """Forget one of the user's devices and clear it as the execution device of its Sources; return them.
+        """Forget one of the user's devices and fail its jobs as cancelled; return those jobs.
 
-        Those Sources run nothing until their owner chooses another device.
-        The device's queued jobs that name it fail as cancelled, and so do the
-        queued sync jobs of its Sources. Raises ``LookupError`` when the user
-        has no such device.
+        These are the queued jobs that name it, the ``document_acquisition``
+        jobs of the Sources it executed included, and the attempts it holds,
+        whose submissions the server then refuses. Raises ``LookupError``
+        when the user has no such device.
         """
 
         removed_at = _utc_iso(None)
-        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
-        placeholders = ",".join("?" for _ in operations)
         async with self._write_lock:
             try:
                 deleted = await self.db.execute(
@@ -7383,32 +7397,44 @@ class Database:
                 )
                 if not deleted.rowcount:
                     raise LookupError("local_agent_device_not_found")
+                held = """execution_owner_user_id = ? AND (
+                    (status = 'queued' AND device_id = ?) OR (status = 'leased' AND lease_device_id = ?))"""
+                held_args = (user_id, device_id, device_id)
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {held} ORDER BY created_at, job_id",
+                    held_args,
+                ) as cursor:
+                    cancelled = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?, leased_until = NULL,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {held}""",
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, removed_at, removed_at, *held_args),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return cancelled
+
+    async def release_execution_device(self, execution_owner_user_id: str, device_id: str) -> list[str]:
+        """Clear a removed device as the execution device of the owner's Sources; return those Sources.
+
+        They run nothing until their owner chooses another device.
+        """
+
+        async with self._write_lock:
+            try:
                 async with self.db.execute(
                     """SELECT id FROM sources WHERE execution_owner_user_id = ? AND execution_device_id = ?
                        ORDER BY id""",
-                    (user_id, device_id),
+                    (execution_owner_user_id, device_id),
                 ) as cursor:
                     source_ids = [str(row["id"]) async for row in cursor]
                 await self.db.execute(
-                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
-                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
-                       WHERE status = 'queued'
-                         AND ((execution_owner_user_id = ? AND device_id = ?)
-                              OR (operation IN ({placeholders}) AND source_id IN (SELECT value FROM json_each(?))))""",
-                    (
-                        SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
-                        removed_at,
-                        removed_at,
-                        user_id,
-                        device_id,
-                        *operations,
-                        json.dumps(source_ids),
-                    ),
-                )
-                await self.db.execute(
                     """UPDATE sources SET execution_device_id = NULL
                        WHERE execution_owner_user_id = ? AND execution_device_id = ?""",
-                    (user_id, device_id),
+                    (execution_owner_user_id, device_id),
                 )
                 await self.db.commit()
             except BaseException:
@@ -7447,9 +7473,8 @@ class Database:
         config_json: str,
         execution_owner_user_id: str | None = None,
         execution_device_id: str | None = None,
-        now: datetime | None = None,
-    ) -> list[str]:
-        """Move where the Source's acquisition runs, keeping everything it holds; return the jobs it cancelled.
+    ) -> None:
+        """Move where the Source's acquisition runs, keeping everything it holds.
 
         The executor and the execution device are not part of the Source's
         scope: the change opens no scope transition, and leaves its Documents,
@@ -7461,26 +7486,17 @@ class Database:
         Source, and is cleared for a server Source.
 
         The change waits for the Source's sync: it raises
-        :class:`SourceSyncRunActive` while a run is pending or running, and
-        :class:`SourceAcquisitionLeased` while a daemon holds one of its
-        ``document_acquisition`` jobs. The Source's queued sync jobs fail as
-        cancelled by the change, because each was planned for the previous
-        executor, and so do a device Source's queued setup jobs that name a
-        device other than its new execution device, since only that device
-        holds the Source's credentials and location. Raises ``LookupError``
-        for an unknown Source.
+        :class:`SourceSyncRunActive` while a run is pending or running. The
+        Source's local-agent jobs are its job store's; the caller cancels the
+        ones planned for the previous executor. Raises ``LookupError`` for an
+        unknown Source.
         """
 
-        changed_at = _utc_iso(now)
-        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
-        placeholders = ",".join("?" for _ in operations)
         async with self._write_lock:
             try:
                 source_lock = await self.db.execute("UPDATE sources SET status = status WHERE id = ?", (source_id,))
                 if not source_lock.rowcount:
                     raise LookupError("source_not_found")
-                async with self.db.execute("SELECT executor FROM sources WHERE id = ?", (source_id,)) as cursor:
-                    previous = await cursor.fetchone()
                 async with self.db.execute(
                     """SELECT run_id FROM source_sync_runs
                        WHERE source_id = ? AND status IN ('pending', 'running')
@@ -7492,33 +7508,6 @@ class Database:
                     raise SourceSyncRunActive(
                         f"source sync run already active: {active_run['run_id']}", run_id=str(active_run["run_id"])
                     )
-                async with self.db.execute(
-                    """SELECT job_id FROM local_agent_jobs
-                       WHERE source_id = ? AND operation = ? AND status = 'leased'
-                       ORDER BY created_at, job_id LIMIT 1""",
-                    (source_id, DOCUMENT_ACQUISITION_OPERATION),
-                ) as cursor:
-                    leased_job = await cursor.fetchone()
-                if leased_job is not None:
-                    raise SourceAcquisitionLeased(
-                        f"source acquisition job is leased: {leased_job['job_id']}", job_id=str(leased_job["job_id"])
-                    )
-                new_device = execution_device_id if executor == "device" else None
-                queued = f"""source_id = ? AND status = 'queued'
-                    AND (operation IN ({placeholders})
-                         OR (? = 'device' AND device_id IS NOT NULL AND device_id IS NOT ?))"""
-                queued_args = (source_id, *operations, str(previous["executor"] or ""), new_device)
-                async with self.db.execute(
-                    f"SELECT job_id FROM local_agent_jobs WHERE {queued} ORDER BY created_at, job_id",
-                    queued_args,
-                ) as cursor:
-                    cancelled = [str(row["job_id"]) async for row in cursor]
-                await self.db.execute(
-                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
-                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
-                       WHERE {queued}""",
-                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, changed_at, changed_at, *queued_args),
-                )
                 await self.db.execute(
                     """UPDATE sources SET executor = ?, config = ?,
                            execution_owner_user_id = COALESCE(?, execution_owner_user_id),
@@ -7528,7 +7517,7 @@ class Database:
                         executor,
                         config_json,
                         execution_owner_user_id,
-                        new_device,
+                        execution_device_id if executor == "device" else None,
                         source_id,
                     ),
                 )
@@ -7536,7 +7525,6 @@ class Database:
             except BaseException:
                 await self.db.rollback()
                 raise
-        return cancelled
 
     async def enqueue_due_local_agent_jobs(
         self,
@@ -7614,21 +7602,23 @@ class Database:
                             f"memforge:{workspace_id}:{row['id']}:{expected_due}",
                         ).hex
                     )
-                    # A configuration saved since the payload was read leaves
-                    # the Source due, for the next pass to read it again.
+                    # A configuration saved or a device chosen since the payload
+                    # was read leaves the Source due, for the next pass to read it again.
                     cursor = await self.db.execute(
                         """UPDATE sources SET sync_schedule_next_at = ?,
                            sync_schedule_updated_at = ?
                            WHERE id = ? AND status = 'active'
                              AND sync_schedule_enabled = 1
                              AND sync_schedule_next_at = ?
-                             AND config = ?""",
+                             AND config = ?
+                             AND execution_device_id IS ?""",
                         (
                             _utc_iso(claim_time + timedelta(minutes=interval)),
                             due_at,
                             row["id"],
                             expected_due,
                             row["config"],
+                            row.get("execution_device_id"),
                         ),
                     )
                     if cursor.rowcount:
@@ -7637,6 +7627,11 @@ class Database:
                             source_type=row["type"], operation=operation,
                             payload=payloads[row["id"]], created_by_user_id=owner,
                             execution_owner_user_id=owner, now_iso=due_at, trigger="scheduled",
+                            device_id=(
+                                row.get("execution_device_id")
+                                if operation == DOCUMENT_ACQUISITION_OPERATION
+                                else None
+                            ),
                         )
                         enqueued += int(created)
                 await self.db.commit()

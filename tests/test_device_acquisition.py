@@ -23,6 +23,7 @@ import pytest
 from PIL import Image
 
 import memforge.server.admin_api as admin_api
+from tests.leased_job_store import LeasedJobStore
 from memforge.config import AppConfig
 from memforge.genes.notion_gene import NotionGene
 from memforge.genes.toolkit.pdf import PdfMaterial
@@ -249,7 +250,10 @@ class _Lease:
 
     def lease(self, payload: Mapping[str, object], *, leased_at: datetime, acquisition_contract: int = 1) -> None:
         self.held = LocalAgentLease(
-            payload=dict(payload), leased_at=leased_at, acquisition_contract=acquisition_contract
+            payload=dict(payload),
+            leased_at=leased_at,
+            device_id=DEVICE_ID,
+            acquisition_contract=acquisition_contract,
         )
 
     async def __call__(self, *args, **kwargs) -> LocalAgentLease | None:
@@ -444,7 +448,9 @@ def _base64(body: bytes) -> str:
     return base64.b64encode(body).decode("ascii")
 
 
-def _connect(path) -> Database:
+def _connect(path, *, executor: str = "server") -> Database:
+    """A deployment's database holding the wiki Source, run by ``executor``; a device one runs on ``DEVICE_ID``."""
+
     database = Database(str(path))
     asyncio.run(database.connect())
     asyncio.run(
@@ -456,6 +462,8 @@ def _connect(path) -> Database:
             created_by_user_id=LOCAL_DEV_USER_ID,
             access_policy="workspace",
             owner_user_id=LOCAL_DEV_USER_ID,
+            executor=executor,
+            execution_device_id=DEVICE_ID if executor == "device" else None,
         )
     )
     return database
@@ -500,9 +508,11 @@ def deployments(tmp_path, wiki):
     """A server deployment, and a device deployment whose daemon talks to its routes."""
 
     server = _Side(_connect(tmp_path / "server.db"), LocalDocumentStore(str(tmp_path / "server-docs")))
-    device_db = _connect(tmp_path / "device.db")
+    device_db = _connect(tmp_path / "device.db", executor="device")
     lease = _Lease()
-    app = admin_api.create_admin_app(db=device_db, config=_config(tmp_path), local_agent_lease_validator=lease)
+    app = admin_api.create_admin_app(
+        db=device_db, config=_config(tmp_path), local_agent_jobs=LeasedJobStore(device_db, lease)
+    )
     from fastapi.testclient import TestClient
 
     try:
@@ -1217,7 +1227,7 @@ def test_a_run_that_disagrees_with_its_acquisition_fails_and_a_new_job_acquires_
     held_before = asyncio.run(device.held())
     source = asyncio.run(device.db.get_source(SOURCE_ID))
     asyncio.run(
-        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
+        enqueue_document_acquisition_job(device.db, device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
     )
 
     def fail_a() -> None:
@@ -1599,7 +1609,7 @@ def test_a_run_that_fails_on_a_recorded_provider_error_acquires_again_within_the
     wiki.refused = {"b"}
     source = asyncio.run(device.db.get_source(SOURCE_ID))
     asyncio.run(
-        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
+        enqueue_document_acquisition_job(device.db, device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
     )
 
     attempts: list[int] = []
@@ -1642,7 +1652,7 @@ def _fail_a_run_on_a_recorded_provider_error(device: _Side, client, lease: _Leas
     wiki.refused = {"b"}
     source = asyncio.run(device.db.get_source(SOURCE_ID))
     asyncio.run(
-        enqueue_document_acquisition_job(device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
+        enqueue_document_acquisition_job(device.db, device.db, device.doc_store, source, workspace_id=WORKSPACE, trigger="scheduled")
     )
     _run_queued_job(device, client, lease, config)
 

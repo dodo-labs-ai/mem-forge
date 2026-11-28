@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from rich.logging import RichHandler
 
+from tests.leased_job_store import LeasedJobStore
 from memforge.config import AppConfig
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.local_agent.source_contract import LocalAgentLease
@@ -2627,7 +2628,7 @@ async def test_source_scope_update_cancels_active_sync(db, tmp_path, monkeypatch
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
@@ -2905,7 +2906,7 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
         response = client.post(
@@ -3089,7 +3090,7 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service

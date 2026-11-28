@@ -57,6 +57,7 @@ from memforge.local_agent.document_acquisition import (
     expected_input_ids,
 )
 from memforge.local_agent.device_manifest import ExcludedScopeListing
+from memforge.local_agent.job_store import LocalAgentJobStore
 from memforge.local_agent.source_contract import (
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_PAYLOAD_CONTROL_FIELDS,
@@ -205,6 +206,7 @@ async def document_acquisition_job_payload(
 
 async def enqueue_document_acquisition_job(
     db: Database,
+    jobs: LocalAgentJobStore,
     doc_store: DocumentStore,
     source: Mapping[str, Any],
     request_payload: Mapping[str, Any] | None = None,
@@ -230,9 +232,10 @@ async def enqueue_document_acquisition_job(
     payload = await document_acquisition_job_payload(
         db, doc_store, source, request_payload, acquisition_attempt=acquisition_attempt
     )
-    return await db.enqueue_local_agent_job(
+    return await jobs.enqueue_local_agent_job(
         job_id=f"laj-{uuid.uuid4().hex}",
         workspace_id=workspace_id,
+        device_id=str(source["execution_device_id"]),
         source_id=str(source["id"]),
         source_type=str(source["type"]),
         operation=DOCUMENT_ACQUISITION_OPERATION,

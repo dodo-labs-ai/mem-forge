@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from tests.leased_job_store import LeasedJobStore
 from memforge.config import AppConfig
 from memforge.local_agent.source_contract import LocalAgentLease
 from memforge.storage.database import Database
@@ -80,7 +81,7 @@ def test_create_local_markdown_source_generates_internal_vault_id(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        app = create_admin_app(db=database, config=cfg, local_agent_jobs=LeasedJobStore(database, _allow_local_agent_lease))
         with LeaseAwareTestClient(app) as client:
             response = client.post(
                 "/api/v1/sources",
@@ -113,7 +114,7 @@ def test_update_local_markdown_source_preserves_internal_vault_id(tmp_path):
     cfg = _config(tmp_path)
     database = _connect_database(tmp_path)
     try:
-        app = create_admin_app(db=database, config=cfg, local_agent_lease_validator=_allow_local_agent_lease)
+        app = create_admin_app(db=database, config=cfg, local_agent_jobs=LeasedJobStore(database, _allow_local_agent_lease))
         with LeaseAwareTestClient(app) as client:
             created = _create_local_markdown_source(client, vault_id="engineering")
             response = client.put(
@@ -211,7 +212,7 @@ def test_a_retried_artifact_upload_survives_cleanup_of_the_failed_attempt(tmp_pa
     try:
         app = create_admin_app(
             db=database, config=cfg, document_store=document_store,
-            local_agent_lease_validator=_allow_local_agent_lease,
+            local_agent_jobs=LeasedJobStore(database, _allow_local_agent_lease),
         )
         record = _FailOnceThenCleanUp(database, document_store)
         database.create_source_sync_input = record

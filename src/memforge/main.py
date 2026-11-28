@@ -4266,7 +4266,7 @@ def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, .
             runtime = await DefaultRuntimeProvider().build_sync_runtime(db, config)
             results = [
                 await apply_package_migration(
-                    db, config, str(source["id"]), runtime=runtime, workspace_id=SELF_HOSTED_WORKSPACE_ID
+                    db, config, str(source["id"]), jobs=db, runtime=runtime, workspace_id=SELF_HOSTED_WORKSPACE_ID
                 )
                 for source in sources
             ]

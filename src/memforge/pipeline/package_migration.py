@@ -55,9 +55,10 @@ import copy
 import json
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from memforge.local_agent.executor_change import move_source_executor
+from memforge.local_agent.job_store import LocalAgentJobStore
 from memforge.genes import gene_class
 from memforge.genes.recorded import AcquiredInput, AcquisitionRecordMismatch
 from memforge.github_repo_utils import GITHUB_SYMLINK_MODE, build_github_repo_doc_id, parse_github_repo_url
@@ -592,6 +593,7 @@ async def apply_package_migration(
     config: AppConfig,
     source_id: str,
     *,
+    jobs: LocalAgentJobStore,
     runtime: SyncRuntime,
     workspace_id: str,
 ) -> PackageMigrationResult:
@@ -652,14 +654,15 @@ async def apply_package_migration(
         execution_device_id = str(source.get("execution_device_id") or "") or None
         owner = str(source.get("execution_owner_user_id") or "")
         if execution_device_id is None and owner:
-            devices = await db.list_local_agent_devices(owner)
+            devices = await jobs.list_local_agent_devices(owner)
             execution_device_id = devices[0].report.device_id if len(devices) == 1 else None
-        await db.change_source_executor(
+        await move_source_executor(
+            db,
+            jobs,
             source_id,
             executor=SOURCE_EXECUTOR_DEVICE,
             config_json=json.dumps(device_config),
             execution_device_id=execution_device_id,
-            now=datetime.now(timezone.utc),
         )
     return PackageMigrationResult(plan=plan, status="migrated")
 

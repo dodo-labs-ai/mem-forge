@@ -330,6 +330,8 @@ from memforge.local_agent.credential_check import (
     signs_in_with_browser_session,
 )
 from memforge.local_agent.device_lease import EXECUTED_SOURCES_FIELD
+from memforge.local_agent.executor_change import move_source_executor
+from memforge.local_agent.job_store import LocalAgentJobStore
 from memforge.local_agent.device_report import (
     DEVICE_ID_MAX_CHARS,
     DeviceReport,
@@ -664,9 +666,13 @@ def _require_source_sync_support(source: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="source_sync_not_supported")
 
 
+def _job_store(request: Request) -> LocalAgentJobStore:
+    """The deployment's store of local-agent jobs and devices."""
+    return request.app.state.local_agent_jobs
+
+
 async def _require_current_local_agent_lease(
     request: Request,
-    db: Database,
     *,
     source: Mapping[str, Any],
     job_id: str | None,
@@ -675,59 +681,42 @@ async def _require_current_local_agent_lease(
     """The Source's job attempt while the caller holds its lease; 409 otherwise.
 
     The lease's payload carries the Source's current configuration revision.
-    A deployment's own lease validator returns the :class:`LocalAgentLease`
-    it holds while the lease is current, and ``None`` otherwise.
+    A ``document_acquisition`` attempt is current only while the device that
+    holds it is still the Source's execution device.
     """
     source_id = str(source.get("id") or "").strip()
     expected_config_revision = local_agent_source_config_revision(source)
     normalized_job_id = str(job_id or "").strip()
     if not normalized_job_id or attempt_count is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
-    validator = getattr(request.app.state, "local_agent_lease_validator", None)
-    lease: LocalAgentLease | None = None
-    if validator is not None:
-        lease = await validator(
-            request,
-            source_id,
-            normalized_job_id,
-            int(attempt_count or 0),
-            expected_config_revision,
-        )
-    else:
-        job = await db.get_local_agent_job(normalized_job_id)
-        leased_until = _lease_time(job.get("leased_until")) if job else None
-        leased_at = _lease_time(job.get("leased_at")) if job else None
-        if (
-            job
-            and job.get("status") == "leased"
-            and job.get("source_id") == source_id
-            and job.get("lease_owner_user_id") == resolve_request_principal(request)
-            and int(job.get("attempt_count") or 0) == attempt_count
-            and (job.get("payload") or {}).get("source_config_revision") == expected_config_revision
-            and leased_until is not None
-            and leased_until > datetime.now(timezone.utc)
-            and leased_at is not None
-        ):
-            lease = LocalAgentLease(
-                payload=dict(job.get("payload") or {}),
-                leased_at=leased_at,
-                acquisition_contract=job.get("acquisition_contract"),
-            )
+    jobs = _job_store(request)
+    lease = await jobs.current_local_agent_lease(
+        job_id=normalized_job_id,
+        attempt_count=int(attempt_count),
+        source_id=source_id,
+        lease_owner_user_id=resolve_request_principal(request),
+        source_config_revision=expected_config_revision,
+    )
     if lease is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
     if lease.payload.get("operation") == DOCUMENT_ACQUISITION_OPERATION:
+        # The job named its device when it was queued; a Source moved since
+        # then no longer runs there, and the attempt's results are not its own.
+        if not source_runs_on_device(source) or source.get("execution_device_id") != lease.device_id:
+            raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
         await _require_current_acquisition_contract(
-            db, source=source, lease=lease, job_id=normalized_job_id, attempt_count=int(attempt_count)
+            jobs, source=source, lease=lease, job_id=normalized_job_id, attempt_count=int(attempt_count)
         )
     return LocalAgentLease(
         payload={**lease.payload, "source_config_revision": expected_config_revision},
         leased_at=lease.leased_at,
+        device_id=lease.device_id,
         acquisition_contract=lease.acquisition_contract,
     )
 
 
 async def _require_current_acquisition_contract(
-    db: Database,
+    jobs: LocalAgentJobStore,
     *,
     source: Mapping[str, Any],
     lease: LocalAgentLease,
@@ -745,7 +734,7 @@ async def _require_current_acquisition_contract(
     descriptor = source_type_descriptor(str(source.get("type") or ""))
     if descriptor is not None and lease.acquisition_contract == descriptor.acquisition_contract:
         return
-    await db.requeue_local_agent_job_uncounted(job_id=job_id, attempt_count=attempt_count)
+    await jobs.requeue_local_agent_job_uncounted(job_id=job_id, attempt_count=attempt_count)
     raise HTTPException(status_code=409, detail=ACQUISITION_CONTRACT_CHANGED)
 
 
@@ -786,13 +775,6 @@ def _device_source_entry(source: Mapping[str, Any]) -> dict[str, Any]:
         "config": acquisition_job_config(str(source["type"]), source.get("config") or {}),
         "execution_device_id": source.get("execution_device_id"),
     }
-
-
-def _lease_time(value: object) -> datetime | None:
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
-    except ValueError:
-        return None
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -3068,7 +3050,7 @@ EXECUTION_DEVICE_REQUIRED_DETAIL = {
 
 
 async def _chosen_execution_device(
-    db: Database, *, executor: str, chooser: str, device_id: str | None
+    jobs: LocalAgentJobStore, *, executor: str, chooser: str, device_id: str | None
 ) -> str | None:
     """The device a device Source is to run on: one of the chooser's own devices, by its id.
 
@@ -3084,10 +3066,10 @@ async def _chosen_execution_device(
                 detail={"code": EXECUTION_DEVICE_INVALID, "message": "A server source runs on no device."},
             )
         return None
-    return await _choosers_device(db, chooser=chooser, device_id=device_id)
+    return await _choosers_device(jobs, chooser=chooser, device_id=device_id)
 
 
-async def _choosers_device(db: Database, *, chooser: str, device_id: str | None) -> str:
+async def _choosers_device(jobs: LocalAgentJobStore, *, chooser: str, device_id: str | None) -> str:
     """One of the chooser's own devices, by its id; 400 ``execution_device_invalid`` otherwise."""
 
     if not device_id:
@@ -3095,7 +3077,7 @@ async def _choosers_device(db: Database, *, chooser: str, device_id: str | None)
             status_code=400,
             detail={"code": EXECUTION_DEVICE_INVALID, "message": "Choose the device that runs the source."},
         )
-    if not any(device.report.device_id == device_id for device in await db.list_local_agent_devices(chooser)):
+    if not any(device.report.device_id == device_id for device in await jobs.list_local_agent_devices(chooser)):
         raise HTTPException(
             status_code=400,
             detail={
@@ -3123,11 +3105,7 @@ async def _stop_source_sync(
     """
 
     source_id = str(source["id"])
-    stopper = getattr(request.app.state, "local_agent_job_stopper", None)
-    if stopper is not None:
-        job_ids = await stopper(source_id)
-    else:
-        job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
+    job_ids = await _job_store(request).stop_local_agent_source_jobs(source_id=source_id)
     run = await sync_service.stop_source(source_id)
     if run is not None and run.status == "running":
         outcome = "stopping"
@@ -3254,7 +3232,6 @@ async def _require_acquisition_lease(
 
     lease = await _require_current_local_agent_lease(
         request,
-        db,
         source=source,
         job_id=attempt.local_agent_job_id,
         attempt_count=attempt.local_agent_attempt_count,
@@ -5140,11 +5117,7 @@ def create_admin_app(
     workspace_role_resolver: Callable[[Request], str] | None = None,
     maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
-    local_agent_lease_validator: (
-        Callable[[Request, str, str, int, str], Awaitable[LocalAgentLease | None]] | None
-    ) = None,
-    local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
-    local_agent_job_stopper: Callable[[str], Awaitable[list[str]]] | None = None,
+    local_agent_jobs: LocalAgentJobStore | None = None,
     langfuse_annotation_adapter: object | None = None,
     workspace_id: str = SELF_HOSTED_WORKSPACE_ID,
 ) -> FastAPI:
@@ -5210,9 +5183,7 @@ def create_admin_app(
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.maintenance_operator_resolver = maintenance_operator_resolver
-        app.state.local_agent_lease_validator = local_agent_lease_validator
-        app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
-        app.state.local_agent_job_stopper = local_agent_job_stopper
+        app.state.local_agent_jobs = local_agent_jobs or app.state.db
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
         app.state.sync_service = SyncService(
             app.state.db,
@@ -5339,9 +5310,8 @@ def create_admin_app(
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
     app.state.maintenance_operator_resolver = maintenance_operator_resolver
-    app.state.local_agent_lease_validator = local_agent_lease_validator
-    app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
-    app.state.local_agent_job_stopper = local_agent_job_stopper
+    # A database the lifespan opens is its own job store, set there.
+    app.state.local_agent_jobs = local_agent_jobs or db
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
 
     @app.middleware("http")
@@ -7274,7 +7244,7 @@ def create_admin_app(
             if source_runs_on_device(s):
                 owner = execution_owner_user_id(s) or ""
                 if owner not in owner_devices:
-                    owner_devices[owner] = await db.list_local_agent_devices(owner) if owner else []
+                    owner_devices[owner] = await _job_store(request).list_local_agent_devices(owner) if owner else []
                 device, connection = device_source_readiness(
                     source_id=str(s["id"]),
                     source_type=str(s["type"]),
@@ -8614,7 +8584,10 @@ def create_admin_app(
                     },
                 )
         execution_device_id = await _chosen_execution_device(
-            db, executor=req.executor, chooser=resolve_request_principal(request), device_id=req.execution_device_id
+            _job_store(request),
+            executor=req.executor,
+            chooser=resolve_request_principal(request),
+            device_id=req.execution_device_id,
         )
 
         source_id = f"src-{uuid.uuid4().hex[:8]}"
@@ -8749,7 +8722,7 @@ def create_admin_app(
             raise _executor_change_refused(f"Not a secret of a {source_type} source: {', '.join(unknown)}.")
         chooser = resolve_request_principal(request)
         device_id = await _chosen_execution_device(
-            db, executor=req.executor, chooser=chooser, device_id=req.execution_device_id
+            _job_store(request), executor=req.executor, chooser=chooser, device_id=req.execution_device_id
         )
         unchanged = req.executor == source_executor(existing) and (
             req.executor == SOURCE_EXECUTOR_SERVER
@@ -8784,7 +8757,9 @@ def create_admin_app(
 
         await sync_service.cancel_source(source_id)
         try:
-            cancelled = await db.change_source_executor(
+            cancelled = await move_source_executor(
+                db,
+                _job_store(request),
                 source_id,
                 executor=req.executor,
                 config_json=json.dumps(config),
@@ -8966,14 +8941,10 @@ def create_admin_app(
 
     async def _enqueue_sync_local_agent_job(
         request: Request,
-        db: Database,
         **job: Any,
     ) -> tuple[str, bool]:
-        enqueuer = getattr(request.app.state, "local_agent_job_enqueuer", None)
         try:
-            if enqueuer is not None:
-                return await enqueuer(**job)
-            return await db.enqueue_local_agent_job(**job)
+            return await _job_store(request).enqueue_local_agent_job(**job)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -9017,7 +8988,6 @@ def create_admin_app(
             payload = await local_agent_sync_job_payload(db, source, request_payload)
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
-            db,
             job_id=f"laj-{uuid.uuid4().hex}",
             source_id=source["id"],
             source_type=source["type"],
@@ -9025,6 +8995,7 @@ def create_admin_app(
             payload=payload,
             created_by_user_id=resolve_request_principal(request),
             execution_owner_user_id=owner,
+            device_id=source["execution_device_id"] if operation == DOCUMENT_ACQUISITION_OPERATION else None,
         )
         return {
             "ok": True,
@@ -9252,7 +9223,6 @@ def create_admin_app(
         lease_payload = (
             await _require_current_local_agent_lease(
                 request,
-                db,
                 source=current_source,
                 job_id=req.local_agent_job_id if req else None,
                 attempt_count=req.local_agent_attempt_count if req else None,
@@ -9500,7 +9470,6 @@ def create_admin_app(
         lease_payload = (
             await _require_current_local_agent_lease(
                 request,
-                db,
                 source=source,
                 job_id=local_agent_job_id,
                 attempt_count=local_agent_attempt_count,
@@ -9588,7 +9557,6 @@ def create_admin_app(
         lease_payload = (
             await _require_current_local_agent_lease(
                 request,
-                db,
                 source=source,
                 job_id=attempt.local_agent_job_id,
                 attempt_count=attempt.local_agent_attempt_count,
@@ -10806,7 +10774,7 @@ def create_admin_app(
             if source_runs_on_device(source):
                 device_id = _source_execution_device(source, requester, req.device_id)
             elif req.device_id is not None:
-                device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
+                device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:
@@ -10825,11 +10793,11 @@ def create_admin_app(
                     _require_source_discoverability(request, saved)
                 if req.device_id is not None or saved is None or not source_runs_on_device(saved):
                     # A device location is picked on the device chosen in Where it runs.
-                    device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
+                    device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
                 else:
                     device_id = _source_execution_device(saved, requester, None)
             elif req.device_id is not None:
-                device_id = await _choosers_device(db, chooser=requester, device_id=req.device_id)
+                device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
@@ -10837,7 +10805,6 @@ def create_admin_app(
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
             job_id, created = await _enqueue_sync_local_agent_job(
                 request,
-                db,
                 job_id=job_id,
                 workspace_id=workspace_id,
                 source_id=source_id,
@@ -11113,8 +11080,13 @@ def create_admin_app(
         appears again with its next report, without its Sources.
         """
 
+        requester = resolve_request_principal(request)
+        if not any(device.report.device_id == device_id for device in await db.list_local_agent_devices(requester)):
+            raise HTTPException(status_code=404, detail="local_agent_device_not_found")
+        # The Sources go first: once none names the device, no new job does.
+        source_ids = await db.release_execution_device(requester, device_id)
         try:
-            source_ids = await db.remove_local_agent_device(resolve_request_principal(request), device_id)
+            await db.remove_local_agent_device(requester, device_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="local_agent_device_not_found") from exc
         return {"device_id": device_id, "source_ids": source_ids}

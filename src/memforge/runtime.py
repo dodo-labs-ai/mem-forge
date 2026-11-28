@@ -87,6 +87,7 @@ from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_pr
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
+    from memforge.local_agent.job_store import LocalAgentJobStore
     from memforge.memory.reindex import MemoryVectorIndexes
     from memforge.storage.database import Database
 
@@ -1187,11 +1188,15 @@ class SourceSyncWorker:
         *,
         worker_id: str = "source-sync-worker",
         workspace_id: str | None = None,
+        local_agent_jobs: "LocalAgentJobStore | None" = None,
         lease_seconds: int = 300,
         heartbeat_seconds: float | None = None,
         progress_flush_seconds: float = 1.0,
     ) -> None:
         self.db = db
+        # A deployment that keeps local-agent jobs outside the workspace
+        # database names their store; the self-hosted database is its own.
+        self.local_agent_jobs = local_agent_jobs or db
         self.config = config
         self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
         self.worker_id = worker_id
@@ -1783,7 +1788,7 @@ class SourceSyncWorker:
         if source is None or source.get("status") != "active":
             return
         job = (
-            await self.db.get_local_agent_job(run.predecessor_activity_id)
+            await self.local_agent_jobs.get_local_agent_job(run.predecessor_activity_id)
             if run.predecessor_activity_id is not None
             else None
         )
@@ -1795,6 +1800,7 @@ class SourceSyncWorker:
             return
         await enqueue_document_acquisition_job(
             self.db,
+            self.local_agent_jobs,
             doc_store,
             source,
             {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},

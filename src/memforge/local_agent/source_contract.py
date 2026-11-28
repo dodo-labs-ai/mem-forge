@@ -55,13 +55,15 @@ class LocalAgentLease:
 
     ``payload`` is the job's payload, and ``leased_at`` when the attempt was
     leased: a device run reads its provider from then on.
-    ``acquisition_contract`` is the acquisition contract a
-    ``document_acquisition`` attempt was leased under, and ``None`` for any
-    other job.
+    ``device_id`` is the device that holds the attempt, and
+    ``acquisition_contract`` the acquisition contract a
+    ``document_acquisition`` attempt was leased under, ``None`` for any other
+    job.
     """
 
     payload: Mapping[str, Any]
     leased_at: datetime
+    device_id: str | None = None
     acquisition_contract: int | None = None
 
 

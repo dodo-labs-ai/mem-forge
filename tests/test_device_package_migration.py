@@ -300,6 +300,7 @@ def _apply(deployment: Deployment, source_id: str):
             deployment.db,
             AppConfig(),
             source_id,
+            jobs=deployment.db,
             runtime=_runtime(deployment),
             workspace_id=deployment.app.state.workspace_id,
         )
