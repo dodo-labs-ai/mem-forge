@@ -288,13 +288,9 @@ def project_native(*, source_id, item, native, normalized):
     """Build provider identity, immutable Observations, relations and coverage."""
     from memforge.source_projection import ProjectionCoverage, SourceRelationType
     from memforge.source_adapters.contracts import _ObservationInput, _NativeProjection, _unit_title, _canonical_json
-    from memforge.genes.jira_gene import LOCAL_AGENT_JIRA_PACKAGE_KIND
-
-    data = native if isinstance(native, dict) else {}
-    if data.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND and isinstance(data.get("raw_payload"), dict):
-        data = data["raw_payload"]
     from memforge.local_agent.jira_contract import validate_jira_observation_identities
 
+    data = native if isinstance(native, dict) else {}
     validate_jira_observation_identities(data)
     fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
     raw_issue_id = data.get("id") or item.extra.get("issue_id")

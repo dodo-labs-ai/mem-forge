@@ -10,7 +10,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const CREATE = "POST /api/cloud/local-agent/jobs";
+const CREATE = "POST /api/v1/local-agent/jobs";
 const READ = "GET /api/cloud/local-agent/jobs/laj-1";
 
 function renderJob<Op extends SetupJobOperation>(operation: Op, routes: Record<string, Route>) {

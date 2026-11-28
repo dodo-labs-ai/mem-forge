@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { appPath } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 const SOURCE = {
   id: "src-jira",
@@ -17,7 +18,7 @@ const SOURCE = {
   created_at: "2026-09-01T00:00:00Z",
   project_binding: { mode: "fixed", project_key: "PAYROLL_V2" },
   capabilities: { can_sync: true, can_subscribe: true, can_configure: true, can_delete: true },
-  execution: { kind: "server", operation: null, immutable_config_fields: [] },
+  execution: { kind: "server", operation: null },
   enabled_for_me: true,
   pinned_for_me: false,
 };
@@ -34,7 +35,7 @@ const RESPONSES: Record<string, unknown> = {
   "GET /api/v1/projects/p-payroll/deletion-impact": { memory_count: 708, source_count: 1 },
   "GET /api/v1/sources": { data: [SOURCE] },
   "GET /api/v1/genes": [{ name: "jira", display_name: "Jira" }],
-  "GET /api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+  "GET /api/cloud/local-agent/status": localSyncStatus(true),
   "DELETE /api/v1/projects/p-payroll": {
     id: "p-payroll",
     rebucketed_count: 708,

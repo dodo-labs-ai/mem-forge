@@ -18,7 +18,6 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
-from memforge.local_adapter import default_local_adapter_inbox
 from memforge.release import current_release
 from memforge.server.admin_api import create_admin_app
 from memforge.source_item_failures import SourceItemFailure
@@ -391,22 +390,6 @@ async def test_a_save_that_expects_the_open_scope_change_is_saved(db, tmp_path):
 
     assert unchanged.status_code == superseding.status_code == 200
     assert (await db.get_open_projection_scope_transition(SOURCE_ID)).predecessor_transition_id == seen.id
-
-
-@pytest.mark.asyncio
-async def test_a_preview_creates_no_local_inbox(db, tmp_path):
-    await _source(
-        db,
-        "local_markdown",
-        {"root": "/vault", "vault_id": "vault-1", "include": ["notes/**"]},
-        execution_owner_user_id="dev",
-    )
-    inbox = default_local_adapter_inbox(_config(tmp_path), SOURCE_ID)
-
-    preview = _preview(tmp_path, db, {"root": "/vault", "vault_id": "vault-1", "include": ["docs/**"]})
-
-    assert preview["outcome"] == "opens_transition"
-    assert not inbox.exists()
 
 
 @pytest.mark.asyncio

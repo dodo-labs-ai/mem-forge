@@ -5,7 +5,7 @@ import { extname, join } from "node:path";
 import {
   LOCAL_AGENT_HOST_BASE_URL,
   createWorkspaceApiController,
-  currentLocalAgentBaseUrl,
+  currentWorkspaceKey,
   currentWorkspaceIsShared,
   resourceClient,
   subscribeWorkspaceTarget,
@@ -28,24 +28,19 @@ subscribeWorkspaceTarget(() => {
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.equal(workspaceApi.current(), null);
 assert.equal(currentWorkspaceIsShared(), false, "the standalone workspace has one user");
-assert.equal(
-  currentLocalAgentBaseUrl(),
-  LOCAL_AGENT_HOST_BASE_URL,
-  "the standalone admin UI must reach local-agent jobs on the host route",
-);
+assert.equal(currentWorkspaceKey(), "/api/v1#local");
 
-const serverLocalAgentPrefix = readFileSync("../src/memforge/server/admin_api.py", "utf8").match(
-  /local_agent_router\s*=\s*APIRouter\(\s*prefix="([^"]+)"/,
+const serverLocalAgentPrefix = readFileSync("../src/memforge/server/local_agent_host_api.py", "utf8").match(
+  /LOCAL_AGENT_HOST_PREFIX\s*=\s*"([^"]+)"/,
 )?.[1];
 assert.equal(
   LOCAL_AGENT_HOST_BASE_URL,
   serverLocalAgentPrefix,
-  "the local-agent host route must match the server's local_agent_router prefix",
+  "the local-agent host route must match the server's daemon route prefix",
 );
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1/",
-  localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent/",
   workspaceId: "team_alpha",
   shared: true,
 });
@@ -53,12 +48,12 @@ assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.deepEqual(resourceClient.defaults.params, { workspace_id: "team_alpha" });
 assert.deepEqual(workspaceApi.current(), {
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
   workspaceId: "team_alpha",
   shared: true,
 });
 assert.equal(clearCount, 1);
 assert.equal(currentWorkspaceIsShared(), true);
+assert.equal(currentWorkspaceKey(), "/api/v1#team_alpha");
 assert.equal(targetNotifications, 1);
 const resourceHref = workspaceResourceUrl("/api/v1/source-units/unit-1/content?view=raw&workspace_id=old#evidence", "https://admin.test");
 assert.equal(resourceHref, "https://admin.test/api/v1/source-units/unit-1/content?view=raw&workspace_id=team_alpha#evidence");
@@ -66,7 +61,6 @@ assert.equal(workspaceResourceUrl("https://wiki.example.test/api/v1/page", "http
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
   workspaceId: "team_alpha",
   shared: true,
 });
@@ -75,7 +69,6 @@ assert.equal(targetNotifications, 1, "a semantically identical target must not n
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
   workspaceId: "team_alpha",
   shared: false,
 });
@@ -85,7 +78,6 @@ assert.equal(currentWorkspaceIsShared(), false);
 
 workspaceApi.setTarget({
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
   workspaceId: "team_alpha",
 } as WorkspaceApiTarget);
 assert.equal(currentWorkspaceIsShared(), true, "a target that does not say it has one user keeps the access controls");
@@ -94,7 +86,7 @@ workspaceApi.setTarget(null);
 assert.equal(resourceClient.defaults.baseURL, "/api/v1");
 assert.deepEqual(resourceClient.defaults.params, {});
 assert.equal(workspaceApi.current(), null);
-assert.equal(currentLocalAgentBaseUrl(), LOCAL_AGENT_HOST_BASE_URL);
+assert.equal(currentWorkspaceKey(), "/api/v1#local");
 assert.equal(clearCount, 2);
 assert.equal(workspaceResourceUrl("/api/v1/source-units/unit-1/pdf", "https://admin.test"), "https://admin.test/api/v1/source-units/unit-1/pdf?workspace_id=local");
 
@@ -131,7 +123,8 @@ assert.deepEqual(
 );
 
 const localAgentJobsSource = readFileSync("src/api/localAgentJobs.ts", "utf8");
-assert.match(localAgentJobsSource, /hostClient/);
+assert.match(localAgentJobsSource, /resourceClient\.post<LocalAgentJobCreateResponse>\("\/local-agent\/jobs"/);
+assert.match(localAgentJobsSource, /hostClient\.get<LocalAgentDaemonStatusResponse>\(`\$\{LOCAL_AGENT_HOST_BASE_URL\}\/status`\)/);
 assert.doesNotMatch(localAgentJobsSource, /workspace_id|requireCurrentWorkspaceId/);
 
 console.log("api-target.test.ts: all assertions passed");

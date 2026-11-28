@@ -16,7 +16,7 @@ MemForge or contribute to it.
 | Storage | SQLite for documents, memories and sync state, with FTS5 for keyword search, and Chroma for vectors | `src/memforge/storage` |
 | Retrieval | Vector, keyword and entity channels run in parallel and are fused into one ranking | `src/memforge/retrieval` |
 | Agent plugins | Claude Code and Codex plugins. A `SessionStart` hook adds MemForge usage guidance, and a local MCP proxy forwards tool calls to the API | `integrations` |
-| Local daemon | Uploads files from a local folder or repository for a Local Repository source | `src/memforge/local_agent` |
+| Local daemon | Runs on your computer: reads the Sources that run there with their own connector (a local folder, or Jira, GitHub and wiki Sources set to run on My computer) and Teams chats, and hands what it read to the API | `src/memforge/local_agent` |
 | Admin UI | The web UI for sources, memories, reviews, projects and settings, served at `/` by `admin`. The previous UI, `admin-ui`, is served at `/v1/` for one release | `admin`, `admin-ui` |
 
 ## How data moves
@@ -86,9 +86,11 @@ type whose Gene subclasses neither.
 holds every fact shared code needs about the type: its Gene, the configuration
 fields that name the provider and those that define the scope (with
 `scope_defaults` and `canonical_scope`), how items project into Units and
-Evidence, secret fields and configuration checks, whether the local daemon
-collects it, and, for a conversation type, its provider and the factory that
-opens it. Each built-in type has a module in `source_types` that exports
+Evidence, secret fields and configuration checks, the executors its
+acquisition can run on (`executors`: the server, a device, or both) and the
+configuration fields that name a folder on the device
+(`device_location_fields`), and, for a conversation type, its provider, the
+factory that opens it and whether the local daemon collects it. Each built-in type has a module in `source_types` that exports
 `DESCRIPTOR`, and `source_types/__init__.py` registers it. Shared code reads the
 descriptor and never branches on a source type name, so a new type adds no
 `if` elsewhere.
@@ -119,7 +121,7 @@ scope:
 - **The listing itself: existence.** An item the listing leaves out is outside
   the scope by definition, so its Document is removed. Examples: a repository
   tree, where a moved file gets a new Document id; a sitemap the site declares
-  complete; pages the user lists; a folder snapshot from the local daemon.
+  complete; pages the user lists; the files of a local folder.
 - **A condition over items that exist on their own: query.** An item can stop
   matching and keep its identifier, so a Document the listing leaves out is
   removed only when `confirm_absent` asks the provider by identifier and hears
@@ -133,10 +135,9 @@ a bounded link crawl; its sources then never remove a Document through a
 listing. Override `unlisted_scope_mode(config)` to name that mode and suggest
 one that lists; a scope change into such a configuration is refused with that
 suggestion. `list_scope()` returns a complete listing or raises; it never returns
-less. A type the local daemon collects is listed by its snapshot manifest and
-declares exactly one kind. When that kind is query, the Gene also implements
-`provider_key` and `confirmation_item`, so the daemon can confirm items by
-identifier.
+less. On a device the Gene runs as it does on the server, so its listing and
+answers are the same; the server interprets what the device read with the
+same rules.
 
 **Startup validation.** Once every type has registered, loading `memforge.genes`
 checks each one against its family's contract (`genes/contract.py`). A type
@@ -144,8 +145,8 @@ that breaks it stops the service with a `SourceTypeContractError` naming the
 type and the missing piece: a collecting Gene outside both families, an
 unimplemented abstract method, undeclared `listing_kinds`, `lists_scope` not
 declared as a class method, a query listing without `confirm_absent`,
-`rediscovers_documents` without `rediscover`, a daemon-collected Gene with more
-than one listing kind, a conversation provider missing a member of the port, or
+`rediscovers_documents` without `rediscover`, a document type with no executor
+or with a local daemon collection of its own, a conversation provider missing a member of the port, or
 a form description that a client could not draw: a condition on a later field
 or on a value the field does not offer, a repeated choice, or an unknown
 widget, panel or group purpose.

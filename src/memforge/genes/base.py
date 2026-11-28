@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
+from memforge.genes.toolkit.pdf import PdfMaterial, render_pdf_material
 from memforge.models import (
     ConfigField,
     ConfigFieldType,
@@ -125,13 +126,22 @@ class Gene(ABC):
         """The filter this run's discovery applied, as source activity shows it."""
         return f"updated >= {since.isoformat()}" if since else None
 
-    async def fetch_pdf(self, item: ContentItem) -> bytes | None:
-        """Render a PDF of one item.
+    async def fetch_pdf_material(self, item: ContentItem) -> PdfMaterial | None:
+        """Read what one item's PDF export renders from, or ``None`` when the item has nothing to export.
 
-        A Gene overrides this exactly when its source type's descriptor sets
-        ``exports_pdf``.
+        This is acquisition: it reaches the provider, on the server or on the
+        owner's device. A Gene overrides it exactly when its source type's
+        descriptor sets ``exports_pdf``.
         """
         raise NotImplementedError(f"{type(self).__name__} does not export PDFs")
+
+    async def render_pdf(self, material: PdfMaterial) -> bytes | None:
+        """Render one item's PDF from its material alone, on the server.
+
+        This is interpretation: the renderer reaches nothing but the material
+        (:func:`memforge.genes.toolkit.pdf.render_pdf_material`).
+        """
+        return await render_pdf_material(material)
 
     def requires_pdf_artifact(
         self,

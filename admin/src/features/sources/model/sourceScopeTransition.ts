@@ -158,8 +158,6 @@ const SCOPE_CHANGE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
     "The scope change in progress changed while you were looking at it. Reload the source, then try again.",
   source_provider_namespace_immutable:
     "This change points the source at another site or project. Create a new source for it instead.",
-  source_execution_mode_immutable:
-    "This change moves the source between the server and a device. Create a new source for it instead.",
 };
 
 /**

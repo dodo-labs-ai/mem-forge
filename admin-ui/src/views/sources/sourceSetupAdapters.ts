@@ -35,8 +35,8 @@ export interface SourceSetupAdapter {
 const CONNECTION_FIELDS: Record<SchemaSourceType, ReadonlySet<string>> = {
   confluence: new Set(["base_url", "pat"]),
   github_pages: new Set(["auth_mode", "pat"]),
-  github_repo: new Set(["connection_mode", "repo_url", "pat"]),
-  jira: new Set(["base_url", "auth_mode", "sync_mode", "pat"]),
+  github_repo: new Set(["repo_url", "pat"]),
+  jira: new Set(["base_url", "auth_mode", "pat"]),
   local_markdown: new Set(["root"]),
 };
 
@@ -80,10 +80,7 @@ const ADAPTERS: Record<SchemaSourceType, SourceSetupAdapter> = {
     connection: { mode: "choice", label: "Cloud or local sync" },
     visible: githubRepoFieldVisible,
     required: githubRepoFieldRequired,
-    connectionSummary: (config) => {
-      const host = hostSummary(config.repo_url, "Repository not configured");
-      return stringValue(config.connection_mode) === "local_push" ? `Local sync · ${host}` : host;
-    },
+    connectionSummary: (config) => hostSummary(config.repo_url, "Repository not configured"),
     contentSummary: (config) => {
       const includeCount = listValue(config.include_paths).length;
       const excludeCount = listValue(config.exclude_paths).length;
@@ -103,7 +100,6 @@ const ADAPTERS: Record<SchemaSourceType, SourceSetupAdapter> = {
     connection: { mode: "choice", label: "Cloud or local sync" },
     visible: jiraFieldVisible,
     required: jiraFieldRequired,
-    normalize: normalizeJiraChange,
     connectionSummary: (config) => hostSummary(config.base_url, "Jira site not configured"),
     contentSummary: (config) => stringValue(config.query_mode) === "advanced"
       ? "Advanced query"
@@ -273,9 +269,7 @@ function githubPagesContentSummary(config: ConfigForm): string {
   return hostSummary(config.page_url, "Page not selected");
 }
 
-function githubRepoFieldVisible(field: ConfigField, config: ConfigForm): boolean {
-  const mode = stringValue(config.connection_mode) || "cloud_pull";
-  if (field.key === "pat") return mode === "cloud_pull";
+function githubRepoFieldVisible(field: ConfigField): boolean {
   if (["include_paths", "exclude_paths"].includes(field.key)) return false;
   return true;
 }
@@ -304,18 +298,11 @@ function jiraFieldRequired(field: ConfigField, config: ConfigForm): boolean {
   return field.required;
 }
 
-function normalizeJiraChange(field: ConfigField, value: ConfigValue, config: ConfigForm): ConfigForm {
-  if (field.key === "auth_mode" && stringValue(value) === "pat") return { ...config, sync_mode: "cloud" };
-  if (field.key === "sync_mode" && stringValue(value) === "local_agent") return { ...config, auth_mode: "browser_cookie" };
-  return config;
-}
-
 function optionLabelFor(fieldKey: string, option: string): string {
   const labels: Record<string, Record<string, string>> = {
     query_mode: { simple: "Simple (projects and issue types)", advanced: "Advanced (JQL)" },
     auth_mode: { browser_cookie: "Browser session", pat: "Personal access token", github_pat: "Personal access token", none: "No authentication" },
-    sync_mode: { cloud: "Cloud", local_agent: "Local sync", page_tree: "This page tree", space: "Whole space", single_page: "Single page", subtree: "Subtree", explicit_list: "Selected pages" },
-    connection_mode: { cloud_pull: "Cloud access", local_push: "Local sync" },
+    sync_mode: { page_tree: "This page tree", space: "Whole space", single_page: "Single page", subtree: "Subtree", explicit_list: "Selected pages" },
   };
   return labels[fieldKey]?.[option] ?? option;
 }

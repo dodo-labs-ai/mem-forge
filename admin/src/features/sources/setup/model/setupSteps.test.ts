@@ -30,7 +30,7 @@ test("the product steps surround the type's groups, and Access appears only when
 });
 
 test("a group's fields are drawn in their declared order", () => {
-  expect(groupFields(sourceTypeSchema("jira"), "connection").map((field) => field.key)).toEqual(["base_url", "sync_mode", "auth_mode", "pat"]);
+  expect(groupFields(sourceTypeSchema("jira"), "connection").map((field) => field.key)).toEqual(["base_url", "auth_mode", "pat"]);
 });
 
 test("Configure opens the connection group and Check setup follows the last content group", () => {

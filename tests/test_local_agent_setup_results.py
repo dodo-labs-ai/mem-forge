@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,9 +21,10 @@ from memforge import main
 from memforge.auth import jira_capture
 from memforge.auth.jira_auth import JIRA_PRINCIPAL_CHANGED_CODE
 from memforge.genes.teams_client import AuthenticationError
-from memforge.local_agent.setup_results import SETUP_RESULT_MODELS, JiraAuthResult, LocalMarkdownPickRootResult
+from memforge.local_agent.credential_check import CREDENTIAL_CHECK_OPERATION
+from memforge.local_agent.setup_results import SETUP_RESULT_MODELS, CredentialCheckResult, LocalMarkdownPickRootResult
 from memforge.server.admin_api import LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES
-from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client, _fake_github_remote_run
+from tests.test_cli_agent_tools import FakeToolClient, _cloud_test_client
 from tests.test_source_authority_api import _app, _connect_database
 
 BROWSE_DATA = {
@@ -56,7 +56,7 @@ def _assert_described(operation: str, result: dict) -> None:
 
 
 def test_every_setup_operation_has_a_result_model():
-    assert set(SETUP_RESULT_MODELS) == set(LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES)
+    assert set(SETUP_RESULT_MODELS) == {*LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES, CREDENTIAL_CHECK_OPERATION}
 
 
 def test_the_live_document_publishes_every_setup_result_model(tmp_path):
@@ -72,31 +72,6 @@ def test_the_live_document_publishes_every_setup_result_model(tmp_path):
     assert schemas["TeamsBrowseResult"]["properties"]["teams"]["anyOf"][0]["items"] == {
         "$ref": "#/components/schemas/TeamsTeamOption"
     }
-
-
-def test_github_repo_preview_tree_result(monkeypatch):
-    monkeypatch.setattr(main.subprocess, "run", _fake_github_remote_run)
-
-    result = _run(
-        "github_repo_preview_tree",
-        {"repo_url": "https://github.example.com/acme/architecture", "ref": "main", "limit": 2},
-        source_id="src-gh",
-    )
-
-    _assert_described("github_repo_preview_tree", result)
-    assert result["counts"] == {"included": 3, "ignored": 2}
-    assert len(result["items"]) == 2
-
-
-def test_local_markdown_preview_tree_result(tmp_path: Path):
-    root = tmp_path / "notes"
-    root.mkdir()
-    (root / "Decision.md").write_text("# Decision\n\nUse the daemon.", encoding="utf-8")
-
-    result = _run("local_markdown_preview_tree", {"root": str(root), "vault_id": "engineering", "limit": 20})
-
-    _assert_described("local_markdown_preview_tree", result)
-    assert result["items"][0]["relative_path"] == "Decision.md"
 
 
 def _picker(outcome: Callable[[], str]):
@@ -156,31 +131,38 @@ PRINCIPAL_CHANGED = {
     [
         ({"status": "active"}, None, {"authenticated": True, "origin": "https://jira.example.test"}),
         (PRINCIPAL_CHANGED, None, {"error": "principal_changed", "new_principal_id": "bob"}),
-        ({"error": "storage unavailable"}, None, {"error_type": "JiraSessionUploadError"}),
+        ({"error": "storage unavailable"}, None, {"error_type": "BrowserSessionUploadError"}),
         ({}, RuntimeError("browser closed"), {"error": "browser closed", "error_type": "RuntimeError"}),
     ],
     ids=["renewed", "principal-changed", "upload-failed", "capture-failed"],
 )
-def test_jira_auth_result(monkeypatch, upload, fail, expected):
+def test_credential_check_result(monkeypatch, upload, fail, expected):
     monkeypatch.setattr(jira_capture, "capture_and_prevalidate", _capture(fail=fail))
     FakeToolClient.reset(upload)
 
     result = _run(
-        "jira_auth",
-        {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie"},
+        "credential_check",
+        {
+            "source_id": "src-jira",
+            "source_type": "jira",
+            "executor": "server",
+            "config": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie"},
+        },
         source_id="src-jira",
         workspace_id="ws-1",
     )
 
-    _assert_described("jira_auth", result)
+    _assert_described("credential_check", result)
     assert expected.items() <= result.items()
 
 
-def test_jira_auth_without_a_source_is_a_described_failure():
-    result = _run("jira_auth", {"base_url": "https://jira.example.test"})
+def test_credential_check_without_a_source_is_a_described_failure():
+    result = _run("credential_check", {"source_type": "jira"})
 
-    _assert_described("jira_auth", result)
-    assert result == JiraAuthResult(operation="jira_auth", error="source_id is required", retryable=False).model_dump()
+    _assert_described("credential_check", result)
+    assert result == CredentialCheckResult(
+        operation="credential_check", error="source_id is required", retryable=False
+    ).model_dump()
 
 
 class _NoTeamsSession:

@@ -19,6 +19,7 @@ from memforge.models import (
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.source_adapters.teams import MESSAGE_SCHEMA
 from memforge.storage.database import Database
+from tests.device_report_fixture import DAEMON_DEVICE, DEVICE_ID, connect_device, device_report
 from tests.legacy_capture_tables import CAPTURE_TABLES_SCHEMA
 from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_sync_bookkeeping import (
@@ -118,19 +119,6 @@ def _teams_payload(name: str = "PCC Agent Dev") -> dict:
     }
 
 
-def _github_repo_payload(*, connection_mode: str) -> dict:
-    return {
-        "type": "github_repo",
-        "name": "Internal Cookbook",
-        "access_policy": "workspace",
-        "config": {
-            "repo_url": "https://github.example.test/platform/cookbook",
-            "ref": "main",
-            "connection_mode": connection_mode,
-        },
-    }
-
-
 def test_public_teams_config_migrates_legacy_history_and_hides_internal_knobs() -> None:
     from memforge.server.admin_api import _public_source_config
 
@@ -150,23 +138,38 @@ def test_public_teams_config_migrates_legacy_history_and_hides_internal_knobs() 
         "rolling_retention_days": None,
     }
 
-    assert _public_source_config(
-        "teams",
-        {"conversation_ids": ["19:conversation-a@example.test"], "rolling_retention_days": 730},
-    )["rolling_retention_days"] == 730
+    assert (
+        _public_source_config(
+            "teams",
+            {"conversation_ids": ["19:conversation-a@example.test"], "rolling_retention_days": 730},
+        )["rolling_retention_days"]
+        == 730
+    )
 
 
-def _jira_payload(*, sync_mode: str) -> dict:
+def _device_jira_payload() -> dict:
+    """A Jira Source whose acquisition runs on its owner's device, signed in with the device's browser session."""
+
     return {
         "type": "jira",
         "name": "Payroll Jira",
         "access_policy": "workspace",
+        "executor": "device",
+        "execution_device_id": DEVICE_ID,
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
-            "sync_mode": sync_mode,
             "projects": ["PAY"],
         },
+    }
+
+
+def _local_markdown_payload() -> dict:
+    return {
+        "type": "local_markdown",
+        "name": "Engineering notes",
+        "access_policy": "workspace",
+        "config": {"root": "/Users/test/engineering-notes", "vault_id": "engineering", "include": ["**/*.md"]},
     }
 
 
@@ -365,6 +368,7 @@ def test_source_list_exposes_capabilities_and_redacts_config_for_non_owner_membe
             "created_by_user_id": "owner-user",
             "owner_user_id": "owner-user",
             "execution_owner_user_id": None,
+            "viewer_is_execution_owner": False,
             "viewer_role": "member",
             "viewer_relationship": "member",
         }
@@ -429,7 +433,10 @@ def test_source_creator_can_manage_and_receives_redacted_config(tmp_path):
     ],
 )
 def test_source_list_returns_the_absence_check_of_the_latest_sync(
-    tmp_path, recorded, reported, unlisted_present_count,
+    tmp_path,
+    recorded,
+    reported,
+    unlisted_present_count,
 ):
     database = _connect_database(tmp_path)
     source_id = "src-absence-check-skipped"
@@ -777,7 +784,6 @@ def test_local_source_creator_becomes_execution_owner_and_client_cannot_override
         assert listed.json()["data"][0]["execution"] == {
             "kind": "local_agent",
             "operation": "teams_sync",
-            "immutable_config_fields": [],
         }
     finally:
         asyncio.run(database.close())
@@ -957,7 +963,7 @@ def test_local_source_sync_enqueues_canonical_owner_job(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert leased.status_code == 200, leased.text
@@ -1004,7 +1010,7 @@ def test_teams_scope_transition_is_attached_to_collection_job(tmp_path):
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             )
 
         assert updated.status_code == 200, updated.text
@@ -1029,9 +1035,8 @@ def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicali
     try:
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(_app(tmp_path, database)) as client:
-            source_id = client.post(
-                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
-            ).json()["id"]
+            connect_device(database, headers["x-test-user"])
+            source_id = client.post("/api/v1/sources", headers=headers, json=_device_jira_payload()).json()["id"]
             asyncio.run(
                 database.create_projection_scope_transition(
                     ProjectionScopeTransition(
@@ -1047,7 +1052,7 @@ def test_a_collection_job_carries_a_stored_transition_with_its_scopes_canonicali
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": device_report([source_id]).to_payload(), "limit": 1, "lease_seconds": 60},
             )
 
         assert triggered.status_code == 202, triggered.text
@@ -1114,7 +1119,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             ).json()["jobs"][0]
             context = {
                 "local_agent_job_id": leased["job_id"],
@@ -1162,14 +1167,7 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
             manifest = manifest_to_payload(collection.manifest(received_at=sent_at))
             del manifest["received_at"]
-            outdated_agent = client.post(
-                f"/api/v1/sources/{source_id}/adapter/manifest",
-                headers=headers,
-                json={**context, "sync_snapshot_id": attempt_id, "coverage": "complete_snapshot", "items": []},
-            )
-            incomplete_process = client.post(
-                f"/api/v1/sources/{source_id}/process", headers=headers, json=context
-            )
+            incomplete_process = client.post(f"/api/v1/sources/{source_id}/process", headers=headers, json=context)
             malformed_manifest = client.post(
                 f"/api/v1/sources/{source_id}/conversation-collection/manifest",
                 headers=headers,
@@ -1223,8 +1221,9 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
             )
             completion_body = {
                 "attempt_count": leased["attempt_count"],
+                "device_id": "dev-laptop",
                 "status": "succeeded",
-                "result": {"ok": True},
+                "result": {"source_sync_run_id": accepted_process.json()["run_id"]},
             }
             first_complete = client.post(
                 f"/api/cloud/local-agent/jobs/{leased['job_id']}/complete",
@@ -1249,8 +1248,6 @@ def test_local_agent_data_plane_is_lease_fenced_and_completion_is_idempotent(tmp
         assert [item["conversation_id"] for item in requested.json()["request"]["conversations"]] == [
             "19:conversation-a@example.test"
         ]
-        assert outdated_agent.status_code == 409, outdated_agent.text
-        assert outdated_agent.json()["detail"] == "local_agent_upgrade_required"
         assert incomplete_process.status_code == 409, incomplete_process.text
         assert incomplete_process.json()["detail"] == "conversation_manifest_required"
         assert malformed_manifest.status_code == 422, malformed_manifest.text
@@ -1291,11 +1288,10 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
     try:
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
+        connect_device(database, "owner-a")
         with TestClient(app) as client:
             teams_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload()).json()["id"]
-            jira_id = client.post(
-                "/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent")
-            ).json()["id"]
+            jira_id = client.post("/api/v1/sources", headers=headers, json=_device_jira_payload()).json()["id"]
             real = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers)
             dry = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
             dry_again = client.post(f"/api/v1/sources/{teams_id}/sync", headers=headers, json={"dry_run": True})
@@ -1307,12 +1303,14 @@ def test_a_dry_run_is_its_own_device_job_and_is_refused_where_nothing_new_is_col
                 json={"dry_run": True, "retry_target": {"execution_kind": "source_sync_run", "execution_id": "run-1"}},
             )
             # A Source whose only job is a dry run, so the lease hands over that job.
-            preview_id = client.post(
-                "/api/v1/sources", headers=headers, json=_teams_payload("Teams preview")
-            ).json()["id"]
+            preview_id = client.post("/api/v1/sources", headers=headers, json=_teams_payload("Teams preview")).json()[
+                "id"
+            ]
             client.post(f"/api/v1/sources/{preview_id}/sync", headers=headers, json={"dry_run": True})
             leased = client.post(
-                "/api/cloud/local-agent/jobs/lease", headers=headers, json={"limit": 5, "lease_seconds": 60}
+                "/api/cloud/local-agent/jobs/lease",
+                headers=headers,
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             ).json()["jobs"]
             [dry_job] = [job for job in leased if job["source_id"] == preview_id]
             dry_processed = client.post(
@@ -1345,16 +1343,16 @@ def test_source_config_change_fences_leased_job_and_enqueues_successor(tmp_path)
         app = _app(tmp_path, database)
         headers = {"x-test-user": "owner-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            created = client.post("/api/v1/sources", headers=headers, json=_jira_payload(sync_mode="local_agent"))
+            created = client.post("/api/v1/sources", headers=headers, json=_teams_payload())
             source_id = created.json()["id"]
             first = client.post(f"/api/v1/sources/{source_id}/sync", headers=headers)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 1, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 1, "lease_seconds": 60},
             ).json()["jobs"][0]
-            updated_payload = _jira_payload(sync_mode="local_agent")
-            updated_payload["config"]["projects"] = ["PAY", "TIME"]
+            updated_payload = _teams_payload()
+            updated_payload["config"]["conversation_ids"] = ["19:conversation-b@example.test"]
             updated = client.put(f"/api/v1/sources/{source_id}", headers=headers, json=updated_payload)
             stale = client.post(
                 f"/api/v1/sources/{source_id}/process",
@@ -1398,29 +1396,29 @@ def test_local_agent_sync_job_can_only_be_created_and_leased_by_source_owner(tmp
             }
 
             forbidden = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
                 json=request_body,
             )
             accepted = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
                 json=request_body,
             )
             other_jobs = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "admin-b", "x-test-workspace-role": "workspace_admin"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
             owner_jobs = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert forbidden.status_code == 403, forbidden.text
         assert accepted.status_code == 201, accepted.text
-        assert other_jobs.json() == {"jobs": []}
+        assert other_jobs.json()["jobs"] == []
         assert [job["job_id"] for job in owner_jobs.json()["jobs"]] == [accepted.json()["job_id"]]
         assert owner_jobs.json()["jobs"][0]["payload"]["conversation_ids"] == ["19:conversation-a@example.test"]
         assert "config" not in owner_jobs.json()["jobs"][0]["payload"]
@@ -1436,22 +1434,24 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
             "source_type": "local_markdown",
             "operation": "local_markdown_pick_root",
             "payload": {"title": "Choose folder"},
+            "device_id": DEVICE_ID,
         }
+        connect_device(database, "member-a")
         with TestClient(app) as client:
             accepted = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
                 json=body,
             )
             forbidden = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 headers={"x-test-user": "viewer-a", "x-test-workspace-role": "viewer"},
                 json=body,
             )
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "member-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert accepted.status_code == 201, accepted.text
@@ -1461,33 +1461,42 @@ def test_local_agent_setup_job_allows_member_but_forbids_viewer(tmp_path):
         asyncio.run(database.close())
 
 
-def test_jira_auth_job_uses_the_current_workspace(tmp_path):
+def test_credential_check_job_uses_the_current_workspace(tmp_path):
     database = _connect_database(tmp_path)
     try:
+        asyncio.run(
+            database.upsert_source(
+                id="src-jira",
+                type="jira",
+                name="Jira",
+                config_json='{"base_url":"https://jira.example.test","auth_mode":"browser_cookie","jql":"project = ACME"}',
+                access_policy="workspace",
+                owner_user_id="owner-a",
+                execution_owner_user_id="owner-a",
+            )
+        )
         app = _app(tmp_path, database, workspace_id="team_alpha")
-        body = {
-            "source_id": "src-jira",
-            "source_type": "jira",
-            "operation": "jira_auth",
-            "payload": {
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-            },
-        }
+        body = {"source_id": "src-jira", "source_type": "jira", "operation": "credential_check", "payload": {}}
         headers = {"x-test-user": "member-a", "x-test-workspace-role": "member"}
         with TestClient(app) as client:
-            accepted = client.post("/api/cloud/local-agent/jobs", headers=headers, json=body)
+            accepted = client.post("/api/v1/local-agent/jobs", headers=headers, json=body)
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers=headers,
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert accepted.status_code == 201, accepted.text
         [job] = leased.json()["jobs"]
         assert job["workspace_id"] == "team_alpha"
         assert job["source_id"] == "src-jira"
-        assert job["operation"] == "jira_auth"
+        assert job["operation"] == "credential_check"
+        assert job["payload"] == {
+            "source_id": "src-jira",
+            "source_type": "jira",
+            "executor": "server",
+            "config": {"base_url": "https://jira.example.test", "auth_mode": "browser_cookie", "jql": "project = ACME"},
+        }
     finally:
         asyncio.run(database.close())
 
@@ -1498,9 +1507,9 @@ def test_local_source_sync_without_execution_owner_returns_contract_error(tmp_pa
         asyncio.run(
             database.upsert_source(
                 id="src-ownerless-local",
-                type="local_markdown",
+                type="teams",
                 name="Ownerless Local",
-                config_json='{"vault_id":"notes"}',
+                config_json='{"conversation_ids":["19:conversation-a@example.test"]}',
                 access_policy="workspace",
                 owner_user_id="owner-a",
             )
@@ -1535,7 +1544,7 @@ def test_local_source_force_resync_collects_fresh_raw_data_before_processing(tmp
             leased = client.post(
                 "/api/cloud/local-agent/jobs/lease",
                 headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"limit": 5, "lease_seconds": 60},
+                json={"device": DAEMON_DEVICE, "limit": 5, "lease_seconds": 60},
             )
 
         assert force.status_code == 202, force.text
@@ -1577,80 +1586,6 @@ def test_local_source_owner_can_change_connection_without_transferring_ownership
         assert source is not None
         assert source["config"]["conversation_ids"] == ["19:conversation-b@example.test"]
         assert source["execution_owner_user_id"] == "owner-a"
-    finally:
-        asyncio.run(database.close())
-
-
-def test_existing_source_cannot_change_between_server_and_local_execution(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        with TestClient(app) as client:
-            cloud_source = client.post(
-                "/api/v1/sources",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json=_github_repo_payload(connection_mode="cloud_pull"),
-            )
-            local_source = client.post(
-                "/api/v1/sources",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json=_github_repo_payload(connection_mode="local_push"),
-            )
-            assert cloud_source.status_code == 200, cloud_source.text
-            assert local_source.status_code == 200, local_source.text
-
-            to_local = client.put(
-                f"/api/v1/sources/{cloud_source.json()['id']}",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"config": _github_repo_payload(connection_mode="local_push")["config"]},
-            )
-            to_cloud = client.put(
-                f"/api/v1/sources/{local_source.json()['id']}",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"config": _github_repo_payload(connection_mode="cloud_pull")["config"]},
-            )
-
-        assert to_local.status_code == 409, to_local.text
-        assert to_cloud.status_code == 409, to_cloud.text
-        assert to_local.json()["detail"] == "source_execution_mode_immutable"
-        assert to_cloud.json()["detail"] == "source_execution_mode_immutable"
-    finally:
-        asyncio.run(database.close())
-
-
-def test_existing_jira_source_cannot_change_between_cloud_and_local_agent(tmp_path):
-    database = _connect_database(tmp_path)
-    try:
-        app = _app(tmp_path, database)
-        with TestClient(app) as client:
-            cloud_source = client.post(
-                "/api/v1/sources",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json=_jira_payload(sync_mode="cloud"),
-            )
-            local_source = client.post(
-                "/api/v1/sources",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json=_jira_payload(sync_mode="local_agent"),
-            )
-            assert cloud_source.status_code == 200, cloud_source.text
-            assert local_source.status_code == 200, local_source.text
-
-            to_local = client.put(
-                f"/api/v1/sources/{cloud_source.json()['id']}",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"config": _jira_payload(sync_mode="local_agent")["config"]},
-            )
-            to_cloud = client.put(
-                f"/api/v1/sources/{local_source.json()['id']}",
-                headers={"x-test-user": "owner-a", "x-test-workspace-role": "member"},
-                json={"config": _jira_payload(sync_mode="cloud")["config"]},
-            )
-
-        assert to_local.status_code == 409, to_local.text
-        assert to_cloud.status_code == 409, to_cloud.text
-        assert to_local.json()["detail"] == "source_execution_mode_immutable"
-        assert to_cloud.json()["detail"] == "source_execution_mode_immutable"
     finally:
         asyncio.run(database.close())
 

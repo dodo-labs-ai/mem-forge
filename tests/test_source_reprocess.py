@@ -137,6 +137,15 @@ class JiraGene(FakeGene):
         return NormalizedContent(item=raw.item, markdown_body=f"# {raw.item.title}\n\nBody")
 
 
+@pytest.fixture(autouse=True)
+def stored_input_is_the_only_copy(monkeypatch):
+    """The Jira Source here cannot ask its provider for one Document, so a reprocess reads only what it stored."""
+
+    from memforge.genes.jira_gene import JiraGene as ProviderJiraGene
+
+    monkeypatch.setattr(ProviderJiraGene, "rediscovers_documents", classmethod(lambda cls, config: False))
+
+
 @pytest.fixture
 async def db(tmp_path):
     database = Database(str(tmp_path / "reprocess.db"))
@@ -177,9 +186,9 @@ class Harness:
 
 
 async def synced(db: Database) -> Harness:
-    """A Jira Source a local agent collects, synced once; its only copy is then the stored input."""
+    """A Jira Source synced once; with its provider closed, its only copy is the stored input."""
     await db.upsert_source(
-        id=SOURCE_ID, type="jira", name="Jira", config_json=json.dumps({"sync_mode": "local_agent"}),
+        id=SOURCE_ID, type="jira", name="Jira", config_json=json.dumps({}),
         access_policy="workspace", owner_user_id="dev",
     )
     harness = Harness(db)
@@ -376,7 +385,7 @@ async def test_stored_input_whose_raw_object_is_not_its_own_has_no_stored_raw_co
 class ConfluenceGene(FakeGene):
     """Places a child page under its parent only from the item metadata fetched with it."""
 
-    async def fetch_pdf(self, item):
+    async def fetch_pdf_material(self, item):
         return None
 
     @classmethod
@@ -592,7 +601,7 @@ async def test_the_worker_runs_a_reprocess_from_storage_once(db, status):
     [call] = provider.calls
     assert call["execution_mode"] is SourceSyncMode.REPROCESS
     assert call["reprocess_doc_ids"] == frozenset({"jira-PAY-1"})
-    assert call["force_full_sync"] is False and call["reusable_projection_doc_ids"] == frozenset()
+    assert call["force_full_sync"] is False
     finished = await db.get_source_sync_run(run.run_id)
     assert finished.status == status
     # An operator requests a failed reprocess again; it is not retried.
@@ -722,7 +731,7 @@ async def test_the_reprocess_route_says_a_source_without_documents_has_none_to_r
 
     harness = await synced(db)
     await db.upsert_source(
-        id="src-empty", type="jira", name="Empty", config_json=json.dumps({"sync_mode": "local_agent"}),
+        id="src-empty", type="jira", name="Empty", config_json=json.dumps({}),
         access_policy="workspace", owner_user_id="dev",
     )
     app = create_admin_app(db=db, config=_admin_config(tmp_path), document_store=harness.store)

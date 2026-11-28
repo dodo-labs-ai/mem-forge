@@ -2,7 +2,8 @@
 
 A setup job is the admin UI asking the user's local daemon to do one
 interactive step while a Source is being set up: open the folder picker, list
-a repository tree, sign in to Jira or Teams, or list Teams conversations. The
+a repository tree, check a Source's credential or sign in to its site, sign
+in to Teams, or list Teams conversations. The
 daemon handler for the operation builds its result through the operation's
 model and completes the job with ``model.model_dump()``, so the model is the
 one owner of the shape and every field it declares is present, as null when
@@ -50,72 +51,6 @@ class LocalSetupJobResult(BaseModel):
     heartbeat_errors: list[str] | None = None
 
 
-# -- github_repo_preview_tree --
-
-
-class GitHubSymlinkHop(BaseModel):
-    """One symbolic link followed on the way to a file's content."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    path: str
-    blob_sha: str
-    target_path: str
-
-
-class GitHubRepoPreviewItem(BaseModel):
-    """One repository file the Source would read.
-
-    ``relative_path`` is the path the Source names the file by. When it is a
-    symbolic link, ``symlink_chain`` lists the links followed and
-    ``resolved_relative_path`` is the file whose content is read.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    relative_path: str
-    blob_sha: str
-    bytes: int
-    file_mode: str
-    logical_file_mode: str
-    symlink_chain: list[GitHubSymlinkHop]
-    resolved_relative_path: str | None
-    content_type: str
-
-
-class GitHubRepoPreviewCounts(BaseModel):
-    """Files the configured paths and extensions include, and files they leave out."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    included: int
-    ignored: int
-
-
-class GitHubRepoPreviewTreeResult(LocalSetupJobResult):
-    """A remote repository's tree as the daemon's Git access reads it.
-
-    The daemon lists the whole tree at ``commit_sha`` of ``ref`` with the
-    configured include and exclude paths cleared, so the folder picker can
-    offer every folder. ``items`` holds at most the requested number of files,
-    and ``counts`` counts all of them. ``extension_counts`` counts the
-    included files by extension.
-    """
-
-    source_id: str
-    profile: str
-    repo_url: str
-    ref: str
-    commit_sha: str
-    root_tree_sha: str
-    include_paths: list[str]
-    exclude_paths: list[str]
-    include_extensions: list[str]
-    counts: GitHubRepoPreviewCounts
-    extension_counts: dict[str, int]
-    items: list[GitHubRepoPreviewItem]
-
-
 # -- local_markdown_pick_root --
 
 
@@ -131,61 +66,25 @@ class LocalMarkdownPickRootResult(LocalSetupJobResult):
     cancelled: bool | None = None
 
 
-# -- local_markdown_preview_tree --
+# -- credential_check --
 
 
-class LocalMarkdownPreviewItem(BaseModel):
-    """One file under the folder that the Source would read."""
+class CredentialCheckResult(LocalSetupJobResult):
+    """A Source's credential checked, and a browser session captured, on the user's computer.
 
-    model_config = ConfigDict(extra="forbid")
+    For a Source whose configuration signs in with a browser session, the
+    session is captured from the user's browser and checked against the
+    provider. A device Source keeps it in the device's keyring for the
+    session's origin; a server Source's session is stored on the server. For
+    a device Source that signs in with a token, the device's stored token is
+    checked by the type's ``authenticate``.
 
-    relative_path: str
-    title: str
-    content_type: str
-    raw_hash: str
-    bytes: int
-
-
-class LocalMarkdownPreviewCounts(BaseModel):
-    """Files the scan read, and files it left out by reason."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    included: int
-    ignored: int
-    too_large: int
-    invalid_utf8: int
-    unreadable: int
-
-
-class LocalMarkdownPreviewTreeResult(LocalSetupJobResult):
-    """The files under a local folder that the configured patterns select.
-
-    ``root`` is the resolved folder and ``vault_id`` the identity its
-    Documents are stored under. ``items`` holds at most the requested number
-    of files, and ``counts`` counts all of them.
-    """
-
-    source_id: str
-    profile: str
-    root: str
-    vault_id: str
-    counts: LocalMarkdownPreviewCounts
-    items: list[LocalMarkdownPreviewItem]
-
-
-# -- jira_auth --
-
-
-class JiraAuthResult(LocalSetupJobResult):
-    """A Jira browser session captured on the user's computer and stored for the Source.
-
-    On success ``authenticated`` is true and ``origin`` is the Jira site the
-    session belongs to. ``error`` is ``principal_changed`` when the user signed
-    in as a different Jira account than the one the stored session names;
-    ``old_principal_id`` and ``new_principal_id`` then name both accounts.
-    ``retryable`` is false for every failure, because renewing again needs the
-    user at the browser.
+    On success ``authenticated`` is true and ``origin`` is the site a captured
+    session belongs to. ``error`` is ``principal_changed`` when the user
+    signed in as a different account than the one the server's stored session
+    names; ``old_principal_id`` and ``new_principal_id`` then name both
+    accounts. ``retryable`` is false for every failure, because renewing a
+    credential needs the user.
     """
 
     source_id: str | None = None
@@ -278,10 +177,8 @@ class TeamsBrowseResult(LocalSetupJobResult):
 
 
 SETUP_RESULT_MODELS: dict[str, type[LocalSetupJobResult]] = {
-    "github_repo_preview_tree": GitHubRepoPreviewTreeResult,
-    "jira_auth": JiraAuthResult,
+    "credential_check": CredentialCheckResult,
     "local_markdown_pick_root": LocalMarkdownPickRootResult,
-    "local_markdown_preview_tree": LocalMarkdownPreviewTreeResult,
     "teams_auth": TeamsAuthResult,
     "teams_auth_check": TeamsAuthCheckResult,
     "teams_browse": TeamsBrowseResult,

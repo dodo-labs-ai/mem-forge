@@ -21,30 +21,21 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Collection, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 
 import aiosqlite
 
 from memforge.derivation_work import DerivationWork
-from memforge.local_agent.snapshot_manifest import (
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    excluded_listing_rows,
-    excluded_listings_from_rows,
-    snapshot_confirmation,
-    snapshot_confirmation_updates,
-    validate_snapshot_confirmation_submission,
-    validate_snapshot_manifest_extras,
-    validate_snapshot_manifest_values,
-)
+from memforge.local_agent.device_report import DeviceReport, DeviceSourceReadiness, LocalAgentDevice
 from memforge.local_agent.source_contract import (
+    DOCUMENT_ACQUISITION_OPERATION,
     LOCAL_AGENT_SYNC_OPERATIONS,
+    LocalAgentLease,
     local_agent_completion_status,
     local_agent_retry_delay,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
-    local_agent_sync_operation,
-    source_sync_input_metadata_with_artifact_attestation,
+    source_collection_operation,
 )
 from memforge.storage.admin_source import is_pause_only_source_update
 from memforge.storage.document_store import DocumentStore
@@ -57,6 +48,7 @@ from memforge.storage.recovery_points import (
     installed_release,
 )
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
     SOURCE_SYNC_CANCELLED_BY_USER,
     SourceActivityConflict,
     SourceActivityKind,
@@ -322,6 +314,12 @@ from memforge.storage.admin_source import (
 
 if TYPE_CHECKING:
     from memforge.config import LlmConfig
+    from memforge.local_agent.document_acquisition import (
+        AcquisitionAnswers,
+        AcquisitionManifest,
+        AcquisitionRequests,
+        StoredAcquisition,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -706,6 +704,14 @@ def _utc_iso(dt: datetime | None) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _parse_utc_iso(value: object) -> datetime | None:
+    """A stored ISO-8601 time, or ``None`` when it is missing or malformed."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+    except ValueError:
+        return None
+
+
 def _lifecycle_memory_version(row: Any | None) -> str:
     if row is None:
         return ""
@@ -726,10 +732,6 @@ def _non_empty_string(value: object) -> str | None:
     return text or None
 
 
-def _manifest_doc_id(metadata: Mapping[str, object]) -> str | None:
-    entry = metadata.get("manifest_entry")
-    nested = _non_empty_string(entry.get("doc_id")) if isinstance(entry, Mapping) else None
-    return nested or _non_empty_string(metadata.get("doc_id"))
 
 
 def _validate_replacement_kind(value: str) -> ReplacementKind:
@@ -783,6 +785,14 @@ def _source_schedule_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "next_run_at": row.get("sync_schedule_next_at"),
         "updated_at": row.get("sync_schedule_updated_at"),
     }
+
+
+def _source_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    source = dict(row)
+    source["config"] = json.loads(source["config"])
+    source["project_binding"] = json.loads(source["project_binding"]) if source.get("project_binding") else None
+    source["sync_schedule"] = _source_schedule_from_row(source)
+    return source
 
 
 def _source_sync_run_from_row(
@@ -1315,6 +1325,9 @@ CREATE TABLE IF NOT EXISTS sources (
     access_state    TEXT NOT NULL DEFAULT 'active'
                     CHECK (access_state IN ('active', 'changing', 'orphaned_private')),
     execution_owner_user_id TEXT,
+    executor        TEXT NOT NULL DEFAULT 'server' CHECK (executor IN ('server', 'device')),
+    -- The device of the execution owner that runs a device Source's jobs; NULL while it has none.
+    execution_device_id TEXT,
     sync_schedule_enabled INTEGER NOT NULL DEFAULT 0,
     sync_schedule_interval_minutes INTEGER NOT NULL DEFAULT 1440,
     sync_schedule_next_at TEXT,
@@ -1898,64 +1911,29 @@ CREATE TABLE IF NOT EXISTS source_sync_snapshot_items (
 CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_items_input
     ON source_sync_snapshot_items(input_id);
 
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifests (
+-- One device run's acquisition of a document Source (ADR 0058): the manifest
+-- the device submitted (its listing, the items it discovered in order and the
+-- listings of excluded scopes), what the manifest response asked of the
+-- device, the device's answers (NULL until it answers), and when the job
+-- attempt was leased, which is the run's start for the sync cursor. Each
+-- acquired input is a source_sync_inputs row the attempt's
+-- source_sync_snapshot_items row names.
+CREATE TABLE IF NOT EXISTS source_acquisition_manifests (
     workspace_id        TEXT NOT NULL,
     source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     snapshot_id         TEXT NOT NULL,
-    coverage            TEXT NOT NULL CHECK (coverage IN ('complete_snapshot', 'bounded_delta')),
-    item_count          INTEGER NOT NULL CHECK (item_count >= 0),
     manifest_sha256     TEXT NOT NULL,
+    manifest_json       TEXT NOT NULL,
+    requests_json       TEXT NOT NULL,
+    answers_json        TEXT,
+    acquisition_started_at TEXT NOT NULL,
     local_agent_job_id  TEXT NOT NULL,
     local_agent_attempt_count INTEGER NOT NULL,
     source_config_revision TEXT NOT NULL,
     created_at          TEXT NOT NULL,
+    answered_at         TEXT,
     PRIMARY KEY (workspace_id, source_id, snapshot_id)
 );
-
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_manifest_items (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    doc_id              TEXT NOT NULL,
-    revision            TEXT NOT NULL,
-    change_kind         TEXT NOT NULL CHECK (change_kind IN ('upsert', 'tombstone')),
-    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_sync_manifest_item_attestation
-    ON source_sync_snapshot_manifest_items(
-        workspace_id, source_id, doc_id, revision, change_kind, snapshot_id
-    );
-
--- The unlisted items a snapshot asks its device to confirm, issued with the
--- manifest; answer is NULL until the device answers.
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_confirmations (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    doc_id              TEXT NOT NULL,
-    provider_key        TEXT NOT NULL,
-    answer              TEXT CHECK (answer IN ('absent', 'exists', 'hidden', 'failed')),
-    cause               TEXT,
-    answered_at         TEXT,
-    PRIMARY KEY (workspace_id, source_id, snapshot_id, doc_id)
-);
-
--- One scope row per excluded scope a device listed (doc_id NULL; rejection
--- NULL when the scope was listed, its cause when the provider rejected it)
--- and one item row per Document the scope lists.
-CREATE TABLE IF NOT EXISTS source_sync_snapshot_excluded_listings (
-    workspace_id        TEXT NOT NULL,
-    source_id           TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    snapshot_id         TEXT NOT NULL,
-    scope_key           TEXT NOT NULL,
-    doc_id              TEXT,
-    rejection           TEXT,
-    CHECK (doc_id IS NULL OR rejection IS NULL)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_sync_snapshot_excluded_listings_snapshot
-    ON source_sync_snapshot_excluded_listings(workspace_id, source_id, snapshot_id, scope_key);
 
 -- The collection request the server issued to each conversation collection
 -- attempt, the immutable Collection Manifest that answered it, and the message
@@ -1994,6 +1972,12 @@ CREATE TABLE IF NOT EXISTS conversation_collection_bodies (
     PRIMARY KEY (workspace_id, source_id, collection_attempt_id, conversation_id, message_id)
 );
 
+-- A job's uncounted_attempt_count counts the attempts that ended without
+-- counting toward its retry budget: those whose submission came under an
+-- acquisition contract the server no longer has. acquisition_contract is the
+-- contract a document_acquisition attempt was leased under. device_id names
+-- the device a device-bound setup job runs on; lease_device_id is the device
+-- that holds the current attempt.
 CREATE TABLE IF NOT EXISTS local_agent_jobs (
     job_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL DEFAULT 'default',
@@ -2006,7 +1990,12 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
     execution_owner_user_id TEXT NOT NULL,
     lease_owner_user_id TEXT,
     leased_until TEXT,
+    leased_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    uncounted_attempt_count INTEGER NOT NULL DEFAULT 0,
+    acquisition_contract INTEGER,
+    device_id TEXT,
+    lease_device_id TEXT,
     result_json TEXT,
     last_error TEXT,
     next_attempt_at TEXT,
@@ -2016,9 +2005,19 @@ CREATE TABLE IF NOT EXISTS local_agent_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_local_agent_jobs_owner_status
     ON local_agent_jobs(execution_owner_user_id, status, leased_until);
-CREATE TABLE IF NOT EXISTS local_agent_heartbeats (
-    user_id TEXT PRIMARY KEY,
-    last_seen_at TEXT NOT NULL
+-- Each daemon installation of a user is one device; the row keeps its latest
+-- device report (ADR 0058): its name and MemForge version, the acquisition
+-- contract of each document type, the readiness of each Source it executes,
+-- and when the report arrived.
+CREATE TABLE IF NOT EXISTS local_agent_devices (
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    acquisition_contracts_json TEXT NOT NULL,
+    sources_json TEXT NOT NULL DEFAULT '{}',
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, device_id)
 );
 
 -- ---------------------------------------------------------------
@@ -5067,6 +5066,61 @@ MIGRATIONS: Sequence[tuple[int, str, list[str]]] = [
         # defaults to a personal access token.
         [],
     ),
+    (
+        134,
+        "Acquire document Sources on their execution device",
+        # A document Source's acquisition runs on the server or on one device
+        # of its execution owner (ADR 0058). Each daemon installation keeps
+        # one row with its latest device report; a local-agent job names the
+        # device that runs it and records the attempt's lease, its device and
+        # the acquisition contract it was leased under, and counts the
+        # attempts that ended outside its retry budget. A device run submits
+        # its acquisition manifest, and the server answers what the run needs
+        # beyond discovery. Package snapshots and their confirmations have no
+        # writer left.
+        [
+            """CREATE TABLE IF NOT EXISTS source_acquisition_manifests (
+                workspace_id TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                snapshot_id TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                requests_json TEXT NOT NULL,
+                answers_json TEXT,
+                acquisition_started_at TEXT NOT NULL,
+                local_agent_job_id TEXT NOT NULL,
+                local_agent_attempt_count INTEGER NOT NULL,
+                source_config_revision TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                answered_at TEXT,
+                PRIMARY KEY (workspace_id, source_id, snapshot_id)
+            )""",
+            "DROP TABLE IF EXISTS local_agent_heartbeats",
+            """CREATE TABLE IF NOT EXISTS local_agent_devices (
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                acquisition_contracts_json TEXT NOT NULL,
+                sources_json TEXT NOT NULL DEFAULT '{}',
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, device_id)
+            )""",
+            "ALTER TABLE local_agent_jobs ADD COLUMN device_id TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN lease_device_id TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN leased_at TEXT",
+            "ALTER TABLE local_agent_jobs ADD COLUMN acquisition_contract INTEGER",
+            "ALTER TABLE local_agent_jobs ADD COLUMN uncounted_attempt_count INTEGER NOT NULL DEFAULT 0",
+            """ALTER TABLE sources ADD COLUMN executor TEXT NOT NULL DEFAULT 'server'
+               CHECK (executor IN ('server', 'device'))""",
+            "ALTER TABLE sources ADD COLUMN execution_device_id TEXT",
+            "DROP TABLE IF EXISTS source_sync_snapshot_confirmations",
+            "DROP TABLE IF EXISTS source_sync_snapshot_excluded_listings",
+            "DROP INDEX IF EXISTS idx_source_sync_manifest_item_attestation",
+            "DROP TABLE IF EXISTS source_sync_snapshot_manifest_items",
+            "DROP TABLE IF EXISTS source_sync_snapshot_manifests",
+        ],
+    ),
 ]
 
 # Migrations that rebuild a table other tables refer to run with foreign key
@@ -6397,6 +6451,23 @@ class Database:
                     (json.dumps(audit, sort_keys=True), run_id),
                 )
 
+    async def take_recovery_point(self, reason: str) -> RecoveryPoint:
+        """Hold the data root alone and take a recovery point of the data as it is now.
+
+        For a data migration that rewrites what Sources hold. The data root
+        stays held alone until the database is closed, so nothing but this
+        process changes the data after the point is taken. Raises
+        ``DataRootBusy`` while another MemForge process has the data open, and
+        ``UpgradeError`` for a database opened without its recovery points.
+        """
+
+        if self._recovery_points is None or self._data_root_lock is None:
+            raise UpgradeError(f"The database {self.db_path} was opened without its recovery points.")
+        self._data_root_lock.acquire(exclusive=True)
+        point = await asyncio.to_thread(self._recovery_points.create, reason)
+        await asyncio.to_thread(self._recovery_points.prune, reason, keep=frozenset({point.id}))
+        return point
+
     async def close(self) -> None:
         """Close the database connection and release the data-root lock."""
         if self._db:
@@ -6696,17 +6767,24 @@ class Database:
         payload: Mapping[str, Any],
         created_by_user_id: str,
         execution_owner_user_id: str,
-        workspace_id: str = "default",
+        workspace_id: str,
+        device_id: str | None = None,
         now: datetime | None = None,
     ) -> bool:
+        """Queue a setup job; ``device_id`` names the one device of the owner that may lease it.
+
+        A job without a device goes to whichever of the owner's devices
+        leases first.
+        """
+
         now_iso = _utc_iso(now)
         async with self._write_lock:
             cursor = await self.db.execute(
                 """INSERT OR IGNORE INTO local_agent_jobs (
                     job_id, workspace_id, source_id, source_type, operation,
                     payload_json, created_by_user_id, execution_owner_user_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    device_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
                     workspace_id,
@@ -6716,6 +6794,7 @@ class Database:
                     json.dumps(dict(payload), sort_keys=True),
                     created_by_user_id,
                     execution_owner_user_id,
+                    device_id,
                     now_iso,
                     now_iso,
                 ),
@@ -6733,10 +6812,20 @@ class Database:
         payload: Mapping[str, Any],
         created_by_user_id: str,
         execution_owner_user_id: str,
-        workspace_id: str = "default",
+        workspace_id: str,
+        device_id: str | None = None,
         trigger: str = "manual",
         retry_job_id: str | None = None,
+        next_attempt_at: datetime | None = None,
     ) -> tuple[str, bool]:
+        """Queue a local-agent job, or coalesce it with the Source's current one.
+
+        ``device_id`` is the one device that may lease the job; a
+        ``document_acquisition`` job names its Source's execution device, and
+        coalesces only with a job that names the same device.
+        ``next_attempt_at`` is the earliest time a daemon may lease a job this
+        call creates; a job it coalesces with keeps its own.
+        """
         async with self._write_lock:
             try:
                 result = await self._enqueue_local_agent_job_locked(
@@ -6748,9 +6837,11 @@ class Database:
                     created_by_user_id=created_by_user_id,
                     execution_owner_user_id=execution_owner_user_id,
                     workspace_id=workspace_id,
+                    device_id=device_id,
                     trigger=trigger,
                     retry_job_id=retry_job_id,
                     now_iso=_utc_iso(None),
+                    next_attempt_at=_utc_iso(next_attempt_at) if next_attempt_at is not None else None,
                 )
                 await self.db.commit()
                 return result
@@ -6771,7 +6862,9 @@ class Database:
         workspace_id: str,
         trigger: str,
         now_iso: str,
+        device_id: str | None = None,
         retry_job_id: str | None = None,
+        next_attempt_at: str | None = None,
     ) -> tuple[str, bool]:
         """Coalesce work inside the caller's source-write transaction.
 
@@ -6813,12 +6906,13 @@ class Database:
             )
             return retry_job_id, False
 
+        # A job for another device was planned for an executor the Source has left.
         async with self.db.execute(
             """SELECT * FROM local_agent_jobs
                WHERE workspace_id = ? AND source_id = ? AND operation = ?
-                 AND execution_owner_user_id = ? AND status IN ('queued', 'leased')
+                 AND execution_owner_user_id = ? AND device_id IS ? AND status IN ('queued', 'leased')
                ORDER BY created_at""",
-            (workspace_id, source_id, operation, execution_owner_user_id),
+            (workspace_id, source_id, operation, execution_owner_user_id, device_id),
         ) as cursor:
             existing = None
             async for row in cursor:
@@ -6849,11 +6943,11 @@ class Database:
             """INSERT INTO local_agent_jobs (
                 job_id, workspace_id, source_id, source_type, operation,
                 payload_json, created_by_user_id, execution_owner_user_id,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                device_id, next_attempt_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, workspace_id, source_id, source_type, operation,
              json.dumps(dict(payload), sort_keys=True), created_by_user_id,
-             execution_owner_user_id, now_iso, now_iso),
+             execution_owner_user_id, device_id, next_attempt_at, now_iso, now_iso),
         )
         return job_id, True
 
@@ -6889,26 +6983,50 @@ class Database:
         self,
         *,
         user_id: str,
+        device: DeviceReport,
+        acquisition_contracts: Mapping[str, int],
         limit: int,
         lease_seconds: int,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        """Keep the device's report and lease it up to ``limit`` of its user's due jobs.
+
+        A job that names a device is leased only by that device; a
+        ``document_acquisition`` job names its Source's execution device, and
+        is leased only while that device's report names the Source ready and
+        its acquisition contract for the type equals ``acquisition_contracts``,
+        the server's. The attempt records that contract. Any other device leaves such a
+        job waiting, queued, without counting an attempt. Each leased attempt
+        records the device that holds it.
+        """
+
         lease_time = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(lease_time)
         leased_until = _utc_iso(lease_time + timedelta(seconds=lease_seconds))
+        acquiring_types = {
+            source_type: contract
+            for source_type, contract in acquisition_contracts.items()
+            if device.acquires(source_type, acquisition_contracts)
+        }
+        routing = (
+            device.device_id,
+            DOCUMENT_ACQUISITION_OPERATION,
+            json.dumps(sorted(device.ready_source_ids())),
+            json.dumps(sorted(acquiring_types)),
+        )
         leased_ids: list[str] = []
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
-                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
-                   last_seen_at = excluded.last_seen_at""",
-                (user_id, now_iso),
-            )
+            await self._record_local_agent_device(user_id=user_id, device=device, seen_at=now_iso)
             async with self.db.execute(
-                """SELECT j.job_id FROM local_agent_jobs j
+                """SELECT j.job_id, j.operation, j.source_type FROM local_agent_jobs j
                    WHERE j.execution_owner_user_id = ?
                      AND ((j.status = 'queued' AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= ?)) OR
                           (j.status = 'leased' AND j.leased_until <= ?))
+                     AND (j.device_id IS NULL OR j.device_id = ?)
+                     AND (j.operation <> ?
+                          OR (j.device_id IS NOT NULL
+                              AND j.source_id IN (SELECT value FROM json_each(?))
+                              AND j.source_type IN (SELECT value FROM json_each(?))))
                      AND NOT EXISTS (
                          SELECT 1 FROM local_agent_jobs active
                          WHERE active.workspace_id = j.workspace_id
@@ -6920,13 +7038,19 @@ class Database:
                            AND active.job_id <> j.job_id
                      )
                    ORDER BY j.created_at, j.job_id LIMIT ?""",
-                (user_id, now_iso, now_iso, now_iso, limit),
+                (user_id, now_iso, now_iso, *routing, now_iso, limit),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                contract = (
+                    acquiring_types[str(row["source_type"])]
+                    if row["operation"] == DOCUMENT_ACQUISITION_OPERATION
+                    else None
+                )
                 cursor = await self.db.execute(
                     """UPDATE local_agent_jobs SET status = 'leased',
-                       lease_owner_user_id = ?, leased_until = ?,
+                       lease_owner_user_id = ?, lease_device_id = ?, leased_at = ?, leased_until = ?,
+                       acquisition_contract = ?,
                        attempt_count = attempt_count + 1, result_json = NULL,
                        last_error = NULL, next_attempt_at = NULL, finished_at = NULL, updated_at = ?
                        WHERE job_id = ? AND execution_owner_user_id = ?
@@ -6944,7 +7068,10 @@ class Database:
                          )""",
                     (
                         user_id,
+                        device.device_id,
+                        now_iso,
                         leased_until,
+                        contract,
                         now_iso,
                         row["job_id"],
                         user_id,
@@ -6966,19 +7093,17 @@ class Database:
         user_id: str,
         attempt_count: int,
         lease_seconds: int,
+        device: DeviceReport,
         progress: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> bool:
+        """Keep the device's report and extend the attempt's lease while this device still holds it."""
+
         heartbeat_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(heartbeat_at)
         leased_until = _utc_iso(heartbeat_at + timedelta(seconds=lease_seconds))
         async with self._write_lock:
-            await self.db.execute(
-                """INSERT INTO local_agent_heartbeats (user_id, last_seen_at)
-                   VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET
-                   last_seen_at = excluded.last_seen_at""",
-                (user_id, now_iso),
-            )
+            await self._record_local_agent_device(user_id=user_id, device=device, seen_at=now_iso)
             result_json = None
             if progress is not None:
                 result_json = json.dumps(
@@ -6990,8 +7115,8 @@ class Database:
                 """UPDATE local_agent_jobs SET leased_until = ?,
                        result_json = COALESCE(?, result_json), updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
-                     AND lease_owner_user_id = ? AND attempt_count = ?""",
-                (leased_until, result_json, now_iso, job_id, user_id, attempt_count),
+                     AND lease_owner_user_id = ? AND lease_device_id = ? AND attempt_count = ?""",
+                (leased_until, result_json, now_iso, job_id, user_id, device.device_id, attempt_count),
             )
             await self.db.commit()
         return bool(cursor.rowcount)
@@ -7001,6 +7126,7 @@ class Database:
         *,
         job_id: str,
         user_id: str,
+        device_id: str,
         attempt_count: int,
         status: str,
         result: Mapping[str, Any],
@@ -7008,24 +7134,36 @@ class Database:
         retryable: bool = False,
         now: datetime | None = None,
     ) -> bool:
+        """End the attempt ``device_id`` holds; ``False`` when that device no longer holds it."""
+
         completed_at = now or datetime.now(timezone.utc)
         now_iso = _utc_iso(completed_at)
-        stored_status = local_agent_completion_status(
-            status,
-            retryable=retryable,
-            attempt_count=attempt_count,
-        )
-        should_retry = stored_status == "queued"
-        delay = local_agent_retry_delay(status, retryable=retryable, attempt_count=attempt_count)
-        next_attempt_at = _utc_iso(completed_at + delay) if delay is not None else None
-        finished_at = None if should_retry else now_iso
         async with self._write_lock:
+            async with self.db.execute(
+                """SELECT uncounted_attempt_count FROM local_agent_jobs
+                   WHERE job_id = ? AND status = 'leased' AND lease_owner_user_id = ?
+                     AND lease_device_id = ? AND attempt_count = ?""",
+                (job_id, user_id, device_id, attempt_count),
+            ) as cursor:
+                leased = await cursor.fetchone()
+            if leased is None:
+                return False
+            # Only the attempts that count toward the job's retry budget decide whether it retries.
+            counted_attempts = attempt_count - int(leased["uncounted_attempt_count"])
+            stored_status = local_agent_completion_status(
+                status,
+                retryable=retryable,
+                attempt_count=counted_attempts,
+            )
+            delay = local_agent_retry_delay(status, retryable=retryable, attempt_count=counted_attempts)
+            next_attempt_at = _utc_iso(completed_at + delay) if delay is not None else None
+            finished_at = None if stored_status == "queued" else now_iso
             cursor = await self.db.execute(
                 """UPDATE local_agent_jobs SET status = ?, result_json = ?,
-                   last_error = ?, lease_owner_user_id = NULL,
+                   last_error = ?, lease_owner_user_id = NULL, lease_device_id = NULL,
                    leased_until = NULL, next_attempt_at = ?, finished_at = ?, updated_at = ?
                    WHERE job_id = ? AND status = 'leased'
-                     AND lease_owner_user_id = ? AND attempt_count = ?""",
+                     AND lease_owner_user_id = ? AND lease_device_id = ? AND attempt_count = ?""",
                 (
                     stored_status,
                     json.dumps(dict(result), sort_keys=True),
@@ -7035,6 +7173,7 @@ class Database:
                     now_iso,
                     job_id,
                     user_id,
+                    device_id,
                     attempt_count,
                 ),
             )
@@ -7068,7 +7207,7 @@ class Database:
                     job_ids = [str(row["job_id"]) async for row in cursor]
                 await self.db.execute(
                     f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
-                           lease_owner_user_id = NULL, leased_until = NULL,
+                           lease_owner_user_id = NULL, lease_device_id = NULL, leased_until = NULL,
                            next_attempt_at = NULL, finished_at = ?, updated_at = ?
                        WHERE {selection}""",
                     (SOURCE_SYNC_CANCELLED_BY_USER, stopped_at, stopped_at, *params),
@@ -7079,21 +7218,325 @@ class Database:
                 raise
         return job_ids
 
-    async def get_local_agent_heartbeat(self, user_id: str) -> str | None:
+    async def requeue_local_agent_job_uncounted(
+        self,
+        *,
+        job_id: str,
+        attempt_count: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Queue a leased attempt's job again without counting the attempt toward its retry budget.
+
+        A ``document_acquisition`` attempt whose submission comes under an
+        acquisition contract the server no longer has ends this way: the job
+        waits for a device whose contract matches. Returns whether that
+        attempt was still leased.
+        """
+
+        now_iso = _utc_iso(now)
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                """UPDATE local_agent_jobs SET status = 'queued',
+                       uncounted_attempt_count = uncounted_attempt_count + 1,
+                       lease_owner_user_id = NULL, lease_device_id = NULL, leased_until = NULL, acquisition_contract = NULL,
+                       next_attempt_at = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = 'leased' AND attempt_count = ?""",
+                (now_iso, job_id, attempt_count),
+            )
+            await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def current_local_agent_lease(
+        self,
+        *,
+        job_id: str,
+        attempt_count: int,
+        source_id: str,
+        lease_owner_user_id: str,
+        source_config_revision: str,
+    ) -> LocalAgentLease | None:
+        """The attempt's lease while it is current for this Source, owner and configuration, else ``None``."""
+
+        job = await self.get_local_agent_job(job_id)
+        if job is None:
+            return None
+        leased_until = _parse_utc_iso(job.get("leased_until"))
+        leased_at = _parse_utc_iso(job.get("leased_at"))
+        if (
+            job.get("status") != "leased"
+            or job.get("source_id") != source_id
+            or job.get("lease_owner_user_id") != lease_owner_user_id
+            or int(job.get("attempt_count") or 0) != attempt_count
+            or (job.get("payload") or {}).get("source_config_revision") != source_config_revision
+            or leased_until is None
+            or leased_until <= datetime.now(timezone.utc)
+            or leased_at is None
+        ):
+            return None
+        return LocalAgentLease(
+            payload=dict(job.get("payload") or {}),
+            leased_at=leased_at,
+            device_id=job.get("lease_device_id"),
+            acquisition_contract=job.get("acquisition_contract"),
+        )
+
+    async def leased_document_acquisition_job(self, source_id: str) -> str | None:
+        """The id of a ``document_acquisition`` job of the Source a daemon holds unexpired, if any."""
+
         async with self.db.execute(
-            "SELECT last_seen_at FROM local_agent_heartbeats WHERE user_id = ?",
-            (user_id,),
+            """SELECT job_id FROM local_agent_jobs
+               WHERE source_id = ? AND operation = ? AND status = 'leased' AND leased_until > ?
+               ORDER BY created_at, job_id LIMIT 1""",
+            (source_id, DOCUMENT_ACQUISITION_OPERATION, _utc_iso(None)),
         ) as cursor:
             row = await cursor.fetchone()
-        return str(row["last_seen_at"]) if row else None
+        return str(row["job_id"]) if row is not None else None
+
+    async def cancel_queued_source_jobs(
+        self,
+        source_id: str,
+        *,
+        execution_device_id: str | None,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Fail the Source's queued jobs planned for another executor as cancelled by a Source change; return them.
+
+        These are its queued sync jobs, and its queued setup jobs that name a
+        device other than ``execution_device_id``, the Source's execution
+        device, or any device when it has none.
+        """
+
+        cancelled_at = _utc_iso(now)
+        operations = sorted(LOCAL_AGENT_SYNC_OPERATIONS)
+        placeholders = ",".join("?" for _ in operations)
+        queued = f"""source_id = ? AND status = 'queued'
+            AND (operation IN ({placeholders}) OR (device_id IS NOT NULL AND device_id IS NOT ?))"""
+        queued_args = (source_id, *operations, execution_device_id)
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {queued} ORDER BY created_at, job_id",
+                    queued_args,
+                ) as cursor:
+                    cancelled = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {queued}""",
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, cancelled_at, cancelled_at, *queued_args),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return cancelled
+
+    async def _record_local_agent_device(self, *, user_id: str, device: DeviceReport, seen_at: str) -> None:
+        """Keep the device's latest report; the caller holds the write lock and commits."""
+
+        await self.db.execute(
+            """INSERT INTO local_agent_devices (
+                   user_id, device_id, name, version, acquisition_contracts_json, sources_json, last_seen_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, device_id) DO UPDATE SET
+                   name = excluded.name, version = excluded.version,
+                   acquisition_contracts_json = excluded.acquisition_contracts_json,
+                   sources_json = excluded.sources_json, last_seen_at = excluded.last_seen_at""",
+            (
+                user_id,
+                device.device_id,
+                device.name,
+                device.version,
+                json.dumps(dict(sorted(device.acquisition_contracts.items()))),
+                json.dumps(device.to_payload()["sources"]),
+                seen_at,
+            ),
+        )
+
+    async def list_local_agent_devices(self, user_id: str) -> list[LocalAgentDevice]:
+        """Each device of the user, as its latest report left it, most recently seen first."""
+
+        async with self.db.execute(
+            """SELECT * FROM local_agent_devices WHERE user_id = ?
+               ORDER BY last_seen_at DESC, device_id""",
+            (user_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            LocalAgentDevice(
+                user_id=str(row["user_id"]),
+                report=DeviceReport(
+                    device_id=str(row["device_id"]),
+                    name=str(row["name"]),
+                    version=str(row["version"]),
+                    acquisition_contracts=json.loads(row["acquisition_contracts_json"]),
+                    sources={
+                        str(source_id): DeviceSourceReadiness.from_payload(readiness)
+                        for source_id, readiness in json.loads(row["sources_json"]).items()
+                    },
+                ),
+                last_seen_at=datetime.fromisoformat(str(row["last_seen_at"])),
+            )
+            for row in rows
+        ]
+
+    async def remove_local_agent_device(self, user_id: str, device_id: str) -> list[str]:
+        """Forget one of the user's devices and fail its jobs as cancelled; return those jobs.
+
+        These are the queued jobs that name it, the ``document_acquisition``
+        jobs of the Sources it executed included, and the attempts it holds,
+        whose submissions the server then refuses. Raises ``LookupError``
+        when the user has no such device.
+        """
+
+        removed_at = _utc_iso(None)
+        async with self._write_lock:
+            try:
+                deleted = await self.db.execute(
+                    "DELETE FROM local_agent_devices WHERE user_id = ? AND device_id = ?", (user_id, device_id)
+                )
+                if not deleted.rowcount:
+                    raise LookupError("local_agent_device_not_found")
+                held = """execution_owner_user_id = ? AND (
+                    (status = 'queued' AND device_id = ?) OR (status = 'leased' AND lease_device_id = ?))"""
+                held_args = (user_id, device_id, device_id)
+                async with self.db.execute(
+                    f"SELECT job_id FROM local_agent_jobs WHERE {held} ORDER BY created_at, job_id",
+                    held_args,
+                ) as cursor:
+                    cancelled = [str(row["job_id"]) async for row in cursor]
+                await self.db.execute(
+                    f"""UPDATE local_agent_jobs SET status = 'failed', last_error = ?, leased_until = NULL,
+                           next_attempt_at = NULL, finished_at = ?, updated_at = ?
+                       WHERE {held}""",
+                    (SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE, removed_at, removed_at, *held_args),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return cancelled
+
+    async def release_execution_device(self, execution_owner_user_id: str, device_id: str) -> list[str]:
+        """Clear a removed device as the execution device of the owner's Sources; return those Sources.
+
+        They run nothing until their owner chooses another device.
+        """
+
+        async with self._write_lock:
+            try:
+                async with self.db.execute(
+                    """SELECT id FROM sources WHERE execution_owner_user_id = ? AND execution_device_id = ?
+                       ORDER BY id""",
+                    (execution_owner_user_id, device_id),
+                ) as cursor:
+                    source_ids = [str(row["id"]) async for row in cursor]
+                await self.db.execute(
+                    """UPDATE sources SET execution_device_id = NULL
+                       WHERE execution_owner_user_id = ? AND execution_device_id = ?""",
+                    (execution_owner_user_id, device_id),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+        return source_ids
+
+    async def list_device_sources(
+        self, execution_owner_user_id: str, *, device_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """The Sources whose acquisition runs on a device of this execution owner, by id.
+
+        With ``device_id``, only the Sources that device executes.
+        """
+
+        async with self.db.execute(
+            """SELECT * FROM sources
+               WHERE executor = 'device' AND execution_owner_user_id = ? AND status <> 'retired'
+                 AND (? IS NULL OR execution_device_id = ?)
+               ORDER BY id""",
+            (execution_owner_user_id, device_id, device_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [_source_from_row(row) for row in rows]
+
+    async def change_source_executor(
+        self,
+        source_id: str,
+        *,
+        executor: str,
+        config_json: str,
+        execution_owner_user_id: str | None = None,
+        execution_device_id: str | None = None,
+    ) -> None:
+        """Move where the Source's acquisition runs, keeping everything it holds.
+
+        The executor and the execution device are not part of the Source's
+        scope: the change opens no scope transition, and leaves its Documents,
+        Units, Memories, cursor, failure ledger and an open transition as they
+        are. ``config_json`` is the configuration with the credentials the new
+        executor's server side holds. ``execution_owner_user_id`` becomes the
+        Source's execution owner; ``None`` keeps the current one.
+        ``execution_device_id`` is the device of that owner that runs a device
+        Source, and is cleared for a server Source.
+
+        The change waits for the Source's sync: it raises
+        :class:`SourceSyncRunActive` while a run is pending or running. The
+        Source's local-agent jobs are its job store's; the caller cancels the
+        ones planned for the previous executor. Raises ``LookupError`` for an
+        unknown Source.
+        """
+
+        async with self._write_lock:
+            try:
+                source_lock = await self.db.execute("UPDATE sources SET status = status WHERE id = ?", (source_id,))
+                if not source_lock.rowcount:
+                    raise LookupError("source_not_found")
+                async with self.db.execute(
+                    """SELECT run_id FROM source_sync_runs
+                       WHERE source_id = ? AND status IN ('pending', 'running')
+                       ORDER BY created_at LIMIT 1""",
+                    (source_id,),
+                ) as cursor:
+                    active_run = await cursor.fetchone()
+                if active_run is not None:
+                    raise SourceSyncRunActive(
+                        f"source sync run already active: {active_run['run_id']}", run_id=str(active_run["run_id"])
+                    )
+                await self.db.execute(
+                    """UPDATE sources SET executor = ?, config = ?,
+                           execution_owner_user_id = COALESCE(?, execution_owner_user_id),
+                           execution_device_id = ?
+                       WHERE id = ?""",
+                    (
+                        executor,
+                        config_json,
+                        execution_owner_user_id,
+                        execution_device_id if executor == "device" else None,
+                        source_id,
+                    ),
+                )
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
 
     async def enqueue_due_local_agent_jobs(
         self,
         *,
+        device_acquisition_payload: Callable[[Mapping[str, Any]], Awaitable[dict[str, Any]]],
         now: datetime | None = None,
         limit: int = 50,
-        workspace_id: str = "default",
+        workspace_id: str,
     ) -> int:
+        """Queue the scheduled job of each due Source collected on its execution owner's device.
+
+        A device Source's job is ``document_acquisition``, whose payload
+        ``device_acquisition_payload`` builds from the Source as of now; a
+        Source on its type's local-agent path gets that type's operation.
+        Returns how many jobs were created.
+        """
+
         claim_time = now or datetime.now(timezone.utc)
         due_at = _utc_iso(claim_time)
         enqueued = 0
@@ -7108,15 +7551,22 @@ class Database:
             (due_at, limit),
         ) as cursor:
             rows = [dict(row) async for row in cursor]
+        operations = {
+            row["id"]: operation for row in rows if (operation := source_collection_operation(row)) is not None
+        }
         payloads = {
-            row["id"]: await local_agent_sync_job_payload(self, row)
+            row["id"]: (
+                await device_acquisition_payload(_source_from_row(row))
+                if operations[row["id"]] == DOCUMENT_ACQUISITION_OPERATION
+                else await local_agent_sync_job_payload(self, row)
+            )
             for row in rows
-            if local_agent_sync_operation(row["type"], row["config"]) is not None
+            if row["id"] in operations
         }
         async with self._write_lock:
             try:
                 for row in rows:
-                    operation = local_agent_sync_operation(row["type"], row["config"])
+                    operation = operations.get(row["id"])
                     if operation is None:
                         continue
                     owner = str(row.get("execution_owner_user_id") or "").strip()
@@ -7124,7 +7574,8 @@ class Database:
                     interval = int(
                         row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
                     )
-                    if not owner:
+                    # A device Source without an execution device runs nothing until its owner chooses one.
+                    if not owner or (operation == DOCUMENT_ACQUISITION_OPERATION and not row.get("execution_device_id")):
                         await self.db.execute(
                             """UPDATE sources SET sync_schedule_next_at = ?,
                                sync_schedule_updated_at = ?
@@ -7146,21 +7597,23 @@ class Database:
                             f"memforge:{workspace_id}:{row['id']}:{expected_due}",
                         ).hex
                     )
-                    # A configuration saved since the payload was read leaves
-                    # the Source due, for the next pass to read it again.
+                    # A configuration saved or a device chosen since the payload
+                    # was read leaves the Source due, for the next pass to read it again.
                     cursor = await self.db.execute(
                         """UPDATE sources SET sync_schedule_next_at = ?,
                            sync_schedule_updated_at = ?
                            WHERE id = ? AND status = 'active'
                              AND sync_schedule_enabled = 1
                              AND sync_schedule_next_at = ?
-                             AND config = ?""",
+                             AND config = ?
+                             AND execution_device_id IS ?""",
                         (
                             _utc_iso(claim_time + timedelta(minutes=interval)),
                             due_at,
                             row["id"],
                             expected_due,
                             row["config"],
+                            row.get("execution_device_id"),
                         ),
                     )
                     if cursor.rowcount:
@@ -7169,6 +7622,11 @@ class Database:
                             source_type=row["type"], operation=operation,
                             payload=payloads[row["id"]], created_by_user_id=owner,
                             execution_owner_user_id=owner, now_iso=due_at, trigger="scheduled",
+                            device_id=(
+                                row.get("execution_device_id")
+                                if operation == DOCUMENT_ACQUISITION_OPERATION
+                                else None
+                            ),
                         )
                         enqueued += int(created)
                 await self.db.commit()
@@ -16394,8 +16852,15 @@ class Database:
         execution_owner_user_id: str | None = None,
         projection_scope_transition: ProjectionScopeTransition | None = None,
         expected_open_transition_id: str | None = None,
+        executor: str | None = None,
+        execution_device_id: str | None = None,
     ) -> None:
         """Insert or update a source row.
+
+        `executor` is where the Source's acquisition runs, `server` or
+        `device`; `None` keeps the current one, and a new Source runs on the
+        server. `execution_device_id` is the device of the execution owner
+        that runs a device Source; `None` keeps the current one.
 
         `project_binding` is the structured rule the project resolver
         consults when memories are extracted from this source. `None`
@@ -16498,9 +16963,9 @@ class Database:
                     """INSERT INTO sources (
                        id, type, name, config, status, project_binding,
                        created_by_user_id, owner_user_id, access_policy,
-                       access_state, execution_owner_user_id
+                       access_state, execution_owner_user_id, executor, execution_device_id
                    )
-                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, COALESCE(?, 'active'), ?, ?, ?, ?, ?, ?, COALESCE(?, 'server'), ?)
                    ON CONFLICT(id) DO UPDATE SET
                    type=excluded.type,
                    name=excluded.name,
@@ -16517,7 +16982,12 @@ class Database:
                    execution_owner_user_id=COALESCE(
                        sources.execution_owner_user_id,
                        excluded.execution_owner_user_id
-                   )""",
+                   ),
+                   executor=CASE
+                       WHEN ? IS NULL THEN sources.executor
+                       ELSE excluded.executor
+                   END,
+                   execution_device_id=COALESCE(excluded.execution_device_id, sources.execution_device_id)""",
                     (
                         id,
                         type,
@@ -16530,7 +17000,10 @@ class Database:
                         access_policy,
                         access_state,
                         execution_owner_user_id,
+                        executor,
+                        execution_device_id,
                         status,
+                        executor,
                     ),
                 )
                 if projection_scope_transition is not None or expected_open_transition_id is not None:
@@ -16569,13 +17042,7 @@ class Database:
     async def get_source(self, source_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)) as cursor:
             row = await cursor.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["config"] = json.loads(d["config"])
-            d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
-            d["sync_schedule"] = _source_schedule_from_row(d)
-            return d
+            return _source_from_row(row) if row else None
 
     async def create_source_access_transition(
         self,
@@ -17096,11 +17563,7 @@ class Database:
             "SELECT * FROM sources WHERE status <> 'retired' ORDER BY created_at"
         ) as cursor:
             async for row in cursor:
-                d = dict(row)
-                d["config"] = json.loads(d["config"])
-                d["project_binding"] = json.loads(d["project_binding"]) if d.get("project_binding") else None
-                d["sync_schedule"] = _source_schedule_from_row(d)
-                results.append(d)
+                results.append(_source_from_row(row))
         return results
 
     async def list_searchable_source_ids_for_user(
@@ -17269,7 +17732,7 @@ class Database:
                 ) as cursor:
                     rows = [dict(row) async for row in cursor]
                 for row in rows:
-                    if local_agent_sync_operation(row["type"], row["config"]) is not None:
+                    if source_collection_operation(row) is not None:
                         continue
                     interval_minutes = int(
                         row.get("sync_schedule_interval_minutes") or SOURCE_SYNC_SCHEDULE_DEFAULT_INTERVAL_MINUTES
@@ -18276,7 +18739,8 @@ class Database:
         """Queue one sync run, or coalesce into the Source's active run.
 
         ``reprocess_document_ids`` queue an operator reprocess of those
-        Documents instead. It never coalesces: it is refused with
+        Documents instead, bound to ``input_snapshot_id`` when a device
+        acquired them. It never coalesces: it is refused with
         :class:`SourceSyncRunActive` while another run is pending or running.
         A sync requested while a reprocess is active runs after it.
 
@@ -18327,10 +18791,8 @@ class Database:
         now: str | None = None,
     ) -> SourceSyncRun:
         now_iso = now or _now_iso()
-        if reprocess_document_ids and (
-            trigger != "reprocess" or force_full_sync or input_snapshot_id or retry_run_id
-        ):
-            raise ValueError("a reprocess run names its Documents only")
+        if reprocess_document_ids and (trigger != "reprocess" or force_full_sync or retry_run_id):
+            raise ValueError("a reprocess run names its Documents and the attempt that acquired them only")
         normalized_snapshot_id = _non_empty_string(input_snapshot_id)
         normalized_config_revision = _non_empty_string(source_config_revision)
         normalized_predecessor_activity_id = _non_empty_string(predecessor_activity_id)
@@ -19346,7 +19808,7 @@ class Database:
         now = _now_iso()
         metadata_payload = dict(metadata or {})
         snapshot_id = _non_empty_string(sync_snapshot_id)
-        snapshot_doc_id = _manifest_doc_id(metadata_payload)
+        snapshot_doc_id = _non_empty_string(metadata_payload.get("doc_id"))
         if snapshot_id and not snapshot_doc_id:
             raise ValueError("snapshot input requires doc_id")
         async with self._write_lock:
@@ -19375,7 +19837,6 @@ class Database:
                             snapshot_id=snapshot_id,
                             doc_id=snapshot_doc_id,
                             input_id=str(existing["input_id"]),
-                            metadata=metadata_payload,
                             now=now,
                         )
                     await self.db.commit()
@@ -19413,7 +19874,6 @@ class Database:
                         snapshot_id=snapshot_id,
                         doc_id=snapshot_doc_id,
                         input_id=input_id,
-                        metadata=metadata_payload,
                         now=now,
                     )
                 await self.db.commit()
@@ -19478,207 +19938,33 @@ class Database:
                 results.append(_source_sync_input_from_row(row))
         return results
 
-    async def find_source_sync_input_attestations(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        manifest_items: Sequence[tuple[str, str, str]],
-    ) -> list[SourceSyncInput]:
-        """Return only latest immutable inputs matching exact manifest identities."""
-
-        from memforge.storage.source_sync_manifest import (
-            MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE,
-        )
-
-        identities = tuple(
-            dict.fromkeys(
-                (str(doc_id), str(revision), str(change_kind)) for doc_id, revision, change_kind in manifest_items
-            )
-        )
-        if not identities:
-            return []
-        results: list[SourceSyncInput] = []
-        for offset in range(0, len(identities), MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE):
-            chunk = identities[offset : offset + MANIFEST_ATTESTATION_LOOKUP_CHUNK_SIZE]
-            predicates = " OR ".join(
-                "(mi.doc_id = ? AND mi.revision = ? AND mi.change_kind = ?)" for _identity in chunk
-            )
-            params: tuple[Any, ...] = (
-                workspace_id,
-                source_id,
-                *(value for identity in chunk for value in identity),
-            )
-            query = f"""WITH ranked_inputs AS (
-                           SELECT i.*,
-                                  ROW_NUMBER() OVER (
-                                      PARTITION BY mi.doc_id, mi.revision, mi.change_kind
-                                      ORDER BY i.input_generation DESC
-                                  ) AS attestation_rank
-                           FROM source_sync_snapshot_manifest_items mi
-                           JOIN source_sync_snapshot_items si
-                             ON si.workspace_id = mi.workspace_id
-                            AND si.source_id = mi.source_id
-                            AND si.snapshot_id = mi.snapshot_id
-                            AND si.doc_id = mi.doc_id
-                           JOIN source_sync_inputs i ON i.input_id = si.input_id
-                           WHERE mi.workspace_id = ? AND mi.source_id = ?
-                             AND ({predicates})
-                       )
-                       SELECT * FROM ranked_inputs
-                       WHERE attestation_rank = 1
-                       ORDER BY input_generation"""
-            async with self.db.execute(query, params) as cursor:
-                async for row in cursor:
-                    results.append(_source_sync_input_from_row(row))
-        return results
-
-    async def find_reusable_source_projection_memberships(
+    async def record_source_acquisition(
         self,
         *,
         source_id: str,
         workspace_id: str,
         snapshot_id: str,
-        expected_access_hash: str,
-    ) -> frozenset[str]:
-        """Resolve current projections reusable by one exact manifest snapshot.
-
-        A current membership is reusable only when its immutable input was
-        already attested by an earlier manifest, the item stored with its
-        current Unit revision still has the manifest's revision, and that
-        revision was projected under the current access context. Nothing is
-        reusable while the Source has an open scope transition (``pending``,
-        ``running`` or ``failed``): each listed Document must commit under the
-        transition to become one of its members.
-        """
-
-        normalized_snapshot_id = _non_empty_string(snapshot_id)
-        normalized_access_hash = _non_empty_string(expected_access_hash)
-        if normalized_snapshot_id is None or normalized_access_hash is None:
-            return frozenset()
-        query = """SELECT DISTINCT mi.doc_id
-                   FROM source_sync_snapshot_manifest_items mi
-                   JOIN source_sync_snapshot_manifests current_manifest
-                     ON current_manifest.workspace_id = mi.workspace_id
-                    AND current_manifest.source_id = mi.source_id
-                    AND current_manifest.snapshot_id = mi.snapshot_id
-                   JOIN source_sync_snapshot_items si
-                     ON si.workspace_id = mi.workspace_id
-                    AND si.source_id = mi.source_id
-                    AND si.snapshot_id = mi.snapshot_id
-                    AND si.doc_id = mi.doc_id
-                   JOIN source_unit_document_lineage_history lineage
-                     ON lineage.source_id = mi.source_id
-                    AND lineage.document_id = mi.doc_id
-                    AND lineage.is_current = 1
-                   JOIN source_units unit
-                     ON unit.id = lineage.source_unit_id
-                    AND unit.source_id = mi.source_id
-                   JOIN source_unit_inputs input
-                     ON input.source_unit_id = unit.id
-                    AND input.unit_revision_id = unit.current_revision_id
-                    AND json_extract(input.item_json, '$.version') = mi.revision
-                   JOIN source_unit_revisions revision
-                     ON revision.id = unit.current_revision_id
-                    AND revision.access_hash = ?
-                   JOIN sources src
-                     ON src.id = mi.source_id
-                    AND src.access_state = 'active'
-                   WHERE mi.workspace_id = ?
-                     AND mi.source_id = ?
-                     AND mi.snapshot_id = ?
-                     AND mi.change_kind = 'upsert'
-                     AND NOT EXISTS (
-                         SELECT 1
-                         FROM projection_scope_transitions transition
-                         WHERE transition.source_id = mi.source_id
-                           AND transition.status IN ('pending', 'running', 'failed')
-                     )
-                     AND EXISTS (
-                         SELECT 1
-                         FROM source_sync_snapshot_manifest_items prior_mi
-                         JOIN source_sync_snapshot_manifests prior_manifest
-                           ON prior_manifest.workspace_id = prior_mi.workspace_id
-                          AND prior_manifest.source_id = prior_mi.source_id
-                          AND prior_manifest.snapshot_id = prior_mi.snapshot_id
-                         JOIN source_sync_snapshot_items prior_si
-                           ON prior_si.workspace_id = prior_mi.workspace_id
-                          AND prior_si.source_id = prior_mi.source_id
-                          AND prior_si.snapshot_id = prior_mi.snapshot_id
-                          AND prior_si.doc_id = prior_mi.doc_id
-                         WHERE prior_mi.workspace_id = mi.workspace_id
-                           AND prior_mi.source_id = mi.source_id
-                           AND prior_mi.snapshot_id <> mi.snapshot_id
-                           AND prior_mi.doc_id = mi.doc_id
-                           AND prior_mi.revision = mi.revision
-                           AND prior_mi.change_kind = mi.change_kind
-                           AND prior_si.input_id = si.input_id
-                           AND prior_manifest.source_config_revision = current_manifest.source_config_revision
-                     )
-                   ORDER BY mi.doc_id"""
-        params = (
-            normalized_access_hash,
-            workspace_id,
-            source_id,
-            normalized_snapshot_id,
-        )
-        async with self.db.execute(query, params) as cursor:
-            return frozenset([str(row["doc_id"]) async for row in cursor])
-
-    async def attach_source_sync_inputs_to_snapshot(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        snapshot_id: str,
-        memberships: list[tuple[str, str]],
-        coverage: str,
-        manifest_count: int,
-        manifest_sha256: str,
-        manifest_items: list[tuple[str, str, str]],
+        manifest: AcquisitionManifest,
+        requests: AcquisitionRequests,
+        started_at: datetime,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
         source_config_revision: str,
-        confirm: Sequence[SnapshotConfirmation] = (),
-        excluded_listings: Sequence[ExcludedScopeListing] = (),
-    ) -> None:
-        """Persist one fenced manifest and attach its reusable immutable inputs.
+    ) -> StoredAcquisition:
+        """Keep the manifest one device run submitted, with what its response asks, and return what is kept.
 
-        The manifest declares ``complete_snapshot`` coverage and every item an
-        ``upsert``; any other value is refused. ``confirm`` is the set of unlisted items the server asks the device to
-        confirm, issued unanswered in the manifest's transaction.
-        ``excluded_listings`` is what the device listed in each excluded scope
-        of an open transition. Both belong to the manifest: a replay must
-        carry the same ones, as it must carry the same items.
+        The manifest belongs to its job attempt. A replay of the same manifest
+        by the same attempt returns the stored record, including the requests
+        it was issued, without asking again; a different manifest for the
+        attempt is refused. The embedded job broker's lease is checked again
+        in the same transaction.
         """
-        validate_snapshot_manifest_values(coverage, manifest_items)
-        validate_snapshot_manifest_extras(manifest_items, confirm, excluded_listings)
-        normalized_snapshot_id = _non_empty_string(snapshot_id)
-        if normalized_snapshot_id is None:
-            raise ValueError("snapshot_id is required")
-        if len({doc_id for doc_id, _input_id in memberships}) != len(memberships):
-            raise ValueError("snapshot memberships contain duplicate doc_id")
-        if manifest_count < 0 or len(memberships) > manifest_count:
-            raise ValueError("snapshot manifest count is invalid")
-        if manifest_count != len(manifest_items):
-            raise ValueError("snapshot manifest item count is invalid")
-        manifest_doc_ids = {doc_id for doc_id, _revision, _change_kind in manifest_items}
-        if len(manifest_doc_ids) != len(manifest_items):
-            raise ValueError("snapshot manifest contains duplicate doc_id")
-        if {doc_id for doc_id, _input_id in memberships} - manifest_doc_ids:
-            raise ValueError("snapshot membership was not declared by the manifest")
-        if len(manifest_sha256) != 64:
-            raise ValueError("snapshot manifest digest is invalid")
+        from memforge.local_agent.document_acquisition import StoredAcquisition
+
+        digest = manifest.digest()
         now = _now_iso()
         async with self._write_lock:
             try:
-                async with self.db.execute(
-                    "SELECT 1 FROM sources WHERE id = ?",
-                    (source_id,),
-                ) as cursor:
-                    source = await cursor.fetchone()
-                if source is None:
-                    raise ValueError(f"Source not found: {source_id}")
                 async with self.db.execute(
                     """SELECT status, attempt_count, leased_until, payload_json
                        FROM local_agent_jobs
@@ -19686,214 +19972,65 @@ class Database:
                     (local_agent_job_id, source_id),
                 ) as cursor:
                     job = await cursor.fetchone()
-                # The embedded broker shares this transaction and is fenced
-                # again here. Cloud uses its external Service Metadata lease
-                # validator; the persisted job/attempt binding is rechecked
-                # by the processing route before enqueue.
                 if job is not None:
-                    job_payload = json.loads(job["payload_json"] or "{}") if job is not None else {}
-                    leased_until = _parse_dt(job["leased_until"]) if job is not None else None
+                    job_payload = json.loads(job["payload_json"] or "{}")
+                    leased_until = _parse_dt(job["leased_until"])
                     if not (
-                        job is not None
-                        and job["status"] == "leased"
+                        job["status"] == "leased"
                         and int(job["attempt_count"] or 0) == local_agent_attempt_count
                         and leased_until is not None
                         and leased_until > datetime.now(timezone.utc)
                         and str(job_payload.get("source_config_revision") or "") == source_config_revision
                     ):
                         raise SourceActivityConflict("local agent lease changed")
-                async with self.db.execute(
-                    """SELECT input_id FROM source_sync_inputs
-                       WHERE workspace_id = ? AND source_id = ?""",
-                    (workspace_id, source_id),
-                ) as cursor:
-                    valid_input_ids = {str(row["input_id"]) async for row in cursor}
-                missing_input_ids = {input_id for _doc_id, input_id in memberships if input_id not in valid_input_ids}
-                if missing_input_ids:
-                    raise ValueError(f"Source sync input not found: {sorted(missing_input_ids)[0]}")
-                async with self.db.execute(
-                    """SELECT coverage, item_count, manifest_sha256,
-                              local_agent_job_id, local_agent_attempt_count,
-                              source_config_revision
-                       FROM source_sync_snapshot_manifests
-                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-                    (workspace_id, source_id, normalized_snapshot_id),
-                ) as cursor:
-                    existing_manifest = await cursor.fetchone()
-                expected_manifest = (
-                    coverage,
-                    manifest_count,
-                    manifest_sha256,
-                    local_agent_job_id,
-                    local_agent_attempt_count,
-                    source_config_revision,
-                )
-                if existing_manifest is not None:
-                    actual_manifest = (
-                        str(existing_manifest["coverage"]),
-                        int(existing_manifest["item_count"]),
-                        str(existing_manifest["manifest_sha256"]),
-                        str(existing_manifest["local_agent_job_id"]),
-                        int(existing_manifest["local_agent_attempt_count"]),
-                        str(existing_manifest["source_config_revision"]),
-                    )
-                    if actual_manifest != expected_manifest:
-                        raise SourceActivityConflict("source snapshot manifest changed")
-                    async with self.db.execute(
-                        """SELECT doc_id, revision, change_kind
-                           FROM source_sync_snapshot_manifest_items
-                           WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
-                           ORDER BY doc_id""",
-                        (workspace_id, source_id, normalized_snapshot_id),
-                    ) as cursor:
-                        existing_items = [
-                            (str(row["doc_id"]), str(row["revision"]), str(row["change_kind"])) async for row in cursor
-                        ]
-                    if existing_items != sorted(manifest_items):
-                        raise SourceActivityConflict("source snapshot manifest changed")
-                    issued = await self._list_source_sync_snapshot_confirmations_unlocked(
-                        workspace_id, source_id, normalized_snapshot_id
-                    )
-                    listed = await self.list_source_sync_snapshot_excluded_listings(
-                        source_id=source_id, workspace_id=workspace_id, snapshot_id=normalized_snapshot_id
-                    )
-                    if [(item.doc_id, item.provider_key) for item in issued] != sorted(
-                        (item.doc_id, item.provider_key) for item in confirm
-                    ) or listed != tuple(sorted(excluded_listings, key=lambda listing: listing.scope_key)):
-                        raise SourceActivityConflict("source snapshot manifest changed")
-                else:
-                    async with self.db.execute(
-                        """SELECT doc_id FROM source_sync_snapshot_items
-                           WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
-                           LIMIT 1""",
-                        (workspace_id, source_id, normalized_snapshot_id),
-                    ) as cursor:
-                        preexisting_item = await cursor.fetchone()
-                    if preexisting_item is not None:
-                        raise SourceActivityConflict("source snapshot manifest must precede materialization")
-                    await self.db.execute(
-                        """INSERT INTO source_sync_snapshot_manifests (
-                        workspace_id, source_id, snapshot_id, coverage, item_count, manifest_sha256,
-                        local_agent_job_id, local_agent_attempt_count,
+                stored = await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
+                if stored is not None:
+                    if (
+                        stored.manifest_sha256,
+                        stored.local_agent_job_id,
+                        stored.local_agent_attempt_count,
+                        stored.source_config_revision,
+                    ) != (digest, local_agent_job_id, local_agent_attempt_count, source_config_revision):
+                        raise SourceActivityConflict("source acquisition manifest changed")
+                    return stored
+                await self.db.execute(
+                    """INSERT INTO source_acquisition_manifests (
+                        workspace_id, source_id, snapshot_id, manifest_sha256, manifest_json, requests_json,
+                        acquisition_started_at, local_agent_job_id, local_agent_attempt_count,
                         source_config_revision, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            workspace_id,
-                            source_id,
-                            normalized_snapshot_id,
-                            coverage,
-                            manifest_count,
-                            manifest_sha256,
-                            local_agent_job_id,
-                            local_agent_attempt_count,
-                            source_config_revision,
-                            now,
-                        ),
-                    )
-                    await self.db.executemany(
-                        """INSERT INTO source_sync_snapshot_manifest_items (
-                            workspace_id, source_id, snapshot_id, doc_id, revision, change_kind
-                        ) VALUES (?, ?, ?, ?, ?, ?)""",
-                        [
-                            (
-                                workspace_id,
-                                source_id,
-                                normalized_snapshot_id,
-                                doc_id,
-                                revision,
-                                change_kind,
-                            )
-                            for doc_id, revision, change_kind in manifest_items
-                        ],
-                    )
-                    await self.db.executemany(
-                        """INSERT INTO source_sync_snapshot_confirmations (
-                            workspace_id, source_id, snapshot_id, doc_id, provider_key
-                        ) VALUES (?, ?, ?, ?, ?)""",
-                        [
-                            (workspace_id, source_id, normalized_snapshot_id, item.doc_id, item.provider_key)
-                            for item in confirm
-                        ],
-                    )
-                    await self.db.executemany(
-                        """INSERT INTO source_sync_snapshot_excluded_listings (
-                            workspace_id, source_id, snapshot_id, scope_key, doc_id, rejection
-                        ) VALUES (?, ?, ?, ?, ?, ?)""",
-                        [
-                            (workspace_id, source_id, normalized_snapshot_id, *row)
-                            for row in excluded_listing_rows(excluded_listings)
-                        ],
-                    )
-                await self.db.executemany(
-                    """INSERT INTO source_sync_snapshot_items (
-                        workspace_id, source_id, snapshot_id, doc_id, input_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(workspace_id, source_id, snapshot_id, doc_id)
-                    DO UPDATE SET input_id = excluded.input_id,
-                                  created_at = excluded.created_at""",
-                    [
-                        (
-                            workspace_id,
-                            source_id,
-                            normalized_snapshot_id,
-                            doc_id,
-                            input_id,
-                            now,
-                        )
-                        for doc_id, input_id in memberships
-                    ],
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        workspace_id,
+                        source_id,
+                        snapshot_id,
+                        digest,
+                        json.dumps(manifest.to_payload(), sort_keys=True),
+                        json.dumps(requests.to_payload(), sort_keys=True),
+                        _utc_iso(started_at),
+                        local_agent_job_id,
+                        local_agent_attempt_count,
+                        source_config_revision,
+                        now,
+                    ),
                 )
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
+        return StoredAcquisition(
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            manifest=manifest,
+            manifest_sha256=digest,
+            requests=requests,
+            answers=None,
+            started_at=started_at,
+            local_agent_job_id=local_agent_job_id,
+            local_agent_attempt_count=local_agent_attempt_count,
+            source_config_revision=source_config_revision,
+        )
 
-    async def get_source_sync_snapshot_manifest_status(
-        self,
-        *,
-        source_id: str,
-        workspace_id: str,
-        snapshot_id: str,
-    ) -> dict[str, Any] | None:
-        """Return manifest coverage and whether the manifest is ready to process.
-
-        It is ready once every declared item is materialized and every issued
-        confirmation is answered; a manifest issued none awaits nothing.
-        """
-        async with self.db.execute(
-            """SELECT m.coverage, m.item_count, m.local_agent_job_id,
-                      m.local_agent_attempt_count, m.source_config_revision,
-                      (SELECT COUNT(*) FROM source_sync_snapshot_items si
-                        WHERE si.workspace_id = m.workspace_id
-                          AND si.source_id = m.source_id
-                          AND si.snapshot_id = m.snapshot_id) AS materialized_count,
-                      (SELECT COUNT(*) FROM source_sync_snapshot_confirmations c
-                        WHERE c.workspace_id = m.workspace_id
-                          AND c.source_id = m.source_id
-                          AND c.snapshot_id = m.snapshot_id
-                          AND c.answer IS NULL) AS unanswered_count
-               FROM source_sync_snapshot_manifests m
-               WHERE m.workspace_id = ? AND m.source_id = ? AND m.snapshot_id = ?""",
-            (workspace_id, source_id, snapshot_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return None
-        materialized_count = int(row["materialized_count"] or 0)
-        item_count = int(row["item_count"] or 0)
-        awaiting_confirmations = int(row["unanswered_count"] or 0) > 0
-        return {
-            "coverage": str(row["coverage"]),
-            "item_count": item_count,
-            "materialized_count": materialized_count,
-            "awaiting_confirmations": awaiting_confirmations,
-            "ready": materialized_count == item_count and not awaiting_confirmations,
-            "local_agent_job_id": str(row["local_agent_job_id"]),
-            "local_agent_attempt_count": int(row["local_agent_attempt_count"]),
-            "source_config_revision": str(row["source_config_revision"]),
-        }
-
-    async def write_source_sync_snapshot_confirmations(
+    async def record_source_acquisition_answers(
         self,
         *,
         source_id: str,
@@ -19902,112 +20039,132 @@ class Database:
         manifest_sha256: str,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
-        answers: Sequence[SnapshotConfirmation] = (),
-        failure_cause: str | None = None,
+        answers: AcquisitionAnswers,
     ) -> None:
-        """Store a device's answers to the confirmations its snapshot was issued.
+        """Keep a device's answers to what its manifest response asked.
 
-        The submission is bound to the manifest's collection attempt and
-        digest. It answers every issued item with ``absent``, ``exists`` or
-        ``hidden``, or, when ``confirm_absent`` raised, gives
-        ``failure_cause``, which every issued item then carries as ``failed``.
-        Repeating the stored answers is accepted; an item that was not issued,
-        a submission for another digest or attempt, and answers that differ
-        from the stored ones are refused, and nothing is written.
+        The answers bind to the manifest's job attempt and digest, and must
+        answer exactly what the response asked. Repeating the stored answers
+        is accepted; a submission for another digest or attempt, and answers
+        that differ from the stored ones, are refused, and nothing is written.
         """
-        validate_snapshot_confirmation_submission(answers, failure_cause)
         async with self._write_lock:
             try:
-                async with self.db.execute(
-                    """SELECT manifest_sha256, local_agent_job_id, local_agent_attempt_count
-                       FROM source_sync_snapshot_manifests
-                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-                    (workspace_id, source_id, snapshot_id),
-                ) as cursor:
-                    manifest = await cursor.fetchone()
-                issued = await self._list_source_sync_snapshot_confirmations_unlocked(
-                    workspace_id, source_id, snapshot_id
-                )
-                pending = snapshot_confirmation_updates(
-                    manifest=(
-                        (
-                            str(manifest["manifest_sha256"]),
-                            str(manifest["local_agent_job_id"]),
-                            int(manifest["local_agent_attempt_count"]),
-                        )
-                        if manifest is not None
-                        else None
+                stored = await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
+                if stored is None:
+                    raise ValueError("source acquisition manifest not found")
+                if stored.manifest_sha256 != manifest_sha256:
+                    raise SourceActivityConflict("acquisition answers answer another manifest digest")
+                if (stored.local_agent_job_id, stored.local_agent_attempt_count) != (
+                    local_agent_job_id,
+                    local_agent_attempt_count,
+                ):
+                    raise SourceActivityConflict("acquisition answers belong to another collection attempt")
+                answers.check_answers(stored.requests)
+                if stored.answers is not None:
+                    if stored.answers.to_payload() != answers.to_payload():
+                        raise SourceActivityConflict("acquisition answers were already answered differently")
+                    return
+                cursor = await self.db.execute(
+                    """UPDATE source_acquisition_manifests SET answers_json = ?, answered_at = ?
+                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND answers_json IS NULL""",
+                    (
+                        json.dumps(answers.to_payload(), sort_keys=True),
+                        _now_iso(),
+                        workspace_id,
+                        source_id,
+                        snapshot_id,
                     ),
-                    submitted=(manifest_sha256, local_agent_job_id, local_agent_attempt_count),
-                    issued=issued,
-                    answers=answers,
-                    failure_cause=failure_cause,
                 )
-                now = _now_iso()
-                cursor = await self.db.executemany(
-                    """UPDATE source_sync_snapshot_confirmations
-                       SET answer = ?, cause = ?, answered_at = ?
-                       WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?
-                         AND answer IS NULL""",
-                    [
-                        (item.answer.value, item.cause, now, workspace_id, source_id, snapshot_id, item.doc_id)
-                        for item in pending
-                        if item.answer is not None
-                    ],
-                )
-                # After executemany, rowcount is the total of rows the batch changed.
-                if pending and cursor.rowcount != len(pending):
-                    raise SourceActivityConflict("snapshot confirmations were answered by another submission")
+                if cursor.rowcount != 1:
+                    raise SourceActivityConflict("acquisition answers were answered by another submission")
                 await self.db.commit()
             except Exception:
                 await self.db.rollback()
                 raise
 
-    async def list_source_sync_snapshot_confirmations(
+    async def get_source_acquisition(
         self,
         *,
         source_id: str,
         workspace_id: str,
         snapshot_id: str,
-    ) -> tuple[SnapshotConfirmation, ...]:
-        """The confirmations a snapshot was issued, in doc id order, with their answers once stored."""
-        return await self._list_source_sync_snapshot_confirmations_unlocked(workspace_id, source_id, snapshot_id)
+    ) -> StoredAcquisition | None:
+        """The acquisition one device run's job attempt submitted, ``None`` when it submitted none."""
+        return await self._get_source_acquisition_unlocked(workspace_id, source_id, snapshot_id)
 
-    async def _list_source_sync_snapshot_confirmations_unlocked(
+    async def _get_source_acquisition_unlocked(
         self,
         workspace_id: str,
         source_id: str,
         snapshot_id: str,
-    ) -> tuple[SnapshotConfirmation, ...]:
-        rows = await self.db.execute_fetchall(
-            """SELECT doc_id, provider_key, answer, cause
-               FROM source_sync_snapshot_confirmations
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?
-               ORDER BY doc_id""",
+    ) -> StoredAcquisition | None:
+        from memforge.local_agent.document_acquisition import (
+            AcquisitionAnswers,
+            AcquisitionManifest,
+            AcquisitionRequests,
+            StoredAcquisition,
+        )
+
+        async with self.db.execute(
+            """SELECT * FROM source_acquisition_manifests
+               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
             (workspace_id, source_id, snapshot_id),
-        )
-        return tuple(
-            snapshot_confirmation(row["doc_id"], row["provider_key"], row["answer"], row["cause"])
-            for row in rows
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        started_at = _parse_dt(row["acquisition_started_at"])
+        assert started_at is not None
+        return StoredAcquisition(
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            manifest=AcquisitionManifest.from_payload(json.loads(row["manifest_json"])),
+            manifest_sha256=str(row["manifest_sha256"]),
+            requests=AcquisitionRequests.from_payload(json.loads(row["requests_json"])),
+            answers=(
+                AcquisitionAnswers.from_payload(json.loads(row["answers_json"]))
+                if row["answers_json"] is not None
+                else None
+            ),
+            started_at=started_at,
+            local_agent_job_id=str(row["local_agent_job_id"]),
+            local_agent_attempt_count=int(row["local_agent_attempt_count"]),
+            source_config_revision=str(row["source_config_revision"]),
         )
 
-    async def list_source_sync_snapshot_excluded_listings(
+    async def get_source_sync_snapshot_input(
         self,
         *,
         source_id: str,
         workspace_id: str,
         snapshot_id: str,
-    ) -> tuple[ExcludedScopeListing, ...]:
-        """What a snapshot's device listed in each excluded scope, in scope key order."""
+        doc_id: str,
+    ) -> SourceSyncInput | None:
+        """The input a collection attempt holds for one Document, ``None`` when it holds none."""
+        async with self.db.execute(
+            """SELECT i.* FROM source_sync_snapshot_items si
+               JOIN source_sync_inputs i ON i.input_id = si.input_id
+               WHERE si.workspace_id = ? AND si.source_id = ? AND si.snapshot_id = ? AND si.doc_id = ?""",
+            (workspace_id, source_id, snapshot_id, doc_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return _source_sync_input_from_row(row) if row is not None else None
+
+    async def list_source_sync_snapshot_doc_ids(
+        self,
+        *,
+        source_id: str,
+        workspace_id: str,
+        snapshot_id: str,
+    ) -> frozenset[str]:
+        """The Documents a collection attempt holds an input for."""
         rows = await self.db.execute_fetchall(
-            """SELECT scope_key, doc_id, rejection
-               FROM source_sync_snapshot_excluded_listings
+            """SELECT doc_id FROM source_sync_snapshot_items
                WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
             (workspace_id, source_id, snapshot_id),
         )
-        return excluded_listings_from_rows(
-            (str(row["scope_key"]), row["doc_id"], row["rejection"]) for row in rows
-        )
+        return frozenset(str(row["doc_id"]) for row in rows)
 
     async def record_conversation_collection_request(
         self,
@@ -20241,48 +20398,6 @@ class Database:
             for row in rows
         ]
 
-    async def attest_source_sync_input_artifact(
-        self,
-        *,
-        source_id: str,
-        input_id: str,
-        package_sha256: str,
-    ) -> SourceSyncInput:
-        """Atomically fill or verify a retained input's own package hash."""
-        async with self._write_lock:
-            try:
-                source_lock = await self.db.execute(
-                    "UPDATE sources SET status = status WHERE id = ?",
-                    (source_id,),
-                )
-                if source_lock.rowcount != 1:
-                    raise ValueError(f"Source not found: {source_id}")
-                async with self.db.execute(
-                    "SELECT * FROM source_sync_inputs WHERE input_id = ? AND source_id = ?",
-                    (input_id, source_id),
-                ) as cursor:
-                    existing = await cursor.fetchone()
-                if existing is None:
-                    raise ValueError(f"Source sync input not found: {input_id}")
-                current = _source_sync_input_from_row(existing)
-                metadata = source_sync_input_metadata_with_artifact_attestation(
-                    current.metadata,
-                    package_sha256=package_sha256,
-                    input_id=input_id,
-                )
-                async with self.db.execute(
-                    """UPDATE source_sync_inputs SET metadata_json = ?
-                       WHERE input_id = ? AND source_id = ?""",
-                    (json.dumps(metadata, sort_keys=True), input_id, source_id),
-                ) as cursor:
-                    if cursor.rowcount != 1:
-                        raise ValueError(f"Source sync input not found: {input_id}")
-                await self.db.commit()
-            except Exception:
-                await self.db.rollback()
-                raise
-        return replace(current, metadata=metadata)
-
     async def _record_source_sync_snapshot_item_unlocked(
         self,
         *,
@@ -20291,33 +20406,8 @@ class Database:
         snapshot_id: str,
         doc_id: str,
         input_id: str,
-        metadata: Mapping[str, object],
         now: str,
     ) -> None:
-        async with self.db.execute(
-            """SELECT revision, change_kind
-               FROM source_sync_snapshot_manifest_items
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ? AND doc_id = ?""",
-            (workspace_id, source_id, snapshot_id, doc_id),
-        ) as cursor:
-            expected = await cursor.fetchone()
-        async with self.db.execute(
-            """SELECT 1 FROM source_sync_snapshot_manifests
-               WHERE workspace_id = ? AND source_id = ? AND snapshot_id = ?""",
-            (workspace_id, source_id, snapshot_id),
-        ) as cursor:
-            manifest = await cursor.fetchone()
-        if expected is None:
-            if manifest is not None:
-                raise ValueError("snapshot input was not declared by the manifest")
-        else:
-            entry = metadata.get("manifest_entry")
-            if not isinstance(entry, Mapping):
-                raise ValueError("snapshot input requires manifest_entry metadata")
-            revision = str(entry.get("provider_revision") or entry.get("version") or "").strip()
-            change_kind = str(entry.get("change_kind") or "upsert").strip()
-            if str(expected["revision"]) != revision or str(expected["change_kind"]) != change_kind:
-                raise ValueError("snapshot input revision or change kind does not match manifest")
         await self.db.execute(
             """INSERT INTO source_sync_snapshot_items (
                 workspace_id, source_id, snapshot_id, doc_id, input_id, created_at

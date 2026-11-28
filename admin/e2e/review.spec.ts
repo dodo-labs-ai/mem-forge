@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 const ACTIONS = [
   {
@@ -82,7 +83,7 @@ async function stubApi(page: Page, detail: Record<string, unknown>) {
     "/api/v1/memory-reviews": { data: [{ ...REVIEW, can_decide: detail.can_decide }], total: 1, limit: 25, offset: 0 },
     "/api/v1/memory-reviews/review-1": detail,
     "/api/v1/genes": [{ name: "jira", display_name: "Jira" }],
-    "/api/cloud/local-agent/status": { status: "offline", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+    "/api/cloud/local-agent/status": localSyncStatus(false),
   };
   await page.route("**/api/**", (route) => {
     const body = responses[new URL(route.request().url()).pathname];

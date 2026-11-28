@@ -14,8 +14,6 @@ const REFUSAL_MESSAGES: Readonly<Record<string, string>> = {
     "This source finishes its scope change in progress before it accepts another one. Save again once it completes.",
   source_provider_namespace_immutable:
     "This change points the source at another site or project. Create a new source for it instead.",
-  source_execution_mode_immutable:
-    "This change moves the source between the server and a device. Create a new source for it instead.",
 };
 
 /** The code of a refused save, which the server sends as `{ detail: { code } }` or as `{ detail: "<code>" }`. */

@@ -7,6 +7,7 @@ the parts most likely to drift from the admin API. The transport itself
 
 from __future__ import annotations
 
+
 import hashlib
 import json
 from typing import Any
@@ -16,8 +17,8 @@ import pytest
 
 import memforge.tool_client as tool_client
 from memforge.api_target import build_host_target, build_target
-from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.tool_client import ToolClient
+from tests.device_report_fixture import device_report
 
 
 class _RecordingClient(ToolClient):
@@ -37,6 +38,9 @@ class _RecordingClient(ToolClient):
     def _http_json(self, method, url, body):  # type: ignore[override]
         self.calls.append((method, url.removeprefix(self.target.origin), body))
         return self._response
+
+
+DEVICE = device_report(["src-local"]).to_payload()
 
 
 def test_health_uses_edition_owned_host_contract():
@@ -153,161 +157,6 @@ def test_update_source_schedule_puts_source_schedule_payload():
     ]
 
 
-def test_push_github_repo_document_posts_adapter_payload():
-    client = _RecordingClient({"package_id": "github_repo_document:hash"})
-
-    result = client.push_github_repo_document(
-        source_id="src-github",
-        repo_url="https://github.example.com/org/repo",
-        repo_ref="main",
-        relative_path="docs/design.md",
-        markdown_body="# Design",
-        title="Design",
-        raw_hash="raw-1",
-        blob_sha="blob-1",
-        symlink_chain=[{
-            "path": "docs/design.md",
-            "blob_sha": "link-1",
-            "target_path": "docs/current-design.md",
-        }],
-        resolved_relative_path="docs/current-design.md",
-        sync_snapshot_id="laj-sync-1",
-        submitted_by="codex",
-        submitted_at="2026-07-07T08:00:00Z",
-    )
-
-    assert result["package_id"] == "github_repo_document:hash"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-github/adapter/packages",
-            {
-                "repo_url": "https://github.example.com/org/repo",
-                "repo_ref": "main",
-                "relative_path": "docs/design.md",
-                "markdown_body": "# Design",
-                "content_type": "text/markdown",
-                "title": "Design",
-                "raw_hash": "raw-1",
-                "blob_sha": "blob-1",
-                "symlink_chain": [{
-                    "path": "docs/design.md",
-                    "blob_sha": "link-1",
-                    "target_path": "docs/current-design.md",
-                }],
-                "resolved_relative_path": "docs/current-design.md",
-                "sync_snapshot_id": "laj-sync-1",
-                "submitted_by": "codex",
-                "submitted_at": "2026-07-07T08:00:00Z",
-            },
-        )
-    ]
-
-
-def test_prepare_local_source_snapshot_posts_complete_fenced_manifest():
-    client = _RecordingClient({"required_doc_ids": []})
-
-    result = client.prepare_local_source_snapshot(
-        source_id="src-github",
-        items=[{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
-        coverage="complete_snapshot",
-        sync_snapshot_id="job-1:attempt:2",
-        local_agent_job_id="job-1",
-        local_agent_attempt_count=2,
-    )
-
-    assert result == {"required_doc_ids": []}
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-github/adapter/manifest",
-            {
-                "items": [{"doc_id": "doc-1", "revision": "blob-1", "change_kind": "upsert"}],
-                "coverage": "complete_snapshot",
-                "sync_snapshot_id": "job-1:attempt:2",
-                "local_agent_job_id": "job-1",
-                "local_agent_attempt_count": 2,
-                "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
-            },
-        )
-    ]
-    # The agent confirms by identifier what a query manifest leaves out.
-    assert LOCAL_PACKAGE_CONTRACT_VERSION == 3
-
-
-def test_submit_local_source_confirmations_posts_answers_bound_to_the_manifest():
-    client = _RecordingClient({"answered_count": 1})
-    binding = {
-        "manifest_sha256": "d" * 64,
-        "sync_snapshot_id": "job-1:attempt:2",
-        "local_agent_job_id": "job-1",
-        "local_agent_attempt_count": 2,
-    }
-
-    answered = client.submit_local_source_confirmations(
-        source_id="src-jira",
-        answers=[{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}],
-        **binding,
-    )
-    failed = client.submit_local_source_confirmations(
-        source_id="src-jira", failure_cause="RuntimeError: HTTP 401 from Jira", **binding
-    )
-
-    assert answered == {"answered_count": 1}
-    assert failed == {"answered_count": 1}
-    route = "/api/v1/sources/src-jira/adapter/manifest/confirmations"
-    assert client.calls == [
-        (
-            "POST",
-            route,
-            {**binding, "answers": [{"doc_id": "jira-doc-7", "provider_key": "100007", "answer": "absent"}]},
-        ),
-        ("POST", route, {**binding, "answers": [], "failure_cause": "RuntimeError: HTTP 401 from Jira"}),
-    ]
-
-
-def test_push_jira_package_posts_raw_payload_without_markdown_body():
-    client = _RecordingClient({"doc_id": "jira-doc"})
-
-    result = client.push_jira_package(
-        source_id="src-jira",
-        base_url="https://jira.example.test",
-        issue_key="PAY-1",
-        source_url="https://jira.example.test/browse/PAY-1",
-        raw_payload={"key": "PAY-1", "fields": {"summary": "Payroll task"}},
-        title="Payroll task",
-        raw_hash="raw-1",
-        provider_revision="2026-07-07T07:59:00Z",
-        sync_snapshot_id="laj-sync-2",
-        artifact_source_unit_key="PAY-1",
-        artifact_input_hashes=["b" * 64],
-        submitted_by="codex",
-        submitted_at="2026-07-07T08:00:00Z",
-    )
-
-    assert result["doc_id"] == "jira-doc"
-    assert client.calls == [
-        (
-            "POST",
-            "/api/v1/sources/src-jira/adapter/packages",
-            {
-                "base_url": "https://jira.example.test",
-                "issue_key": "PAY-1",
-                "source_url": "https://jira.example.test/browse/PAY-1",
-                "raw_payload": {"key": "PAY-1", "fields": {"summary": "Payroll task"}},
-                "title": "Payroll task",
-                "raw_hash": "raw-1",
-                "provider_revision": "2026-07-07T07:59:00Z",
-                "sync_snapshot_id": "laj-sync-2",
-                "artifact_source_unit_key": "PAY-1",
-                "artifact_input_hashes": ["b" * 64],
-                "submitted_by": "codex",
-                "submitted_at": "2026-07-07T08:00:00Z",
-            },
-        )
-    ]
-
-
 def test_conversation_collection_calls_use_the_source_resource():
     client = _RecordingClient({"missing": []})
     attempt = {"local_agent_job_id": "laj-teams", "local_agent_attempt_count": 1}
@@ -384,11 +233,12 @@ def test_start_source_processing_resolves_the_workspace_resource_url(monkeypatch
 def test_local_agent_job_methods_use_cloud_local_agent_contract():
     client = _RecordingClient({"jobs": []})
 
-    lease = client.lease_local_agent_jobs(limit=3, lease_seconds=120, wait_seconds=25)
+    lease = client.lease_local_agent_jobs(device=DEVICE, limit=3, lease_seconds=120, wait_seconds=25)
     status = client.get_local_agent_status()
-    heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, lease_seconds=120)
+    heartbeat = client.heartbeat_local_agent_job("laj-1", attempt_count=2, device=DEVICE, lease_seconds=120)
     complete = client.complete_local_agent_job(
         "laj-1",
+        device_id="dev-laptop",
         attempt_count=2,
         status="succeeded",
         result={"count": 1},
@@ -402,7 +252,7 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25},
+            {"limit": 3, "lease_seconds": 120, "wait_seconds": 25, "device": DEVICE},
         ),
         (
             "GET",
@@ -412,12 +262,12 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
         (
             "POST",
             "/api/cloud/local-agent/jobs/laj-1/heartbeat",
-            {"attempt_count": 2, "lease_seconds": 120},
+            {"attempt_count": 2, "lease_seconds": 120, "device": DEVICE},
         ),
         (
             "POST",
             "/api/cloud/local-agent/jobs/laj-1/complete",
-            {"status": "succeeded", "attempt_count": 2, "result": {"count": 1}},
+            {"status": "succeeded", "attempt_count": 2, "device_id": "dev-laptop", "result": {"count": 1}},
         ),
     ]
 
@@ -425,13 +275,13 @@ def test_local_agent_job_methods_use_cloud_local_agent_contract():
 def test_local_agent_job_lease_default_matches_ui_sync_wait_window():
     client = _RecordingClient({"jobs": []})
 
-    client.lease_local_agent_jobs()
+    client.lease_local_agent_jobs(device=DEVICE)
 
     assert client.calls == [
         (
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": 5, "lease_seconds": 60, "wait_seconds": 0},
+            {"limit": 5, "lease_seconds": 60, "wait_seconds": 0, "device": DEVICE},
         )
     ]
 
@@ -442,6 +292,7 @@ def test_local_agent_job_heartbeat_sends_user_progress():
     result = client.heartbeat_local_agent_job(
         "laj-1",
         attempt_count=2,
+        device=DEVICE,
         lease_seconds=120,
         progress={
             "schema_version": 1,
@@ -458,6 +309,7 @@ def test_local_agent_job_heartbeat_sends_user_progress():
             {
                 "attempt_count": 2,
                 "lease_seconds": 120,
+                "device": DEVICE,
                 "progress": {
                     "schema_version": 1,
                     "phase": "uploading",
@@ -523,7 +375,7 @@ def test_control_plane_lease_unavailable_reports_attempted_host_url(monkeypatch)
         workspace_id="ws-a",
     )
 
-    result = client.lease_local_agent_jobs()
+    result = client.lease_local_agent_jobs(device=DEVICE)
 
     assert result["error"] == "MemForge API unavailable"
     assert result["api_url"] == "https://memforge.example.com/api/cloud/local-agent/jobs/lease"

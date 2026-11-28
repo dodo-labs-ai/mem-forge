@@ -4,19 +4,23 @@ import { errorMessage } from "@/lib/errors";
 import { Button } from "@/ui/button";
 import { Input } from "@/ui/input";
 import { useLocalSetupJob } from "../../useLocalSetupJob";
+import { useSetupDevice } from "../setupDevice";
 import type { ConfigControlProps } from "../widgets";
 
 /**
  * The folder a local markdown Source reads: a path the person types, or one
- * chosen in the native folder picker on their computer through local sync
- * (`local_markdown_pick_root`). Closing the picker without choosing keeps the
- * path as it was.
+ * chosen in the native folder picker through local sync
+ * (`local_markdown_pick_root`), which opens on the computer chosen in Where
+ * it runs, or on the Source's execution device. Closing the picker without
+ * choosing keeps the path as it was.
  */
 export default function LocalFolderPicker({ field, id, describedBy, value, onChange, onBlur, invalid, readOnly }: ConfigControlProps) {
   const path = typeof value === "string" ? value : "";
   const pickRoot = useLocalSetupJob("local_markdown_pick_root");
+  const deviceId = useSetupDevice();
   const pick = useMutation({
-    mutationFn: () => pickRoot({ payload: { title: "Choose folder to sync", initial_directory: path.trim() || null } }),
+    mutationFn: () =>
+      pickRoot({ deviceId, payload: { title: "Choose folder to sync", initial_directory: path.trim() || null } }),
     onSuccess: (result) => {
       const root = result.root?.trim();
       if (result.cancelled || !root) return;

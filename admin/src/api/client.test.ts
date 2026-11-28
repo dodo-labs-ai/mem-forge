@@ -37,7 +37,6 @@ describe("createApiClient", () => {
     const workspace = createWorkspaceController(() => {});
     workspace.setTarget({
       resourceBaseUrl: "/api/cloud/workspaces/ws-1/v1/",
-      localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent",
       workspaceId: "ws-1",
       shared: true,
     });
@@ -48,17 +47,20 @@ describe("createApiClient", () => {
     expect(new URL(calls[0]!.url).searchParams.get("workspace_id")).toBe("ws-1");
   });
 
-  test("sends local sync routes to the workspace's local sync base", async () => {
-    const { calls } = fakeFetch({
-      "GET /api/cloud/workspaces/ws-1/local-agent/status": () => ({ status: "online" }),
-    });
+  test("sends the routes of the user's devices to the host whatever workspace is selected", async () => {
+    const { calls } = fakeFetch({ "GET /api/cloud/local-agent/status": () => ({ status: "online" }) });
     const workspace = createWorkspaceController(() => {});
-    workspace.setTarget({ ...STANDALONE_TARGET, localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent", workspaceId: "ws-1" });
+    workspace.setTarget({ ...STANDALONE_TARGET, resourceBaseUrl: "/api/cloud/workspaces/ws-1/v1", workspaceId: "ws-1" });
     const api = createApiClient(workspace, ORIGIN);
 
     await unwrap(api.GET("/api/cloud/local-agent/status"));
+    workspace.setTarget(null);
+    await unwrap(api.GET("/api/cloud/local-agent/status"));
 
-    expect(new URL(calls[0]!.url).searchParams.has("workspace_id")).toBe(false);
+    expect(calls.map((request) => new URL(request.url).pathname)).toEqual([
+      "/api/cloud/local-agent/status", "/api/cloud/local-agent/status",
+    ]);
+    expect(calls.some((request) => new URL(request.url).searchParams.has("workspace_id"))).toBe(false);
   });
 
   test("refuses requests while no workspace is selected", async () => {
@@ -73,7 +75,6 @@ describe("createApiClient", () => {
     const { calls } = fakeFetch({ "GET /api/cloud/local-agent/jobs/laj-auth": () => ({ status: "succeeded" }) });
     const workspace = createWorkspaceController(() => {}, {
       ...STANDALONE_TARGET,
-      localAgentBaseUrl: "/api/cloud/workspaces/ws-1/local-agent",
       workspaceId: "ws-1",
       shared: true,
     });

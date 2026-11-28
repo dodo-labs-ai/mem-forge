@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import pytest
 
 from memforge import source_representation
+from memforge.genes.local_markdown_gene import LOCAL_FILE_CONTENT_TYPE
 from memforge.models import ContentItem, NormalizedContent, RawContent
 from memforge.pipeline import evidence_fragments
 from memforge.pipeline.evidence_fragments import EvidenceFragmentKind
@@ -255,12 +256,11 @@ def _markdown(text, base=None, *, path="docs/guide.md", run_id="run-md"):
     item = ContentItem(
         item_id="local-guide", title="Guide", source_url=f"file:///vault/{path}",
         last_modified=datetime(2026, 7, 15, tzinfo=timezone.utc), version="1",
-        extra={"relative_path": path, "file_lineage_id": "file-77"},
+        extra={"vault_id": "vault-a", "relative_path": path},
     )
-    raw = {"vault_id": "vault-a", "relative_path": path, "file_lineage_id": "file-77", "markdown": text}
     return project_source_item(
         source_id="src-md", source_type="local_markdown", run_id=run_id, item=item,
-        raw=RawContent(item=item, body=json.dumps(raw).encode(), content_type="application/json"),
+        raw=RawContent(item=item, body=text.encode(), content_type=LOCAL_FILE_CONTENT_TYPE),
         normalized=NormalizedContent(item=item, markdown_body=text), **prior_of(base),
     )
 

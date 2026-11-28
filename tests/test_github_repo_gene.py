@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import ssl
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -13,7 +12,7 @@ from memforge.genes import GENE_REGISTRY, github_repo_gene
 from memforge.genes.github_repo_gene import GitHubRepoGene
 from memforge.genes.toolkit.github_api import GitHubRateLimitError
 from memforge.github_repo_utils import build_github_repo_doc_id
-from memforge.models import ConfigCondition, ContentItem, RawContent, require_attested_content
+from memforge.models import ContentItem, require_attested_content
 from memforge.source_artifacts import SourceArtifactContractError
 from tests.github_api_fixture import FakeGitHub, git_blob_sha
 from tests.tls_bundle_fixture import BUNDLE_CA_COUNT, trusted_ca_count, write_ca_bundle
@@ -27,7 +26,7 @@ FILES = {
     "Flexible Payroll/README.md": b"# Flexible Payroll\n",
     "Payroll Processing V2/Main Algorithm.md": b"# Main Algorithm\n",
 }
-CLOUD_PULL = {"connection_mode": "cloud_pull", "repo_url": REPO_URL, "ref": "main"}
+REPO_CONFIG = {"repo_url": REPO_URL, "ref": "main"}
 FILE_COMMIT_TIME = "2026-05-01T10:00:00+00:00"
 
 
@@ -52,7 +51,7 @@ def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
     assert meta.data_shape == "document"
 
     fields = {field.key: field for field in GitHubRepoGene.config_schema().fields}
-    assert [option.value for option in fields["connection_mode"].choices] == ["cloud_pull", "local_push"]
+    assert "connection_mode" not in fields
     assert fields["repo_url"].required is True
     assert fields["ref"].default == "main"
     assert fields["include_paths"].required is False
@@ -61,7 +60,7 @@ def test_github_repo_gene_is_registered_and_schema_is_repo_oriented():
     assert fields["include_extensions"].default == "md, markdown, txt, adoc, rst"
     assert fields["max_files"].default == "500"
     assert fields["pat"].required is False
-    assert fields["pat"].visible_when == (ConfigCondition("connection_mode", ("cloud_pull",)),)
+    assert fields["pat"].visible_when == ()
 
 
 @pytest.mark.asyncio
@@ -70,7 +69,7 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content():
     gene = await _connected(
         github,
         {
-            **CLOUD_PULL,
+            **REPO_CONFIG,
             "include_paths": [],
             "exclude_paths": ["Flexible Payroll", "Payroll Processing V2"],
             "include_extensions": ["md"],
@@ -114,7 +113,6 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content():
     assert normalized.source_semantics == {
         "source_updated_at": FILE_COMMIT_TIME,
         "source_type": "github_repo",
-        "connection_mode": "cloud_pull",
         "repo_url": REPO_URL,
         "repo_identifier": "github.example.test/payroll/architecture",
         "repo_host": "github.example.test",
@@ -131,7 +129,7 @@ async def test_cloud_pull_discovers_scoped_markdown_and_fetches_content():
 async def _discovered_cloud_pull_item(github: FakeGitHub) -> tuple[GitHubRepoGene, ContentItem]:
     gene = await _connected(
         github,
-        {**CLOUD_PULL, "include_paths": ["Payroll Processing/"], "include_extensions": ["md"], "max_files": 10},
+        {**REPO_CONFIG, "include_paths": ["Payroll Processing/"], "include_extensions": ["md"], "max_files": 10},
     )
     [item] = [item async for item in gene.discover()]
     return gene, item
@@ -184,7 +182,7 @@ async def test_cloud_pull_syncs_the_file_without_a_time_when_github_refuses_the_
 async def test_a_permission_refusal_of_the_tree_fails_discovery_without_retrying():
     refused = httpx.Response(403, json={"message": "Resource not accessible by integration"})
     github = FakeGitHub(API, files=FILES, answers={"/git/trees/tree-main?recursive=1": refused})
-    gene = await _connected(github, dict(CLOUD_PULL))
+    gene = await _connected(github, dict(REPO_CONFIG))
 
     with pytest.raises(httpx.HTTPStatusError) as raised:
         _ = [item async for item in gene.discover()]
@@ -215,7 +213,7 @@ async def test_a_rate_limit_that_resets_soon_is_waited_out():
         return github.handle(request)
 
     github.http.transport = httpx.MockTransport(handle)
-    gene = await _connected(github, {**CLOUD_PULL, "include_extensions": ["md"]})
+    gene = await _connected(github, {**REPO_CONFIG, "include_extensions": ["md"]})
 
     items = [item async for item in gene.discover()]
 
@@ -234,7 +232,7 @@ async def test_a_rate_limit_that_resets_later_than_a_sync_waits_fails_with_its_r
         json={"message": "API rate limit exceeded"},
     )
     github = FakeGitHub(API, files=FILES, answers={"/commits/main": limited})
-    gene = await _connected(github, dict(CLOUD_PULL))
+    gene = await _connected(github, dict(REPO_CONFIG))
 
     with pytest.raises(GitHubRateLimitError, match=r"GitHub rate limit reached .* it resets at ") as raised:
         _ = [item async for item in gene.discover()]
@@ -247,7 +245,7 @@ async def test_a_rate_limit_that_resets_later_than_a_sync_waits_fails_with_its_r
 async def test_cloud_pull_materializes_explicitly_selected_image_blob():
     image_bytes = b"\x89PNG\r\n\x1a\nstable-github-image"
     github = FakeGitHub(API, files={"docs/architecture.png": image_bytes})
-    gene = await _connected(github, {**CLOUD_PULL, "include_extensions": ["png"]})
+    gene = await _connected(github, {**REPO_CONFIG, "include_extensions": ["png"]})
 
     item = [item async for item in gene.discover()][0]
     raw = await gene.fetch(item)
@@ -307,7 +305,7 @@ async def test_cloud_pull_rejects_a_raw_blob_sent_with_a_content_encoding():
 @pytest.mark.asyncio
 async def test_cloud_pull_rejects_explicitly_selected_unsupported_image():
     github = FakeGitHub(API, files={"docs/architecture.svg": b"<svg/>"})
-    gene = await _connected(github, {**CLOUD_PULL, "include_extensions": ["svg"]})
+    gene = await _connected(github, {**REPO_CONFIG, "include_extensions": ["svg"]})
 
     item = [item async for item in gene.discover()][0]
 
@@ -318,7 +316,6 @@ async def test_cloud_pull_rejects_explicitly_selected_unsupported_image():
 
 def test_normalize_config_canonicalizes_repository_scope() -> None:
     config = {
-        "connection_mode": "local_push",
         "repo_url": "https://github.example.test/payroll/architecture",
         "include_paths": ["docs/current/guide.md", "docs"],
         "exclude_paths": ["docs/archive/old.md", "docs/archive"],
@@ -333,7 +330,7 @@ def test_normalize_config_canonicalizes_repository_scope() -> None:
 @pytest.mark.asyncio
 async def test_cloud_pull_reads_a_truncated_tree_by_its_subtrees():
     github = FakeGitHub(API, files=FILES, truncated={""})
-    gene = await _connected(github, {**CLOUD_PULL, "include_extensions": ["md"]})
+    gene = await _connected(github, {**REPO_CONFIG, "include_extensions": ["md"]})
 
     items = [item async for item in gene.discover()]
 
@@ -350,7 +347,7 @@ async def test_cloud_pull_reads_a_truncated_tree_by_its_subtrees():
 async def test_cloud_pull_stops_reading_a_truncated_tree_once_it_selects_more_than_max_files():
     files = {f"area-{index}/{name}.md": f"# {index} {name}\n".encode() for index in range(5) for name in ("a", "b")}
     github = FakeGitHub(API, files=files, truncated={""})
-    gene = await _connected(github, {**CLOUD_PULL, "max_files": 3})
+    gene = await _connected(github, {**REPO_CONFIG, "max_files": 3})
 
     with pytest.raises(RuntimeError) as raised:
         await gene.list_scope()
@@ -364,7 +361,7 @@ async def test_cloud_pull_stops_reading_a_truncated_tree_once_it_selects_more_th
 async def test_cloud_pull_counts_every_selected_file_of_a_complete_tree_against_max_files():
     files = {f"docs/{index}.md": b"# Doc\n" for index in range(4)}
     github = FakeGitHub(API, files=files)
-    gene = await _connected(github, {**CLOUD_PULL, "max_files": 3})
+    gene = await _connected(github, {**REPO_CONFIG, "max_files": 3})
 
     with pytest.raises(RuntimeError, match=r"^GitHub Repository discovery matched 4 files, exceeding max_files=3$"):
         await gene.list_scope()
@@ -373,7 +370,7 @@ async def test_cloud_pull_counts_every_selected_file_of_a_complete_tree_against_
 @pytest.mark.asyncio
 async def test_cloud_pull_rejects_missing_git_tree_without_completion_evidence():
     github = FakeGitHub(API, files=FILES, answers={"/git/trees/tree-main?recursive=1": {}})
-    gene = await _connected(github, dict(CLOUD_PULL))
+    gene = await _connected(github, dict(REPO_CONFIG))
 
     with pytest.raises(RuntimeError, match="truncated=false"):
         _ = [item async for item in gene.discover()]
@@ -398,7 +395,7 @@ async def test_cloud_pull_rejects_missing_git_tree_without_completion_evidence()
 )
 async def test_cloud_pull_rejects_tree_without_unique_stable_inventory(tree_payload):
     github = FakeGitHub(API, files=FILES, answers={"/git/trees/tree-main?recursive=1": tree_payload})
-    gene = await _connected(github, dict(CLOUD_PULL))
+    gene = await _connected(github, dict(REPO_CONFIG))
 
     with pytest.raises(RuntimeError):
         _ = [item async for item in gene.discover()]
@@ -409,8 +406,8 @@ async def test_cloud_pull_rejects_tree_without_unique_stable_inventory(tree_payl
 @pytest.mark.asyncio
 async def test_cloud_pull_uses_optional_pat_as_bearer_header():
     github = FakeGitHub(API, files=FILES)
-    await _connected(github, {**CLOUD_PULL, "pat": "secret-token"})
-    await _connected(github, dict(CLOUD_PULL))
+    await _connected(github, {**REPO_CONFIG, "pat": "secret-token"})
+    await _connected(github, dict(REPO_CONFIG))
 
     with_token, without_token = github.http.options
     assert with_token["headers"]["Authorization"] == "Bearer secret-token"
@@ -421,7 +418,7 @@ async def test_cloud_pull_uses_optional_pat_as_bearer_header():
 async def test_cloud_pull_reads_the_token_from_its_environment_variable(monkeypatch):
     monkeypatch.setenv("GHE_TOKEN", "env-token")
     github = FakeGitHub(API, files=FILES)
-    await _connected(github, {**CLOUD_PULL, "pat_env_var": "GHE_TOKEN"})
+    await _connected(github, {**REPO_CONFIG, "pat_env_var": "GHE_TOKEN"})
 
     assert github.http.options[-1]["headers"]["Authorization"] == "Bearer env-token"
 
@@ -432,7 +429,7 @@ async def test_cloud_pull_follows_redirects_and_trusts_requests_ca_bundle(tmp_pa
     monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(bundle))
     github = FakeGitHub(API, files=FILES)
 
-    await _connected(github, dict(CLOUD_PULL))
+    await _connected(github, dict(REPO_CONFIG))
 
     options = github.http.options[-1]
     assert options["follow_redirects"] is True
@@ -445,7 +442,7 @@ async def test_cloud_pull_uses_the_default_trust_store_without_a_bundle(monkeypa
     monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
     github = FakeGitHub(API, files=FILES)
 
-    await _connected(github, dict(CLOUD_PULL))
+    await _connected(github, dict(REPO_CONFIG))
 
     assert github.http.options[-1]["verify"] is True
 
@@ -453,7 +450,7 @@ async def test_cloud_pull_uses_the_default_trust_store_without_a_bundle(monkeypa
 @pytest.mark.asyncio
 async def test_a_closed_gene_does_not_reconnect_on_its_own():
     github = FakeGitHub(API, files=FILES)
-    gene = await _connected(github, dict(CLOUD_PULL))
+    gene = await _connected(github, dict(REPO_CONFIG))
     await gene.close()
 
     with github.http.serving(github_repo_gene), pytest.raises(RuntimeError, match="call authenticate"):
@@ -467,124 +464,12 @@ async def test_a_closed_gene_does_not_reconnect_on_its_own():
 @pytest.mark.asyncio
 async def test_a_gene_that_never_authenticated_does_not_connect_on_its_own():
     github = FakeGitHub(API, files=FILES)
-    gene = GitHubRepoGene(config=dict(CLOUD_PULL), source_id="src-github-repo")
+    gene = GitHubRepoGene(config=dict(REPO_CONFIG), source_id="src-github-repo")
 
     with github.http.serving(github_repo_gene), pytest.raises(RuntimeError, match="call authenticate"):
         await gene.list_scope()
 
     assert github.http.clients == []
-
-
-@pytest.mark.asyncio
-async def test_local_push_discovers_and_normalizes_pushed_package(tmp_path):
-    package = tmp_path / "github-repo-doc.json"
-    encoded_time = datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc).isoformat()
-    package.write_text(
-        """
-{
-  "package_kind": "github_repo_document",
-  "doc_id": "github-repo-src-doc",
-  "title": "Architecture README",
-  "source_url": "https://github.example.test/payroll/architecture/blob/main/README.md",
-  "last_modified": "%s",
-  "space_or_project": "payroll/architecture",
-  "version": "blob-sha-1",
-  "repo_url": "https://github.example.test/payroll/architecture",
-  "repo_host": "github.example.test",
-  "repo_owner": "payroll",
-  "repo_name": "architecture",
-  "repo_ref": "main",
-  "relative_path": "README.md",
-  "blob_sha": "blob-sha-1",
-  "content_type": "text/markdown",
-  "raw_hash": "raw-hash",
-  "submitted_at": "%s",
-  "submitted_by": "cli",
-  "markdown": "# Architecture\\n\\nMemory source design."
-}
-""".strip()
-        % (encoded_time, encoded_time),
-        encoding="utf-8",
-    )
-
-    gene = GitHubRepoGene(
-        config={
-            "connection_mode": "local_push",
-            "repo_url": "https://github.example.test/payroll/architecture",
-            "documents_dir": str(tmp_path),
-        },
-        source_id="src-github-repo",
-    )
-
-    await gene.authenticate()
-    items = [item async for item in gene.discover()]
-
-    assert len(items) == 1
-    assert items[0].title == "Architecture README"
-    assert items[0].extra["relative_path"] == "README.md"
-
-    normalized = await gene.normalize(await gene.fetch(items[0]))
-
-    assert normalized.markdown_body == "# Architecture\n\nMemory source design."
-    assert normalized.source_semantics["source_type"] == "github_repo"
-    assert normalized.source_semantics["connection_mode"] == "local_push"
-    assert normalized.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
-    assert normalized.source_semantics["relative_path"] == "README.md"
-
-
-def _local_push_package(**overrides) -> dict:
-    package = {
-        "package_kind": "github_repo_document",
-        "doc_id": "github-repo-src-doc",
-        "title": "Architecture README",
-        "source_url": "https://github.example.test/payroll/architecture/blob/main/README.md",
-        "last_modified": "2026-07-07T09:30:00+00:00",
-        "space_or_project": "payroll/architecture",
-        "version": "blob-sha-1",
-        "repo_url": "https://github.example.test/payroll/architecture",
-        "repo_host": "github.example.test",
-        "repo_owner": "payroll",
-        "repo_name": "architecture",
-        "repo_ref": "main",
-        "relative_path": "README.md",
-        "blob_sha": "blob-sha-1",
-        "content_type": "text/markdown",
-        "markdown": "# Architecture\n\nMemory source design.",
-    }
-    return {**package, **overrides}
-
-
-async def _discovered_package(tmp_path, package: dict) -> tuple[GitHubRepoGene, ContentItem, RawContent]:
-    (tmp_path / "github-repo-doc.json").write_text(json.dumps(package), encoding="utf-8")
-    gene = GitHubRepoGene(
-        config={
-            "connection_mode": "local_push",
-            "repo_url": "https://github.example.test/payroll/architecture",
-            "documents_dir": str(tmp_path),
-        },
-        source_id="src-github-repo",
-    )
-    [item] = [item async for item in gene.discover()]
-    return gene, item, await gene.fetch(item)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("markdown", ["# Architecture\n\nMemory source design.", ""])
-async def test_a_stored_package_is_read_by_its_own_kind_without_discovery_metadata(tmp_path, markdown):
-    gene, item, fetched = await _discovered_package(tmp_path, _local_push_package(markdown=markdown))
-    assert item.extra["package_path"]
-
-    # Stored input keeps the package bytes; its item may carry no discovery metadata.
-    stored_item = replace(item, extra={})
-    stored = gene.raw_from_stored_input(stored_item, fetched.body, "application/json")
-    from_fetch = await gene.normalize(fetched)
-    from_storage = await gene.normalize(stored)
-
-    assert from_storage.markdown_body == from_fetch.markdown_body == markdown
-    assert from_storage.source_semantics == from_fetch.source_semantics
-    assert from_storage.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
-    assert (stored.authoritative_empty, stored.empty_evidence) == (fetched.authoritative_empty, fetched.empty_evidence)
-    require_attested_content(stored, from_storage)
 
 
 @pytest.mark.asyncio
@@ -600,13 +485,12 @@ async def test_a_json_repository_file_is_read_as_file_text(package_kind):
         last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
         content_type="application/json",
         extra={
-            "connection_mode": "cloud_pull",
             "repo_url": "https://github.example.test/payroll/architecture",
             "relative_path": "config.json",
         },
     )
     gene = GitHubRepoGene(
-        config={"connection_mode": "cloud_pull", "repo_url": "https://github.example.test/payroll/architecture"},
+        config={"repo_url": "https://github.example.test/payroll/architecture"},
         source_id="src-github-repo",
     )
     text = json.dumps(body).encode("utf-8")
@@ -616,7 +500,6 @@ async def test_a_json_repository_file_is_read_as_file_text(package_kind):
 
     assert (stored.authoritative_empty, stored.empty_evidence) == (False, None)
     assert "not a package" in normalized.markdown_body
-    assert normalized.source_semantics["connection_mode"] == "cloud_pull"
     assert normalized.source_semantics["repo_identifier"] == "github.example.test/payroll/architecture"
     assert normalized.source_semantics["relative_path"] == "config.json"
 
@@ -635,13 +518,12 @@ async def test_a_stored_image_file_is_rebuilt_as_the_empty_text_its_fetch_attest
         last_modified=datetime(2026, 7, 7, tzinfo=timezone.utc),
         content_type=content_type,
         extra={
-            "connection_mode": "cloud_pull",
             "repo_url": "https://github.example.test/payroll/architecture",
             "relative_path": "docs/diagram.png",
         },
     )
     gene = GitHubRepoGene(
-        config={"connection_mode": "cloud_pull", "repo_url": "https://github.example.test/payroll/architecture"},
+        config={"repo_url": "https://github.example.test/payroll/architecture"},
         source_id="src-github-repo",
     )
 
@@ -657,139 +539,9 @@ async def test_a_stored_image_file_is_rebuilt_as_the_empty_text_its_fetch_attest
 
 
 @pytest.mark.asyncio
-async def test_local_push_explicit_empty_manifest_does_not_fall_back_to_inbox(tmp_path):
-    (tmp_path / "stale.json").write_text(
-        '{"package_kind":"github_repo_document","doc_id":"stale"}',
-        encoding="utf-8",
-    )
-    gene = GitHubRepoGene(
-        config={
-            "connection_mode": "local_push",
-            "repo_url": "https://github.example.test/payroll/architecture",
-            "documents_dir": str(tmp_path),
-            "local_agent_package_manifest": [],
-        },
-        source_id="src-github-repo",
-    )
-
-    await gene.authenticate()
-    items = [item async for item in gene.discover()]
-
-    assert items == []
-
-
-@pytest.mark.asyncio
-async def test_local_push_discovery_filters_packages_by_current_scope(tmp_path):
-    encoded_time = datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc).isoformat()
-    for name, relative_path, repo_ref in [
-        ("keep.json", "Payroll Processing/README.md", "main"),
-        ("wrong-path.json", "Flexible Payroll/README.md", "main"),
-        ("wrong-ref.json", "Payroll Processing/Old.md", "feature"),
-        ("wrong-extension.json", "Payroll Processing/diagram.png", "main"),
-    ]:
-        (tmp_path / name).write_text(
-            """
-{
-  "package_kind": "github_repo_document",
-  "doc_id": "%s",
-  "title": "%s",
-  "source_url": "https://github.example.test/payroll/architecture/blob/%s/%s",
-  "last_modified": "%s",
-  "space_or_project": "payroll/architecture",
-  "version": "blob-sha-1",
-  "repo_url": "https://github.example.test/payroll/architecture",
-  "repo_host": "github.example.test",
-  "repo_owner": "payroll",
-  "repo_name": "architecture",
-  "repo_ref": "%s",
-  "relative_path": "%s",
-  "blob_sha": "blob-sha-1",
-  "content_type": "text/markdown",
-  "submitted_at": "%s",
-  "submitted_by": "cli",
-  "markdown": "# Doc"
-}
-""".strip()
-            % (name, relative_path, repo_ref, relative_path, encoded_time, repo_ref, relative_path, encoded_time),
-            encoding="utf-8",
-        )
-
-    gene = GitHubRepoGene(
-        config={
-            "connection_mode": "local_push",
-            "repo_url": "https://github.example.test/payroll/architecture",
-            "ref": "main",
-            "include_paths": ["Payroll Processing/"],
-            "include_extensions": ["md"],
-            "documents_dir": str(tmp_path),
-        },
-        source_id="src-github-repo",
-    )
-
-    await gene.authenticate()
-    items = [item async for item in gene.discover()]
-
-    assert [item.extra["relative_path"] for item in items] == ["Payroll Processing/README.md"]
-
-
-@pytest.mark.asyncio
-async def test_local_push_discovery_enforces_max_files_on_current_scope(tmp_path):
-    encoded_time = datetime(2026, 7, 7, 9, 30, tzinfo=timezone.utc).isoformat()
-    for name, relative_path in [
-        ("one.json", "Payroll Processing/One.md"),
-        ("two.json", "Payroll Processing/Two.md"),
-        ("ignored.json", "Flexible Payroll/Ignored.md"),
-    ]:
-        (tmp_path / name).write_text(
-            """
-{
-  "package_kind": "github_repo_document",
-  "doc_id": "%s",
-  "title": "%s",
-  "source_url": "https://github.example.test/payroll/architecture/blob/main/%s",
-  "last_modified": "%s",
-  "space_or_project": "payroll/architecture",
-  "version": "blob-sha-1",
-  "repo_url": "https://github.example.test/payroll/architecture",
-  "repo_host": "github.example.test",
-  "repo_owner": "payroll",
-  "repo_name": "architecture",
-  "repo_ref": "main",
-  "relative_path": "%s",
-  "blob_sha": "blob-sha-1",
-  "content_type": "text/markdown",
-  "submitted_at": "%s",
-  "submitted_by": "cli",
-  "markdown": "# Doc"
-}
-""".strip()
-            % (name, relative_path, relative_path, encoded_time, relative_path, encoded_time),
-            encoding="utf-8",
-        )
-
-    gene = GitHubRepoGene(
-        config={
-            "connection_mode": "local_push",
-            "repo_url": "https://github.example.test/payroll/architecture",
-            "ref": "main",
-            "include_paths": ["Payroll Processing/"],
-            "include_extensions": ["md"],
-            "max_files": 1,
-            "documents_dir": str(tmp_path),
-        },
-        source_id="src-github-repo",
-    )
-
-    await gene.authenticate()
-    with pytest.raises(RuntimeError, match="max_files"):
-        [item async for item in gene.discover()]
-
-
-
-@pytest.mark.asyncio
 async def test_incremental_cloud_pull_lists_the_whole_tree_as_an_existence_listing():
     github = FakeGitHub(API, files=FILES)
-    gene = await _connected(github, {**CLOUD_PULL, "include_extensions": ["md"], "max_files": 10})
+    gene = await _connected(github, {**REPO_CONFIG, "include_extensions": ["md"], "max_files": 10})
 
     _ = [item async for item in gene.discover(since=datetime(2026, 9, 30, tzinfo=timezone.utc))]
     listing = await gene.list_scope()

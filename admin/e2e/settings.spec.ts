@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 const SETTINGS_ROUTE = "/api/v1/model-settings";
 
@@ -250,8 +251,8 @@ const RESPONSES: Record<string, unknown> = {
   "/api/v1/projects": { data: [], can_manage: true },
   "/api/v1/genes": [],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
-  "/api/cloud/local-agent/status": { status: "offline", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
-  "/api/cloud/local-agent/jobs/current": { data: [] },
+  "/api/cloud/local-agent/status": localSyncStatus(false),
+  "/api/v1/local-agent/jobs/current": { data: [] },
 };
 
 interface CandidateBody {

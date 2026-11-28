@@ -36,7 +36,6 @@ import {
 import type { ParsedConfluenceWikiUrl } from "./confluenceConfig";
 import { GitHubRepoFolderPicker } from "./GitHubRepoFolderPicker";
 import type { RepoPickerItem } from "./githubRepoFolderPickerUtils";
-import { isImmutableExecutionModeField } from "./localAgentSources";
 import { ProjectBindingFields } from "./ProjectBindingFields";
 import { projectBindingIsComplete } from "./projectBinding";
 import { useRunningSyncSave } from "./runningSyncSave";
@@ -198,9 +197,6 @@ function SourceConfigForm({
     initialFocus?.step ?? "basics",
   );
   const authMode = stringValue(config.auth_mode) || "browser_cookie";
-  const githubConnectionMode = sourceType === "github_repo"
-    ? stringValue(config.connection_mode) || "cloud_pull"
-    : "";
   const githubRepoUrl = sourceType === "github_repo" ? stringValue(config.repo_url).trim() : "";
   const githubPickerConfig = sourceType === "github_repo" ? serializeConfig(schema.fields, config) : {};
   const jiraBaseUrl = stringValue(config.base_url).trim();
@@ -263,22 +259,6 @@ function SourceConfigForm({
   const previewDiscovery = useMutation<DiscoveryPreviewResponse, unknown, void>({
     mutationFn: async () => {
       const serializedConfig = serializeConfig(schema.fields, config);
-      if (sourceType === "local_markdown") {
-        const created = await createLocalAgentJob({
-          sourceId: source?.id ?? "",
-          sourceType: "local_markdown",
-          operation: "local_markdown_preview_tree",
-          payload: {
-            ...localMarkdownPreviewJobConfig(serializedConfig, source),
-            limit: DISCOVERY_PREVIEW_LIMIT,
-          },
-        });
-        const status = await pollLocalAgentPreviewJob(created.job_id);
-        if (status.status === "failed") {
-          throw new Error(status.last_error || "Local daemon could not preview this folder.");
-        }
-        return localMarkdownPreviewFromJob(status);
-      }
       return resourceClient
         .post(`/genes/${sourceType}/preview-discovery`, {
           ...(source ? { source_id: source.id } : {}),
@@ -343,8 +323,8 @@ function SourceConfigForm({
     isEdit && canConfigureConnection && previewReady ? serializeConfig(schema.fields, config) : null,
     secretFieldKeys(schema.fields),
   );
-  const showDiscoveryPreview = sourceType !== "github_repo"
-    && !(sourceType === "jira" && stringValue(config.sync_mode) === "local_agent");
+  // A local folder is read only on its device, which the server does not preview.
+  const showDiscoveryPreview = sourceType !== "github_repo" && sourceType !== "local_markdown";
   const scheduleSummary = scheduleEnabled
     ? scheduleIntervalLabel(scheduleInterval)
     : "Manual only";
@@ -353,7 +333,7 @@ function SourceConfigForm({
     setValidationMessage(null);
     if (
       sourceType === "github_repo"
-      && ["connection_mode", "repo_url", "ref"].includes(field.key)
+      && ["repo_url", "ref"].includes(field.key)
     ) {
       setGitHubRepoTreeItems([]);
     }
@@ -417,7 +397,6 @@ function SourceConfigForm({
           hasExistingSecret={Boolean(config[`${field.key}_configured`])}
           decryptFailed={Boolean(config[`${field.key}_decrypt_failed`])}
           required={adapter.isRequired(field, config)}
-          disabled={source ? isImmutableExecutionModeField(source, field.key) : false}
           onChange={(value) => updateField(field, value)}
         />
         {sourceType === "confluence" && field.key === "base_url" && confluenceUrlInfo && (
@@ -437,7 +416,6 @@ function SourceConfigForm({
         )}
         {sourceType === "github_repo" && field.key === "ref" && (
           <GitHubRepoFolderPicker
-            connectionMode={githubConnectionMode}
             sourceId={source?.id}
             config={githubPickerConfig}
             items={githubRepoTreeItems}
@@ -661,7 +639,6 @@ function ConfigFieldInput({
   hasExistingSecret,
   decryptFailed,
   required,
-  disabled,
   onChange,
 }: {
   adapter: SourceSetupAdapter;
@@ -670,7 +647,6 @@ function ConfigFieldInput({
   hasExistingSecret?: boolean;
   decryptFailed?: boolean;
   required?: boolean;
-  disabled?: boolean;
   onChange: (value: ConfigValue) => void;
 }) {
   if (field.field_type === "boolean") {
@@ -680,7 +656,6 @@ function ConfigFieldInput({
           type="checkbox"
           className="mt-0.5 size-4"
           checked={booleanValue(value)}
-          disabled={disabled}
           onChange={(event) => onChange(event.target.checked)}
         />
         <span>
@@ -700,7 +675,6 @@ function ConfigFieldInput({
       <Field label={field.label} required={required} helpText={field.help_text}>
         <Select<string>
           value={selected}
-          disabled={disabled}
           onValueChange={(next) => onChange(stringValue(next))}
         >
           <SelectTrigger>
@@ -728,7 +702,6 @@ function ConfigFieldInput({
               <input
                 type="checkbox"
                 checked={selected.has(option)}
-                disabled={disabled}
                 onChange={(event) => {
                   const next = new Set(selected);
                   if (event.target.checked) next.add(option);
@@ -751,7 +724,6 @@ function ConfigFieldInput({
           className="min-h-20 w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs shadow-xs outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           rows={4}
           value={stringValue(value)}
-          disabled={disabled}
           placeholder={field.placeholder}
           onChange={(event) => onChange(event.target.value)}
         />
@@ -770,7 +742,6 @@ function ConfigFieldInput({
         autoComplete={isSecret ? "new-password" : "off"}
         name={`source-${field.key}`}
         value={isList ? listValue(value).join(", ") : stringValue(value)}
-        disabled={disabled}
         onChange={(event) => {
           if (isInteger) {
             onChange(event.target.value === "" ? "" : Number(event.target.value));
@@ -1103,14 +1074,6 @@ function Field({
   );
 }
 
-function localMarkdownPreviewJobConfig(config: ConfigForm, source?: Source | null): ConfigForm {
-  const sourceVaultId = source?.config?.vault_id;
-  return {
-    ...config,
-    vault_id: (typeof sourceVaultId === "string" ? sourceVaultId.trim() : "") || "preview",
-  };
-}
-
 function parseScheduleInterval(value: string): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : 1440;
@@ -1150,28 +1113,6 @@ async function pollLocalAgentPreviewJob(jobId: string): Promise<LocalAgentJobSta
     await new Promise((resolve) => window.setTimeout(resolve, LOCAL_AGENT_PREVIEW_POLL_INTERVAL_MS));
   }
   throw new Error("Timed out waiting for the local daemon.");
-}
-
-function localMarkdownPreviewFromJob(status: LocalAgentJobStatusResponse): DiscoveryPreviewResponse {
-  const result = status.result as {
-    counts?: { included?: number };
-    items?: Array<{ relative_path?: string; title?: string }>;
-  } | null;
-  const items = result?.items ?? [];
-  return {
-    source_type: "local_markdown",
-    count: Number(result?.counts?.included ?? items.length),
-    truncated: false,
-    items: items.map((item) => {
-      const path = item.relative_path ?? "";
-      return {
-        item_id: path,
-        title: item.title || path,
-        source_url: `local-agent://${path}`,
-        last_modified: null,
-      };
-    }),
-  };
 }
 
 function secretFieldKeys(fields: ConfigField[]): string[] {

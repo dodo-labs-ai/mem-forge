@@ -4,7 +4,12 @@ import { groupSourcesByProject, projectGroupKey, type ResolvedBySource } from ".
 import { sourceAttention, type SourceAttention } from "./sourceAttention";
 import { sourceFailedItems, type SourceFailedItems } from "./sourceFailedItems";
 import { organizeSourceGroups, type SourceListSortMode } from "./sourceListOrganization";
-import { resolveSourceReadiness, type LocalDaemonReadiness, type SourceReadiness } from "./sourceReadiness";
+import {
+  resolveSourceReadiness,
+  sourceDeviceReadiness,
+  type LocalDaemonReadiness,
+  type SourceReadiness,
+} from "./sourceReadiness";
 import { selectSourceSyncActivity, type SourceSyncActivity } from "./sourceSyncActivity";
 import type { LocalAgentJob, Project, Source, SourceProjectGroup } from "./types";
 
@@ -70,7 +75,7 @@ export function describeSource(
   const activity = selectSourceSyncActivity({ sync: source.sync, localJob });
   const readiness = resolveSourceReadiness({
     localExecution: isLocalAgentBackedSource(source),
-    daemon,
+    daemon: sourceDeviceReadiness(source, daemon),
     connectionStatus: source.connection_status,
   });
   return {

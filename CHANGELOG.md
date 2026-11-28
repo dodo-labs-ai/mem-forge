@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+- A Source that runs on My computer runs on one of your computers, its
+  execution device, which you choose in Where it runs (a single computer is
+  chosen already). Only that computer takes its syncs, and its folder picker
+  opens there. Choosing another of your computers moves the Source; its
+  credential stays on the old computer until that computer stops being told
+  about it, and the new one needs its own. A Source whose computer is offline
+  offers Move in Configure. A Source without a computer shows Finish setup
+  until you choose one; removing a computer in Where it runs sends its Sources
+  there.
+- Each computer reports, per Source it runs, whether it is ready, or what it
+  lacks: a credential, shown as Sign in required, or a folder, shown as Finish
+  setup with the path. `memforge daemon status` lists the same reasons. A
+  Source whose type needs neither, such as a public GitHub Pages site, is
+  ready without `memforge source credentials set`.
+- Device protocol: the lease answer names the Sources the device runs
+  (`sources`, without secrets), and the device report carries each Source's
+  readiness (`sources`). A job completion names the device. An
+  acquired input names its body by `body_sha256`, and the device first asks
+  `POST /sources/{id}/acquisition/held-bodies` and uploads only bodies the
+  server does not hold for the Source. Devices and the server must run this
+  release together.
+- The `local_markdown_preview_tree` local-agent operation is removed: a local
+  folder has no Check setup, because only its computer reads it.
+- Local-agent jobs belong to their workspace's API: the admin UI queues them
+  with `POST /api/v1/local-agent/jobs` and lists each Source's current job
+  with `GET /api/v1/local-agent/jobs/current`. The routes a daemon calls stay
+  under `/api/cloud/local-agent`, and `GET /api/cloud/local-agent/status`
+  serves the admin UI too. A Source's Sync now job is listed with the
+  workspace's other jobs.
+
+- Local Repository Sources run on their computer like every other Source on My
+  computer: the daemon walks the whole folder on every run, uploads only file
+  text the server does not hold, and the server extracts only files whose
+  content changed. A renamed folder's files are read under their new paths and
+  the old ones leave the Source. A file that is too large, not UTF-8 or
+  unreadable fails as its own Document and keeps what it held, instead of
+  stopping the folder's run; a missing folder or a directory the daemon cannot
+  list fails the run and removes nothing. The `local_markdown_sync` operation,
+  `POST /sources/{id}/adapter/packages`, `POST /sources/{id}/adapter/manifest`
+  and the server-side `documents_dir` inbox are removed.
+
+- Upgrading a self-hosted installation with Local Repository Sources: they hold
+  what the old upload path stored and do not sync until they move. Run
+  `memforge maintenance migrate-device-packages` as for Jira and GitHub
+  repository Sources below; each file keeps its Document, Memories and Support,
+  and nothing is extracted again. A file last uploaded by a daemon before
+  0.2.0b1 recorded no file time; it moves without one, and the Source's first
+  run on its computer gives it the file's time without extracting it. On a
+  moved Source's first run, files under an excluded folder (by default
+  `.obsidian/**`, `.trash/**` and `.git/**`) that the upload path still listed,
+  such as `.obsidian/plugins/x/manifest.json`, leave the Source.
+
+- Jira and GitHub repository Sources that collect on your own computer run the
+  type's own connector on the device: choose Where it runs: My computer, and
+  store the device's credential with `memforge source credentials set <id>`.
+  Jira `sync_mode: local_agent` and GitHub repository
+  `connection_mode: local_push` are removed, with
+  `POST /sources/{id}/adapter/manifest/confirmations`, the manifest route's
+  `confirm` field and its `awaiting_confirmations` status. The manifest's
+  `snapshot_manifest_sha256` now hashes its items only.
+
+- Upgrading a self-hosted installation with a Jira Source on local agent sync
+  or a GitHub repository Source on local push: these Sources hold what the old
+  path stored and do not sync until they move. Before you start the upgraded
+  server, run `memforge maintenance migrate-device-packages` to see what moves
+  and what would be extracted again, then, with the server stopped,
+  `memforge maintenance migrate-device-packages --apply`. It takes a recovery
+  point first (`memforge backup restore` undoes it), keeps every Memory and its
+  Support (Jira issues move to their `jira-<KEY>` Documents), extracts only
+  items whose content the move changes, and sets each Source to run on its
+  owner's device. Then store each moved Source's device credential with
+  `memforge source credentials set <id>`. A Source whose move failed keeps its
+  old path and shows the command in its sync error; run `--apply` again. A
+  Source the check refuses names the cause: an item that cannot be rebuilt, two
+  items that map to one Document, or a GitHub file the configured repository
+  names differently.
+
 - Search: a Memory that a newer Memory updates reports `freshness: outdated` in
   search results and recent-memory listings, beside the `relation_notice` that
   names the newer Memory. It is `outdated` for as long as the caller sees that

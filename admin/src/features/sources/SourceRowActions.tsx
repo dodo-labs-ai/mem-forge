@@ -60,15 +60,17 @@ export function SourceRowActions({
   const syncIsLive = activity !== undefined && ["queued", "active", "recovering"].includes(activity.state);
   // While a sync runs, the row's button stops it; a queued sync keeps its own button.
   const stopIsPrimary = canStop && (activity?.state === "active" || activity?.state === "recovering");
-  const control = attention && actions.attentionControl(attention.action, source, attention.actionLabel);
+  const control = attention?.action ? actions.attentionControl(attention.action, source, attention.actionLabel) : null;
   const fullSync = actions.fullSyncControl(source, activity);
 
   return (
     <div className="flex items-center justify-end gap-1" onClick={(event) => event.stopPropagation()}>
       {attention ? (
-        <Button size="sm" disabled={!control?.enabled} onClick={() => actions.runAttention(attention.action, source)}>
-          {control?.label}
-        </Button>
+        attention.action === null ? null : (
+          <Button size="sm" disabled={!control?.enabled} onClick={() => actions.runAttention(attention.action, source)}>
+            {control?.label}
+          </Button>
+        )
       ) : stopIsPrimary ? (
         <Button size="sm" variant="outline" onClick={() => actions.stopSync(source)}>
           Stop sync

@@ -28,7 +28,7 @@ let queryClient: QueryClient;
 const workspaceApi = createWorkspaceApiController({ clear: () => queryClient?.clear() });
 
 function useWorkspace(shared: boolean) {
-  workspaceApi.setTarget({ resourceBaseUrl: "/api/v1", localAgentBaseUrl: "/api/cloud/local-agent", workspaceId: "local", shared });
+  workspaceApi.setTarget({ resourceBaseUrl: "/api/v1", workspaceId: "local", shared });
 }
 
 beforeEach(() => {

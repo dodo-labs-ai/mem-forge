@@ -3,13 +3,13 @@ import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tansta
 import { projectQueryKeys, unwrap, useApi, type components } from "@/api";
 import { localSyncKeys } from "@/features/local-sync";
 import { sourceKeys } from "../api";
-import { useLocalSetupJob } from "../useLocalSetupJob";
-import type { CheckSetupKind } from "./model/checkSetup";
+import type { SourceExecutor } from "../model/localAgentSources";
 
 type Schemas = components["schemas"];
 export type ConfigCheck = Schemas["ConfigCheckResponse"];
 export type CreateSourceBody = Schemas["CreateSourceRequest"];
 export type UpdateSourceBody = Schemas["UpdateSourceRequest"];
+export type SourceExecutorChangeBody = Schemas["SourceExecutorChangeRequest"];
 export type ScopeChangePreview = Schemas["SourceScopeChangePreviewResponse"];
 
 /** How many items "Check setup" lists. */
@@ -22,10 +22,13 @@ const SCOPE_PREVIEW_DELAY_MS = 400;
  * configuration, which return the values save would derive, facts and field
  * issues. `result` is the answer to the latest check, so an earlier answer
  * that arrives late never replaces a later one. `check` also returns its
- * answer, for the check before a save. With `sourceId` the server reads the
+ * answer, for the check before a save. `executor` is where the Source runs
+ * once saved, so a stored Source moving between the server and a device is
+ * checked against its new executor, and a device Source's form neither
+ * requires nor accepts its secrets. With `sourceId` the server reads the
  * stored configuration for kept secrets and fixed fields.
  */
-export function useConfigCheck(sourceType: string, sourceId: string | undefined) {
+export function useConfigCheck(sourceType: string, sourceId: string | undefined, executor: SourceExecutor) {
   const api = useApi();
   const latest = useRef(0);
   const [result, setResult] = useState<ConfigCheck | null>(null);
@@ -35,13 +38,13 @@ export function useConfigCheck(sourceType: string, sourceId: string | undefined)
       const answer = await unwrap(
         api.POST("/api/v1/genes/{name}/config-check", {
           params: { path: { name: sourceType } },
-          body: { config, source_id: sourceId ?? null },
+          body: { config, source_id: sourceId ?? null, executor },
         }),
       );
       if (ticket === latest.current) setResult(answer);
       return answer;
     },
-    [api, sourceType, sourceId],
+    [api, sourceType, sourceId, executor],
   );
   return { result, check };
 }
@@ -54,41 +57,22 @@ export interface SetupPreview {
 }
 
 /**
- * The identity a local folder's preview files its Documents under. An
- * existing Source has one; a new Source is given one when it is created, so
- * its preview uses a placeholder, which changes no file it lists.
- */
-function previewVaultId(stored: Readonly<Record<string, unknown>>): string {
-  return typeof stored.vault_id === "string" && stored.vault_id.trim() ? stored.vault_id.trim() : "preview";
-}
-
-/**
  * "Check setup": the first items the configuration would sync, read without
  * saving anything. The server reads the provider through preview-discovery,
  * with `sourceId` supplying what the form leaves out, such as a kept
- * secret; a local folder is listed by local sync on the person's computer
- * (`local_markdown_preview_tree`).
+ * secret. `executor` is where the Source runs once saved, as for
+ * config-check: the server previews only through its own connection, so a
+ * configuration on My computer has no Check setup, and a stored device
+ * Source moving to the server previews with the credential the form carries.
  */
-export function useCheckSetup(sourceType: string, kind: CheckSetupKind | null, source?: { id: string; config: Readonly<Record<string, unknown>> }) {
+export function useCheckSetup(sourceType: string, executor: SourceExecutor, source?: { id: string }) {
   const api = useApi();
-  const previewFolder = useLocalSetupJob("local_markdown_preview_tree");
   return useMutation({
     mutationFn: async (config: Record<string, unknown>): Promise<SetupPreview> => {
-      if (kind === "local_folder") {
-        const result = await previewFolder({
-          sourceId: source?.id,
-          payload: { ...config, vault_id: previewVaultId(source?.config ?? {}), limit: CHECK_SETUP_LIMIT },
-        });
-        return {
-          count: result.counts.included,
-          truncated: result.counts.included > result.items.length,
-          items: result.items.map((item) => ({ id: item.relative_path, title: item.title || item.relative_path, href: null })),
-        };
-      }
       const preview = await unwrap(
         api.POST("/api/v1/genes/{name}/preview-discovery", {
           params: { path: { name: sourceType } },
-          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null },
+          body: { config, limit: CHECK_SETUP_LIMIT, source_id: source?.id ?? null, executor },
         }),
       );
       return {
@@ -126,6 +110,21 @@ export function useUpdateSource(sourceId: string) {
   return useMutation({
     mutationFn: (body: UpdateSourceBody) =>
       unwrap(api.PUT("/api/v1/sources/{source_id}", { params: { path: { source_id: sourceId } }, body })),
+    onSuccess: invalidate,
+  });
+}
+
+/**
+ * Changes where a Source runs (`PUT /sources/{id}/executor`). Moving it to a
+ * device makes the person its execution owner and deletes the server's
+ * copies of its secrets; moving it to the server sends them.
+ */
+export function useChangeSourceExecutor(sourceId: string) {
+  const api = useApi();
+  const invalidate = useInvalidateAfterSave();
+  return useMutation({
+    mutationFn: (body: SourceExecutorChangeBody) =>
+      unwrap(api.PUT("/api/v1/sources/{source_id}/executor", { params: { path: { source_id: sourceId } }, body })),
     onSuccess: invalidate,
   });
 }

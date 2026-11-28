@@ -353,7 +353,6 @@ export type SourceExecutionKind = "server" | "local_agent";
 export interface SourceExecution {
   kind: SourceExecutionKind;
   operation: string | null;
-  immutable_config_fields: string[];
 }
 
 export type SourceConnectionStatusReason = "authentication" | "configuration" | "identity_conflict";
@@ -785,9 +784,30 @@ export interface LocalAgentJobStatusResponse {
   last_error?: string | null;
 }
 
+/** One of the caller's devices, as its latest report left it. */
+export interface LocalAgentDeviceStatus {
+  device_id: string;
+  name: string;
+  version: string;
+  status: "online" | "offline";
+  last_seen_at: string;
+}
+
+/** A Source whose acquisition runs on one of the caller's devices. */
+export interface LocalAgentDeviceSource {
+  id: string;
+  name: string;
+  type: string;
+  /** The configuration without secrets. */
+  config: Record<string, unknown>;
+}
+
 export interface LocalAgentDaemonStatusResponse {
   status: "online" | "offline";
   last_seen_at: string | null;
+  devices: LocalAgentDeviceStatus[];
+  sources: LocalAgentDeviceSource[];
+  server: { version: string; acquisition_contracts: Record<string, number> };
   checked_at: string;
   stale_after_seconds: number;
 }

@@ -1,0 +1,9 @@
+<h2>Queue tiers</h2>
+<p>Every Kestrel queue belongs to one tier. The tier sets how long a job may wait before a worker picks it up.</p>
+<table><colgroup><col /><col /><col /></colgroup><tbody>
+<tr><th>Tier</th><th>Queue</th><th>Maximum wait</th></tr>
+<tr><td rowspan="2">Gold</td><td>payments</td><td>30 seconds</td></tr>
+<tr><td>invoices</td><td>2 minutes</td></tr>
+<tr><td>Bronze</td><td>reports</td><td>1 hour</td></tr>
+</tbody></table>
+<p>A queue whose wait exceeds its tier's maximum pages the on-call engineer.</p>

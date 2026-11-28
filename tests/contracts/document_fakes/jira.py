@@ -85,7 +85,11 @@ def _issue(key: str, profile_zone: ZoneInfo) -> dict:
             "status": None,
             "priority": None,
             "assignee": None,
+            "resolution": None,
+            "description": f"The rules {key} records.",
+            "comment": {"comments": [], "startAt": 0, "maxResults": 50, "total": 0},
         },
+        "changelog": {"histories": [], "startAt": 0, "maxResults": 0, "total": 0},
     }
 
 
@@ -180,9 +184,6 @@ class JiraFakes(DocumentConnectorFakes):
         "simple": ListingConfig(SIMPLE, walks_scope=False, edited_in_the_cursor_minute="jira-PAY-4"),
         "advanced": ListingConfig(ADVANCED, walks_scope=False, edited_in_the_cursor_minute="jira-PAY-4"),
     }
-    device_configs = {
-        "local-agent": {"base_url": BASE_URL, "auth_mode": "browser_cookie", "sync_mode": "local_agent", "projects": ["PAY"]},
-    }
 
     @asynccontextmanager
     async def connect(
@@ -196,19 +197,6 @@ class JiraFakes(DocumentConnectorFakes):
             yield provider.connection(gene)
         finally:
             await gene.close()
-
-    def manifest_entries(self, config: Mapping[str, object]) -> list[dict]:
-        return [
-            {
-                "doc_id": f"jira-{key}",
-                "issue_key": key,
-                "title": key,
-                "version": ISSUES[key][2].isoformat(),
-                "last_modified": ISSUES[key][2].isoformat(),
-                "change_kind": "upsert",
-            }
-            for key in ("PAY-1", "PAY-2", "PAY-4")
-        ]
 
     def rediscover_candidates(self, config: Mapping[str, object]) -> list[ContentItem]:
         return [

@@ -3,7 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import { renderWithApi } from "@/test/renderWithApi";
-import { setupJobRoutes } from "@/test/setupJobs";
 import { sourceTypeSchema } from "@/test/sourceTypeForms";
 import type { FieldValue } from "../model/configForm";
 import GitHubRepoPathsPicker from "./GitHubRepoPathsPicker";
@@ -91,42 +90,3 @@ test("the exclude picker suggests outdated folders and counts the files left to 
   expect(screen.queryByRole("button", { name: "+ docs/archive" })).not.toBeInTheDocument();
 });
 
-test("local sync lists the remote repository through the daemon with a job that carries no secret or path", async () => {
-  const created: Parameters<typeof setupJobRoutes>[1] = [];
-  const config = {
-    connection_mode: "local_push",
-    repo_url: "https://github.tools.example/acme/docs",
-    ref: "dev",
-    pat: "ghp_typed-under-cloud-access",
-    exclude_paths: ["docs/archive"],
-    include_extensions: ["md"],
-  };
-  renderWithApi(
-    <Picker fieldKey="include_paths" config={config} onChange={vi.fn()} />,
-    setupJobRoutes(
-      {
-        github_repo_preview_tree: {
-          status: "succeeded",
-          result: {
-            operation: "github_repo_preview_tree",
-            counts: { included: 2, ignored: 0 },
-            items: [{ relative_path: "docs/guide.md" }, { relative_path: "README.md" }],
-          },
-        },
-      },
-      created,
-    ),
-  );
-
-  await userEvent.click(screen.getByRole("button", { name: "Browse repository" }));
-  const tree = await screen.findByRole("tree", { name: "Repository paths" });
-  expect(within(tree).getByRole("checkbox", { name: "docs/guide.md" })).toBeInTheDocument();
-  expect(created).toEqual([
-    {
-      source_id: "",
-      source_type: "github_repo",
-      operation: "github_repo_preview_tree",
-      payload: { repo_url: "https://github.tools.example/acme/docs", ref: "dev", include_extensions: ["md"], limit: 2000 },
-    },
-  ]);
-});

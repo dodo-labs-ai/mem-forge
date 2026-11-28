@@ -195,7 +195,6 @@ async def test_a_search_without_since_never_reads_the_profile():
     gene = await jira.gene()
     try:
         _ = [item async for item in gene.discover(None)]
-        _ = [item async for item in gene.discover_inventory()]
         await gene.list_scope()
     finally:
         await gene.close()

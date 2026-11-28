@@ -34,7 +34,7 @@ const ACTIONS: SourceAttentionAction[] = [
 ];
 
 function Harness({ source, action }: { source: Source; action: SourceAttentionAction }) {
-  const actions = useSourceActions({ onViewDetails: () => undefined });
+  const actions = useSourceActions({ onViewDetails: () => undefined, onUpdateDevice: () => undefined });
   const location = useLocation();
   const control = actions.attentionControl(action, source, "Act");
   return (
@@ -124,7 +124,7 @@ test.each(ACTIONS)("no action navigates outside the app (%s)", async (action) =>
 
 /** A source's row menu wired to the Full sync confirmation, as the Sources page wires them. */
 function FullSyncHarness({ source }: { source: Source }) {
-  const actions = useSourceActions({ onViewDetails: () => undefined });
+  const actions = useSourceActions({ onViewDetails: () => undefined, onUpdateDevice: () => undefined });
   const [pending, setPending] = useState<Source | null>(null);
   const row: SourceRow = { key: source.id, source, memoryCount: 0, activity: undefined, readiness: null, attention: null, failedItems: null };
   const ignore = () => undefined;

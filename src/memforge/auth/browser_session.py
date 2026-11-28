@@ -17,6 +17,7 @@ validate that provider's session.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Awaitable
 from typing import Any, Callable, Protocol, runtime_checkable
 
 
@@ -112,6 +113,16 @@ class BrowserSessionStore(Protocol):
 
 
 @dataclass(frozen=True)
+class CapturedBrowserSession:
+    """A session read from the user's browser for one origin, checked against the provider."""
+
+    origin: str
+    cookie_header: str
+    browser: str | None
+    principal: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class BrowserSessionProvider:
     """Everything the generic layer needs to manage one provider's sessions."""
 
@@ -119,9 +130,15 @@ class BrowserSessionProvider:
     source_type: str
     label: str
     cookie_config_key: str
+    principal_changed_code: str
+    """The code the server answers when an uploaded session belongs to another account than the one it holds."""
     canonical_origin: Callable[[str], str]
     service_factory: Callable[[BrowserSessionStore], BrowserSessionService]
     uses_browser_session: Callable[[dict], bool]
+    capture_session: Callable[..., Awaitable[CapturedBrowserSession]]
+    """Captures the origin's session from the user's browser: ``(base_url, *, browser, tls_config)``."""
+    validate_session: Callable[[str, str, dict | None], Awaitable[dict[str, Any]]]
+    """Checks a session against the provider: ``(origin, cookie_header, tls_config)``, returning the principal."""
 
 
 _PROVIDERS: dict[str, BrowserSessionProvider] = {}
@@ -158,13 +175,19 @@ def ensure_builtin_providers() -> None:
 
 
 async def list_origins(db: BrowserSessionStore, provider: str) -> list[dict[str, Any]]:
-    """Known origins for a provider: authenticated sessions + configured sources.
+    """Known origins for a provider: authenticated sessions + configured server Sources.
 
     Only safe fields are returned; the encrypted cookie is never included.
     """
+    from memforge.local_agent.source_contract import source_runs_on_device
+
     descriptor = get_provider(provider)
     sessions = await db.list_auth_sessions(provider)
-    sources = [src for src in await db.list_sources() if src.get("type") == descriptor.source_type]
+    sources = [
+        src
+        for src in await db.list_sources()
+        if src.get("type") == descriptor.source_type and not source_runs_on_device(src)
+    ]
 
     entries: dict[str, dict[str, Any]] = {}
     for session in sessions:

@@ -8,21 +8,19 @@ import hashlib
 import json
 import logging
 import os
-import selectors
 import shutil
 import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from importlib import metadata
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Callable
-from urllib.parse import quote
 
 try:
     import tomllib
@@ -38,62 +36,19 @@ from memforge.api_target import Edition, MemForgeTarget, build_target
 from memforge.auth import browser_session
 from memforge.capability_discovery import discover_target
 from memforge.config import DEFAULT_SEARCH_TOP_K, AppConfig, load_config
-from memforge.github_repo_utils import (
-    DEFAULT_INCLUDE_EXTENSION_LIST,
-    GITHUB_SYMLINK_MODE,
-    GitHubBlobBuffer,
-    GitHubResolvedTreeEntry,
-    GitHubTreeEntryResolver,
-    build_github_repo_doc_id,
-    decode_github_base64_content,
-    decode_github_text,
-    github_content_paths,
-    github_content_type,
-    github_content_type_is_binary,
-    github_exclude_paths,
-    github_extension,
-    github_include_extensions,
-    github_include_paths,
-    github_latest_commit_time,
-    github_path_commits_query,
-    github_path_in_scope,
-    normalize_github_relative_path,
-    parse_github_repo_url,
-    validate_github_file_mode,
-    validate_github_tree_payload,
-)
 from memforge.local_agent.folder_picker import FolderPickerCancelled, FolderPickerUnavailable, pick_folder
-from memforge.local_agent.document_identity import (
-    build_jira_doc_id,
-    build_local_markdown_doc_id,
-)
-from memforge.local_agent.snapshot_manifest import SNAPSHOT_MANIFEST_MAX_ITEMS
 from memforge.local_agent.setup_results import (
-    GitHubRepoPreviewTreeResult,
-    JiraAuthResult,
+    CredentialCheckResult,
     LocalMarkdownPickRootResult,
-    LocalMarkdownPreviewTreeResult,
     LocalSetupJobResult,
     TeamsAuthCheckResult,
     TeamsAuthResult,
     TeamsBrowseResult,
 )
 from memforge.local_agent.source_contract import (
-    LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
-    LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS,
-    GitHubProviderConnectionError,
-    local_agent_sync_snapshot_id,
     source_processing_receipt,
 )
 from memforge.retrieval.intents import RANKED_RETRIEVAL_INTENTS
-from memforge.source_time import latest_source_time, source_time_iso
-from memforge.source_artifacts import (
-    MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
-    MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT,
-    SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES,
-    SOURCE_ARTIFACT_STREAM_CHUNK_BYTES,
-    read_source_artifact_bytes,
-)
 from memforge.sync_progress import normalize_sync_progress_snapshot
 from memforge.storage.admin_source import (
     SOURCE_SYNC_SCHEDULE_MAX_INTERVAL_MINUTES,
@@ -107,7 +62,14 @@ from memforge.workspace_bindings import (
 )
 
 if TYPE_CHECKING:
-    from memforge.genes.jira_gene import JiraGene
+    from memforge.local_agent.document_acquisition import (
+        AcquiredInputPackage,
+        AcquisitionAnswers,
+        AcquisitionManifest,
+        AcquisitionRequests,
+    )
+    from memforge.models import ContentItem
+    from memforge.source_artifacts import RawSourceArtifact
 
 console = Console()
 log_console = Console(stderr=True)
@@ -116,26 +78,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLI_CONFIG_PATH = Path.home() / ".memforge" / "cli.toml"
 DEFAULT_LOCAL_AGENT_STATE_PATH = Path.home() / ".memforge" / "local-agent-state.json"
 DEFAULT_LOCAL_AGENT_LOCK_PATH = Path.home() / ".memforge" / "local-agent-daemon.lock"
-DEFAULT_KB_INCLUDE = [
-    "*.md",
-    "**/*.md",
-    "*.markdown",
-    "**/*.markdown",
-    "*.txt",
-    "**/*.txt",
-    "*.json",
-    "**/*.json",
-    "*.html",
-    "**/*.html",
-    "*.htm",
-    "**/*.htm",
-]
-DEFAULT_KB_EXCLUDE = [".obsidian/**", ".trash/**", ".git/**", "**/.git/**"]
-LOCAL_MARKDOWN_SOURCE_TYPE = "local_markdown"
-GITHUB_REPO_SOURCE_TYPE = "github_repo"
-GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS = 30.0
-JIRA_SOURCE_TYPE = "jira"
-DEFAULT_GITHUB_INCLUDE_EXTENSIONS = DEFAULT_INCLUDE_EXTENSION_LIST
 # Watch defaults. The tick interval is deliberately shorter than a typical Jira
 # idle-session timeout so the stored copy is renewed while it is still valid.
 WATCH_DEFAULT_INTERVAL_SECONDS = 1800  # 30 minutes
@@ -492,6 +434,23 @@ def _acquire_local_agent_daemon_lock(lock_path: Path | None = None) -> _LocalAge
     return _LocalAgentDaemonLock(path, fd)
 
 
+def _this_device_report(server: str, sources: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """This installation's device report to the server at API origin ``server``, as of now.
+
+    It names each of ``sources``, the Sources the server's latest lease answer
+    says this device executes, with whether this device is ready to run it,
+    which can change at any time.
+    """
+    from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_report import this_device_report
+    from memforge.local_agent.device_sources import readiness_of_sources
+
+    identity = DeviceIdentityStore(device_identity_path()).ensure()
+    readiness = readiness_of_sources(sources, device_credentials(server))
+    return this_device_report(identity.device_id, identity.name, readiness).to_payload()
+
+
 def _build_local_agent_runner(
     ctx,
     *,
@@ -499,19 +458,38 @@ def _build_local_agent_runner(
 ):
     from memforge.local_agent.runner import LocalAgentRunner
 
+    from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_lease import DeviceLeaseAnswers
+
     client = _local_agent_tool_client(ctx)
+    server = client.target.origin
+    device_id = DeviceIdentityStore(device_identity_path()).ensure().device_id
+    lease_answers = DeviceLeaseAnswers(device_credentials(server), log=lambda message: click.echo(message, err=True))
+
+    def device() -> dict[str, Any]:
+        return _this_device_report(server, lease_answers.sources)
+
+    def lease(limit: int = 1, wait_seconds: int = 0, lease_seconds: int = 60) -> dict[str, Any]:
+        answer = client.lease_local_agent_jobs(
+            device=device(),
+            limit=limit,
+            wait_seconds=wait_seconds,
+            lease_seconds=lease_seconds,
+        )
+        if not answer.get("error"):
+            lease_answers.observe(answer)
+        return answer
+
     return LocalAgentRunner(
         state_store=_local_agent_state_store(),
         cloud_job_handler=lambda job, report_progress=None: _run_cloud_local_agent_job(
             job, client, browser=browser, report_progress=report_progress
         ),
-        cloud_jobs_provider=lambda limit=1, wait_seconds=0, lease_seconds=60: client.lease_local_agent_jobs(
-            limit=limit,
-            wait_seconds=wait_seconds,
-            lease_seconds=lease_seconds,
-        ),
+        cloud_jobs_provider=lease,
         cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: client.complete_local_agent_job(
             job_id,
+            device_id=device_id,
             attempt_count=attempt_count,
             status=status,
             result=result,
@@ -521,349 +499,12 @@ def _build_local_agent_runner(
             client.heartbeat_local_agent_job(
                 job_id,
                 attempt_count=attempt_count,
+                device=device(),
                 lease_seconds=lease_seconds,
                 progress=progress,
             )
         ),
     )
-
-
-def _string_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item)]
-    if isinstance(value, tuple):
-        return [str(item) for item in value if str(item)]
-    return []
-
-
-def _merge_default_excludes(excludes: tuple[str, ...] | list[str]) -> list[str]:
-    merged: list[str] = []
-    for pattern in [*DEFAULT_KB_EXCLUDE, *[str(item) for item in excludes]]:
-        if pattern and pattern not in merged:
-            merged.append(pattern)
-    return merged
-
-
-def _parse_github_repo_url(repo_url: str) -> dict[str, str]:
-    try:
-        parsed = parse_github_repo_url(repo_url)
-    except ValueError as exc:
-        raise click.ClickException(str(exc).replace("repo_url", "Repository URL")) from exc
-    return {"repo_url": parsed["repo_url"], "host": parsed["host"], "owner": parsed["owner"], "repo": parsed["repo"]}
-
-
-def _github_gh_env(host: str) -> dict[str, str]:
-    env = dict(os.environ)
-    if host != "github.com":
-        env["GH_HOST"] = host
-    else:
-        env.pop("GH_HOST", None)
-    return env
-
-
-def _gh_api_json(repo: dict[str, str], endpoint: str) -> dict[str, Any]:
-    payload = _gh_api_payload(repo, endpoint)
-    return payload if isinstance(payload, dict) else {}
-
-
-def _gh_api_payload(repo: dict[str, str], endpoint: str) -> object:
-    try:
-        result = subprocess.run(
-            ["gh", "api", endpoint],
-            capture_output=True,
-            text=True,
-            env=_github_gh_env(repo["host"]),
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "gh api failed").strip()
-        _raise_github_cli_error(detail)
-    try:
-        return json.loads(result.stdout or "{}")
-    except ValueError as exc:
-        raise click.ClickException("GitHub CLI returned invalid JSON.") from exc
-
-
-def _github_last_commit_at(
-    repo: dict[str, str],
-    *,
-    commit_sha: str,
-    relative_path: str,
-    resolved_relative_path: object,
-) -> str | None:
-    """The file's latest commit time at the collection commit, its symlink target included.
-
-    A refused request leaves the time unknown; the service then asks for the
-    file again on the next collection (``LOCAL_PACKAGE_SOURCE_TIME_CONTRACT_VERSION``).
-    """
-
-    commit_times = []
-    for path in github_content_paths(relative_path, resolved_relative_path):
-        try:
-            payload = _gh_api_payload(
-                repo,
-                f"repos/{repo['owner']}/{repo['repo']}/commits?"
-                + github_path_commits_query(relative_path=path, ref=commit_sha),
-            )
-        except click.ClickException as exc:
-            logger.warning("GitHub commit time for %s is unknown: %s", path, exc.message)
-            return None
-        commit_times.append(github_latest_commit_time(payload))
-    return latest_source_time(commit_times)
-
-
-def _raise_github_cli_error(detail: str) -> None:
-    normalized_detail = detail.lower()
-    if any(marker in normalized_detail for marker in (
-        "error connecting to", "check your internet connection", "could not resolve host",
-        "no such host", "temporary failure in name resolution", "network is unreachable",
-        "connection refused", "connection timed out", "i/o timeout", "tls handshake timeout",
-    )):
-        raise GitHubProviderConnectionError(f"GitHub CLI request failed: {detail}")
-    raise click.ClickException(f"GitHub CLI request failed: {detail}")
-
-
-@dataclass(frozen=True)
-class _GitHubCollectionSnapshot:
-    commit_sha: str
-    root_tree_sha: str
-
-
-def _resolve_github_collection_snapshot(
-    repo: dict[str, str],
-    ref: str,
-) -> _GitHubCollectionSnapshot:
-    payload = _gh_api_json(
-        repo,
-        f"repos/{repo['owner']}/{repo['repo']}/commits/{quote(ref, safe='')}",
-    )
-    commit_sha = str(payload.get("sha") or "").strip()
-    commit = payload.get("commit") if isinstance(payload.get("commit"), dict) else {}
-    tree = commit.get("tree") if isinstance(commit.get("tree"), dict) else {}
-    root_tree_sha = str(tree.get("sha") or "").strip()
-    if not commit_sha or not root_tree_sha:
-        raise click.ClickException(
-            "GitHub did not return an immutable commit and root tree for this collection."
-        )
-    return _GitHubCollectionSnapshot(
-        commit_sha=commit_sha,
-        root_tree_sha=root_tree_sha,
-    )
-
-
-def _github_tree(repo: dict[str, str], tree_sha: str) -> list[dict[str, Any]]:
-    payload = _gh_api_json(
-        repo,
-        f"repos/{repo['owner']}/{repo['repo']}/git/trees/{quote(tree_sha, safe='')}?recursive=1",
-    )
-    try:
-        return validate_github_tree_payload(payload, label="GitHub repository")
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-def _github_blob(repo: dict[str, str], blob_sha: str, relative_path: str) -> bytes:
-    payload = _gh_api_json(
-        repo,
-        f"repos/{repo['owner']}/{repo['repo']}/git/blobs/{quote(blob_sha, safe='')}",
-    )
-    if str(payload.get("sha") or "").strip() != blob_sha:
-        raise click.ClickException(
-            f"GitHub returned a different blob revision for {relative_path}."
-        )
-    try:
-        return decode_github_base64_content(
-            content=payload.get("content"),
-            encoding=payload.get("encoding"),
-            size=payload.get("size"),
-            label=relative_path,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-def _github_text_blob(
-    repo: dict[str, str], blob_sha: str, relative_path: str, *, size: object,
-) -> bytes:
-    """Read one immutable raw body with bounded pipes and a transport deadline."""
-    try:
-        buffer = GitHubBlobBuffer(sha=blob_sha, size=size, label=relative_path)
-        command = ["gh", "api", f"repos/{repo['owner']}/{repo['repo']}/git/blobs/{blob_sha}",
-                   "-H", "Accept: application/vnd.github.raw+json", "-H", "Accept-Encoding: identity"]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   env=_github_gh_env(repo["host"]))
-    except FileNotFoundError as exc:
-        raise click.ClickException("GitHub CLI `gh` is required for local GitHub repository sync.") from exc
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    stderr = bytearray()
-    deadline = time.monotonic() + GITHUB_RAW_TRANSFER_TIMEOUT_SECONDS
-    try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ, "body")
-            selector.register(process.stderr, selectors.EVENT_READ, "error")
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise GitHubProviderConnectionError("GitHub raw blob request timed out")
-                for key, _ in selector.select(remaining):
-                    chunk = os.read(key.fd, SOURCE_ARTIFACT_STREAM_CHUNK_BYTES)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                    elif key.data == "body":
-                        buffer.write(chunk)
-                    else:
-                        stderr.extend(chunk[:max(0, 8192 - len(stderr))])
-            process.wait(timeout=max(0.001, deadline - time.monotonic()))
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip() or "gh api failed"
-            _raise_github_cli_error(detail)
-        return buffer.finish()
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GitHubProviderConnectionError("GitHub raw blob request timed out") from exc
-    finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        process.stdout.close()
-        process.stderr.close()
-
-
-def _resolve_github_profile(
-    name: str,
-    profile: dict[str, Any],
-) -> tuple[dict[str, str], str, list[str], list[str], list[str]]:
-    repo = _parse_github_repo_url(str(profile.get("repo_url") or ""))
-    ref = str(profile.get("ref") or "main").strip() or "main"
-    if ref.startswith("-"):
-        raise click.ClickException("GitHub repository ref must not start with '-'.")
-    try:
-        include_paths = github_include_paths(profile)
-        exclude_paths = github_exclude_paths(profile)
-    except ValueError as exc:
-        raise click.ClickException(str(exc).replace("relative_path", "GitHub include path")) from exc
-    include_extensions = sorted(github_include_extensions(profile))
-    return repo, ref, include_paths, exclude_paths, include_extensions
-
-
-def _github_title(markdown_body: str, fallback: str) -> str:
-    for line in markdown_body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# ") and stripped[2:].strip():
-            return stripped[2:].strip()
-    return fallback
-
-
-def _resolve_github_profile_entry(
-    repo: dict[str, str],
-    entry: dict[str, Any],
-    *,
-    entries_by_path: dict[str, dict[str, Any]],
-    exclude_paths: list[str],
-) -> GitHubResolvedTreeEntry:
-    """Bind one logical GitHub path to its immutable regular content blob."""
-
-    resolver = GitHubTreeEntryResolver(
-        entry,
-        entries_by_path=entries_by_path,
-        exclude_paths=exclude_paths,
-    )
-    try:
-        while link := resolver.next_symlink_read():
-            raw_target = _github_text_blob(
-                repo,
-                link.blob_sha,
-                link.path,
-                size=link.blob_size,
-            )
-            resolver.accept_symlink_target(raw_target)
-        return resolver.result()
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
-
-def _preview_github_profile(name: str, profile: dict[str, Any], *, limit: int | None) -> dict[str, Any]:
-    repo, ref, include_paths, exclude_paths, include_extensions = _resolve_github_profile(name, profile)
-    snapshot = _resolve_github_collection_snapshot(repo, ref)
-    counts = {"included": 0, "ignored": 0}
-    extension_counts: dict[str, int] = {}
-    items: list[dict[str, Any]] = []
-    tree = _github_tree(repo, snapshot.root_tree_sha)
-    entries_by_path = {
-        normalize_github_relative_path(str(entry.get("path") or "")).rstrip("/"): entry
-        for entry in tree
-    }
-    for entry in tree:
-        if (
-            entry.get("type") not in {"blob", "commit"}
-            and entry.get("mode") != GITHUB_SYMLINK_MODE
-        ):
-            continue
-        relative_path = str(entry.get("path") or "")
-        if not github_path_in_scope(relative_path, include_paths, exclude_paths):
-            counts["ignored"] += 1
-            continue
-        extension = github_extension(relative_path)
-        if extension:
-            extension_counts[extension] = extension_counts.get(extension, 0) + 1
-        if include_extensions and extension not in include_extensions:
-            counts["ignored"] += 1
-            continue
-        counts["included"] += 1
-        if limit is None or len(items) < limit:
-            resolved = _resolve_github_profile_entry(
-                repo,
-                entry,
-                entries_by_path=entries_by_path,
-                exclude_paths=exclude_paths,
-            )
-            content_entry = resolved.content_entry
-            content_type = github_content_type(relative_path)
-            resolved_content_type = github_content_type(
-                resolved.resolved_relative_path or relative_path
-            )
-            if resolved.symlink_chain and (
-                github_content_type_is_binary(content_type)
-                or github_content_type_is_binary(resolved_content_type)
-            ):
-                raise click.ClickException(
-                    f"GitHub symlink {relative_path} selects a binary Artifact; "
-                    "symlinked Artifacts are unsupported"
-                )
-            items.append(
-                {
-                    "relative_path": resolved.logical_path,
-                    "blob_sha": content_entry.get("sha"),
-                    "bytes": content_entry.get("size"),
-                    "file_mode": content_entry.get("mode"),
-                    "logical_file_mode": resolved.logical_file_mode,
-                    "symlink_chain": [dict(item) for item in resolved.symlink_chain],
-                    "resolved_relative_path": resolved.resolved_relative_path,
-                    "content_type": content_type,
-                }
-            )
-    payload = {
-        "profile": name,
-        "repo_url": repo["repo_url"],
-        "ref": ref,
-        "commit_sha": snapshot.commit_sha,
-        "root_tree_sha": snapshot.root_tree_sha,
-        "include_paths": include_paths,
-        "exclude_paths": exclude_paths,
-        "include_extensions": include_extensions,
-        "counts": counts,
-        "extension_counts": dict(sorted(extension_counts.items())),
-        "items": items,
-    }
-    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -1848,15 +1489,8 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         raise click.ClickException(str(exc)) from exc
     runtime = _local_agent_status_payload(ctx, verbose=verbose)
     try:
-        environment = manager.environment()
-        target = _build_cli_target(
-            api_url=environment["MEMFORGE_API_URL"],
-            edition=environment.get("MEMFORGE_EDITION"),
-        )
-        connection = ToolClient(
-            target=target,
-            api_token=environment.get("MEMFORGE_API_TOKEN"),
-        ).get_local_agent_status()
+        daemon_client = _daemon_client(manager)
+        connection = daemon_client.get_local_agent_status()
     except (DaemonServiceError, click.ClickException) as exc:
         connection = {
             "status": "unconfigured",
@@ -1867,12 +1501,40 @@ def _daemon_health_payload(ctx, *, verbose: bool) -> dict[str, Any]:
         and runtime.get("status") == "running"
         and connection.get("status") == "online"
     )
-    return {
+    payload: dict[str, Any] = {
         "status": "healthy" if healthy else "unhealthy",
         "service": service,
         "runtime": runtime,
         "connection": connection,
     }
+    if not connection.get("error"):
+        payload["sources"] = _device_source_states(connection, daemon_client.target.origin)
+    return payload
+
+
+def _daemon_client(manager) -> ToolClient:
+    """A client for the server the installed daemon serves, as the daemon's user."""
+    environment = manager.environment()
+    target = _build_cli_target(
+        api_url=environment["MEMFORGE_API_URL"],
+        edition=environment.get("MEMFORGE_EDITION"),
+    )
+    return ToolClient(target=target, api_token=environment.get("MEMFORGE_API_TOKEN"))
+
+
+def _device_source_states(status: Mapping[str, Any], server: str) -> list[dict[str, Any]]:
+    """Each Source this device executes on ``server``: ready, or waiting for an update, a credential or its folder."""
+    from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_sources import device_source_states
+
+    try:
+        identity = DeviceIdentityStore(device_identity_path()).load()
+        if identity is None:
+            return []
+        return device_source_states(status, device_credentials(server), device_id=identity.device_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @daemon_service.command("check")
@@ -1962,26 +1624,126 @@ def _status_timestamp(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _reported_device(status: Mapping[str, Any], device_id: str) -> dict[str, Any] | None:
+    """One device of a ``/local-agent/status`` answer, by id."""
+    for device in status.get("devices") or ():
+        if isinstance(device, Mapping) and device.get("device_id") == device_id:
+            return dict(device)
+    return None
+
+
 def _wait_for_local_agent_online(
     client: ToolClient,
     *,
+    device_id: str,
     after_last_seen_at: str | None,
     timeout_seconds: float = 35.0,
 ) -> dict[str, Any]:
+    """Wait for a report from this installation's own device newer than ``after_last_seen_at``."""
     deadline = time.monotonic() + timeout_seconds
     baseline = _status_timestamp(after_last_seen_at)
     latest: dict[str, Any] = {"status": "offline"}
     while True:
         latest = client.get_local_agent_status()
-        observed = _status_timestamp(latest.get("last_seen_at"))
-        fresh = observed is not None and (baseline is None or observed > baseline)
-        if latest.get("status") == "online" and fresh:
-            return {**latest, "fresh": True}
         if latest.get("error"):
             return latest
+        device = _reported_device(latest, device_id) or {
+            "device_id": device_id,
+            "status": "offline",
+            "last_seen_at": None,
+        }
+        observed = _status_timestamp(device.get("last_seen_at"))
+        fresh = observed is not None and (baseline is None or observed > baseline)
+        if device.get("status") == "online" and fresh:
+            return {**device, "fresh": True}
         if time.monotonic() >= deadline:
-            return {**latest, "fresh": False}
+            return {**device, "fresh": False}
         time.sleep(0.5)
+
+
+@cli.command("upgrade")
+@click.pass_context
+def upgrade_command(ctx):
+    """Install exactly the MemForge version the server runs, and restart the daemon with it.
+
+    A device syncs its document Sources only while its acquisition contracts
+    equal the server's, so this also brings back a device that is ahead of
+    the server. MemForge is installed the way it was installed before.
+    """
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.service import DaemonServiceError
+    from memforge.local_agent.upgrade import UnknownInstallMethod, install_method
+    from memforge.release import installed_version
+
+    manager = _daemon_service_manager()
+    try:
+        environment = manager.environment()
+        client = _daemon_client(manager)
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"{exc} Run `memforge setup` first.") from exc
+    status = client.get_local_agent_status()
+    if status.get("error"):
+        _emit_tool_payload(ctx, status)
+        return
+    version = str((status.get("server") or {}).get("version") or "")
+    if not version:
+        raise click.ClickException("The server did not name its MemForge version.")
+    previous_version = installed_version()
+    if version == previous_version:
+        _emit_tool_payload(ctx, {"ok": True, "version": version, "upgraded": False})
+        return
+    executable = _current_cli_executable()
+    try:
+        method = install_method(Path(executable))
+    except UnknownInstallMethod as exc:
+        raise click.ClickException(
+            f"{exc}. Install MemForge {version} the way you installed it, then run `memforge daemon restart`."
+        ) from exc
+    command = method.install_command(version)
+    installed = subprocess.run(command, check=False)
+    if installed.returncode != 0:
+        raise click.ClickException(f"`{' '.join(command)}` failed with exit status {installed.returncode}.")
+    device = DeviceIdentityStore(device_identity_path()).ensure()
+    try:
+        replacement = manager.replace(
+            executable=executable,
+            api_url=environment["MEMFORGE_API_URL"],
+            api_token=environment.get("MEMFORGE_API_TOKEN"),
+            edition=environment.get("MEMFORGE_EDITION"),
+        )
+    except DaemonServiceError as exc:
+        raise click.ClickException(str(exc)) from exc
+    daemon_status = _wait_for_local_agent_online(
+        client,
+        device_id=device.device_id,
+        after_last_seen_at=(_reported_device(status, device.device_id) or {}).get("last_seen_at"),
+    )
+    if daemon_status.get("fresh") is not True or daemon_status.get("version") != version:
+        restore_command = method.install_command(previous_version)
+        reinstalled = subprocess.run(restore_command, check=False)
+        if reinstalled.returncode == 0:
+            reinstall_outcome = f"MemForge {previous_version} was installed again"
+        else:
+            reinstall_outcome = (
+                f"`{' '.join(restore_command)}` failed with exit status {reinstalled.returncode}, "
+                f"so MemForge {version} stays installed"
+            )
+        try:
+            replacement.rollback()
+        except DaemonServiceError as rollback_error:
+            raise click.ClickException(
+                f"The daemon did not report MemForge {version} after the restart; {reinstall_outcome}, "
+                f"and its service could not be restored: {rollback_error}"
+            ) from rollback_error
+        raise click.ClickException(
+            f"The daemon did not report MemForge {version} after the restart; {reinstall_outcome}, "
+            "and its service was restored. Run `memforge daemon logs`."
+        )
+    try:
+        replacement.commit()
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"Could not commit the daemon restart: {exc}") from exc
+    _emit_tool_payload(ctx, {"ok": True, "version": version, "upgraded": True, "install_method": method.name})
 
 
 @cli.command("setup")
@@ -1990,10 +1752,16 @@ def _wait_for_local_agent_online(
 @click.option(
     "--token-env", default="MEMFORGE_API_TOKEN", show_default=True, help="Environment variable holding the token."
 )
+@click.option("--device-name", default=None, help="Name of this computer in MemForge. Defaults to its host name.")
 @click.pass_context
-def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str):
-    """Configure a target and install the local daemon user service."""
+def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: str, device_name: str | None):
+    """Configure a target, name this device and install the local daemon user service.
+
+    The device takes its new name once the setup is committed; a setup that
+    is rolled back leaves the device as it was named.
+    """
     from memforge.api_target import Edition
+    from memforge.local_agent.device_identity import DeviceIdentityStore, checked_device_name, device_identity_path
     from memforge.local_agent.service import DaemonServiceError
 
     cli_config_path = _cli_config_path()
@@ -2033,6 +1801,12 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
     if health.get("error"):
         _emit_tool_payload(ctx, health)
         return
+    identities = DeviceIdentityStore(device_identity_path())
+    try:
+        new_device_name = checked_device_name(device_name)
+        device = identities.ensure()
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     try:
         replacement = manager.replace(
             executable=_current_cli_executable(),
@@ -2056,7 +1830,8 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
 
     daemon_status = _wait_for_local_agent_online(
         client,
-        after_last_seen_at=baseline_status.get("last_seen_at"),
+        device_id=device.device_id,
+        after_last_seen_at=(_reported_device(baseline_status, device.device_id) or {}).get("last_seen_at"),
     )
     if daemon_status.get("status") != "online" or daemon_status.get("fresh") is not True:
         try:
@@ -2104,6 +1879,7 @@ def setup_command(ctx, api_url: str | None, target_name: str | None, token_env: 
         if recovery_errors:
             detail += "; " + "; ".join(recovery_errors)
         raise click.ClickException(detail) from commit_error
+    identities.ensure(new_device_name)
     payload: dict[str, Any] = {
         "ok": True,
         "target": {
@@ -2435,6 +2211,63 @@ def sources():
     pass
 
 
+@cli.group("source")
+def source_group():
+    """Manage one Source on this device."""
+
+
+@source_group.group("credentials")
+def source_credentials():
+    """The provider credentials this device holds for a device Source."""
+
+
+@source_credentials.command("set")
+@click.argument("source_id")
+@click.pass_context
+def source_credentials_set(ctx, source_id: str):
+    """Store a device Source's secrets in this device's keyring, prompting for each secret field of its form."""
+    from memforge.local_agent.credential_check import signs_in_with_browser_session
+    from memforge.local_agent.device_credentials import device_credentials
+    from memforge.local_agent.device_identity import DeviceIdentityStore, device_identity_path
+    from memforge.local_agent.device_sources import SIGN_IN_INSTRUCTION, credential_fields
+    from memforge.local_agent.service import DaemonServiceError
+
+    try:
+        daemon_client = _daemon_client(_daemon_service_manager())
+        status = daemon_client.get_local_agent_status()
+    except DaemonServiceError as exc:
+        raise click.ClickException(f"{exc} Run `memforge setup` first.") from exc
+    if status.get("error"):
+        _emit_tool_payload(ctx, status)
+        return
+    source = next((entry for entry in status.get("sources") or () if entry.get("id") == source_id), None)
+    if source is None:
+        raise click.ClickException(
+            f"Source {source_id} is not one of your Sources that run on your computer. "
+            "Choose My computer under Where it runs in its Configure page first."
+        )
+    identity = DeviceIdentityStore(device_identity_path()).load()
+    if identity is None or source.get("execution_device_id") != identity.device_id:
+        raise click.ClickException(
+            f"Source {source_id} runs on another of your devices. Store its credentials there, or choose this "
+            "device under Where it runs in its Configure page first."
+        )
+    source_type = str(source["type"])
+    config = dict(source.get("config") or {})
+    if signs_in_with_browser_session(source_type, config):
+        raise click.ClickException(f"Source {source_id} signs in with a browser session. {SIGN_IN_INSTRUCTION}.")
+    secrets: dict[str, str] = {}
+    for field in credential_fields(source_type, config):
+        value = click.prompt(field.label, hide_input=True, default="" if not field.required else None)
+        if value:
+            secrets[field.key] = value
+    try:
+        device_credentials(daemon_client.target.origin).set(source_id, secrets)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    _emit_tool_payload(ctx, {"ok": True, "source_id": source_id, "fields": sorted(secrets)})
+
+
 @sources.command("list")
 @_workspace_id_option
 @click.pass_context
@@ -2763,7 +2596,6 @@ def adapter_list(ctx):
             "data": [
                 {"type": "jira", "auth": "browser_session"},
                 {"type": "kb", "kind": "markdown"},
-                {"type": "github", "kind": "repository"},
                 {"type": "teams", "auth": "browser_session", "kind": "conversation"},
             ]
         },
@@ -2780,10 +2612,6 @@ def adapter_status(ctx):
             "status": "available",
             "capabilities": [
                 "jira.browser_session",
-                "kb.markdown_preview",
-                "kb.markdown_push",
-                "github.repo_preview",
-                "github.repo_push",
                 "teams.auth",
                 "teams.browse",
                 "teams.sync",
@@ -3065,339 +2893,6 @@ def _run_local_agent_daemon(
         daemon_lock.close()
 
 
-@dataclass(frozen=True)
-class _GitHubTransferResult:
-    """Body-free receipt and byte accounting for one document transfer."""
-
-    receipt: dict[str, Any]
-    prepared_bytes: int | None = None
-    submitted_bytes: int | None = None
-
-
-def _push_github_source_entry(
-    entry: dict[str, Any],
-    *,
-    repo: dict[str, str],
-    ref: str,
-    commit_sha: str,
-    source_id: str,
-    client: ToolClient,
-    sync_snapshot_id: str | None,
-    local_agent_job_id: str | None,
-    local_agent_attempt_count: int | None,
-    submitted_by: str | None,
-    on_body_ready: Callable[[], None],
-) -> _GitHubTransferResult:
-    """Own a single body's lifetime through validation and synchronous upload."""
-
-    relative_path = str(entry["relative_path"])
-    content_type = str(entry.get("content_type") or "text/plain")
-    blob_sha = str(entry.get("blob_sha") or "")
-    is_source_artifact = content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES
-    try:
-        if github_content_type_is_binary(content_type) and not is_source_artifact:
-            raise click.ClickException(f"unsupported binary media type: {content_type}")
-        if is_source_artifact:
-            declared_size = entry.get("bytes")
-            if not isinstance(declared_size, int) or isinstance(declared_size, bool) or declared_size < 0:
-                raise click.ClickException("GitHub tree did not return a valid blob size")
-            if declared_size > MAX_SOURCE_ARTIFACT_STORAGE_BYTES:
-                raise click.ClickException("Source Artifact exceeds storage limit")
-        raw = (
-            _github_blob(repo, blob_sha, relative_path)
-            if is_source_artifact
-            else _github_text_blob(repo, blob_sha, relative_path, size=entry.get("bytes"))
-        )
-        if is_source_artifact and len(raw) != declared_size:
-            raise click.ClickException("GitHub blob size changed after tree discovery")
-        text_body = "" if is_source_artifact else decode_github_text(raw, label=relative_path)
-        last_commit_at = _github_last_commit_at(
-            repo,
-            commit_sha=commit_sha,
-            relative_path=relative_path,
-            resolved_relative_path=entry.get("resolved_relative_path"),
-        )
-    except ValueError as exc:
-        return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
-    except click.ClickException as exc:
-        return _GitHubTransferResult({"relative_path": relative_path, "error": str(exc)})
-
-    body_bytes = len(raw)
-    raw_hash = hashlib.sha256(raw).hexdigest()
-    on_body_ready()
-    artifact_input_hashes: list[str] = []
-    if is_source_artifact:
-        artifact_response = client.push_source_artifact(
-            source_id=source_id,
-            source_unit_key=relative_path,
-            provider_key=relative_path,
-            provider_revision=blob_sha,
-            parent_observation_type="file_content",
-            parent_provider_key="content",
-            filename=Path(relative_path).name,
-            media_type=content_type,
-            content=raw,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-        )
-        _raise_if_local_agent_lease_not_current(artifact_response)
-        input_hash = str(artifact_response.get("input_sha256") or "").strip()
-        if artifact_response.get("error") or len(input_hash) != 64:
-            return _GitHubTransferResult(
-                {
-                    "relative_path": relative_path,
-                    "error": artifact_response.get("error") or "Source Artifact upload failed",
-                    "detail": artifact_response.get("detail"),
-                    "status_code": artifact_response.get("status_code"),
-                },
-                prepared_bytes=body_bytes,
-            )
-        artifact_input_hashes.append(input_hash)
-    response = client.push_github_repo_document(
-        source_id=source_id,
-        repo_url=repo["repo_url"],
-        repo_ref=ref,
-        relative_path=relative_path,
-        markdown_body=text_body,
-        content_type=content_type,
-        title=relative_path if is_source_artifact else _github_title(text_body, relative_path),
-        raw_hash=raw_hash,
-        blob_sha=blob_sha,
-        symlink_chain=(
-            [dict(item) for item in entry.get("symlink_chain", [])]
-            if isinstance(entry.get("symlink_chain"), list)
-            else None
-        ),
-        resolved_relative_path=(
-            str(entry.get("resolved_relative_path") or "").strip() or None
-        ),
-        source_updated_at=last_commit_at,
-        sync_snapshot_id=sync_snapshot_id,
-        local_agent_job_id=local_agent_job_id,
-        local_agent_attempt_count=local_agent_attempt_count,
-        artifact_source_unit_key=relative_path if artifact_input_hashes else None,
-        artifact_input_hashes=artifact_input_hashes,
-        submitted_by=submitted_by,
-    )
-    _raise_if_local_agent_lease_not_current(response)
-    if response.get("error"):
-        receipt = {
-            "relative_path": relative_path,
-            "error": response["error"],
-            "detail": response.get("detail"),
-            "status_code": response.get("status_code"),
-        }
-    else:
-        receipt = {
-            "relative_path": relative_path,
-            "doc_id": response.get("doc_id"),
-            "document_hash": response.get("document_hash"),
-        }
-    return _GitHubTransferResult(receipt, prepared_bytes=body_bytes, submitted_bytes=body_bytes)
-
-
-def _push_github_profile_to_source(
-    name: str,
-    profile: dict[str, Any],
-    *,
-    source_id: str,
-    limit: int,
-    force_full_sync: bool,
-    submitted_by: str | None,
-    client: ToolClient,
-    sync_snapshot_id: str | None = None,
-    local_agent_job_id: str | None = None,
-    local_agent_attempt_count: int | None = None,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    started_at = time.perf_counter()
-    source_id = source_id.strip()
-    if not source_id:
-        raise click.ClickException("source_id is required")
-    if limit and sync_snapshot_id:
-        raise ValueError("limited collection cannot finalize a fenced source snapshot")
-
-    repo, ref, _include_paths, _exclude_paths, _include_extensions = _resolve_github_profile(name, profile)
-    preview = _preview_github_profile(name, profile, limit=None if limit == 0 else max(limit, 0))
-    selected_entries = list(preview["items"])
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="discovering",
-            completed=len(selected_entries),
-            unit="file",
-        ),
-    )
-
-    manifest_items: list[dict[str, str]] = []
-    entries_by_doc_id: dict[str, dict[str, Any]] = {}
-    revisions_complete = True
-    for entry in selected_entries:
-        relative_path = str(entry["relative_path"])
-        try:
-            validate_github_file_mode(entry.get("file_mode"), label=relative_path)
-        except ValueError as exc:
-            raise click.ClickException(str(exc)) from exc
-        revision = str(entry.get("blob_sha") or "").strip()
-        if not revision:
-            revisions_complete = False
-        doc_id = build_github_repo_doc_id(
-            source_id=source_id,
-            repo_url=repo["repo_url"],
-            repo_ref=ref,
-            relative_path=relative_path,
-        )
-        manifest_items.append({"doc_id": doc_id, "revision": revision, "change_kind": "upsert"})
-        entries_by_doc_id[doc_id] = entry
-
-    required_doc_ids = set(entries_by_doc_id)
-    comparison_started_at = time.perf_counter()
-    fallback_reason: str | None = None
-    if (
-        not limit
-        and revisions_complete
-        and sync_snapshot_id
-        and local_agent_job_id
-        and local_agent_attempt_count is not None
-    ):
-        try:
-            required_doc_ids = _plan_local_source_manifest(
-                client,
-                source_id=source_id,
-                items=manifest_items,
-                coverage="complete_snapshot",
-                known_doc_ids=set(entries_by_doc_id),
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=local_agent_job_id,
-                local_agent_attempt_count=local_agent_attempt_count,
-            ).required_doc_ids
-        except RuntimeError as exc:
-            return {
-                "profile": name,
-                "repo_url": repo["repo_url"],
-                "ref": ref,
-                "source_id": source_id,
-                "counts": {
-                    "selected": len(selected_entries),
-                    "reused": 0,
-                    "fetched": 0,
-                    "pushed": 0,
-                    "failed": 0,
-                },
-                "error": str(exc),
-                "retryable": True,
-            }
-    elif not revisions_complete:
-        fallback_reason = "missing_provider_revision"
-    comparison_latency_ms = round(
-        (time.perf_counter() - comparison_started_at) * 1000,
-        3,
-    )
-
-    entries_to_fetch = [entry for doc_id, entry in entries_by_doc_id.items() if doc_id in required_doc_ids]
-    pushed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    fetched_count = submitted_count = 0
-    read_body_bytes = uploaded_body_bytes = 0
-
-    def report_transfer_phase(phase: str, completed: int) -> None:
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase=phase,
-                completed=completed,
-                total=len(entries_to_fetch),
-                unit="file",
-                failed=len(failed),
-            ),
-        )
-
-    report_transfer_phase("fetching", 0)
-    for index, entry in enumerate(entries_to_fetch, start=1):
-        if index > 1:
-            report_transfer_phase("fetching", index - 1)
-
-        def body_ready() -> None:
-            report_transfer_phase("fetching", index)
-            report_transfer_phase("uploading", index - 1)
-
-        transfer = _push_github_source_entry(
-            entry,
-            repo=repo,
-            ref=ref,
-            commit_sha=str(preview["commit_sha"]),
-            source_id=source_id,
-            client=client,
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-            submitted_by=submitted_by,
-            on_body_ready=body_ready,
-        )
-        if transfer.prepared_bytes is not None:
-            fetched_count += 1
-            read_body_bytes += transfer.prepared_bytes
-        if transfer.submitted_bytes is not None:
-            submitted_count += 1
-            uploaded_body_bytes += transfer.submitted_bytes
-        if transfer.receipt.get("error"):
-            failed.append(transfer.receipt)
-        else:
-            pushed.append(transfer.receipt)
-        report_transfer_phase(
-            "uploading" if transfer.prepared_bytes is not None else "fetching",
-            index,
-        )
-
-    payload = {
-        "profile": name,
-        "repo_url": repo["repo_url"],
-        "ref": ref,
-        "source_id": source_id,
-        "counts": {
-            "selected": len(selected_entries),
-            "reused": len(selected_entries) - len(entries_to_fetch),
-            "fetched": fetched_count,
-            "pushed": len(pushed),
-            "failed": len(failed),
-        },
-        "pushed": pushed,
-        "failed": failed,
-        "metrics": {
-            "manifest_items": len(manifest_items),
-            "full_bodies_read": fetched_count,
-            "full_bodies_uploaded": submitted_count,
-            "bytes_read": read_body_bytes,
-            "bytes_uploaded": uploaded_body_bytes,
-            "comparison_latency_ms": comparison_latency_ms,
-            "end_to_end_latency_ms": round(
-                (time.perf_counter() - started_at) * 1000,
-                3,
-            ),
-            "fallback_reason": fallback_reason,
-        },
-    }
-    if failed:
-        examples = "; ".join(f"{item.get('relative_path')}: {item.get('error')}" for item in failed[:3])
-        payload["error"] = f"{len(failed)} document(s) failed to push" + (f": {examples}" if examples else "")
-    if not failed:
-        sync_result = client.start_source_processing(
-            source_id=source_id,
-            force_full_sync=force_full_sync,
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-        )
-        payload["sync_started"] = not bool(sync_result.get("error"))
-        payload.update(source_processing_receipt(sync_result))
-        if sync_result.get("error"):
-            payload["error"] = "source processing failed to start"
-            payload["sync_error"] = sync_result
-    if payload.get("error"):
-        payload["retryable"] = True
-    return payload
-
-
 def _run_cloud_local_agent_job(
     job: dict[str, Any],
     client: ToolClient,
@@ -3405,15 +2900,12 @@ def _run_cloud_local_agent_job(
     browser: str | None = None,
     report_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    from memforge.local_agent.document_acquisition import DOCUMENT_ACQUISITION_OPERATION
+
     operation = str(job.get("operation") or "").strip()
     handlers = {
-        "github_repo_preview_tree": lambda: _run_cloud_github_preview_job(job),
-        "github_repo_sync": lambda: _run_cloud_github_sync_job(job, client, report_progress=report_progress),
         "local_markdown_pick_root": lambda: _run_cloud_pick_root_job(job),
-        "local_markdown_preview_tree": lambda: _run_cloud_local_markdown_preview_job(job),
-        "local_markdown_sync": lambda: _run_cloud_local_markdown_sync_job(job, client, report_progress=report_progress),
-        "jira_auth": lambda: _run_cloud_jira_auth_job(job, client, browser=browser),
-        "jira_sync": lambda: _run_cloud_jira_sync_job(job, client, browser=browser, report_progress=report_progress),
+        "credential_check": lambda: _run_cloud_credential_check_job(job, client, browser=browser),
         "teams_auth_check": lambda: _run_cloud_teams_auth_check_job(job),
         "teams_auth": lambda: _run_cloud_teams_auth_job(job),
         "teams_browse": lambda: _run_cloud_teams_browse_job(job),
@@ -3421,6 +2913,9 @@ def _run_cloud_local_agent_job(
             job,
             client,
             report_progress=report_progress,
+        ),
+        DOCUMENT_ACQUISITION_OPERATION: lambda: _run_cloud_document_acquisition_job(
+            job, client, report_progress=report_progress
         ),
     }
     handler = handlers.get(operation)
@@ -3432,86 +2927,246 @@ def _run_cloud_local_agent_job(
     return handler()
 
 
+class _ClientAcquisitionTransport:
+    """Hands one job attempt's acquisition to the server through the API client."""
+
+    def __init__(self, client: ToolClient, *, source_id: str, job_id: str, attempt_count: int) -> None:
+        self._client = client
+        self._source_id = source_id
+        self._job_id = job_id
+        self._attempt_count = attempt_count
+        self._manifest_sha256 = ""
+
+    def _checked(self, response: dict[str, Any], what: str) -> dict[str, Any]:
+        _raise_if_local_agent_lease_not_current(response)
+        if response.get("error"):
+            raise RuntimeError(f"{what} failed: {response.get('detail') or response.get('error')}")
+        return response
+
+    async def submit_manifest(self, manifest: AcquisitionManifest) -> AcquisitionRequests:
+        from memforge.local_agent.document_acquisition import AcquisitionRequests
+
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.submit_acquisition_manifest,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                manifest=manifest.to_payload(),
+            ),
+            "submitting the acquisition manifest",
+        )
+        self._manifest_sha256 = str(response["manifest_sha256"])
+        return AcquisitionRequests.from_payload(response.get("requests") or {})
+
+    async def stored_extras(self, item_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.read_acquisition_stored_extras,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                item_ids=list(item_ids),
+            ),
+            "reading the stored extras",
+        )
+        return {str(item_id): dict(extra) for item_id, extra in (response.get("stored_extras") or {}).items()}
+
+    async def upload_artifact(self, item: ContentItem, artifact: RawSourceArtifact, body: bytes) -> str:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.push_source_artifact,
+                source_id=self._source_id,
+                source_unit_key=item.item_id,
+                provider_key=artifact.provider_key,
+                provider_revision=artifact.provider_revision,
+                parent_observation_type=artifact.parent_observation_type,
+                parent_provider_key=artifact.parent_provider_key,
+                filename=artifact.filename,
+                media_type=artifact.media_type,
+                content=body,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+            ),
+            f"uploading artifact {artifact.provider_key}",
+        )
+        return str(response["input_sha256"])
+
+    async def held_bodies(self, body_sha256s: Sequence[str]) -> set[str]:
+        response = self._checked(
+            await asyncio.to_thread(
+                self._client.read_held_acquired_bodies,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                body_sha256s=list(body_sha256s),
+            ),
+            "asking which bodies the server holds",
+        )
+        return {str(digest) for digest in response.get("held") or ()}
+
+    async def upload_input(self, package: AcquiredInputPackage, body: bytes | None) -> None:
+        from memforge.local_agent.document_acquisition import ACQUIRED_BODY_REQUIRED, AcquiredBodyRequired
+
+        response = await asyncio.to_thread(
+            self._client.upload_acquired_input,
+            source_id=self._source_id,
+            local_agent_job_id=self._job_id,
+            local_agent_attempt_count=self._attempt_count,
+            package=package.to_payload(),
+            body=body,
+        )
+        if response.get("status_code") == HTTPStatus.CONFLICT and response.get("detail") == ACQUIRED_BODY_REQUIRED:
+            raise AcquiredBodyRequired(package.body_sha256)
+        self._checked(response, f"uploading the acquired input of {package.item.item_id}")
+
+    async def submit_answers(self, answers: AcquisitionAnswers) -> None:
+        self._checked(
+            await asyncio.to_thread(
+                self._client.submit_acquisition_answers,
+                source_id=self._source_id,
+                local_agent_job_id=self._job_id,
+                local_agent_attempt_count=self._attempt_count,
+                manifest_sha256=self._manifest_sha256,
+                answers=answers.to_payload(),
+            ),
+            "submitting the acquisition answers",
+        )
+
+
+def _run_cloud_document_acquisition_job(
+    job: dict[str, Any],
+    client: ToolClient,
+    *,
+    report_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Acquire one document Source's run with its type's own Gene, then ask the server to process it.
+
+    The Gene runs with the credentials this device holds for the Source, and
+    a browser session is checked against the provider before anything is
+    read. A missing credential or a refused session fails the job without a
+    retry, because only the owner can renew it. A manifest above the bound
+    every device manifest has fails the job with the count, and does not
+    retry either: the same scope is as large next time.
+    """
+
+    from memforge.genes import gene_class
+    from memforge.llm.structured import failure_retryable
+    from memforge.local_agent.acquisition_daemon import acquire_document_source
+    from memforge.local_agent.device_credentials import check_browser_session, device_credentials
+    from memforge.local_agent.document_acquisition import CONFIG_PAYLOAD_FIELD
+    from memforge.local_agent.runner import CloudJobLeaseLost
+    from memforge.source_types import source_type_descriptor
+
+    operation = str(job.get("operation") or "").strip()
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    source_id, client, error = _local_agent_job_source_client(job, payload, operation=operation, client=client)
+    if error:
+        return error
+    source_type = str(payload.get("source_type") or job.get("source_type") or "")
+    job_id = str(job["job_id"])
+    attempt_count = int(job["attempt_count"])
+    gene_cls = gene_class(source_type)
+    descriptor = source_type_descriptor(source_type)
+    credentials = device_credentials(client.target.origin)
+
+    def open_gene(config: Mapping[str, Any]) -> Any:
+        return gene_cls(config=credentials.gene_config(source_id, source_type, config), source_id=source_id)
+
+    async def acquire() -> Any:
+        await check_browser_session(
+            source_type,
+            credentials.gene_config(source_id, source_type, payload.get(CONFIG_PAYLOAD_FIELD) or {}),
+        )
+        return await acquire_document_source(
+            payload,
+            open_gene=open_gene,
+            transport=_ClientAcquisitionTransport(client, source_id=source_id, job_id=job_id, attempt_count=attempt_count),
+            exports_pdf=bool(descriptor and descriptor.exports_pdf),
+        )
+
+    _report_local_agent_progress(report_progress, _sync_progress_snapshot(phase="connecting"))
+    try:
+        summary = asyncio.run(acquire())
+    except CloudJobLeaseLost:
+        raise
+    except Exception as exc:
+        return {
+            "operation": operation,
+            "source_id": source_id,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "retryable": failure_retryable(exc),
+        }
+    sync_result = client.start_source_processing(
+        source_id=source_id,
+        local_agent_job_id=job_id,
+        local_agent_attempt_count=attempt_count,
+    )
+    _raise_if_local_agent_lease_not_current(sync_result)
+    result: dict[str, Any] = {
+        "operation": operation,
+        "source_id": source_id,
+        "counts": {"discovered": summary.discovered, "uploaded": summary.uploaded, "failed": summary.failed},
+        "sync_started": not bool(sync_result.get("error")),
+        **source_processing_receipt(sync_result),
+    }
+    if sync_result.get("error"):
+        result.update({"error": "source sync failed to start", "sync_error": sync_result, "retryable": True})
+    return result
+
+
 def _setup_result(result: LocalSetupJobResult) -> dict[str, Any]:
     """Complete a setup job with every field its model declares, null where the handler set none."""
     return result.model_dump()
 
 
-def _run_cloud_jira_auth_job(
+def _run_cloud_credential_check_job(
     job: dict[str, Any],
     client: ToolClient,
     *,
     browser: str | None,
 ) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
+    from memforge.genes import gene_class
+    from memforge.local_agent.credential_check import CREDENTIAL_CHECK_OPERATION, run_credential_check
+    from memforge.local_agent.device_credentials import device_credentials
+
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
+    source_type = str(payload.get("source_type") or "")
+    _source_id, scoped_client, error = _local_agent_job_source_client(
+        job, payload, operation=CREDENTIAL_CHECK_OPERATION, client=client
     )
     if error:
-        return _setup_result(JiraAuthResult(**error, retryable=False))
-
-    try:
-        from memforge.auth.jira_capture import capture_and_prevalidate
-
-        session_config = _jira_cloud_config_from_job_payload(payload)
-        captured = asyncio.run(
-            capture_and_prevalidate(
-                str(session_config["base_url"]),
-                browser=browser,
-                tls_config=session_config,
-                interactive=True,
-            )
+        return _setup_result(CredentialCheckResult(**error, retryable=False))
+    result = asyncio.run(
+        run_credential_check(
+            payload,
+            credentials=device_credentials(client.target.origin),
+            open_gene=lambda source_id, config: gene_class(source_type)(config=dict(config), source_id=source_id),
+            upload_session=lambda provider, captured: scoped_client.upload_browser_session(
+                provider=provider,
+                base_url=captured.origin,
+                cookie_header=captured.cookie_header,
+                browser=captured.browser,
+            ),
+            browser=browser,
         )
-        uploaded_session = client.upload_jira_session(
-            base_url=captured.origin,
-            cookie_header=captured.cookie_header,
-            browser=captured.browser,
-        )
-        if _is_jira_principal_change(uploaded_session):
-            return _setup_result(
-                JiraAuthResult(
-                    operation=operation,
-                    source_id=source_id,
-                    **_principal_change_payload(uploaded_session),
-                    error_type="JiraPrincipalChangedError",
-                    retryable=False,
-                )
-            )
-        if uploaded_session.get("error"):
-            return _setup_result(
-                JiraAuthResult(
-                    operation=operation,
-                    source_id=source_id,
-                    error="Unable to store the renewed Jira browser session",
-                    error_type="JiraSessionUploadError",
-                    retryable=False,
-                )
-            )
-    except Exception as exc:
-        return _setup_result(
-            JiraAuthResult(
-                operation=operation,
-                source_id=source_id,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                retryable=False,
-            )
-        )
-
-    return _setup_result(
-        JiraAuthResult(operation=operation, source_id=source_id, authenticated=True, origin=captured.origin)
     )
+    return _setup_result(result)
 
 
 def _local_agent_lease_not_current(response: object) -> bool:
+    """Whether the server answered that the attempt is no longer this device's.
+
+    A submission under an acquisition contract the server no longer has
+    queues the job again, so it ends the attempt as a lost lease does.
+    """
+    from memforge.local_agent.source_contract import ACQUISITION_CONTRACT_CHANGED
+
     return (
         isinstance(response, dict)
         and response.get("status_code") == HTTPStatus.CONFLICT
-        and response.get("detail") == LOCAL_AGENT_LEASE_NOT_CURRENT
+        and response.get("detail") in {LOCAL_AGENT_LEASE_NOT_CURRENT, ACQUISITION_CONTRACT_CHANGED}
     )
 
 
@@ -3520,127 +3175,7 @@ def _raise_if_local_agent_lease_not_current(response: object) -> None:
         return
     from memforge.local_agent.runner import CloudJobLeaseLost
 
-    raise CloudJobLeaseLost(LOCAL_AGENT_LEASE_NOT_CURRENT)
-
-
-@dataclass(frozen=True)
-class _LocalSourceManifestPlan:
-    """The server's answer to one fenced manifest.
-
-    ``required_doc_ids`` are the items whose bodies the agent uploads.
-    ``confirm`` names the unlisted items, as ``{"doc_id", "provider_key"}``,
-    that the agent confirms by identifier before it asks for processing,
-    bound to the manifest by ``manifest_sha256``.
-    """
-
-    required_doc_ids: set[str]
-    manifest_sha256: str
-    confirm: tuple[dict[str, str], ...]
-
-
-def _plan_local_source_manifest(
-    client: ToolClient,
-    *,
-    source_id: str,
-    items: list[dict[str, str]],
-    coverage: str,
-    known_doc_ids: set[str],
-    sync_snapshot_id: str,
-    local_agent_job_id: str,
-    local_agent_attempt_count: int,
-    excluded_listings: list[dict[str, Any]] | None = None,
-) -> _LocalSourceManifestPlan:
-    """Plan one fenced collection and validate the returned materialization and confirmation sets."""
-    plan = client.prepare_local_source_snapshot(
-        source_id=source_id,
-        items=items,
-        coverage=coverage,
-        sync_snapshot_id=sync_snapshot_id,
-        local_agent_job_id=local_agent_job_id,
-        local_agent_attempt_count=local_agent_attempt_count,
-        excluded_listings=excluded_listings,
-    )
-    _raise_if_local_agent_lease_not_current(plan)
-    if plan.get("error"):
-        raise RuntimeError("source manifest comparison failed")
-    required_doc_ids = {
-        str(doc_id)
-        for doc_id in plan.get("required_doc_ids", [])
-        if str(doc_id)
-    }
-    if required_doc_ids - known_doc_ids:
-        raise RuntimeError("source manifest comparison returned unknown document identities")
-    confirm = tuple(
-        {"doc_id": str(entry.get("doc_id") or ""), "provider_key": str(entry.get("provider_key") or "")}
-        for entry in plan.get("confirm") or []
-        if isinstance(entry, dict)
-    )
-    if any(not entry["doc_id"] or not entry["provider_key"] for entry in confirm):
-        raise RuntimeError("source manifest comparison returned an incomplete confirmation")
-    if {entry["doc_id"] for entry in confirm} & known_doc_ids:
-        raise RuntimeError("source manifest comparison asked to confirm a listed document")
-    return _LocalSourceManifestPlan(
-        required_doc_ids=required_doc_ids,
-        manifest_sha256=str(plan.get("manifest_sha256") or ""),
-        confirm=confirm,
-    )
-
-
-def _run_cloud_github_preview_job(job: dict[str, Any]) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    profile = _github_profile_from_cloud_job(job)
-    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-
-    limit = _cloud_job_limit(payload.get("limit"), default=200)
-    tree_profile = {**profile, "include_paths": [], "exclude_paths": []}
-    preview = _preview_github_profile(profile_name, tree_profile, limit=limit)
-    return _setup_result(GitHubRepoPreviewTreeResult(operation=operation, source_id=source_id, **preview))
-
-
-def _run_cloud_github_sync_job(
-    job: dict[str, Any],
-    client: ToolClient,
-    *,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    profile = _github_profile_from_cloud_job(job)
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
-    )
-    if error:
-        return error
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-    result = _push_github_profile_to_source(
-        profile_name,
-        profile,
-        source_id=source_id,
-        limit=0,
-        force_full_sync=bool(payload.get("force_full_sync", False)),
-        submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-        client=client,
-        sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
-        local_agent_job_id=str(job["job_id"]),
-        local_agent_attempt_count=int(job["attempt_count"]),
-        report_progress=report_progress,
-    )
-    return {"operation": operation, **result}
-
-
-def _run_cloud_local_markdown_preview_job(job: dict[str, Any]) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id = str(job.get("source_id") or payload.get("source_id") or "").strip()
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-    profile = _kb_profile_from_cloud_job(job)
-    preview = _preview_kb_profile(profile_name, profile, limit=_cloud_job_limit(payload.get("limit"), default=200))
-    return _setup_result(LocalMarkdownPreviewTreeResult(operation=operation, source_id=source_id, **preview))
+    raise CloudJobLeaseLost(str(response["detail"]))  # type: ignore[index]
 
 
 def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -3656,223 +3191,6 @@ def _run_cloud_pick_root_job(job: dict[str, Any]) -> dict[str, Any]:
     except FolderPickerUnavailable as exc:
         return _setup_result(LocalMarkdownPickRootResult(operation=operation, error=str(exc)))
     return _setup_result(LocalMarkdownPickRootResult(operation=operation, root=root))
-
-
-def _run_cloud_local_markdown_sync_job(
-    job: dict[str, Any],
-    client: ToolClient,
-    *,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
-    )
-    if error:
-        return error
-    profile_name = f"cloud-job:{job.get('job_id') or operation or 'unknown'}"
-    result = _push_kb_profile_to_source(
-        profile_name,
-        _kb_profile_from_cloud_job(job),
-        source_id=source_id,
-        limit=0,
-        force_full_sync=bool(payload.get("force_full_sync", False)),
-        submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-        client=client,
-        sync_snapshot_id=local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count")),
-        local_agent_job_id=str(job["job_id"]),
-        local_agent_attempt_count=int(job["attempt_count"]),
-        report_progress=report_progress,
-    )
-    return {"operation": operation, **result}
-
-
-def _run_cloud_jira_sync_job(
-    job: dict[str, Any],
-    client: ToolClient,
-    *,
-    browser: str | None,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    operation = str(job.get("operation") or "").strip()
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    source_id, client, error = _local_agent_job_source_client(
-        job,
-        payload,
-        operation=operation,
-        client=client,
-    )
-    if error:
-        return error
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(phase="connecting"),
-    )
-    try:
-        from memforge.auth.jira_capture import capture_and_prevalidate
-        from memforge.genes.jira_gene import JiraGene
-        from memforge.genes.toolkit.config import validate_bool_fields
-
-        session_config = _jira_cloud_config_from_job_payload(payload)
-        # A configuration no run can use fails before the browser session is captured.
-        validate_bool_fields(session_config, JiraGene.config_schema().fields)
-        base_url = str(session_config["base_url"])
-        captured = asyncio.run(
-            capture_and_prevalidate(
-                base_url,
-                browser=browser,
-                tls_config=session_config,
-            )
-        )
-        uploaded_session = client.upload_jira_session(
-            base_url=captured.origin,
-            cookie_header=captured.cookie_header,
-            browser=captured.browser,
-        )
-        if _is_jira_principal_change(uploaded_session):
-            principal_change = _principal_change_payload(uploaded_session)
-            return {
-                "operation": operation,
-                "source_id": source_id,
-                **principal_change,
-                "error_type": "JiraPrincipalChangedError",
-                "retryable": False,
-            }
-        if uploaded_session.get("error"):
-            return {
-                "operation": operation,
-                "source_id": source_id,
-                "error": "Unable to store the renewed Jira browser session",
-                "error_type": "JiraSessionUploadError",
-                "retryable": True,
-            }
-        sync_snapshot_id = local_agent_sync_snapshot_id(job.get("job_id"), job.get("attempt_count"))
-        collection = asyncio.run(
-            _collect_jira_documents_from_cloud_job(
-                job,
-                source_id=source_id,
-                jira_cookie=captured.cookie_header,
-                client=client,
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=str(job["job_id"]),
-                local_agent_attempt_count=int(job["attempt_count"]),
-                limit=0,
-                report_progress=report_progress,
-            )
-        )
-    except Exception as exc:
-        from memforge.auth.jira_auth import JiraAuthSessionMissingError
-        from memforge.genes.base import SourceConfigurationError
-
-        return {
-            "operation": operation,
-            "source_id": source_id,
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            # A configuration Jira cannot run, such as an odd boolean or a JQL it
-            # rejects, fails every attempt alike.
-            "retryable": not isinstance(exc, (JiraAuthSessionMissingError, SourceConfigurationError)),
-        }
-
-    pushed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-    scoped_client = client
-    documents = collection["documents"]
-    sync_result: dict[str, Any] | None = None
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="uploading",
-            completed=0,
-            total=len(documents),
-            unit="issue",
-        ),
-    )
-    for index, doc in enumerate(documents, start=1):
-        artifact_input_hashes = [str(value) for value in doc.get("artifact_input_hashes", []) if str(value).strip()]
-        response = scoped_client.push_jira_package(
-            source_id=source_id,
-            base_url=str(doc["base_url"]),
-            issue_key=str(doc["issue_key"]),
-            source_url=str(doc["source_url"]),
-            raw_payload=doc.get("raw_payload") if isinstance(doc.get("raw_payload"), dict) else {},
-            title=str(doc["title"]),
-            raw_hash=str(doc["raw_hash"]),
-            provider_revision=str(doc["provider_revision"]),
-            submitted_by=str(payload.get("submitted_by") or "memforge-local-agent"),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=str(job["job_id"]),
-            local_agent_attempt_count=int(job["attempt_count"]),
-            artifact_source_unit_key=(str(doc["issue_key"]) if artifact_input_hashes else None),
-            artifact_input_hashes=artifact_input_hashes,
-        )
-        _raise_if_local_agent_lease_not_current(response)
-        if isinstance(response, dict) and response.get("error"):
-            failed.append(
-                {
-                    "issue_key": doc["issue_key"],
-                    "error": response.get("error"),
-                    "detail": response.get("detail"),
-                    "status_code": response.get("status_code"),
-                }
-            )
-        else:
-            pushed.append(
-                {
-                    "issue_key": doc["issue_key"],
-                    "doc_id": response.get("doc_id"),
-                    "document_hash": response.get("document_hash"),
-                }
-            )
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(documents),
-                unit="issue",
-                failed=len(failed),
-            ),
-        )
-    if not failed:
-        sync_result = scoped_client.start_source_processing(
-            source_id=source_id,
-            force_full_sync=bool(payload.get("force_full_sync", False)),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=str(job["job_id"]),
-            local_agent_attempt_count=int(job["attempt_count"]),
-        )
-    result = {
-        "operation": operation,
-        "source_id": source_id,
-        "base_url": str(payload.get("base_url") or ""),
-        "counts": {
-            "selected": int(collection["inventory_count"]),
-            "reused": int(collection["reused_count"]),
-            "pushed": len(pushed),
-            "failed": len(failed),
-        },
-        "pushed": pushed,
-        "failed": failed,
-        "sync_started": bool(sync_result and not sync_result.get("error")),
-        **(source_processing_receipt(sync_result) if sync_result else {}),
-    }
-    sync_failed = isinstance(sync_result, dict) and bool(sync_result.get("error"))
-    if sync_failed:
-        result["sync_error"] = sync_result
-    if failed and sync_failed:
-        result["error"] = "one or more documents failed to push; source sync failed to start"
-    elif sync_failed:
-        result["error"] = "source sync failed to start"
-    elif failed:
-        result["error"] = "one or more documents failed to push"
-    if result.get("error"):
-        result["retryable"] = True
-    return result
 
 
 def _run_cloud_teams_auth_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -4113,37 +3431,6 @@ async def _collect_conversation_on_device(
         )
 
 
-def _github_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    profile: dict[str, Any] = {
-        "repo_url": str(payload.get("repo_url") or "").strip(),
-        "ref": str(payload.get("ref") or "main").strip() or "main",
-    }
-    for key in ("include_paths", "exclude_paths", "include_extensions"):
-        if key in payload:
-            profile[key] = payload[key]
-    return profile
-
-
-def _kb_profile_from_cloud_job(job: dict[str, Any]) -> dict[str, Any]:
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    root = str(payload.get("root") or "").strip()
-    vault_id = str(payload.get("vault_id") or "").strip()
-    if not root:
-        raise click.ClickException("local_markdown root is required")
-    if not vault_id:
-        raise click.ClickException("local_markdown vault_id is required")
-    profile: dict[str, Any] = {
-        "root": root,
-        "vault_id": vault_id,
-    }
-    if "include" in payload:
-        profile["include"] = payload["include"]
-    if "exclude" in payload:
-        profile["exclude"] = payload["exclude"]
-    return profile
-
-
 def _local_agent_job_source_client(
     job: dict[str, Any],
     payload: dict[str, Any],
@@ -4164,310 +3451,6 @@ def _local_agent_job_source_client(
             "error": "workspace_id is required",
         }
     return source_id, client.for_workspace(workspace_id), None
-
-
-async def _collect_jira_documents_from_cloud_job(
-    job: dict[str, Any],
-    *,
-    source_id: str,
-    limit: int,
-    jira_cookie: str,
-    client: ToolClient,
-    sync_snapshot_id: str,
-    local_agent_job_id: str,
-    local_agent_attempt_count: int,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    from memforge.genes.jira_gene import JiraGene
-
-    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-    if limit:
-        raise ValueError("limited Jira collection cannot finalize a fenced source snapshot")
-    config = _jira_cloud_config_from_job_payload(payload)
-    base_url = str(config["base_url"])
-    config["jira_cookie"] = jira_cookie
-
-    gene = JiraGene(config, source_id)
-    documents: list[dict[str, Any]] = []
-    try:
-        await gene.authenticate()
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(phase="discovering", completed=0, unit="issue"),
-        )
-        inventory_items = []
-        async for item in gene.discover_inventory():
-            if limit and len(inventory_items) >= limit:
-                break
-            issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
-            revision = str(item.version or "").strip()
-            if not issue_key or not revision:
-                raise RuntimeError("Jira inventory item is missing issue identity or provider revision")
-            inventory_items.append(item)
-            _report_local_agent_progress(
-                report_progress,
-                _sync_progress_snapshot(
-                    phase="discovering",
-                    completed=len(inventory_items),
-                    unit="issue",
-                ),
-            )
-
-        items_by_doc_id = {
-            build_jira_doc_id(
-                source_id=source_id,
-                issue_key=str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")),
-            ): item
-            for item in inventory_items
-        }
-        excluded_listings = await _list_excluded_jira_scopes(payload, source_id=source_id, jira_cookie=jira_cookie)
-        manifest = _plan_local_source_manifest(
-            client,
-            source_id=source_id,
-            items=[
-                {
-                    "doc_id": doc_id,
-                    "revision": str(item.version),
-                    "change_kind": "upsert",
-                }
-                for doc_id, item in items_by_doc_id.items()
-            ],
-            coverage="complete_snapshot",
-            known_doc_ids=set(items_by_doc_id),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-            excluded_listings=excluded_listings,
-        )
-        if manifest.confirm:
-            await _confirm_unlisted_jira_issues(
-                gene,
-                manifest,
-                client=client,
-                source_id=source_id,
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=local_agent_job_id,
-                local_agent_attempt_count=local_agent_attempt_count,
-            )
-        required_doc_ids = manifest.required_doc_ids
-        items_to_fetch = [
-            item
-            for doc_id, item in items_by_doc_id.items()
-            if doc_id in required_doc_ids
-        ]
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="fetching",
-                completed=0,
-                total=len(items_to_fetch),
-                unit="issue",
-            ),
-        )
-        for index, item in enumerate(items_to_fetch, start=1):
-            raw = await gene.fetch(item)
-            issue_key = str(item.extra.get("issue_key") or item.item_id.replace("jira-", "")).strip()
-            raw_payload = json.loads(raw.body.decode("utf-8"))
-            hydrated_fields = raw_payload.get("fields")
-            hydrated_revision = (
-                str(hydrated_fields.get("updated") or "").strip()
-                if isinstance(hydrated_fields, dict)
-                else ""
-            )
-            inventory_revision = str(item.version or "").strip()
-            if not hydrated_revision or hydrated_revision != inventory_revision:
-                raise RuntimeError(
-                    f"Jira issue {issue_key} changed during materialization; retry inventory"
-                )
-            artifact_input_hashes: list[str] = []
-            remaining_artifact_bytes = MAX_SOURCE_ARTIFACT_STORAGE_BYTES_PER_UNIT
-            for artifact in raw.artifacts:
-                content = await read_source_artifact_bytes(
-                    artifact=artifact,
-                    remaining_unit_bytes=remaining_artifact_bytes,
-                    open_artifact=gene.open_source_artifact,
-                )
-                remaining_artifact_bytes -= len(content)
-                artifact_response = client.push_source_artifact(
-                    source_id=source_id,
-                    source_unit_key=issue_key,
-                    provider_key=artifact.provider_key,
-                    provider_revision=artifact.provider_revision,
-                    parent_observation_type=artifact.parent_observation_type,
-                    parent_provider_key=artifact.parent_provider_key,
-                    filename=artifact.filename,
-                    media_type=artifact.media_type,
-                    content=content,
-                    local_agent_job_id=local_agent_job_id,
-                    local_agent_attempt_count=local_agent_attempt_count,
-                )
-                _raise_if_local_agent_lease_not_current(artifact_response)
-                input_hash = str(artifact_response.get("input_sha256") or "").strip()
-                if artifact_response.get("error") or len(input_hash) != 64:
-                    raise RuntimeError(
-                        str(
-                            artifact_response.get("detail")
-                            or artifact_response.get("error")
-                            or "Jira Source Artifact upload failed"
-                        )
-                    )
-                artifact_input_hashes.append(input_hash)
-            raw_hash = hashlib.sha256(raw.body).hexdigest()
-            documents.append(
-                {
-                    "base_url": base_url,
-                    "issue_key": issue_key,
-                    "source_url": item.source_url,
-                    "title": item.title,
-                    "provider_revision": str(item.version),
-                    "raw_payload": raw_payload,
-                    "raw_hash": raw_hash,
-                    "artifact_input_hashes": artifact_input_hashes,
-                }
-            )
-            _report_local_agent_progress(
-                report_progress,
-                _sync_progress_snapshot(
-                    phase="fetching",
-                    completed=index,
-                    total=len(items_to_fetch),
-                    unit="issue",
-                ),
-            )
-    finally:
-        await gene.close()
-    return {
-        "documents": documents,
-        "inventory_count": len(inventory_items),
-        "reused_count": len(inventory_items) - len(items_to_fetch),
-        "confirmed_count": len(manifest.confirm),
-    }
-
-
-async def _list_excluded_jira_scopes(
-    payload: dict[str, Any],
-    *,
-    source_id: str,
-    jira_cookie: str,
-) -> list[dict[str, Any]]:
-    """List each scope the job's open transition excludes, as the manifest's ``excluded_listings``.
-
-    Each scope runs its own JQL with this session, and its issues are named by
-    this Source's device Document ids. A scope whose configuration cannot be
-    built, whose JQL Jira rejects, or which lists more issues than a manifest
-    holds, is reported rejected with the cause. A
-    scope that fails for any other reason, such as the network, is left out,
-    so the transition stays open until a later collection lists it.
-    """
-    from memforge.genes.base import SourceConfigurationError
-    from memforge.genes.jira_gene import JiraGene
-
-    listings: list[dict[str, Any]] = []
-    for scope in payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ():
-        scope_key = str(scope.get("scope_key") or "")
-        gene = None
-        try:
-            config = _jira_cloud_config_from_job_payload(dict(scope.get("config") or {}))
-            config["jira_cookie"] = jira_cookie
-            gene = JiraGene(config, source_id)
-            await gene.authenticate()
-            listing = await gene.list_scope()
-        except (SourceConfigurationError, ValueError, click.ClickException) as exc:
-            listings.append({"scope_key": scope_key, "rejection": f"{type(exc).__name__}: {exc}"[:2_000]})
-            continue
-        except Exception as exc:
-            logger.warning("Listing an excluded Jira scope of %s failed: %s", source_id, exc)
-            continue
-        finally:
-            if gene is not None:
-                await gene.close()
-        if len(listing.doc_ids) > SNAPSHOT_MANIFEST_MAX_ITEMS:
-            # The scope can never be listed within a manifest, so it is as
-            # definitive as a JQL Jira refuses.
-            listings.append(
-                {
-                    "scope_key": scope_key,
-                    "rejection": (
-                        f"The excluded scope lists {len(listing.doc_ids)} issues, more than the "
-                        f"{SNAPSHOT_MANIFEST_MAX_ITEMS} a manifest holds"
-                    ),
-                }
-            )
-            continue
-        listings.append(
-            {
-                "scope_key": scope_key,
-                "doc_ids": sorted(
-                    build_jira_doc_id(source_id=source_id, issue_key=doc_id.removeprefix("jira-"))
-                    for doc_id in listing.doc_ids
-                ),
-            }
-        )
-    return listings
-
-
-async def _confirm_unlisted_jira_issues(
-    gene: JiraGene,
-    manifest: _LocalSourceManifestPlan,
-    *,
-    client: ToolClient,
-    source_id: str,
-    sync_snapshot_id: str,
-    local_agent_job_id: str,
-    local_agent_attempt_count: int,
-) -> None:
-    """Read each issue the manifest left out by its id, and post the answers bound to the manifest.
-
-    When an issue cannot be rebuilt or ``confirm_absent`` raises, the agent
-    posts the cause instead, so the run removes nothing. A post the server
-    refuses fails the collection.
-    """
-    answers: list[dict[str, str]] = []
-    failure_cause: str | None = None
-    try:
-        items = [gene.confirmation_item(entry["doc_id"], entry["provider_key"]) for entry in manifest.confirm]
-        confirmed = await gene.confirm_absent(items)
-        answers = [
-            {"doc_id": entry["doc_id"], "provider_key": entry["provider_key"], "answer": confirmed[entry["doc_id"]].value}
-            for entry in manifest.confirm
-        ]
-    except Exception as exc:
-        logger.warning("Confirming the unlisted Jira issues of %s failed: %s", source_id, exc)
-        failure_cause = f"{type(exc).__name__}: {exc}"[:2_000]
-    response = client.submit_local_source_confirmations(
-        source_id=source_id,
-        manifest_sha256=manifest.manifest_sha256,
-        sync_snapshot_id=sync_snapshot_id,
-        local_agent_job_id=local_agent_job_id,
-        local_agent_attempt_count=local_agent_attempt_count,
-        answers=answers,
-        failure_cause=failure_cause,
-    )
-    _raise_if_local_agent_lease_not_current(response)
-    if response.get("error"):
-        raise RuntimeError(
-            str(response.get("detail") or response.get("error") or "Jira confirmation upload failed")
-        )
-
-
-def _jira_cloud_config_from_job_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
-
-    config = {key: value for key, value in payload.items() if key not in LOCAL_AGENT_TRANSITION_PAYLOAD_FIELDS}
-    auth_mode = jira_auth_mode(config)
-    config.pop("local_agent_documents_dir", None)
-    config.pop("pat", None)
-    config.pop("pat_encrypted", None)
-    config.pop("pat_configured", None)
-    config["sync_mode"] = "cloud"
-    base_url = str(config.get("base_url") or "").strip().rstrip("/")
-    if not base_url:
-        raise click.ClickException("Jira base_url is required")
-    if auth_mode != JIRA_AUTH_MODE_COOKIE:
-        raise click.ClickException("Jira local sync requires browser-session authentication")
-    config["base_url"] = base_url
-    config["auth_mode"] = auth_mode
-    return config
 
 
 def _report_local_agent_progress(
@@ -4512,487 +3495,12 @@ def _sync_progress_snapshot(
     return normalize_sync_progress_snapshot(snapshot)
 
 
-def _int_or_zero(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def _cloud_job_limit(value: Any, *, default: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         return default
     return max(parsed, 0)
-
-
-def _push_kb_profile_to_source(
-    name: str,
-    profile: dict[str, Any],
-    *,
-    source_id: str,
-    limit: int,
-    force_full_sync: bool,
-    submitted_by: str | None,
-    client: ToolClient,
-    sync_snapshot_id: str | None = None,
-    local_agent_job_id: str | None = None,
-    local_agent_attempt_count: int | None = None,
-    report_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    started_at = time.perf_counter()
-    if limit and sync_snapshot_id:
-        raise ValueError("limited collection cannot finalize a fenced source snapshot")
-    root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    pushed: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-
-    entries = list(_scan_kb_profile(root, include=include, exclude=exclude, counts=counts))
-    selected_entries = entries[:limit] if limit else entries
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="discovering",
-            completed=len(selected_entries),
-            unit="file",
-        ),
-    )
-
-    incomplete_reasons = {
-        key: counts[key]
-        for key in ("too_large", "invalid_utf8", "unreadable")
-        if counts[key]
-    }
-    if incomplete_reasons:
-        return {
-            "profile": name,
-            "root": str(root),
-            "vault_id": vault_id,
-            "source_id": source_id,
-            "counts": {**counts, "pushed": 0, "failed": sum(incomplete_reasons.values())},
-            "error": "local collection was incomplete",
-            "retryable": True,
-        }
-    try:
-        _attest_kb_scan_stable(
-            root,
-            include=include,
-            exclude=exclude,
-            entries=entries,
-        )
-    except ValueError as exc:
-        return {
-            "profile": name,
-            "root": str(root),
-            "vault_id": vault_id,
-            "source_id": source_id,
-            "counts": {**counts, "pushed": 0, "failed": 1},
-            "error": "local collection was incomplete",
-            "detail": str(exc),
-            "retryable": True,
-        }
-
-    entries_by_doc_id: dict[str, dict[str, Any]] = {}
-    manifest_items: list[dict[str, str]] = []
-    for entry in selected_entries:
-        doc_id = build_local_markdown_doc_id(
-            source_id=source_id,
-            vault_id=vault_id,
-            relative_path=str(entry["relative_path"]),
-        )
-        entries_by_doc_id[doc_id] = entry
-        manifest_items.append(
-            {
-                "doc_id": doc_id,
-                "revision": str(entry["raw_hash"]),
-                "change_kind": "upsert",
-            }
-        )
-
-    required_doc_ids = set(entries_by_doc_id)
-    comparison_started_at = time.perf_counter()
-    fallback_reason: str | None = None
-    if not limit and sync_snapshot_id and local_agent_job_id and local_agent_attempt_count is not None:
-        try:
-            required_doc_ids = _plan_local_source_manifest(
-                client,
-                source_id=source_id,
-                items=manifest_items,
-                coverage="complete_snapshot",
-                known_doc_ids=set(entries_by_doc_id),
-                sync_snapshot_id=sync_snapshot_id,
-                local_agent_job_id=local_agent_job_id,
-                local_agent_attempt_count=local_agent_attempt_count,
-            ).required_doc_ids
-        except RuntimeError as exc:
-            return {
-                "profile": name,
-                "root": str(root),
-                "vault_id": vault_id,
-                "source_id": source_id,
-                "counts": {**counts, "pushed": 0, "failed": 0},
-                "error": str(exc),
-                "retryable": True,
-            }
-    else:
-        fallback_reason = "missing_fenced_snapshot"
-    comparison_latency_ms = round((time.perf_counter() - comparison_started_at) * 1000, 3)
-    entries_to_upload = [
-        entry
-        for doc_id, entry in entries_by_doc_id.items()
-        if doc_id in required_doc_ids
-    ]
-
-    _report_local_agent_progress(
-        report_progress,
-        _sync_progress_snapshot(
-            phase="uploading",
-            completed=0,
-            total=len(entries_to_upload),
-            unit="file",
-        ),
-    )
-
-    uploaded_body_bytes = 0
-    worktree = _git_worktree(root) if entries_to_upload else None
-    for index, entry in enumerate(entries_to_upload, start=1):
-        uploaded_body_bytes += int(entry["bytes"])
-        response = client.push_local_markdown_document(
-            source_id=source_id,
-            vault_id=vault_id,
-            relative_path=entry["relative_path"],
-            markdown_body=entry["text"],
-            content_type=entry["content_type"],
-            title=entry["title"],
-            raw_hash=entry["raw_hash"],
-            source_updated_at=_local_file_source_time(root, entry, worktree),
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-            submitted_by=submitted_by,
-        )
-        _raise_if_local_agent_lease_not_current(response)
-        if isinstance(response, dict) and response.get("error"):
-            failed.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "error": response.get("error"),
-                    "detail": response.get("detail"),
-                    "status_code": response.get("status_code"),
-                }
-            )
-        else:
-            pushed.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "doc_id": response.get("doc_id"),
-                    "document_hash": response.get("document_hash"),
-                }
-            )
-        _report_local_agent_progress(
-            report_progress,
-            _sync_progress_snapshot(
-                phase="uploading",
-                completed=index,
-                total=len(entries_to_upload),
-                unit="file",
-                failed=len(failed),
-            ),
-        )
-
-    payload = {
-        "profile": name,
-        "root": str(root),
-        "vault_id": vault_id,
-        "source_id": source_id,
-        "counts": {
-            **counts,
-            "reused": len(selected_entries) - len(entries_to_upload),
-            "pushed": len(pushed),
-            "failed": len(failed),
-        },
-        "pushed": pushed,
-        "failed": failed,
-        "metrics": {
-            "manifest_items": len(manifest_items),
-            "full_bodies_read": len(selected_entries),
-            "full_bodies_uploaded": len(pushed),
-            "bytes_uploaded": uploaded_body_bytes,
-            "comparison_latency_ms": comparison_latency_ms,
-            "end_to_end_latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
-            "fallback_reason": fallback_reason,
-        },
-    }
-    if failed:
-        payload["error"] = "one or more documents failed to push"
-    if not failed:
-        sync_result = client.start_source_processing(
-            source_id=source_id,
-            force_full_sync=force_full_sync,
-            sync_snapshot_id=sync_snapshot_id,
-            local_agent_job_id=local_agent_job_id,
-            local_agent_attempt_count=local_agent_attempt_count,
-        )
-        payload["sync_started"] = not bool(sync_result.get("error"))
-        payload.update(source_processing_receipt(sync_result))
-        if sync_result.get("error"):
-            payload["error"] = "source processing failed to start"
-            payload["sync_error"] = sync_result
-    if payload.get("error"):
-        payload["retryable"] = True
-    return payload
-
-
-def _preview_kb_profile(name: str, profile: dict[str, Any], *, limit: int) -> dict[str, Any]:
-    root, include, exclude, vault_id = _resolve_kb_profile(name, profile)
-    counts = {"included": 0, "ignored": 0, "too_large": 0, "invalid_utf8": 0, "unreadable": 0}
-    items: list[dict[str, Any]] = []
-    for entry in _scan_kb_profile(root, include=include, exclude=exclude, counts=counts):
-        if len(items) < limit:
-            items.append(
-                {
-                    "relative_path": entry["relative_path"],
-                    "title": entry["title"],
-                    "content_type": entry["content_type"],
-                    "raw_hash": entry["raw_hash"],
-                    "bytes": entry["bytes"],
-                }
-            )
-    return {
-        "profile": name,
-        "root": str(root),
-        "vault_id": vault_id,
-        "counts": counts,
-        "items": items,
-    }
-
-
-def _resolve_kb_profile(name: str, profile: dict[str, Any]) -> tuple[Path, list[str], list[str], str]:
-    root_value = str(profile.get("root") or "").strip()
-    if not root_value:
-        raise click.ClickException("Knowledge-base root is required.")
-    root = Path(root_value).expanduser().resolve()
-    if not root.exists() or not root.is_dir():
-        raise click.ClickException(f"Knowledge-base root is not a directory: {root}")
-    include = _string_list(profile.get("include")) or DEFAULT_KB_INCLUDE
-    exclude = _string_list(profile.get("exclude")) or DEFAULT_KB_EXCLUDE
-    vault_id = str(profile.get("vault_id") or name)
-    return root, include, exclude, vault_id
-
-
-def _scan_kb_profile(
-    root: Path,
-    *,
-    include: list[str],
-    exclude: list[str],
-    counts: dict[str, int],
-):
-    """Yield one entry per included file, updating ``counts`` in place.
-
-    The CLI is a thin bridge: it reads each file's raw UTF-8 text and tags it
-    with a ``content_type`` derived from the extension. All conversion to
-    markdown happens server-side during sync.
-    """
-    max_bytes = 1_000_000
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            counts["ignored"] += 1
-            continue
-        if not path.is_file():
-            continue
-        rel_path = path.relative_to(root).as_posix()
-        if _glob_match(rel_path, exclude) or not _glob_match(rel_path, include):
-            counts["ignored"] += 1
-            continue
-        try:
-            stat_before = path.stat()
-            size = stat_before.st_size
-        except OSError:
-            counts["unreadable"] += 1
-            continue
-        if size > max_bytes:
-            counts["too_large"] += 1
-            continue
-        try:
-            raw = path.read_bytes()
-            text = raw.decode("utf-8")
-            stat_after = path.stat()
-        except UnicodeDecodeError:
-            counts["invalid_utf8"] += 1
-            continue
-        except OSError:
-            counts["unreadable"] += 1
-            continue
-        fingerprint_before = (
-            stat_before.st_dev,
-            stat_before.st_ino,
-            stat_before.st_size,
-            stat_before.st_mtime_ns,
-        )
-        fingerprint_after = (
-            stat_after.st_dev,
-            stat_after.st_ino,
-            stat_after.st_size,
-            stat_after.st_mtime_ns,
-        )
-        if fingerprint_before != fingerprint_after or len(raw) != stat_after.st_size:
-            counts["unreadable"] += 1
-            continue
-        content_type = _content_type_for_path(path)
-        raw_hash = hashlib.sha256(raw).hexdigest()
-        title = (_markdown_title(text) if content_type == "text/markdown" else None) or rel_path
-        counts["included"] += 1
-        yield {
-            "relative_path": rel_path,
-            "title": title,
-            "content_type": content_type,
-            "raw_hash": raw_hash,
-            "text": text,
-            "bytes": size,
-            "stat_fingerprint": fingerprint_after,
-            "modified_at": datetime.fromtimestamp(stat_after.st_mtime, timezone.utc).isoformat(),
-        }
-
-
-@dataclass(frozen=True)
-class _GitWorktree:
-    """The Git checkout that holds a local collection root."""
-
-    # Root-relative paths Git reports as modified, staged, renamed or untracked.
-    changed_paths: frozenset[str]
-
-
-def _git_output(root: Path, *args: str) -> str | None:
-    """Run a read-only ``git`` command in ``root``; None when Git is absent or refuses."""
-
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            # Reading status must not take the index lock from the user's own Git work.
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-        )
-    except FileNotFoundError:
-        return None
-    return result.stdout if result.returncode == 0 else None
-
-
-def _git_worktree(root: Path) -> _GitWorktree | None:
-    """The Git checkout holding ``root`` and its uncommitted paths; None outside Git."""
-
-    prefix = _git_output(root, "rev-parse", "--show-prefix")
-    status = (
-        _git_output(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
-        if prefix is not None
-        else None
-    )
-    if prefix is None or status is None:
-        return None
-    prefix = prefix.strip()
-    changed: set[str] = set()
-    records = iter(status.split("\0"))
-    for record in records:
-        if not record:
-            continue
-        state, path = record[:2], record[3:]
-        changed.add(path)
-        if "R" in state or "C" in state:
-            # A rename or copy record is followed by its original path.
-            changed.add(next(records, ""))
-    return _GitWorktree(
-        changed_paths=frozenset(path.removeprefix(prefix) for path in changed if path.startswith(prefix)),
-    )
-
-
-def _local_file_source_time(root: Path, entry: dict[str, Any], worktree: _GitWorktree | None) -> str:
-    """A local file's own time for its current content.
-
-    A committed file without local changes takes its latest commit time,
-    because a checkout or clone sets the modification time to when it ran.
-    Any other file takes its modification time, the only time the file
-    system records for its content.
-    """
-
-    relative_path = str(entry["relative_path"])
-    if worktree is not None and relative_path not in worktree.changed_paths:
-        # Empty for a file Git does not track, such as an ignored one.
-        committed_at = source_time_iso((_git_output(root, "log", "-1", "--format=%cI", "--", relative_path) or "").strip())
-        if committed_at is not None:
-            return committed_at
-    return str(entry["modified_at"])
-
-
-def _attest_kb_scan_stable(
-    root: Path,
-    *,
-    include: list[str],
-    exclude: list[str],
-    entries: list[dict[str, Any]],
-) -> None:
-    """Prove that one body scan still describes the current configured scope."""
-    expected = {
-        str(entry["relative_path"]): tuple(entry["stat_fingerprint"])
-        for entry in entries
-    }
-    observed: dict[str, tuple[int, int, int, int]] = {}
-    try:
-        paths = sorted(root.rglob("*"))
-        for path in paths:
-            if path.is_symlink() or not path.is_file():
-                continue
-            relative_path = path.relative_to(root).as_posix()
-            if _glob_match(relative_path, exclude) or not _glob_match(relative_path, include):
-                continue
-            stat = path.stat()
-            observed[relative_path] = (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-            )
-    except OSError as exc:
-        raise ValueError("local collection could not be revalidated") from exc
-    if set(observed) != set(expected):
-        raise ValueError("local collection membership changed during collection")
-    changed = sorted(
-        relative_path
-        for relative_path, fingerprint in observed.items()
-        if fingerprint != expected[relative_path]
-    )
-    if changed:
-        raise ValueError(f"local file changed during collection: {changed[0]}")
-
-
-def _glob_match(relative_path: str, patterns: list[str]) -> bool:
-    path = PurePosixPath(relative_path)
-    return any(path.match(pattern) for pattern in patterns)
-
-
-_CONTENT_TYPE_BY_SUFFIX = {
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".html": "text/html",
-    ".htm": "text/html",
-}
-
-
-def _content_type_for_path(path: Path) -> str:
-    """Map a file extension to the content type the service converter expects."""
-    return _CONTENT_TYPE_BY_SUFFIX.get(path.suffix.lower(), "text/plain")
-
-
-def _markdown_title(markdown_body: str) -> str | None:
-    for line in markdown_body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            return stripped[2:].strip() or None
-    return None
 
 
 @adapter.group("auth")
@@ -5692,6 +4200,123 @@ def maintenance_reindex(ctx, mode: str):
             await db.close()
 
     raise SystemExit(asyncio.run(_run()))
+
+
+@maintenance.command("migrate-device-packages")
+@click.option("--check", "mode", flag_value="check", default=True, help="List the Sources and what applying would do.")
+@click.option("--apply", "mode", flag_value="apply", help="Take a recovery point, then move each Source.")
+@click.option("--source", "source_ids", multiple=True, help="Only this Source (repeatable).")
+@click.option("--json", "as_json", is_flag=True, help="Print the result as JSON.")
+@click.pass_context
+def maintenance_migrate_device_packages(ctx, mode: str, source_ids: tuple[str, ...], as_json: bool):
+    """Move Jira, GitHub repository and local Markdown Sources off their device package path onto device acquisition.
+
+    A Jira Source set to local agent sync, a GitHub repository Source set to
+    local push, or a local Markdown Source whose files the daemon uploaded to
+    a server inbox, holds what the device submitted as packages. Each such
+    Source moves once: every package its Units hold is rewritten to the input
+    the type's Gene reads, replayed without forced extraction, so only Units
+    whose content the rewrite changes are extracted, and the Source then runs
+    on its owner's device. Jira issues move to their jira-<KEY> Documents with
+    their Memories' Support.
+
+    --check, the default, changes nothing. It names the Units whose content
+    the rewrite changes, and refuses a Source with a package the Gene's form
+    cannot be rebuilt from, with two Units that map to one Document, or with a
+    GitHub file whose Document the configured repository names differently.
+    --apply first takes a recovery point (`memforge backup list`), so stop
+    the MemForge server before it. A Source whose replay fails keeps its
+    package path and moves the next time --apply runs. Until a Source moves,
+    it does not sync.
+    """
+
+    async def _run() -> int:
+        from memforge.pipeline.package_migration import (
+            apply_package_migration,
+            package_path_sources,
+            plan_package_migration,
+        )
+        from memforge.runtime import DefaultRuntimeProvider
+        from memforge.server.admin_api import SELF_HOSTED_WORKSPACE_ID
+        from memforge.storage.document_store import LocalDocumentStore
+        from memforge.storage.recovery_points import PRE_MIGRATION, UpgradeError
+
+        config: AppConfig = ctx.obj["config"]
+        db = await _get_db(config)
+        try:
+            sources = [
+                source for source in await package_path_sources(db) if not source_ids or source["id"] in source_ids
+            ]
+            if mode == "check":
+                doc_store = LocalDocumentStore(config.storage.docs_path)
+                plans = [await plan_package_migration(db, doc_store, source) for source in sources]
+                _print_package_migration([plan.to_payload() for plan in plans], as_json=as_json)
+                if plans and not as_json:
+                    console.print("Run `memforge maintenance migrate-device-packages --apply` to move them.")
+                return 1 if any(plan.refused for plan in plans) else 0
+            if not sources:
+                _print_package_migration([], as_json=as_json)
+                return 0
+            try:
+                point = await db.take_recovery_point(PRE_MIGRATION)
+            except UpgradeError as exc:
+                raise click.ClickException(str(exc)) from exc
+            if not as_json:
+                console.print(f"Took recovery point {point.id}; `memforge backup restore {point.id}` undoes this run.")
+            runtime = await DefaultRuntimeProvider().build_sync_runtime(db, config)
+            results = [
+                await apply_package_migration(
+                    db, config, str(source["id"]), jobs=db, runtime=runtime, workspace_id=SELF_HOSTED_WORKSPACE_ID
+                )
+                for source in sources
+            ]
+            _print_package_migration([result.to_payload() for result in results], as_json=as_json)
+            return 0 if all(result.status == "migrated" for result in results) else 1
+        finally:
+            await db.close()
+
+    raise SystemExit(asyncio.run(_run()))
+
+
+def _print_package_migration(rows: list[dict[str, Any]], *, as_json: bool) -> None:
+    if as_json:
+        click.echo(json.dumps({"sources": rows}, indent=2))
+        return
+    if not rows:
+        console.print("No Source is on a device package path.")
+        return
+    table = Table(title="Sources on a device package path")
+    table.add_column("Source", style="bold")
+    table.add_column("Type")
+    table.add_column("Packages", justify="right")
+    table.add_column("Changed", justify="right")
+    table.add_column("Moved", justify="right")
+    table.add_column("Result")
+    for row in rows:
+        if row["refused"]:
+            causes = [
+                f"{len(row['unrebuildable'])} item(s) not rebuildable" if row["unrebuildable"] else "",
+                f"{len(row['collisions'])} collision(s)" if row["collisions"] else "",
+                f"{len(row['id_changes_refused'])} file(s) the configured repository names differently"
+                if row["id_changes_refused"]
+                else "",
+            ]
+            result = "[red]refused[/]: " + ", ".join(cause for cause in causes if cause)
+        else:
+            result = {
+                None: "[green]ready[/]",
+                "migrated": "[green]moved to the device[/]",
+                "replay_failed": f"[red]replay {row.get('sync_status')}[/]: {row.get('error') or ''}",
+            }.get(row.get("status"), str(row.get("status")))
+        table.add_row(
+            f"{row['source_name']} ({row['source_id']})",
+            row["source_type"],
+            str(row["units"]),
+            str(len(row["changed_document_ids"])),
+            str(len(row["moved_document_ids"])),
+            result,
+        )
+    console.print(table)
 
 
 # ---------------------------------------------------------------------------

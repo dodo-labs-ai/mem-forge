@@ -11,7 +11,6 @@ function textField(overrides: Partial<ConfigField> & Pick<ConfigField, "key" | "
     advanced: false,
     choices: [],
     default: "",
-    fixed_after_create: false,
     help_text: "",
     options: [],
     order: 0,

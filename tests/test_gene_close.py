@@ -326,7 +326,7 @@ async def test_the_discovery_preview_closes_its_gene(database, tmp_path, monkeyp
 )
 async def test_the_github_folder_browse_closes_its_gene(database, tmp_path, listing, status) -> None:
     provider = github_repo_fakes._Provider(listing)
-    config = dict(github_repo_fakes.FAKES.listing_configs["cloud-pull"].config)
+    config = dict(github_repo_fakes.FAKES.listing_configs["repository"].config)
 
     with provider.http.serving(github_repo_gene), _admin_client(database, tmp_path) as client:
         response = client.post("/api/v1/genes/github_repo/browse-tree", json={"config": config, "limit": 50})

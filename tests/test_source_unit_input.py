@@ -83,10 +83,9 @@ class Workspace:
             for uri in (unit_input.raw_content_uri, unit_input.normalized_content_uri)
         )
 
-    async def add_source(self, source_id: str, *, collected_locally: bool) -> None:
-        config = {"sync_mode": "local_agent"} if collected_locally else {}
+    async def add_source(self, source_id: str) -> None:
         await self.db.upsert_source(
-            id=source_id, type="jira", name=source_id, config_json=json.dumps(config),
+            id=source_id, type="jira", name=source_id, config_json=json.dumps({}),
             access_policy="workspace", owner_user_id="dev",
         )
 
@@ -138,10 +137,19 @@ async def workspace(tmp_path):
         await database.close()
 
 
-async def overlapping(workspace: Workspace, *, collected_locally: bool) -> None:
+@pytest.fixture
+def stored_input_only(monkeypatch):
+    """Jira cannot be asked for one Document here, so a reprocess reads only the stored input."""
+
+    from memforge.genes.jira_gene import JiraGene
+
+    monkeypatch.setattr(JiraGene, "rediscovers_documents", classmethod(lambda cls, config: False))
+
+
+async def overlapping(workspace: Workspace) -> None:
     """Two Sources include the same issue; the release Source syncs it after a changelog entry was added."""
-    await workspace.add_source(TEAM, collected_locally=collected_locally)
-    await workspace.add_source(RELEASE, collected_locally=collected_locally)
+    await workspace.add_source(TEAM)
+    await workspace.add_source(RELEASE)
     await workspace.sync(TEAM)
     workspace.provider.histories[ISSUE].append(authored(SPRINT_HISTORY, "Ann"))
     await workspace.sync(RELEASE)
@@ -149,7 +157,7 @@ async def overlapping(workspace: Workspace, *, collected_locally: bool) -> None:
 
 @pytest.mark.asyncio
 async def test_overlapping_sources_keep_separate_stored_inputs(workspace):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
 
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
@@ -172,7 +180,7 @@ async def test_overlapping_sources_keep_separate_stored_inputs(workspace):
 
 @pytest.mark.asyncio
 async def test_a_rediscovering_source_reprocesses_a_document_whose_row_the_other_source_wrote(workspace):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
 
     state = await workspace.reprocess(TEAM)
 
@@ -182,8 +190,8 @@ async def test_a_rediscovering_source_reprocesses_a_document_whose_row_the_other
 
 
 @pytest.mark.asyncio
-async def test_a_stored_input_reprocess_reads_its_own_unit_revision_input(workspace):
-    await overlapping(workspace, collected_locally=True)
+async def test_a_stored_input_reprocess_reads_its_own_unit_revision_input(workspace, stored_input_only):
+    await overlapping(workspace)
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
 
     state = await workspace.reprocess(TEAM)
@@ -198,7 +206,7 @@ async def test_a_stored_input_reprocess_reads_its_own_unit_revision_input(worksp
 
 @pytest.mark.asyncio
 async def test_removing_a_document_from_one_source_keeps_the_other_sources_input(workspace):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
 
@@ -215,7 +223,7 @@ async def test_removing_a_document_from_one_source_keeps_the_other_sources_input
 
 @pytest.mark.asyncio
 async def test_deleting_a_source_keeps_the_other_sources_stored_input(workspace):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
 
     await workspace.db.delete_source_cascade(RELEASE)
@@ -229,7 +237,7 @@ async def test_deleting_a_source_keeps_the_other_sources_stored_input(workspace)
 
 @pytest.mark.asyncio
 async def test_content_links_read_the_input_of_the_supporting_sources_unit(workspace, tmp_path):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
     await workspace.db.upsert_source(
@@ -277,7 +285,7 @@ async def test_content_links_read_the_input_of_the_supporting_sources_unit(works
 
 
 @pytest.mark.asyncio
-async def test_the_upgrade_gives_each_unit_the_input_its_own_source_wrote(tmp_path):
+async def test_the_upgrade_gives_each_unit_the_input_its_own_source_wrote(tmp_path, stored_input_only):
     path = tmp_path / "upgrade.db"
     store = ReadRecordingDocumentStore(str(tmp_path / "documents"))
     database = Database(str(path))
@@ -285,7 +293,7 @@ async def test_the_upgrade_gives_each_unit_the_input_its_own_source_wrote(tmp_pa
     NoopMemoryEngine.db = database
     workspace = Workspace(db=database, store=store, provider=JiraProvider(), engine=RecordingMemoryEngine())
     try:
-        await overlapping(workspace, collected_locally=True)
+        await overlapping(workspace)
         release = await _unit_input(database, RELEASE, doc_id(ISSUE))
         document = await database.get_document(doc_id(ISSUE))
         # The workspace as it was before the upgrade: the Document row holds the
@@ -333,7 +341,7 @@ async def test_the_upgrade_gives_each_unit_the_input_its_own_source_wrote(tmp_pa
 
 @pytest.mark.asyncio
 async def test_a_renamed_document_releases_the_objects_its_previous_input_named(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     await workspace.sync(TEAM)
     before = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     discovered_item = workspace.provider._item
@@ -367,7 +375,7 @@ def _renamed(provider: JiraProvider, suffix: str):
 
 @pytest.mark.asyncio
 async def test_a_document_renamed_back_before_cleanup_keeps_its_current_objects(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     await workspace.sync(TEAM)
     original = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     discovered_item = workspace.provider._item
@@ -390,7 +398,7 @@ async def test_a_document_renamed_back_before_cleanup_keeps_its_current_objects(
 
 @pytest.mark.asyncio
 async def test_a_removed_document_that_returns_before_cleanup_keeps_its_objects(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     await workspace.sync(TEAM)
     workspace.provider.removed.add(ISSUE)
     await workspace.sync(TEAM)
@@ -408,7 +416,7 @@ async def test_a_removed_document_that_returns_before_cleanup_keeps_its_objects(
 
 @pytest.mark.asyncio
 async def test_cleanup_waits_while_the_source_has_an_active_activity(workspace):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
     release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
     await _release_document(workspace.db, source_id=RELEASE, source_type="jira", doc_id=doc_id(ISSUE))
     await workspace.db.delete_projected_document(doc_id(ISSUE), source_id=RELEASE)
@@ -426,7 +434,7 @@ async def test_cleanup_waits_while_the_source_has_an_active_activity(workspace):
 
 @pytest.mark.asyncio
 async def test_released_inputs_sharing_an_object_delete_it_once(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     shared = workspace.store.store_raw(
         source_id=TEAM, doc_id=doc_id(ISSUE), title="Shared", content=b"{}", content_type="application/json",
     )
@@ -462,7 +470,7 @@ async def test_released_inputs_sharing_an_object_delete_it_once(workspace):
 
 @pytest.mark.asyncio
 async def test_a_document_link_falls_back_to_the_next_copy_when_the_newest_is_missing(workspace, tmp_path):
-    await overlapping(workspace, collected_locally=False)
+    await overlapping(workspace)
     team = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     release = await _unit_input(workspace.db, RELEASE, doc_id(ISSUE))
     newest = await workspace.db.list_document_source_unit_inputs(doc_id(ISSUE))
@@ -487,7 +495,7 @@ async def test_a_document_link_falls_back_to_the_next_copy_when_the_newest_is_mi
 
 @pytest.mark.asyncio
 async def test_a_staged_derivation_keeps_the_objects_it_will_commit(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     await workspace.sync(TEAM)
     original = await _unit_input(workspace.db, TEAM, doc_id(ISSUE))
     discovered_item = workspace.provider._item
@@ -514,8 +522,8 @@ async def test_a_staged_derivation_keeps_the_objects_it_will_commit(workspace):
 
 @pytest.mark.asyncio
 async def test_a_busy_source_does_not_hold_up_other_sources_cleanup(workspace):
-    await workspace.add_source(TEAM, collected_locally=False)
-    await workspace.add_source(RELEASE, collected_locally=False)
+    await workspace.add_source(TEAM)
+    await workspace.add_source(RELEASE)
     busy = workspace.store.store_raw(
         source_id=TEAM, doc_id="doc-busy", title="Busy", content=b"{}", content_type="application/json",
     )
@@ -537,7 +545,7 @@ async def test_the_scheduler_cleans_up_released_objects(workspace, tmp_path):
     from memforge.runtime import SyncService
     from memforge.scheduler import ARTIFACT_CLEANUP_JOB_ID, SyncScheduler
 
-    await workspace.add_source(TEAM, collected_locally=False)
+    await workspace.add_source(TEAM)
     released = workspace.store.store_raw(
         source_id=TEAM, doc_id=doc_id(ISSUE), title="Released", content=b"{}", content_type="application/json",
     )

@@ -39,7 +39,7 @@ function renderPage(
     ],
     "GET /api/v1/source-list/preferences": () => ({ sort_mode: "name" }),
     "GET /api/cloud/local-agent/status": () => ({ status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 }),
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [] }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [] }),
     "GET /api/v1/agent-evaluations/online-overview": () => makeOverview({ sources: [] }),
     "POST /api/v1/sources/src-wiki/sync": () => ({ status: "pending", run_id: "run-2" }),
     ...routes,
@@ -159,7 +159,7 @@ test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentica
     connection_status: { state: "action_required", reason: "authentication" },
   });
   const { calls, router } = renderPage([source], {
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => ({ job_id: "laj-auth", status: "succeeded", result: {} }),
   });
   const table = await screen.findByRole("table", { name: "Sources" });
@@ -171,12 +171,12 @@ test.each(["row", "card", "drawer"])("Jira Sign in from the %s starts authentica
 
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const authCall = calls.find((request) => request.method === "POST")!;
-  expect(new URL(authCall.url).pathname).toBe("/api/cloud/local-agent/jobs");
+  expect(new URL(authCall.url).pathname).toBe("/api/v1/local-agent/jobs");
   expect(await authCall.clone().json()).toMatchObject({
     source_id: "src-jira",
     source_type: "jira",
-    operation: "jira_auth",
-    payload: { base_url: "https://jira.example.invalid", auth_mode: "browser_cookie" },
+    operation: "credential_check",
+    payload: {},
   });
   expect(router.state.location.pathname).toBe("/sources");
   await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Signed in to Payroll Jira"));
@@ -199,13 +199,12 @@ test("waits for durable Jira authentication and refreshes readiness in the selec
     "GET /api/cloud/workspaces/team_alpha/v1/projects": () => ({ data: [], can_manage: true }),
     "GET /api/cloud/workspaces/team_alpha/v1/genes": () => [{ name: "jira", display_name: "Jira" }],
     "GET /api/cloud/workspaces/team_alpha/v1/source-list/preferences": () => ({ sort_mode: "name" }),
-    "GET /api/cloud/workspaces/team_alpha/local-agent/status": () => ({ status: "online" }),
-    "GET /api/cloud/workspaces/team_alpha/local-agent/jobs/current": () => ({ data: [] }),
-    "POST /api/cloud/workspaces/team_alpha/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "GET /api/cloud/local-agent/status": () => ({ status: "online" }),
+    "GET /api/cloud/workspaces/team_alpha/v1/local-agent/jobs/current": () => ({ data: [] }),
+    "POST /api/cloud/workspaces/team_alpha/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => new Promise((resolve) => { complete = resolve; }),
   }, {
     resourceBaseUrl: "/api/cloud/workspaces/team_alpha/v1",
-    localAgentBaseUrl: "/api/cloud/workspaces/team_alpha/local-agent",
     workspaceId: "team_alpha",
     shared: true,
   });
@@ -225,7 +224,7 @@ test("waits for durable Jira authentication and refreshes readiness in the selec
 test.each(["daemon", "job", "permission", "timeout"])("reports %s failure without claiming Jira sign-in succeeded", async (failure) => {
   const { calls } = renderPage([expiredJira()], {
     "GET /api/cloud/local-agent/status": () => ({ status: failure === "daemon" ? "offline" : "online" }),
-    "POST /api/cloud/local-agent/jobs": () => failure === "permission"
+    "POST /api/v1/local-agent/jobs": () => failure === "permission"
       ? errorResponse(403, "local_agent_job_forbidden") : { job_id: "laj-auth", status: "queued" },
     "GET /api/cloud/local-agent/jobs/laj-auth": () => {
       if (failure === "timeout") throw new DOMException("Timed out", "TimeoutError");
@@ -236,8 +235,8 @@ test.each(["daemon", "job", "permission", "timeout"])("reports %s failure withou
   await userEvent.click(await within(table).findByRole("button", { name: "Sign in" }));
   await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("Jira sign-in failed", {
     description: failure === "daemon" ? "Start local sync on your computer, then try signing in again."
-      : failure === "timeout" ? "Still waiting for Jira sign-in. Check the browser on your computer, then try again."
-      : failure === "job" ? "Signed in with a different Jira account. Use the account this source was set up with, then try again."
+      : failure === "timeout" ? "Still waiting for sign-in. Check the browser on your computer, then try again."
+      : failure === "job" ? "Signed in with a different account. Use the account this source was set up with, then try again."
         : "You do not have permission to renew this connection. Ask a workspace admin for help.",
   }));
   expect(toast.success).not.toHaveBeenCalled();
@@ -248,7 +247,7 @@ test.each(["daemon", "job", "permission", "timeout"])("reports %s failure withou
 test("retrying a failed status request resumes the admitted sign-in job", async () => {
   let statusReads = 0;
   const { calls } = renderPage([expiredJira()], {
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-auth", status: "queued" }),
     "GET /api/cloud/local-agent/jobs/laj-auth": () => ++statusReads === 1
       ? errorResponse(503, "Service unavailable") : { job_id: "laj-auth", status: "succeeded", result: {} },
   });
@@ -321,7 +320,7 @@ test("Retry now starts the waiting local sync job on the user's device", async (
     type: "teams",
     name: "Team chats",
     sync: null,
-    execution: { kind: "local_agent", operation: "teams_sync", immutable_config_fields: [] },
+    execution: { kind: "local_agent", operation: "teams_sync" },
   });
   const job = makeLocalAgentJob({
     job_id: "laj-waiting",
@@ -329,15 +328,15 @@ test("Retry now starts the waiting local sync job on the user's device", async (
     next_attempt_at: new Date(Date.now() + RETRY_DELAY_MS).toISOString(),
   });
   const { calls } = renderPage([teams], {
-    "GET /api/cloud/local-agent/jobs/current": () => ({ data: [job] }),
-    "POST /api/cloud/local-agent/jobs": () => ({ job_id: "laj-waiting", status: "queued", coalesced: true }),
+    "GET /api/v1/local-agent/jobs/current": () => ({ data: [job] }),
+    "POST /api/v1/local-agent/jobs": () => ({ job_id: "laj-waiting", status: "queued", coalesced: true }),
   });
   const table = await screen.findByRole("table", { name: "Sources" });
   await userEvent.click(await within(table).findByRole("button", { name: "Retry now" }));
 
   await vi.waitFor(() => expect(calls.some((request) => request.method === "POST")).toBe(true));
   const retryCall = calls.find((request) => request.method === "POST")!;
-  expect(new URL(retryCall.url).pathname).toBe("/api/cloud/local-agent/jobs");
+  expect(new URL(retryCall.url).pathname).toBe("/api/v1/local-agent/jobs");
   expect(await retryCall.clone().json()).toMatchObject({ source_id: "src-teams", retry_job_id: "laj-waiting" });
 });
 
@@ -779,4 +778,154 @@ test("deleting a source asks for one confirmation that names what it removes, wi
   await vi.waitFor(() =>
     expect(calls.some((request) => request.method === "DELETE" && new URL(request.url).pathname === "/api/v1/sources/src-wiki")).toBe(true),
   );
+});
+
+type DeviceState = "online" | "offline" | "update_required";
+
+/** A Source that runs on its execution owner's device, as the source API lists it to the viewer. */
+function onDevice(id: string, name: string, state: DeviceState, { device = "Alex's MacBook", owner = "local", viewerOwns = true } = {}) {
+  return makeSource({
+    id,
+    name,
+    ownership: { ...makeSource().ownership, execution_owner_user_id: owner, viewer_is_execution_owner: viewerOwns },
+    execution: {
+      kind: "local_agent",
+      operation: "document_acquisition",
+      device: {
+        id: `dev-${device}`,
+        name: viewerOwns ? device : null,
+        state,
+        not_ready: [],
+        installed_version: state === "update_required" ? "0.2.0b8" : "0.2.0b7",
+        required_version: "0.2.0b7",
+        credential: "secret",
+      },
+    },
+  });
+}
+
+test("one banner per device that needs an update, shown only to the execution owner", async () => {
+  renderPage([
+    onDevice("src-a", "Release wiki", "update_required"),
+    onDevice("src-b", "Build notes", "update_required"),
+    onDevice("src-c", "Build docs", "update_required", { device: "Build box" }),
+    onDevice("src-d", "Team wiki", "update_required", { owner: "user-2", viewerOwns: false }),
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Team wiki");
+  const banners = screen.getAllByText(/needs an update to sync/).map((banner) => banner.textContent);
+  expect(banners).toEqual([
+    "MemForge on Alex's MacBook needs an update to sync 2 sources.",
+    "MemForge on Build box needs an update to sync 1 source.",
+  ]);
+
+  const memberRow = within(table).getByText("Team wiki").closest("tr")!;
+  expect(within(memberRow).getByText("Waiting for user-2 to update local sync")).toBeInTheDocument();
+  expect(within(memberRow).queryByRole("button", { name: "Update" })).not.toBeInTheDocument();
+  expect(within(memberRow).queryByText("Alex's MacBook")).not.toBeInTheDocument();
+  const ownerRow = within(table).getByText("Release wiki").closest("tr")!;
+  expect(within(ownerRow).getByText("Update local sync")).toBeInTheDocument();
+  expect(within(ownerRow).getByRole("button", { name: "Update" })).toBeInTheDocument();
+});
+
+test("another member's waiting source shows no banner and cannot queue a sync", async () => {
+  renderPage([onDevice("src-d", "Team wiki", "update_required", { owner: "user-2", viewerOwns: false })]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await within(table).findByText("Team wiki");
+  expect(screen.queryByText(/needs an update to sync/)).not.toBeInTheDocument();
+  await userEvent.click(within(table).getByRole("button", { name: "More actions for Team wiki" }));
+  expect(await screen.findByRole("menuitem", { name: "Sync now" })).toHaveAttribute("aria-disabled", "true");
+});
+
+test("Sync now on a waiting source opens the update dialog instead of queuing a sync", async () => {
+  const { calls } = renderPage([onDevice("src-wiki", "Release wiki", "update_required"), onDevice("src-b", "Build notes", "update_required")]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  await userEvent.click(await within(table).findByRole("button", { name: "More actions for Release wiki" }));
+  await userEvent.click(await screen.findByRole("menuitem", { name: "Sync now" }));
+
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  expect(within(dialog).getByText(/This computer runs MemForge 0.2.0b8. The server runs 0.2.0b7/)).toBeInTheDocument();
+  const waiting = within(dialog).getByRole("list", { name: "Sources waiting for the update" });
+  expect(within(waiting).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Release wiki", "Build notes"]);
+  expect(within(dialog).getByText("memforge upgrade")).toBeInTheDocument();
+  expect(within(dialog).getByRole("button", { name: "Copy memforge upgrade" })).toBeInTheDocument();
+  expect(within(dialog).getByText("Syncs wait until the update. Nothing is removed, and they start on their own after it.")).toBeInTheDocument();
+  expect(calls.some((request) => request.method === "POST")).toBe(false);
+});
+
+test("the update dialog closes itself once the device reports a matching contract", async () => {
+  let state: DeviceState = "update_required";
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Release wiki", state)] }) });
+
+  const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
+  await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  expect(screen.getByRole("dialog", { name: "Update MemForge on Alex's MacBook" })).toBeInTheDocument();
+
+  state = "online";
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+  await vi.waitFor(() => expect(toast.success).toHaveBeenCalledWith("Updated. Syncing again."));
+  await vi.waitFor(() => expect(screen.queryByRole("dialog", { name: "Update MemForge on Alex's MacBook" })).not.toBeInTheDocument());
+});
+
+test("an offline device is started before it is updated", async () => {
+  let state: DeviceState = "update_required";
+  renderPage([], { "GET /api/v1/sources": () => ({ data: [onDevice("src-wiki", "Release wiki", state)] }) });
+
+  const banner = (await screen.findByText(/needs an update to sync/)).closest("[role=status]") as HTMLElement;
+  await userEvent.click(within(banner).getByRole("button", { name: "Update" }));
+  const dialog = await screen.findByRole("dialog", { name: "Update MemForge on Alex's MacBook" });
+  state = "offline";
+  await userEvent.click(within(dialog).getByRole("button", { name: "Check again" }));
+
+  expect(await within(dialog).findByText("memforge daemon start")).toBeInTheDocument();
+  expect(within(dialog).queryByText("memforge upgrade")).not.toBeInTheDocument();
+});
+
+test("Runs on names the execution device, and the row shows what it still lacks", async () => {
+  const noDevice = onDevice("src-c", "Team notes", "online");
+  renderPage([
+    onDevice("src-wiki", "Release wiki", "online"),
+    { ...onDevice("src-b", "Build notes", "online"), connection_status: { state: "action_required", reason: "authentication" } },
+    {
+      ...noDevice,
+      connection_status: { state: "action_required", reason: "configuration" },
+      execution: { ...noDevice.execution!, device: null },
+    },
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const ready = (await within(table).findByText("Release wiki")).closest("tr")!;
+  expect(within(ready).getByText("Alex's MacBook")).toBeInTheDocument();
+  const signIn = within(table).getByText("Build notes").closest("tr")!;
+  expect(within(signIn).getByText("Alex's MacBook")).toBeInTheDocument();
+  expect(within(signIn).getByText("Sign-in required")).toBeInTheDocument();
+  const unchosen = within(table).getByText("Team notes").closest("tr")!;
+  expect(within(unchosen).getByText("Local sync")).toBeInTheDocument();
+  expect(within(unchosen).getByText("Finish setup")).toBeInTheDocument();
+});
+
+test("a missing folder on the execution device shows Finish setup with the path to its owner", async () => {
+  const notes = onDevice("src-notes", "Team notes", "online");
+  renderPage([
+    {
+      ...notes,
+      connection_status: { state: "action_required", reason: "configuration" },
+      execution: {
+        ...notes.execution!,
+        device: { ...notes.execution!.device!, not_ready: [{ kind: "location", field: "root", path: "/Users/alex/notes" }] },
+      },
+    },
+  ]);
+
+  const table = await screen.findByRole("table", { name: "Sources" });
+  const row = (await within(table).findByText("Team notes")).closest("tr")!;
+  expect(within(row).getByText("Finish setup")).toBeInTheDocument();
+  await userEvent.click(within(row).getByText("Team notes"));
+  const drawer = await screen.findByRole("dialog", { name: "Team notes" });
+  expect(within(drawer).getByText("The folder /Users/alex/notes is missing on Alex's MacBook.")).toBeInTheDocument();
 });

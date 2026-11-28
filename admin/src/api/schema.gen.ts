@@ -24,7 +24,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/cloud/local-agent/jobs": {
+    "/api/cloud/local-agent/devices/{device_id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -33,26 +33,20 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Create Local Agent Job */
-        post: operations["create_local_agent_job_api_cloud_local_agent_jobs_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/cloud/local-agent/jobs/current": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read Current Local Agent Jobs */
-        get: operations["read_current_local_agent_jobs_api_cloud_local_agent_jobs_current_get"];
-        put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Remove Local Agent Device
+         * @description Forget one of the caller's devices.
+         *
+         *     Each Source it executed, in every workspace the caller's daemon
+         *     serves, loses its execution device and shows Finish setup until its
+         *     owner chooses another device in Where it runs. A Source of a
+         *     workspace the caller has left keeps naming the device, and no job of
+         *     it is leased, since a daemon serves only its user's workspaces. The
+         *     device's queued jobs are cancelled. A daemon that still runs on the
+         *     device appears again with its next report, without its Sources.
+         */
+        delete: operations["remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -67,7 +61,16 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Lease Local Agent Jobs */
+        /**
+         * Lease Local Agent Jobs
+         * @description Lease the device its due jobs.
+         *
+         *     The answer also names the server's version and acquisition contracts,
+         *     and the Sources this device executes, each with its type and its
+         *     configuration without secrets. The device reports its readiness for
+         *     each of them, and deletes the credentials it holds for any other
+         *     Source: one deleted, moved to the server or moved to another device.
+         */
         post: operations["lease_local_agent_jobs_api_cloud_local_agent_jobs_lease_post"];
         delete?: never;
         options?: never;
@@ -82,7 +85,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read Local Agent Job */
+        /**
+         * Read Local Agent Job
+         * @description A job the caller created or executes, in a workspace the caller's daemon still serves.
+         */
         get: operations["read_local_agent_job_api_cloud_local_agent_jobs__job_id__get"];
         put?: never;
         post?: never;
@@ -101,7 +107,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Complete Local Agent Job */
+        /**
+         * Complete Local Agent Job
+         * @description End the device's attempt; completing an attempt that already ended answers the job's status.
+         */
         post: operations["complete_local_agent_job_api_cloud_local_agent_jobs__job_id__complete_post"];
         delete?: never;
         options?: never;
@@ -133,7 +142,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Read Local Agent Status */
+        /**
+         * Read Local Agent Status
+         * @description Each of the caller's devices by its latest report, online while that report is recent.
+         *
+         *     It also names the caller's device Sources with the device that
+         *     executes each, and the server's version and acquisition contracts,
+         *     from which a device tells, per Source it executes, whether it is
+         *     ready, waits for a credential or a folder, or waits for an update.
+         */
         get: operations["read_local_agent_status_api_cloud_local_agent_status_get"];
         put?: never;
         post?: never;
@@ -707,7 +724,9 @@ export interface paths {
          *     The tree is read with the Source's own client and TLS. A tree GitHub
          *     truncates is walked folder by folder within
          *     ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
-         *     400, and its paths are typed instead.
+         *     400, and its paths are typed instead. A device Source answers 409
+         *     ``device_preview_unavailable``, because the server never reaches a
+         *     device Source's provider.
          */
         post: operations["browse_github_repo_tree_api_v1_genes_github_repo_browse_tree_post"];
         delete?: never;
@@ -737,6 +756,10 @@ export interface paths {
          *     about the configuration; ``issues`` holds every refusal. With
          *     ``source_id``, the stored configuration completes the copy as it does
          *     on update, and the caller needs the access that update needs.
+         *     ``executor`` is where the save puts the Source, so a stored Source
+         *     moving between the server and a device is checked against its new
+         *     executor: a move to the server must carry the secrets the server
+         *     requires.
          */
         post: operations["check_gene_config_api_v1_genes__name__config_check_post"];
         delete?: never;
@@ -757,7 +780,7 @@ export interface paths {
          * @description The form description of a source type, which the admin UI draws without per-type code.
          *
          *     Besides what the Gene declares, each field says whether it is a scope
-         *     field and whether it is fixed after create, from the type's descriptor.
+         *     field, from the type's descriptor.
          */
         get: operations["get_gene_config_schema_api_v1_genes__name__config_schema_get"];
         put?: never;
@@ -780,6 +803,13 @@ export interface paths {
         /**
          * Preview Gene Discovery
          * @description Preview the documents a source config would discover without saving it.
+         *
+         *     Only the server's own connection can preview. ``executor`` is where
+         *     the save puts the Source, so a stored device Source moving to the
+         *     server previews with the configuration the form carries. A
+         *     configuration that runs on a device answers 409
+         *     ``device_preview_unavailable``, because the server never reaches a
+         *     device Source's provider.
          */
         post: operations["preview_gene_discovery_api_v1_genes__name__preview_discovery_post"];
         delete?: never;
@@ -822,6 +852,40 @@ export interface paths {
          * @description Return compact memory context for Codex/Claude lifecycle hooks.
          */
         post: operations["build_hook_context_api_v1_hooks_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/local-agent/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Local Agent Job */
+        post: operations["create_local_agent_job_api_v1_local_agent_jobs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/local-agent/jobs/current": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Current Local Agent Jobs */
+        get: operations["read_current_local_agent_jobs_api_v1_local_agent_jobs_current_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1923,6 +1987,133 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/acquisition/answers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Acquisition Answers
+         * @description Keep a device run's answers to what its manifest response asked.
+         *
+         *     The answers must answer exactly what the response asked, bound to the
+         *     manifest's digest and attempt. An identical replay is accepted;
+         *     anything else that differs from the stored answers is refused with 409.
+         */
+        post: operations["submit_acquisition_answers_api_v1_sources__source_id__acquisition_answers_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/acquisition/held-bodies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Held Acquired Bodies
+         * @description Say which of the named bodies the Source holds, so a device run uploads only the others.
+         */
+        post: operations["read_held_acquired_bodies_api_v1_sources__source_id__acquisition_held_bodies_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/acquisition/inputs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upload Acquired Input
+         * @description Keep one acquired input of a device run for its job attempt.
+         *
+         *     The device fetches each discovered item before it submits the
+         *     manifest, so an input belongs to the attempt, not to a manifest
+         *     digest; the run reads only the inputs of items it asks for. Each
+         *     artifact body the input names must already be an uploaded input of
+         *     the Source; an artifact the device could not read names its error
+         *     instead. The input's own body travels with it unless the Source holds
+         *     it already; an input naming a body the Source does not hold is
+         *     answered 409 ``acquired_body_required``, and the device sends it
+         *     again with its body. The same input uploaded again is kept once.
+         */
+        post: operations["upload_acquired_input_api_v1_sources__source_id__acquisition_inputs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/acquisition/manifest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Acquisition Manifest
+         * @description Keep the manifest of one device run and answer what the server run will ask beyond discovery.
+         *
+         *     The response's ``requests`` name the unlisted Units to confirm, the
+         *     failed Documents to rediscover and the failed items to fetch, by the
+         *     server run's own rules. They are computed when the attempt's manifest
+         *     is first recorded and returned unchanged on a replay. The attempt's
+         *     lease time is the run's start for the sync cursor. A manifest
+         *     above the bound every device manifest has, a listing of a scope the
+         *     job did not carry, and a reprocess that discovers or lists answer 422.
+         */
+        post: operations["submit_acquisition_manifest_api_v1_sources__source_id__acquisition_manifest_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/acquisition/stored-extras": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Acquisition Stored Extras
+         * @description Give a device run's ``fetch`` the ``stored_extra`` a server run's ``fetch`` reads.
+         *
+         *     For each named item whose Document the Source has stored, the
+         *     ``extra`` recorded with its Unit's stored input, so a Gene that
+         *     reuses a fact it recorded for an unchanged provider revision does so
+         *     on the device as on the server.
+         */
+        post: operations["read_acquisition_stored_extras_api_v1_sources__source_id__acquisition_stored_extras_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/adapter/artifacts": {
         parameters: {
             query?: never;
@@ -1937,75 +2128,6 @@ export interface paths {
          * @description Receive one bounded binary input for a later local-source package.
          */
         post: operations["push_local_source_artifact_api_v1_sources__source_id__adapter_artifacts_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/adapter/manifest": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Prepare Local Source Manifest
-         * @description Reuse unchanged immutable packages in one complete, fenced collection.
-         */
-        post: operations["prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/adapter/manifest/confirmations": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Submit Local Source Confirmations
-         * @description Store a device's answers for the items its manifest response asked it to confirm.
-         *
-         *     The answers bind to the job attempt and the digest of the manifest. An
-         *     identical replay is accepted; an item the manifest did not ask about,
-         *     another digest or attempt, and answers that differ from the stored
-         *     ones are refused with 409.
-         */
-        post: operations["submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sources/{source_id}/adapter/packages": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Push Local Source Package
-         * @description Receive one local-source package pushed by the local daemon/adapter.
-         *
-         *     The service owns the inbox layout and package format. Local clients
-         *     send raw file text or structured source payloads; source genes perform
-         *     canonical markdown normalization during sync.
-         */
-        post: operations["push_local_source_package_api_v1_sources__source_id__adapter_packages_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2121,6 +2243,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sources/{source_id}/executor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Change Source Executor
+         * @description Change where a document Source's acquisition runs, keeping everything the Source holds.
+         *
+         *     The executor is not part of the scope: the change opens no scope
+         *     transition and keeps the Source's Documents, Units, Memories, cursor,
+         *     failure ledger and an open transition, so its next run is an
+         *     ordinary incremental run. The executor must be one the type declares.
+         *
+         *     - To ``device``: the server's copies of the Source's secrets are
+         *       deleted, the person who changes it becomes its execution owner, and
+         *       ``execution_device_id``, one of their own devices, its execution
+         *       device, which then holds the credentials.
+         *     - To another device: the same, so whoever chooses the device becomes
+         *       the execution owner. The previous device keeps its credentials
+         *       until its next lease answer no longer names the Source; the new
+         *       device needs its own.
+         *     - To ``server``: ``secrets`` must hold what the type's form requires.
+         *
+         *     Like a scope change, it cancels the Source's pending run and queued
+         *     sync jobs, and answers 409 ``source_sync_running`` while a run is
+         *     running or a device holds the Source's acquisition job.
+         */
+        put: operations["change_source_executor_api_v1_sources__source_id__executor_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sources/{source_id}/force-resync": {
         parameters: {
             query?: never;
@@ -2197,6 +2358,11 @@ export interface paths {
         /**
          * Process Collected Local Source
          * @description Enqueue server processing after the owner daemon persisted raw input.
+         *
+         *     A document Source the device acquired with its type's own Gene is
+         *     processed once its attempt is ready (:func:`ready_acquisition`), in
+         *     a run bound to that attempt; a conversation Source, once its
+         *     collection attempt is complete.
          */
         post: operations["process_collected_local_source_api_v1_sources__source_id__process_post"];
         delete?: never;
@@ -2478,6 +2644,67 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AcquiredInputRequest
+         * @description One acquired input of a device run, bound to its job attempt.
+         *
+         *     ``body`` is the base64 of the bytes the package names by ``body_sha256``,
+         *     or ``None`` when the Source holds them already.
+         */
+        AcquiredInputRequest: {
+            /** Body */
+            body?: string | null;
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Package */
+            package: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * AcquisitionAnswersRequest
+         * @description A device run's answers to what its manifest response asked, bound to the manifest's digest.
+         */
+        AcquisitionAnswersRequest: {
+            /** Answers */
+            answers: {
+                [key: string]: unknown;
+            };
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Manifest Sha256 */
+            manifest_sha256: string;
+        };
+        /**
+         * AcquisitionManifestRequest
+         * @description A device run's manifest (:class:`~memforge.local_agent.document_acquisition.AcquisitionManifest`).
+         */
+        AcquisitionManifestRequest: {
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+            /** Manifest */
+            manifest: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * AcquisitionStoredExtrasRequest
+         * @description The items of a device run whose ``fetch`` reads what the Source stored for them.
+         */
+        AcquisitionStoredExtrasRequest: {
+            /** Item Ids */
+            item_ids: string[];
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
+        };
         /** AddAliasRequest */
         AddAliasRequest: {
             /** Alias */
@@ -2848,12 +3075,20 @@ export interface components {
             /** Status */
             status: string;
         };
-        /** ConfigCheckRequest */
+        /**
+         * ConfigCheckRequest
+         * @description A configuration to check against the executor its save will use.
+         *
+         *     ``executor`` is where the Source runs once saved; without it, a stored
+         *     Source keeps its own executor and a new Source runs on the server.
+         */
         ConfigCheckRequest: {
             /** Config */
             config: {
                 [key: string]: unknown;
             };
+            /** Executor */
+            executor?: ("server" | "device") | null;
             /** Source Id */
             source_id?: string | null;
         };
@@ -2904,12 +3139,6 @@ export interface components {
             default: string;
             /** Field Type */
             field_type: string;
-            /**
-             * Fixed After Create
-             * @description Chooses the executor; a stored Source keeps it.
-             * @default false
-             */
-            fixed_after_create: boolean;
             /**
              * Group
              * @default general
@@ -3079,6 +3308,18 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
+            /**
+             * Execution Device Id
+             * @description The creator's device that runs a device Source, from their device reports. Required for device, refused for server.
+             */
+            execution_device_id?: string | null;
+            /**
+             * Executor
+             * @description server: the server reaches the provider with the secrets in config; device: one of the creator's own devices does, with the credential stored there, so config holds no secret.
+             * @default server
+             * @enum {string}
+             */
+            executor: "server" | "device";
             /** Name */
             name: string;
             /** Project Binding */
@@ -3088,6 +3329,73 @@ export interface components {
             sync_schedule?: components["schemas"]["SourceSyncScheduleRequest"] | null;
             /** Type */
             type: string;
+        };
+        /**
+         * CredentialCheckResult
+         * @description A Source's credential checked, and a browser session captured, on the user's computer.
+         *
+         *     For a Source whose configuration signs in with a browser session, the
+         *     session is captured from the user's browser and checked against the
+         *     provider. A device Source keeps it in the device's keyring for the
+         *     session's origin; a server Source's session is stored on the server. For
+         *     a device Source that signs in with a token, the device's stored token is
+         *     checked by the type's ``authenticate``.
+         *
+         *     On success ``authenticated`` is true and ``origin`` is the site a captured
+         *     session belongs to. ``error`` is ``principal_changed`` when the user
+         *     signed in as a different account than the one the server's stored session
+         *     names; ``old_principal_id`` and ``new_principal_id`` then name both
+         *     accounts. ``retryable`` is false for every failure, because renewing a
+         *     credential needs the user.
+         */
+        CredentialCheckResult: {
+            /**
+             * Authenticated
+             * @default null
+             */
+            authenticated: boolean | null;
+            /**
+             * Error
+             * @default null
+             */
+            error: string | null;
+            /**
+             * Error Type
+             * @default null
+             */
+            error_type: string | null;
+            /**
+             * Heartbeat Errors
+             * @default null
+             */
+            heartbeat_errors: string[] | null;
+            /**
+             * New Principal Id
+             * @default null
+             */
+            new_principal_id: string | null;
+            /**
+             * Old Principal Id
+             * @default null
+             */
+            old_principal_id: string | null;
+            /** Operation */
+            operation: string;
+            /**
+             * Origin
+             * @default null
+             */
+            origin: string | null;
+            /**
+             * Retryable
+             * @default null
+             */
+            retryable: boolean | null;
+            /**
+             * Source Id
+             * @default null
+             */
+            source_id: string | null;
         };
         /**
          * CrossSourceReviewConversionApplyRequest
@@ -3227,12 +3535,20 @@ export interface components {
             /** Title */
             title: string;
         };
-        /** DiscoveryPreviewRequest */
+        /**
+         * DiscoveryPreviewRequest
+         * @description A configuration to preview where its save will run it.
+         *
+         *     ``executor`` is where the Source runs once saved; without it, a stored
+         *     Source keeps its own executor and a new Source runs on the server.
+         */
         DiscoveryPreviewRequest: {
             /** Config */
             config: {
                 [key: string]: unknown;
             };
+            /** Executor */
+            executor?: ("server" | "device") | null;
             /**
              * Limit
              * @default 50
@@ -3435,102 +3751,23 @@ export interface components {
             default_sync_interval_minutes: number;
             /** Description */
             description: string;
+            /**
+             * Device Location Fields
+             * @description The configuration fields that name a folder on the Source's execution device, which the folder picker of the device chosen in Where it runs fills.
+             * @default []
+             */
+            device_location_fields: string[];
             /** Display Name */
             display_name: string;
             /** Execution Kinds */
             execution_kinds: ("server" | "local_agent")[];
+            /**
+             * Executors
+             * @description Where a document Source of the type can run, which Configure offers as Where it runs; null for a conversation type.
+             */
+            executors: ("server" | "device")[] | null;
             /** Name */
             name: string;
-        };
-        /**
-         * GitHubRepoPreviewCounts
-         * @description Files the configured paths and extensions include, and files they leave out.
-         */
-        GitHubRepoPreviewCounts: {
-            /** Ignored */
-            ignored: number;
-            /** Included */
-            included: number;
-        };
-        /**
-         * GitHubRepoPreviewItem
-         * @description One repository file the Source would read.
-         *
-         *     ``relative_path`` is the path the Source names the file by. When it is a
-         *     symbolic link, ``symlink_chain`` lists the links followed and
-         *     ``resolved_relative_path`` is the file whose content is read.
-         */
-        GitHubRepoPreviewItem: {
-            /** Blob Sha */
-            blob_sha: string;
-            /** Bytes */
-            bytes: number;
-            /** Content Type */
-            content_type: string;
-            /** File Mode */
-            file_mode: string;
-            /** Logical File Mode */
-            logical_file_mode: string;
-            /** Relative Path */
-            relative_path: string;
-            /** Resolved Relative Path */
-            resolved_relative_path: string | null;
-            /** Symlink Chain */
-            symlink_chain: components["schemas"]["GitHubSymlinkHop"][];
-        };
-        /**
-         * GitHubRepoPreviewTreeResult
-         * @description A remote repository's tree as the daemon's Git access reads it.
-         *
-         *     The daemon lists the whole tree at ``commit_sha`` of ``ref`` with the
-         *     configured include and exclude paths cleared, so the folder picker can
-         *     offer every folder. ``items`` holds at most the requested number of files,
-         *     and ``counts`` counts all of them. ``extension_counts`` counts the
-         *     included files by extension.
-         */
-        GitHubRepoPreviewTreeResult: {
-            /** Commit Sha */
-            commit_sha: string;
-            counts: components["schemas"]["GitHubRepoPreviewCounts"];
-            /**
-             * Error
-             * @default null
-             */
-            error: string | null;
-            /**
-             * Error Type
-             * @default null
-             */
-            error_type: string | null;
-            /** Exclude Paths */
-            exclude_paths: string[];
-            /** Extension Counts */
-            extension_counts: {
-                [key: string]: number;
-            };
-            /**
-             * Heartbeat Errors
-             * @default null
-             */
-            heartbeat_errors: string[] | null;
-            /** Include Extensions */
-            include_extensions: string[];
-            /** Include Paths */
-            include_paths: string[];
-            /** Items */
-            items: components["schemas"]["GitHubRepoPreviewItem"][];
-            /** Operation */
-            operation: string;
-            /** Profile */
-            profile: string;
-            /** Ref */
-            ref: string;
-            /** Repo Url */
-            repo_url: string;
-            /** Root Tree Sha */
-            root_tree_sha: string;
-            /** Source Id */
-            source_id: string;
         };
         /** GitHubRepoTreeItemResponse */
         GitHubRepoTreeItemResponse: {
@@ -3575,18 +3812,6 @@ export interface components {
             /** Truncated */
             truncated: boolean;
         };
-        /**
-         * GitHubSymlinkHop
-         * @description One symbolic link followed on the way to a file's content.
-         */
-        GitHubSymlinkHop: {
-            /** Blob Sha */
-            blob_sha: string;
-            /** Path */
-            path: string;
-            /** Target Path */
-            target_path: string;
-        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -3611,6 +3836,18 @@ export interface components {
             /** Status */
             status: string;
             vector_store: components["schemas"]["ComponentHealth"];
+        };
+        /**
+         * HeldAcquiredBodiesRequest
+         * @description The bodies a device run asks about before it uploads them, each by the hash of its bytes.
+         */
+        HeldAcquiredBodiesRequest: {
+            /** Body Sha256S */
+            body_sha256s: string[];
+            /** Local Agent Attempt Count */
+            local_agent_attempt_count: number;
+            /** Local Agent Job Id */
+            local_agent_job_id: string;
         };
         /**
          * ImageDocumentsReprocessResponse
@@ -3639,66 +3876,6 @@ export interface components {
             document_count: number;
             /** Source Count */
             source_count: number;
-        };
-        /**
-         * JiraAuthResult
-         * @description A Jira browser session captured on the user's computer and stored for the Source.
-         *
-         *     On success ``authenticated`` is true and ``origin`` is the Jira site the
-         *     session belongs to. ``error`` is ``principal_changed`` when the user signed
-         *     in as a different Jira account than the one the stored session names;
-         *     ``old_principal_id`` and ``new_principal_id`` then name both accounts.
-         *     ``retryable`` is false for every failure, because renewing again needs the
-         *     user at the browser.
-         */
-        JiraAuthResult: {
-            /**
-             * Authenticated
-             * @default null
-             */
-            authenticated: boolean | null;
-            /**
-             * Error
-             * @default null
-             */
-            error: string | null;
-            /**
-             * Error Type
-             * @default null
-             */
-            error_type: string | null;
-            /**
-             * Heartbeat Errors
-             * @default null
-             */
-            heartbeat_errors: string[] | null;
-            /**
-             * New Principal Id
-             * @default null
-             */
-            new_principal_id: string | null;
-            /**
-             * Old Principal Id
-             * @default null
-             */
-            old_principal_id: string | null;
-            /** Operation */
-            operation: string;
-            /**
-             * Origin
-             * @default null
-             */
-            origin: string | null;
-            /**
-             * Retryable
-             * @default null
-             */
-            retryable: boolean | null;
-            /**
-             * Source Id
-             * @default null
-             */
-            source_id: string | null;
         };
         /** JiraSessionExpireRequest */
         JiraSessionExpireRequest: {
@@ -3760,12 +3937,20 @@ export interface components {
             /** Cookie Header */
             cookie_header: string;
         };
-        /** LocalAgentDaemonStatusResponse */
+        /**
+         * LocalAgentDaemonStatusResponse
+         * @description The caller's devices, whether any of them is online, the caller's device Sources and the server's contracts.
+         */
         LocalAgentDaemonStatusResponse: {
             /** Checked At */
             checked_at: string;
+            /** Devices */
+            devices: components["schemas"]["LocalAgentDeviceStatus"][];
             /** Last Seen At */
             last_seen_at: string | null;
+            server: components["schemas"]["LocalAgentServerContracts"];
+            /** Sources */
+            sources: components["schemas"]["LocalAgentDeviceSource"][];
             /** Stale After Seconds */
             stale_after_seconds: number;
             /**
@@ -3774,10 +3959,69 @@ export interface components {
              */
             status: "online" | "offline";
         };
+        /**
+         * LocalAgentDeviceRemovedResponse
+         * @description The removed device and the Sources that no longer have an execution device.
+         */
+        LocalAgentDeviceRemovedResponse: {
+            /** Device Id */
+            device_id: string;
+            /** Source Ids */
+            source_ids: string[];
+        };
+        /**
+         * LocalAgentDeviceSource
+         * @description A Source whose acquisition runs on one of the caller's devices, with its configuration without secrets.
+         */
+        LocalAgentDeviceSource: {
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /**
+             * Execution Device Id
+             * @description The caller's device that executes the Source; null while the caller has chosen none.
+             */
+            execution_device_id: string | null;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+        };
+        /** LocalAgentDeviceStatus */
+        LocalAgentDeviceStatus: {
+            /**
+             * Acquisition Contracts
+             * @description The acquisition contract of each document type, as the device's latest report declares it. A device acquires a type only while its contract equals the server's.
+             */
+            acquisition_contracts: {
+                [key: string]: number;
+            };
+            /** Device Id */
+            device_id: string;
+            /** Last Seen At */
+            last_seen_at: string;
+            /** Name */
+            name: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "online" | "offline";
+            /** Version */
+            version: string;
+        };
         /** LocalAgentJobCompleteRequest */
         LocalAgentJobCompleteRequest: {
             /** Attempt Count */
             attempt_count: number;
+            /**
+             * Device Id
+             * @description The device that holds the attempt; only the device that leased it completes it.
+             */
+            device_id: string;
             /** Error */
             error?: string | null;
             /** Result */
@@ -3792,6 +4036,11 @@ export interface components {
         };
         /** LocalAgentJobCreateRequest */
         LocalAgentJobCreateRequest: {
+            /**
+             * Device Id
+             * @description The requester's device that runs a device-bound setup job: the device chosen in Where it runs, whose folder picker picks a device location. Without one, a saved device Source's setup jobs run on its execution device. A credential check of a saved device Source runs on its execution device, which the request may name but not change.
+             */
+            device_id?: string | null;
             /** Operation */
             operation: string;
             /** Payload */
@@ -3807,8 +4056,6 @@ export interface components {
             source_id: string;
             /** Source Type */
             source_type: string;
-            /** Workspace Id */
-            workspace_id?: string | null;
         };
         /** LocalAgentJobCreateResponse */
         LocalAgentJobCreateResponse: {
@@ -3831,6 +4078,10 @@ export interface components {
         LocalAgentJobHeartbeatRequest: {
             /** Attempt Count */
             attempt_count: number;
+            /** Device */
+            device?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Lease Seconds
              * @default 60
@@ -3843,6 +4094,10 @@ export interface components {
         };
         /** LocalAgentJobLeaseRequest */
         LocalAgentJobLeaseRequest: {
+            /** Device */
+            device?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Lease Seconds
              * @default 60
@@ -3910,6 +4165,18 @@ export interface components {
             workspace_id: string;
         };
         /**
+         * LocalAgentServerContracts
+         * @description The server's MemForge version and the acquisition contract of each document type.
+         */
+        LocalAgentServerContracts: {
+            /** Acquisition Contracts */
+            acquisition_contracts: {
+                [key: string]: number;
+            };
+            /** Version */
+            version: string;
+        };
+        /**
          * LocalCollectionReceiptResponse
          * @description Admission receipt for a sync that the execution owner's local daemon collects.
          */
@@ -3966,247 +4233,6 @@ export interface components {
              * @default null
              */
             root: string | null;
-        };
-        /**
-         * LocalMarkdownPreviewCounts
-         * @description Files the scan read, and files it left out by reason.
-         */
-        LocalMarkdownPreviewCounts: {
-            /** Ignored */
-            ignored: number;
-            /** Included */
-            included: number;
-            /** Invalid Utf8 */
-            invalid_utf8: number;
-            /** Too Large */
-            too_large: number;
-            /** Unreadable */
-            unreadable: number;
-        };
-        /**
-         * LocalMarkdownPreviewItem
-         * @description One file under the folder that the Source would read.
-         */
-        LocalMarkdownPreviewItem: {
-            /** Bytes */
-            bytes: number;
-            /** Content Type */
-            content_type: string;
-            /** Raw Hash */
-            raw_hash: string;
-            /** Relative Path */
-            relative_path: string;
-            /** Title */
-            title: string;
-        };
-        /**
-         * LocalMarkdownPreviewTreeResult
-         * @description The files under a local folder that the configured patterns select.
-         *
-         *     ``root`` is the resolved folder and ``vault_id`` the identity its
-         *     Documents are stored under. ``items`` holds at most the requested number
-         *     of files, and ``counts`` counts all of them.
-         */
-        LocalMarkdownPreviewTreeResult: {
-            counts: components["schemas"]["LocalMarkdownPreviewCounts"];
-            /**
-             * Error
-             * @default null
-             */
-            error: string | null;
-            /**
-             * Error Type
-             * @default null
-             */
-            error_type: string | null;
-            /**
-             * Heartbeat Errors
-             * @default null
-             */
-            heartbeat_errors: string[] | null;
-            /** Items */
-            items: components["schemas"]["LocalMarkdownPreviewItem"][];
-            /** Operation */
-            operation: string;
-            /** Profile */
-            profile: string;
-            /** Root */
-            root: string;
-            /** Source Id */
-            source_id: string;
-            /** Vault Id */
-            vault_id: string;
-        };
-        /**
-         * LocalSourceConfirmationAnswerRequest
-         * @description The device's answer for one item its manifest response asked it to confirm.
-         */
-        LocalSourceConfirmationAnswerRequest: {
-            /**
-             * Answer
-             * @enum {string}
-             */
-            answer: "absent" | "exists" | "hidden";
-            /** Doc Id */
-            doc_id: string;
-            /** Provider Key */
-            provider_key: string;
-        };
-        /**
-         * LocalSourceConfirmationsRequest
-         * @description A device's answers for the items its query manifest left out, bound to that manifest.
-         *
-         *     ``manifest_sha256`` is the digest the manifest response returned, and the
-         *     job attempt is the one that submitted the manifest. The request answers
-         *     every item the response named in ``confirm``, or, when the device could
-         *     not confirm them, gives ``failure_cause`` and no answers.
-         */
-        LocalSourceConfirmationsRequest: {
-            /** Answers */
-            answers?: components["schemas"]["LocalSourceConfirmationAnswerRequest"][];
-            /** Failure Cause */
-            failure_cause?: string | null;
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count: number;
-            /** Local Agent Job Id */
-            local_agent_job_id: string;
-            /** Manifest Sha256 */
-            manifest_sha256: string;
-            /** Sync Snapshot Id */
-            sync_snapshot_id: string;
-        };
-        /**
-         * LocalSourceExcludedListingRequest
-         * @description What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
-         *
-         *     ``scope_key`` is the key the job named the scope by. A listing holds the
-         *     Document ids the scope lists, up to the manifest's item bound. A
-         *     definitive rejection, such as a JQL the provider refuses, gives its cause
-         *     in ``rejection`` and lists nothing.
-         */
-        LocalSourceExcludedListingRequest: {
-            /** Doc Ids */
-            doc_ids?: string[];
-            /** Rejection */
-            rejection?: string | null;
-            /** Scope Key */
-            scope_key: string;
-        };
-        /**
-         * LocalSourceManifestItemRequest
-         * @description One item of a device manifest: the item as the device read it.
-         */
-        LocalSourceManifestItemRequest: {
-            /**
-             * Change Kind
-             * @constant
-             */
-            change_kind: "upsert";
-            /** Doc Id */
-            doc_id: string;
-            /** Revision */
-            revision: string;
-        };
-        /**
-         * LocalSourceManifestRequest
-         * @description One complete local collection, planned against the retained packages.
-         *
-         *     A device manifest lists the complete item set of its scope, so it declares
-         *     ``complete_snapshot`` coverage and every item an ``upsert``.
-         *     ``package_contract_version`` is the package contract the local agent
-         *     collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-         *     the numbered contract sends none. ``excluded_listings`` answers the
-         *     excluded scopes the job carried, one entry per scope at most.
-         */
-        LocalSourceManifestRequest: {
-            /**
-             * Coverage
-             * @constant
-             */
-            coverage: "complete_snapshot";
-            /** Excluded Listings */
-            excluded_listings?: components["schemas"]["LocalSourceExcludedListingRequest"][];
-            /** Items */
-            items: components["schemas"]["LocalSourceManifestItemRequest"][];
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count: number;
-            /** Local Agent Job Id */
-            local_agent_job_id: string;
-            /** Package Contract Version */
-            package_contract_version?: number | null;
-            /** Sync Snapshot Id */
-            sync_snapshot_id: string;
-        };
-        /**
-         * LocalSourcePackageRequest
-         * @description One raw local-source package pushed by the local daemon/adapter.
-         *
-         *     File-like sources use ``markdown_body`` as raw file text for the declared
-         *     ``content_type``. Structured sources such as Jira use ``raw_payload`` and
-         *     defer canonical markdown rendering to the source gene.
-         *     ``source_updated_at`` is a file-like source's own time for this content
-         *     (an offset-aware ISO time); structured sources carry their times in
-         *     ``raw_payload``.
-         */
-        LocalSourcePackageRequest: {
-            /** Artifact Input Hashes */
-            artifact_input_hashes?: string[];
-            /** Artifact Source Unit Key */
-            artifact_source_unit_key?: string | null;
-            /** Base Url */
-            base_url?: string | null;
-            /** Blob Sha */
-            blob_sha?: string | null;
-            /**
-             * Content Type
-             * @default text/markdown
-             */
-            content_type: string;
-            /** Issue Key */
-            issue_key?: string | null;
-            /** Local Agent Attempt Count */
-            local_agent_attempt_count?: number | null;
-            /** Local Agent Job Id */
-            local_agent_job_id?: string | null;
-            /**
-             * Markdown Body
-             * @default
-             */
-            markdown_body: string;
-            /** Provider Revision */
-            provider_revision?: string | null;
-            /** Raw Hash */
-            raw_hash?: string | null;
-            /** Raw Payload */
-            raw_payload?: {
-                [key: string]: unknown;
-            };
-            /** Relative Path */
-            relative_path?: string | null;
-            /** Repo Ref */
-            repo_ref?: string | null;
-            /** Repo Url */
-            repo_url?: string | null;
-            /** Resolved Relative Path */
-            resolved_relative_path?: string | null;
-            /** Source Updated At */
-            source_updated_at?: string | null;
-            /** Source Url */
-            source_url?: string | null;
-            /** Submitted At */
-            submitted_at?: string | null;
-            /** Submitted By */
-            submitted_by?: string | null;
-            /** Symlink Chain */
-            symlink_chain?: {
-                [key: string]: string;
-            }[];
-            /** Sync Snapshot Id */
-            sync_snapshot_id?: string | null;
-            /** Title */
-            title?: string | null;
-            /** Vault Id */
-            vault_id?: string | null;
         };
         /** MemoryCorrectionProposalRequest */
         MemoryCorrectionProposalRequest: {
@@ -6058,10 +6084,53 @@ export interface components {
         SourceCurrentAccessTransitionResponse: {
             transition: components["schemas"]["SourceAccessTransitionResponse"] | null;
         };
+        /**
+         * SourceExecutionDeviceResponse
+         * @description The execution device of a device Source, from its latest device report.
+         */
+        SourceExecutionDeviceResponse: {
+            /**
+             * Credential
+             * @description How the Source's credential reaches its device: secret, stored on the device with `memforge source credentials set <source-id>`; browser_session, captured from the device's browser by a credential_check job.
+             * @enum {string}
+             */
+            credential: "secret" | "browser_session";
+            /**
+             * Id
+             * @description The device's id, which Where it runs chooses.
+             */
+            id: string;
+            /**
+             * Installed Version
+             * @description The MemForge version the device runs.
+             */
+            installed_version: string;
+            /**
+             * Name
+             * @description The device's name; null for a viewer other than the execution owner.
+             */
+            name: string | null;
+            /**
+             * Not Ready
+             * @description What the device's latest report says it lacks to run the Source; empty when it is ready, not yet reported, or the viewer is not the execution owner.
+             */
+            not_ready: components["schemas"]["SourceNotReadyReasonResponse"][];
+            /**
+             * Required Version
+             * @description The server's MemForge version, which `memforge upgrade` installs.
+             */
+            required_version: string;
+            /**
+             * State
+             * @description online: it can take the Source's job; offline: no recent report; update_required: online, but its acquisition contract for the type differs from the server's.
+             * @enum {string}
+             */
+            state: "online" | "offline" | "update_required";
+        };
         /** SourceExecutionResponse */
         SourceExecutionResponse: {
-            /** Immutable Config Fields */
-            immutable_config_fields: string[];
+            /** @description The execution device of a Source whose acquisition runs on a device; null while it has none, which shows Finish setup until its owner chooses one. */
+            device?: components["schemas"]["SourceExecutionDeviceResponse"] | null;
             /**
              * Kind
              * @enum {string}
@@ -6069,6 +6138,58 @@ export interface components {
             kind: "server" | "local_agent";
             /** Operation */
             operation: string | null;
+        };
+        /**
+         * SourceExecutorChangeRequest
+         * @description Where a document Source's acquisition runs from now on (ADR 0058).
+         */
+        SourceExecutorChangeRequest: {
+            /**
+             * Execution Device Id
+             * @description The changer's device that runs the Source from now on, from their device reports. Required for device, refused for server. Choosing another device moves the Source to it.
+             */
+            execution_device_id?: string | null;
+            /**
+             * Executor
+             * @description server: the server reaches the provider; device: one of the changer's own devices does.
+             * @enum {string}
+             */
+            executor: "server" | "device";
+            /**
+             * Secrets
+             * @description The secret fields of the type's form, which the server holds from now on. Required to move to the server, as the form requires them; refused otherwise.
+             */
+            secrets?: {
+                [key: string]: string;
+            };
+        };
+        /**
+         * SourceExecutorChangeResponse
+         * @description The Source's executor after the change, and the queued sync jobs it cancelled.
+         */
+        SourceExecutorChangeResponse: {
+            /**
+             * Cancelled Job Ids
+             * @description The Source's queued sync jobs, which were planned for the previous executor.
+             */
+            cancelled_job_ids: string[];
+            /**
+             * Execution Device Id
+             * @description The execution owner's device that runs the Source; null for a server Source.
+             */
+            execution_device_id: string | null;
+            /**
+             * Execution Owner User Id
+             * @description Whose device runs the Source; the person who moved it to the device.
+             */
+            execution_owner_user_id: string | null;
+            /**
+             * Executor
+             * @enum {string}
+             */
+            executor: "server" | "device";
+            /** Id */
+            id: string;
         };
         /** SourceFacetFilterRequest */
         SourceFacetFilterRequest: {
@@ -6153,6 +6274,28 @@ export interface components {
             /** Data */
             data: components["schemas"]["SourceResponse"][];
         };
+        /**
+         * SourceNotReadyReasonResponse
+         * @description What the execution device lacks to run the Source, from its latest report.
+         */
+        SourceNotReadyReasonResponse: {
+            /**
+             * Field
+             * @description For location: the configuration field naming the folder.
+             */
+            field?: string | null;
+            /**
+             * Kind
+             * @description credential: no stored value for a secret field, or no browser session; location: the folder of a device location field is missing or unreadable on the device.
+             * @enum {string}
+             */
+            kind: "credential" | "location";
+            /**
+             * Path
+             * @description For location: the path the device did not find.
+             */
+            path?: string | null;
+        };
         /** SourceOwnershipResponse */
         SourceOwnershipResponse: {
             /** Created By User Id */
@@ -6161,6 +6304,11 @@ export interface components {
             execution_owner_user_id: string | null;
             /** Owner User Id */
             owner_user_id: string;
+            /**
+             * Viewer Is Execution Owner
+             * @description Whether the viewer is the execution owner, whose device collects a Source collected on a device.
+             */
+            viewer_is_execution_owner: boolean;
             /**
              * Viewer Relationship
              * @enum {string}
@@ -6263,7 +6411,7 @@ export interface components {
             config: {
                 [key: string]: unknown;
             };
-            /** @description Readiness of a browser-session connection; present only for Sources that use one. */
+            /** @description Readiness of the connection: a browser session's on the server, or, for a device Source, its execution device's latest report: authentication while a credential is missing, configuration while a device location is missing or no execution device is chosen. Absent until the device reports on the Source, and for Sources without such a dependency. */
             connection_status?: components["schemas"]["SourceConnectionStatusResponse"] | null;
             /** Created At */
             created_at?: string | null;
@@ -6362,7 +6510,7 @@ export interface components {
         SourceScopeChangeRefusalResponse: {
             /**
              * Code
-             * @description scope_change_requires_listing, transition_requires_listing, source_provider_namespace_immutable or source_execution_mode_immutable.
+             * @description scope_change_requires_listing, transition_requires_listing or source_provider_namespace_immutable.
              */
             code: string;
             /** Message */
@@ -7152,44 +7300,13 @@ export interface operations {
             };
         };
     };
-    create_local_agent_job_api_cloud_local_agent_jobs_post: {
+    remove_local_agent_device_api_cloud_local_agent_devices__device_id__delete: {
         parameters: {
             query?: never;
             header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalAgentJobCreateRequest"];
+            path: {
+                device_id: string;
             };
-        };
-        responses: {
-            /** @description Successful Response */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LocalAgentJobCreateResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    read_current_local_agent_jobs_api_cloud_local_agent_jobs_current_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
             cookie?: never;
         };
         requestBody?: never;
@@ -7200,7 +7317,16 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["LocalAgentJobListResponse"];
+                    "application/json": components["schemas"]["LocalAgentDeviceRemovedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -7255,7 +7381,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["LocalAgentJobResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8451,6 +8577,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_local_agent_job_api_v1_local_agent_jobs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LocalAgentJobCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalAgentJobCreateResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_current_local_agent_jobs_api_v1_local_agent_jobs_current_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalAgentJobListResponse"];
                 };
             };
         };
@@ -10330,6 +10509,181 @@ export interface operations {
             };
         };
     };
+    submit_acquisition_answers_api_v1_sources__source_id__acquisition_answers_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcquisitionAnswersRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_held_acquired_bodies_api_v1_sources__source_id__acquisition_held_bodies_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HeldAcquiredBodiesRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upload_acquired_input_api_v1_sources__source_id__acquisition_inputs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcquiredInputRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_acquisition_manifest_api_v1_sources__source_id__acquisition_manifest_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcquisitionManifestRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_acquisition_stored_extras_api_v1_sources__source_id__acquisition_stored_extras_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AcquisitionStoredExtrasRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     push_local_source_artifact_api_v1_sources__source_id__adapter_artifacts_post: {
         parameters: {
             query: {
@@ -10350,111 +10704,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    prepare_local_source_manifest_api_v1_sources__source_id__adapter_manifest_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourceManifestRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    submit_local_source_confirmations_api_v1_sources__source_id__adapter_manifest_confirmations_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourceConfirmationsRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    push_local_source_package_api_v1_sources__source_id__adapter_packages_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                source_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["LocalSourcePackageRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -10636,6 +10885,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    change_source_executor_api_v1_sources__source_id__executor_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceExecutorChangeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceExecutorChangeResponse"];
                 };
             };
             /** @description Validation Error */

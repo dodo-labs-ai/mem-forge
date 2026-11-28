@@ -640,14 +640,14 @@ class ConfigOption:
     otherwise::
 
         ConfigField(
-            key="auth_mode", label="Authentication Method", field_type=ConfigFieldType.SELECT,
+            key="depth", label="Depth", field_type=ConfigFieldType.SELECT,
             choices=[
-                # A token works only when MemForge itself reads Jira.
-                ConfigOption("pat", "Personal access token",
-                             visible_when=(ConfigCondition("sync_mode", ("cloud",)),)),
-                ConfigOption("browser_cookie", "Browser session"),
+                ConfigOption("page", "This page only"),
+                # Offered only while the scope is a tree.
+                ConfigOption("subtree", "The page and its children",
+                             visible_when=(ConfigCondition("scope", ("tree",)),)),
             ],
-            default="pat",
+            default="page",
         )
     """
 
@@ -775,6 +775,11 @@ class SyncState:
     error_message: str | None = None
     failed_docs: list[FailedDoc] = field(default_factory=list)
     failure_retryable: bool = True
+    # The run failed on what its acquisition record answered (ADR 0058): a
+    # question the record holds no answer to, or an error acquisition raised.
+    # Asking the same record again gives the same answer, so such a run is not
+    # retried on it; when ``failure_retryable``, the Source is acquired again.
+    acquisition_failed: bool = False
     absence_check_skipped_reason: AbsenceCheckSkippedReason | None = None
     # Unlisted Units of a query listing confirmed still present (``exists`` or
     # ``hidden``); each is confirmed again every run. ``None`` when the run

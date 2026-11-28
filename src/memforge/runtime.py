@@ -19,7 +19,7 @@ from memforge.evals.agent_evaluation import (
     publish_runtime_events,
 )
 from memforge.auth import browser_session
-from memforge.genes import GENE_REGISTRY, create_gene, source_type_supports_sync
+from memforge.genes import GENE_REGISTRY, create_gene, gene_class, source_type_supports_sync
 from memforge.llm.bindings import embedding_identity, resolve_active_binding, usable_invocation
 from memforge.llm.embedding import (
     EmbeddingIndexMismatch,
@@ -33,13 +33,10 @@ from memforge.llm.structured import LiteLlmStructuredClient, StructuredLlmConfig
 from memforge.local_agent.source_contract import (
     local_agent_source_config_revision,
     local_agent_sync_operation,
-    snapshot_document_ids,
-    source_with_sync_inputs,
+    source_runs_on_device,
 )
 from memforge.source_projection_config import (
     excluded_scope_config,
-    projection_access_fingerprint,
-    source_access_context,
 )
 from memforge.memory.audit import AuditContext, MemoryAuditLogger
 from memforge.memory.engine import MemoryEngine
@@ -51,10 +48,18 @@ from memforge.genes.base import SourceConfigurationError
 from memforge.genes.conversation_gene import CollectionAttempt
 from memforge.genes.document_gene import DocumentGene
 from memforge.genes.family import CollectionFamilyKind
-from memforge.pipeline.collection_family import ExcludedScopeGeneFactory, SnapshotBinding
+from memforge.genes.recorded import AcquisitionRecordStore, recorded_gene_class
+from memforge.local_agent.document_acquisition import ACQUISITION_ATTEMPT_PAYLOAD_FIELD, StoredAcquisition
+from memforge.pipeline.collection_family import ExcludedScopeGeneFactory
+from memforge.pipeline.device_acquisition import (
+    device_excluded_scope_gene_factory,
+    enqueue_document_acquisition_job,
+    recorded_device_gene,
+)
 from memforge.source_types import source_type_descriptor
 from memforge.conversations.collections import StoredCollections
 from memforge.pipeline.memory_extractor import MemoryExtractor
+from memforge.pipeline.package_migration import PACKAGE_MIGRATION_COMMAND, awaits_package_migration
 from memforge.pipeline.sync_memory import SyncMemoryObserver
 from memforge.pipeline.sync import (
     DocumentLifecycleAdmission,
@@ -69,6 +74,7 @@ from memforge.release import current_release
 from memforge.source_item_failures import REMOVAL_STAGE, FailedItemRetry
 from memforge.source_secrets import decrypt_source_config_for_runtime, source_secret_fields
 from memforge.source_activity import (
+    SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
     SOURCE_SYNC_CANCELLED_BY_USER,
     SourceActivityConflict,
     SourceActivityKind,
@@ -81,6 +87,7 @@ from memforge.sync_progress import SourceSyncProgressAccumulator, source_sync_pr
 
 if TYPE_CHECKING:
     from memforge.evals.agent_evaluation import RuntimeEventTraceSink
+    from memforge.local_agent.job_store import LocalAgentJobStore
     from memforge.memory.reindex import MemoryVectorIndexes
     from memforge.storage.database import Database
 
@@ -303,16 +310,15 @@ class RuntimeProvider(Protocol):
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
-        reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
+        acquisition: StoredAcquisition | None = None,
     ) -> SyncState: ...
 
 
@@ -449,16 +455,15 @@ class DefaultRuntimeProvider:
         runtime: SyncRuntime | None = None,
         progress_callback: Callable[[dict], None] | None = None,
         force_full_sync: bool = False,
-        input_snapshot: SnapshotBinding | None = None,
         reprocess_doc_ids: frozenset[str] | None = None,
         execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
         lifecycle_cycle_id: str | None = None,
         scope_transition_run_id: str | None = None,
-        reusable_projection_doc_ids: frozenset[str] = frozenset(),
         record_terminal_result: bool = True,
         source_activity: SourceActivityLease | None = None,
         failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
         collection_attempt: CollectionAttempt | None = None,
+        acquisition: StoredAcquisition | None = None,
     ) -> SyncState:
         return await run_source_sync(
             db=db,
@@ -467,16 +472,15 @@ class DefaultRuntimeProvider:
             runtime=runtime,
             progress_callback=progress_callback,
             force_full_sync=force_full_sync,
-            input_snapshot=input_snapshot,
             reprocess_doc_ids=reprocess_doc_ids,
             execution_mode=execution_mode,
             lifecycle_cycle_id=lifecycle_cycle_id,
             scope_transition_run_id=scope_transition_run_id,
-            reusable_projection_doc_ids=reusable_projection_doc_ids,
             record_terminal_result=record_terminal_result,
             source_activity=source_activity,
             failed_item_retry=failed_item_retry,
             collection_attempt=collection_attempt,
+            acquisition=acquisition,
         )
 
 
@@ -983,6 +987,42 @@ def excluded_scope_gene_factory(source: Mapping[str, Any], source_config: Mappin
     return excluded_scope_gene
 
 
+@contextlib.asynccontextmanager
+async def held_source_activity(db: "Database", source_id: str) -> AsyncIterator[tuple[SourceActivityLease, asyncio.Task[None]]]:
+    """Hold a Source's sync activity while the block runs, renewing it every minute.
+
+    Yields the lease and the task that renews it; the task ends with
+    ``SourceSyncActivityConflict`` when a renewal fails, so a caller that
+    runs work under the lease stops that work then. Raises
+    ``SourceSyncActivityConflict`` when another activity holds the Source.
+    """
+
+    activity_id = f"source-sync-{uuid.uuid4().hex}"
+    try:
+        lease = await db.acquire_source_activity(
+            activity_id=activity_id,
+            source_id=source_id,
+            kind=SourceActivityKind.SYNC,
+            lease_seconds=300,
+        )
+    except SourceActivityConflict as exc:
+        raise SourceSyncActivityConflict(str(exc)) from exc
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(60)
+            await db.renew_source_activity(activity_id=activity_id, lease_seconds=300)
+
+    heartbeat = asyncio.create_task(renew())
+    try:
+        yield lease, heartbeat
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+        await db.release_source_activity(activity_id=activity_id)
+
+
 async def run_source_sync(
     db: "Database",
     config: AppConfig,
@@ -990,122 +1030,151 @@ async def run_source_sync(
     runtime: SyncRuntime | None = None,
     progress_callback: Callable[[dict], None] | None = None,
     force_full_sync: bool = False,
-    input_snapshot: SnapshotBinding | None = None,
     reprocess_doc_ids: frozenset[str] | None = None,
     execution_mode: SourceSyncMode = SourceSyncMode.NORMAL,
     lifecycle_cycle_id: str | None = None,
     scope_transition_run_id: str | None = None,
-    reusable_projection_doc_ids: frozenset[str] = frozenset(),
     record_terminal_result: bool = True,
     source_activity: SourceActivityLease | None = None,
     failed_item_retry: FailedItemRetry = FailedItemRetry.ALL,
     collection_attempt: CollectionAttempt | None = None,
+    acquisition: StoredAcquisition | None = None,
+    replay: AcquisitionRecordStore | None = None,
 ) -> SyncState:
     """Run one Source sync under a Source activity lease.
 
     ``collection_attempt`` names the collection attempt a conversation Source
-    syncs within; a document Source ignores it. ``input_snapshot`` binds a
-    document Source's run to the complete snapshot its device submitted.
+    syncs within; a document Source ignores it. ``acquisition`` is what a device acquired for a document
+    Source's run (ADR 0058): the run interprets it with the type's recorded
+    Gene, from the time the device's job attempt was leased, and reaches
+    neither the provider nor its session. A device Source runs only this way.
+    ``replay`` is the record of a REPLAY run: stored inputs a recoverable
+    migration rewrote, which the type's recorded Gene answers from.
+
+    Without ``source_activity`` the run holds the Source's activity itself,
+    and stops when it can no longer renew it.
     """
-    activity_id = source_activity.id if source_activity is not None else None
-    owns_activity = False
-    heartbeat_task: asyncio.Task[None] | None = None
-    activity_lease = source_activity
+    if (replay is not None) != (execution_mode is SourceSyncMode.REPLAY):
+        raise ValueError("a REPLAY run, and only one, interprets a replay record")
     if source_activity is not None:
         if source_activity.source_id != str(source["id"]):
             raise ValueError("durable Source activity does not belong to the synced Source")
         if source_activity.kind is not SourceActivityKind.SYNC:
             raise ValueError("durable Source activity must be a sync authority")
+        return await _run_source_sync_held(
+            db, config, source, runtime, progress_callback, force_full_sync, reprocess_doc_ids,
+            execution_mode, lifecycle_cycle_id or source_activity.id, scope_transition_run_id,
+            record_terminal_result, source_activity, failed_item_retry,
+            collection_attempt, acquisition, replay, heartbeat=None,
+        )
+    async with held_source_activity(db, str(source["id"])) as (lease, heartbeat):
+        return await _run_source_sync_held(
+            db, config, source, runtime, progress_callback, force_full_sync, reprocess_doc_ids,
+            execution_mode, lifecycle_cycle_id or lease.id, scope_transition_run_id,
+            record_terminal_result, lease, failed_item_retry,
+            collection_attempt, acquisition, replay, heartbeat=heartbeat,
+        )
+
+
+async def _run_source_sync_held(
+    db: "Database",
+    config: AppConfig,
+    source: dict,
+    runtime: SyncRuntime | None,
+    progress_callback: Callable[[dict], None] | None,
+    force_full_sync: bool,
+    reprocess_doc_ids: frozenset[str] | None,
+    execution_mode: SourceSyncMode,
+    lifecycle_cycle_id: str,
+    scope_transition_run_id: str | None,
+    record_terminal_result: bool,
+    activity_lease: SourceActivityLease,
+    failed_item_retry: FailedItemRetry,
+    collection_attempt: CollectionAttempt | None,
+    acquisition: StoredAcquisition | None,
+    replay: AcquisitionRecordStore | None,
+    *,
+    heartbeat: asyncio.Task[None] | None,
+) -> SyncState:
+    """Run one Source sync under ``activity_lease``; ``heartbeat`` renews it when the run holds it itself."""
+
+    if acquisition is None and replay is None and source_runs_on_device(source):
+        # The server never reaches a device Source's provider: its runs
+        # interpret what its device acquired.
+        raise SourceSyncBoundaryError(f"device Source {source['id']} runs only on what its device acquired")
+    if replay is None and awaits_package_migration(source):
+        # Its Units hold the packages of its old device path, which only the
+        # migration rewrites into what the type's Gene reads.
+        raise SourceSyncBoundaryError(
+            f"Source {source['id']} is still on its device package path; "
+            f"run `{PACKAGE_MIGRATION_COMMAND}` before it syncs"
+        )
+    runtime = runtime or await build_sync_runtime(db, config)
+    secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
+    source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
+    excluded_scope_gene: ExcludedScopeGeneFactory
+    if acquisition is not None:
+        gene = recorded_device_gene(db, runtime.doc_store, source, source_config, acquisition)
+        excluded_scope_gene = device_excluded_scope_gene_factory(source, source_config, acquisition)
+    elif replay is not None:
+        gene = recorded_gene_class(gene_class(source["type"]))(
+            config=source_config, source_id=source["id"], record_store=replay
+        )
+        excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
     else:
-        activity_id = f"source-sync-{uuid.uuid4().hex}"
-        try:
-            activity_lease = await db.acquire_source_activity(
-                activity_id=activity_id,
-                source_id=str(source["id"]),
-                kind=SourceActivityKind.SYNC,
-                lease_seconds=300,
-            )
-            owns_activity = True
-        except SourceActivityConflict as exc:
-            raise SourceSyncActivityConflict(str(exc)) from exc
-
-        async def heartbeat_activity() -> None:
-            while True:
-                await asyncio.sleep(60)
-                await db.renew_source_activity(
-                    activity_id=activity_id,
-                    lease_seconds=300,
-                )
-
-        heartbeat_task = asyncio.create_task(heartbeat_activity())
-    lifecycle_cycle_id = lifecycle_cycle_id or activity_id
-    try:
-        runtime = runtime or await build_sync_runtime(db, config)
-        secret_fields = source_secret_fields(source["type"], GENE_REGISTRY)
-        source_config = decrypt_source_config_for_runtime(source["config"], secret_fields=secret_fields)
         await browser_session.inject_cookie_for_source(db, source["type"], source_config)
         gene = create_gene(
             name=source["type"],
             config=source_config,
             source_id=source["id"],
         )
-        sync_task: asyncio.Task[Any] | None = None
+        excluded_scope_gene = excluded_scope_gene_factory(source, source_config)
+    sync_task: asyncio.Task[Any] | None = None
+    try:
+        sync_kwargs: dict[str, Any] = {
+            "gene": gene,
+            "source_name": source["name"],
+            "source_id": source["id"],
+            "progress_callback": progress_callback,
+            "force_full_sync": force_full_sync,
+            "reprocess_doc_ids": reprocess_doc_ids,
+            "execution_mode": execution_mode,
+            "source_activity": activity_lease,
+            "lifecycle_cycle_id": lifecycle_cycle_id,
+            "scope_transition_run_id": scope_transition_run_id,
+            "record_terminal_result": record_terminal_result,
+            "failed_item_retry": failed_item_retry,
+            "collection_attempt": collection_attempt,
+            "excluded_scope_gene": excluded_scope_gene,
+            "started_at": acquisition.started_at if acquisition is not None else None,
+        }
+        sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
+        if heartbeat is None:
+            return await sync_operation
+        sync_task = asyncio.create_task(sync_operation)
+        done, _ = await asyncio.wait({sync_task, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
+        if heartbeat in done:
+            sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sync_task
+            await heartbeat
+            raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_lease.id}")
+        return await sync_task
+    finally:
         try:
-            sync_kwargs: dict[str, Any] = {
-                "gene": gene,
-                "source_name": source["name"],
-                "source_id": source["id"],
-                "progress_callback": progress_callback,
-                "force_full_sync": force_full_sync,
-                "input_snapshot": input_snapshot,
-                "reprocess_doc_ids": reprocess_doc_ids,
-                "execution_mode": execution_mode,
-                "source_activity": activity_lease,
-                "lifecycle_cycle_id": lifecycle_cycle_id,
-                "scope_transition_run_id": scope_transition_run_id,
-                "reusable_projection_doc_ids": reusable_projection_doc_ids,
-                "record_terminal_result": record_terminal_result,
-                "failed_item_retry": failed_item_retry,
-                "collection_attempt": collection_attempt,
-                "excluded_scope_gene": excluded_scope_gene_factory(source, source_config),
-            }
-            sync_operation = runtime.orchestrator().sync_gene(**sync_kwargs)
-            if heartbeat_task is None:
-                return await sync_operation
-            sync_task = asyncio.create_task(sync_operation)
-            done, _ = await asyncio.wait(
-                {sync_task, heartbeat_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat_task in done:
+            # A cancelled caller leaves the sync task running; stop it before its client closes.
+            if sync_task is not None and not sync_task.done():
                 sync_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sync_task
-                await heartbeat_task
-                raise SourceSyncActivityConflict(f"source activity heartbeat stopped: {activity_id}")
-            return await sync_task
         finally:
             try:
-                # A cancelled caller leaves the sync task running; stop it before its client closes.
-                if sync_task is not None and not sync_task.done():
-                    sync_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await sync_task
-            finally:
-                try:
-                    await gene.close()
-                except Exception:
-                    # The run's own result or error is what callers act on; a failed release must not replace it.
-                    logger.warning(
-                        "Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True
-                    )
-    finally:
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
-        if owns_activity and activity_id is not None:
-            await db.release_source_activity(activity_id=activity_id)
+                await gene.close()
+            except Exception:
+                # The run's own result or error is what callers act on; a failed release must not replace it.
+                logger.warning(
+                    "Closing the %s Gene for source %s failed", source["type"], source["id"], exc_info=True
+                )
 
 
 class SourceSyncWorker:
@@ -1119,11 +1188,15 @@ class SourceSyncWorker:
         *,
         worker_id: str = "source-sync-worker",
         workspace_id: str | None = None,
+        local_agent_jobs: "LocalAgentJobStore | None" = None,
         lease_seconds: int = 300,
         heartbeat_seconds: float | None = None,
         progress_flush_seconds: float = 1.0,
     ) -> None:
         self.db = db
+        # A deployment that keeps local-agent jobs outside the workspace
+        # database names their store; the self-hosted database is its own.
+        self.local_agent_jobs = local_agent_jobs or db
         self.config = config
         self.runtime_provider = runtime_provider or DefaultRuntimeProvider()
         self.worker_id = worker_id
@@ -1434,10 +1507,15 @@ class SourceSyncWorker:
             with contextlib.suppress(asyncio.CancelledError):
                 await progress_task
 
-    def _next_retry_at(self, run: SourceSyncRun, failed_at: datetime) -> datetime | None:
-        if run.lease_attempt_count >= self.config.sync.worker_max_attempts:
+    def _retry_at(self, attempt: int, failed_at: datetime) -> datetime | None:
+        """When the attempt after ``attempt``, which failed at ``failed_at``, starts.
+
+        ``None`` once ``attempt`` reaches ``worker_max_attempts``; the delay
+        doubles with each attempt up to ``worker_retry_max_seconds``.
+        """
+        if attempt >= self.config.sync.worker_max_attempts:
             return None
-        exponent = max(0, run.lease_attempt_count - 1)
+        exponent = max(0, attempt - 1)
         delay = min(
             self.config.sync.worker_retry_max_seconds,
             self.config.sync.worker_retry_base_seconds * (2**exponent),
@@ -1537,56 +1615,29 @@ class SourceSyncWorker:
 
             # An operator reprocess reads the provider or stored Documents, not collected input.
             reprocessing = bool(run.reprocess_document_ids)
-            input_snapshot: SnapshotBinding | None = None
-            reusable_projection_doc_ids: frozenset[str] = frozenset()
-            if not reprocessing:
-                inputs = await self.db.list_source_sync_inputs(
-                    source_id=run.source_id,
-                    workspace_id=run.workspace_id,
-                    input_snapshot_id=run.input_snapshot_id,
+            descriptor = source_type_descriptor(str(source.get("type") or ""))
+            # A document Source's run bound to a job attempt interprets what
+            # the device acquired with the type's own Gene, through the
+            # recorded Gene.
+            acquired_on_device = (
+                run.input_snapshot_id is not None
+                and descriptor is not None
+                and descriptor.family is CollectionFamilyKind.DOCUMENT
+            )
+            acquisition: StoredAcquisition | None = None
+            if acquired_on_device:
+                acquisition = await self.db.get_source_acquisition(
+                    source_id=run.source_id, workspace_id=run.workspace_id, snapshot_id=run.input_snapshot_id
                 )
-                local_operation = local_agent_sync_operation(source["type"], source.get("config"))
-                if run.input_snapshot_id is None:
-                    if local_operation is not None and run.input_generation_watermark is None:
-                        raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
-                    if run.input_generation_watermark is not None:
-                        inputs = [
-                            source_input
-                            for source_input in inputs
-                            if source_input.input_generation <= run.input_generation_watermark
-                        ]
-                descriptor = source_type_descriptor(str(source.get("type") or ""))
-                if (
-                    run.input_snapshot_id is not None
-                    and descriptor is not None
-                    and descriptor.family is CollectionFamilyKind.DOCUMENT
-                ):
-                    input_snapshot = SnapshotBinding(
-                        snapshot_id=run.input_snapshot_id,
-                        doc_ids=snapshot_document_ids(inputs),
-                        confirmations=await self.db.list_source_sync_snapshot_confirmations(
-                            source_id=run.source_id,
-                            workspace_id=run.workspace_id,
-                            snapshot_id=run.input_snapshot_id,
-                        ),
-                        excluded_listings=await self.db.list_source_sync_snapshot_excluded_listings(
-                            source_id=run.source_id,
-                            workspace_id=run.workspace_id,
-                            snapshot_id=run.input_snapshot_id,
-                        ),
-                    )
-                if run.input_snapshot_id is not None and not run.force_full_sync:
-                    reusable_projection_doc_ids = await self.db.find_reusable_source_projection_memberships(
-                        source_id=run.source_id,
-                        workspace_id=run.workspace_id,
-                        snapshot_id=run.input_snapshot_id,
-                        expected_access_hash=projection_access_fingerprint(source_access_context(source)),
-                    )
-                source = source_with_sync_inputs(
-                    source,
-                    inputs,
-                    input_snapshot_supplied=run.input_snapshot_id is not None,
-                )
+                if acquisition is None:
+                    raise SourceSyncBoundaryError("the device acquisition of this run is not kept")
+            if (
+                not reprocessing
+                and run.input_snapshot_id is None
+                and run.input_generation_watermark is None
+                and local_agent_sync_operation(source["type"], source.get("config")) is not None
+            ):
+                raise SourceSyncBoundaryError("local-agent sync run is missing its input generation boundary")
 
             runtime = await self._build_runtime()
             self._relation_runtime = runtime
@@ -1602,15 +1653,14 @@ class SourceSyncWorker:
                 runtime=runtime,
                 progress_callback=None,
                 force_full_sync=run.force_full_sync and not reprocessing,
-                input_snapshot=input_snapshot,
                 reprocess_doc_ids=frozenset(run.reprocess_document_ids) or None,
                 execution_mode=(SourceSyncMode.REPROCESS if reprocessing else SourceSyncMode.NORMAL),
                 lifecycle_cycle_id=(f"{run.run_id}:attempt:{run.lease_attempt_count}"),
                 scope_transition_run_id=run.run_id,
-                reusable_projection_doc_ids=reusable_projection_doc_ids,
                 record_terminal_result=False,
                 source_activity=run.source_activity,
                 failed_item_retry=failed_item_retry_for_run(run),
+                acquisition=acquisition,
                 collection_attempt=CollectionAttempt(
                     workspace_id=run.workspace_id,
                     # A device collected into the run's input snapshot; a
@@ -1634,11 +1684,15 @@ class SourceSyncWorker:
                 # the complete durable run would duplicate successful provider
                 # and lifecycle work without improving the failure boundary.
                 # An operator reprocess is not retried; the operator requests it again.
+                # A device run that failed on what its acquisition answered is
+                # not retried on the same acquisition, which answers the same.
+                acquisition_failed = acquisition is not None and final_state.acquisition_failed
                 next_attempt_at = (
-                    self._next_retry_at(run, failed_at)
+                    self._retry_at(run.lease_attempt_count, failed_at)
                     if final_state.last_sync_status == "failed"
                     and final_state.failure_retryable
                     and not reprocessing
+                    and not acquisition_failed
                     else None
                 )
                 failed = await self.db.fail_source_sync_run(
@@ -1661,6 +1715,8 @@ class SourceSyncWorker:
                     _publish_terminal_runtime_bundles(runtime, final_state)
                 if next_attempt_at is None or stopped:
                     await self._release_collection(run, source)
+                if acquisition_failed and final_state.failure_retryable and not reprocessing and ended is not None:
+                    await self._acquire_again(ended, runtime.doc_store, failed_at)
                 return run
             completed = await self.db.complete_source_sync_run(
                 run.run_id,
@@ -1690,7 +1746,7 @@ class SourceSyncWorker:
                     str(exc),
                 )
             failed_at = datetime.now(timezone.utc)
-            next_attempt_at = self._next_retry_at(run, failed_at)
+            next_attempt_at = self._retry_at(run.lease_attempt_count, failed_at)
             retryable = (
                 failure_retryable(exc, store=self.db)
                 and next_attempt_at is not None
@@ -1708,6 +1764,51 @@ class SourceSyncWorker:
             if not failed:
                 logger.warning("Source sync worker stopped failure update after losing lease for run %s", run.run_id)
             return run
+
+    async def _acquire_again(self, run: SourceSyncRun, doc_store: LocalDocumentStore, failed_at: datetime) -> None:
+        """Retry a device run that failed on its acquisition with a new ``document_acquisition`` job.
+
+        ``run`` is the run as it ended. The device acquires the Source again
+        from the start of the job, so the new attempt answers what its own run
+        asks and asks the provider again (ADR 0058). The acquisitions share
+        the retry budget of a server run's attempts: the new job is the next
+        acquisition attempt of the job the run processed, and a daemon leases
+        it after the delay a server run's next attempt waits.
+
+        No job is queued once the attempts reach ``worker_max_attempts``, for
+        a run a person asked to stop, which a server run would not retry
+        either, for a run whose successor already processes a newer
+        acquisition, or for a Source that is no longer active; the next
+        scheduled run acquires again.
+        """
+
+        if run.stop_requested_at is not None or run.rerun_requested:
+            return
+        source = await self.db.get_source(run.source_id)
+        if source is None or source.get("status") != "active":
+            return
+        job = (
+            await self.local_agent_jobs.get_local_agent_job(run.predecessor_activity_id)
+            if run.predecessor_activity_id is not None
+            else None
+        )
+        if job is None:
+            raise SourceSyncBoundaryError(f"device run {run.run_id} has no recorded acquisition job")
+        attempt = int(job["payload"][ACQUISITION_ATTEMPT_PAYLOAD_FIELD])
+        next_attempt_at = self._retry_at(attempt, failed_at)
+        if next_attempt_at is None:
+            return
+        await enqueue_document_acquisition_job(
+            self.db,
+            self.local_agent_jobs,
+            doc_store,
+            source,
+            {"force_full_sync": run.force_full_sync, "retry_failed_items": run.retry_failed_items},
+            workspace_id=run.workspace_id,
+            trigger="retry",
+            acquisition_attempt=attempt + 1,
+            next_attempt_at=next_attempt_at,
+        )
 
     async def _end_stopped_run(self, run: SourceSyncRun, source: Mapping[str, Any] | None) -> SourceSyncRun:
         """Fail a run a person stopped, not retryable, and release its Source.
@@ -1827,14 +1928,13 @@ class SyncService:
         carries that intent from the job a person requested.
         """
         source = await self._ensure_source_can_sync(source_id)
-        current_config_revision = (
+        if source_config_revision is not None and source_config_revision != local_agent_source_config_revision(source):
+            raise ValueError("source config revision changed before sync enqueue")
+        effective_config_revision = source_config_revision or (
             local_agent_source_config_revision(source)
             if local_agent_sync_operation(source["type"], source.get("config")) is not None
             else None
         )
-        if source_config_revision is not None and source_config_revision != current_config_revision:
-            raise ValueError("source config revision changed before sync enqueue")
-        effective_config_revision = source_config_revision or current_config_revision
         return await self.db.enqueue_source_sync_run(
             source_id=source_id,
             workspace_id=self.workspace_id,
@@ -1847,18 +1947,31 @@ class SyncService:
             retry_failed_items=retry_failed_items,
         )
 
-    async def enqueue_reprocess(self, source_id: str, document_ids: tuple[str, ...]) -> SourceSyncRun:
+    async def enqueue_reprocess(
+        self,
+        source_id: str,
+        document_ids: tuple[str, ...],
+        *,
+        input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
+    ) -> SourceSyncRun:
         """Queue an operator reprocess of the Source Units of these Documents.
 
         It keeps the sync cursor, so the Source must have one; it is refused
-        while another run of the Source is pending or running.
+        while another run of the Source is pending or running. A reprocess a
+        device acquired is bound to that job attempt (``input_snapshot_id``)
+        and the configuration revision it acquired with.
         """
         source = await self._ensure_source_can_sync(source_id)
         if not document_ids:
             raise ValueError("reprocess needs at least one Document")
         if not await self._has_sync_cursor(source_id):
             raise SourceSyncBoundaryError(f"Source {source_id} has not completed a sync to reprocess")
-        return await self._enqueue_reprocess_run(source, document_ids)
+        if source_config_revision is not None and source_config_revision != local_agent_source_config_revision(source):
+            raise ValueError("source config revision changed before sync enqueue")
+        return await self._enqueue_reprocess_run(
+            source, document_ids, input_snapshot_id=input_snapshot_id, source_config_revision=source_config_revision
+        )
 
     async def enqueue_release_recovery(self) -> int:
         """Queue one run per Source to retry the failed Documents another release recorded.
@@ -1910,12 +2023,21 @@ class SyncService:
         state = await self.db.get_sync_state(source_id)
         return state is not None and state.last_sync_at is not None
 
-    async def _enqueue_reprocess_run(self, source: dict, document_ids: tuple[str, ...]) -> SourceSyncRun:
+    async def _enqueue_reprocess_run(
+        self,
+        source: dict,
+        document_ids: tuple[str, ...],
+        *,
+        input_snapshot_id: str | None = None,
+        source_config_revision: str | None = None,
+    ) -> SourceSyncRun:
         return await self.db.enqueue_source_sync_run(
             source_id=str(source["id"]),
             workspace_id=self.workspace_id,
             trigger="reprocess",
-            source_config_revision=(
+            input_snapshot_id=input_snapshot_id,
+            source_config_revision=source_config_revision
+            or (
                 local_agent_source_config_revision(source)
                 if local_agent_sync_operation(source["type"], source.get("config")) is not None
                 else None
@@ -2004,7 +2126,7 @@ class SyncService:
         self.progress.pop(source_id, None)
         await self.db.cancel_pending_source_sync_run(
             source_id=source_id,
-            error_message="cancelled_by_source_change",
+            error_message=SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE,
         )
 
     async def stop_source(self, source_id: str) -> SourceSyncRun | None:

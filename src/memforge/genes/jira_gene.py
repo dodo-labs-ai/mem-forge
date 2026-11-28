@@ -12,7 +12,6 @@ import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,16 +25,8 @@ from memforge.genes.atlassian_auth import (
 )
 from memforge.genes.base import SourceConfigurationError
 from memforge.genes.document_gene import DocumentGene
-from memforge.genes.local_adapter_packages import (
-    decode_package,
-    has_package_manifest,
-    open_packaged_source_artifact,
-    read_package_body,
-    source_artifacts_from_package,
-)
 from memforge.genes.toolkit.config import bearer_headers, bool_config, require_https_base_url, tls_verify
 from memforge.genes.toolkit.http import ConnectorHttpClient
-from memforge.genes.toolkit.local_packages import device_packages
 from memforge.genes.toolkit.paging import OffsetPage, PagingErrors, paged_by_offset
 from memforge.local_agent.jira_contract import validate_jira_observation_identities
 from memforge.source_time import SOURCE_UPDATED_AT_KEY, WESTERNMOST_ZONE, source_time_iso
@@ -82,14 +73,12 @@ COMMENT_MAX_RESULTS = 100
 HYDRATED_SEARCH_MAX_RESULTS = 25
 JIRA_SEARCH_FIELDS = ["*all"]
 JIRA_SEARCH_EXPAND = ["changelog", "renderedFields"]
-JIRA_INVENTORY_FIELDS = ["summary", "updated", "project"]
 JIRA_INVENTORY_MAX_RESULTS = 100
 # Listing and confirming the scope read identifiers only; id and key come with
 # every search result, and one small field keeps the response minimal.
 JIRA_IDENTITY_FIELDS = ["updated"]
 _ISSUE_DOC_ID_PREFIX = "jira-"
 JIRA_MYSELF_PATH = "/rest/api/2/myself"
-LOCAL_AGENT_JIRA_PACKAGE_KIND = "jira_document"
 
 JIRA_QUERY_MODE_SIMPLE = "simple"
 JIRA_QUERY_MODE_ADVANCED = "advanced"
@@ -294,11 +283,6 @@ def _search_issue_identities(issue: dict) -> tuple[tuple[str, str], tuple[str, s
     return ("id", str(issue["id"]).strip()), ("key", str(issue["key"]).strip())
 
 
-def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
-    """Whether the owner's local agent reads this Source's issues, instead of the server."""
-    return str(config.get("sync_mode") or "cloud").strip().lower() == "local_agent"
-
-
 def _request_interval_seconds(config: dict) -> float:
     raw_value = config.get("request_interval_ms", DEFAULT_REQUEST_INTERVAL_MS)
     try:
@@ -308,18 +292,9 @@ def _request_interval_seconds(config: dict) -> float:
 
 
 def jira_auth_mode(config: Mapping[str, Any]) -> str:
-    """The configured authentication method, else the one a new Source of its sync location uses.
+    """The configured authentication method; a Source without one authenticates with a personal access token."""
 
-    A new Source authenticates with a personal access token. Local sync offers
-    only a browser session, so a local Source without a method uses that.
-    """
-
-    configured = str(config.get("auth_mode") or "").strip().lower()
-    if configured:
-        return configured
-    if str(config.get("sync_mode") or "").strip().lower() == "local_agent":
-        return JIRA_AUTH_MODE_COOKIE
-    return JIRA_AUTH_MODE_PAT
+    return str(config.get("auth_mode") or "").strip().lower() or JIRA_AUTH_MODE_PAT
 
 
 def _auth_mode(config: dict) -> str:
@@ -428,7 +403,7 @@ def _mark_changelog_completeness(payload: dict) -> None:
         )
 
 
-def _issue_content_item(issue: dict, base_url: str) -> ContentItem:
+def issue_content_item(issue: dict, base_url: str) -> ContentItem:
     """Map a Jira search issue to a ContentItem, tolerating null optional fields.
 
     Jira returns ``priority``/``assignee``/etc. as explicit ``null`` when unset,
@@ -485,7 +460,6 @@ class JiraGene(DocumentGene):
             default_sync_interval_minutes=360,  # 6 hours
             auth_method="pat",
             data_shape="ticket",
-            execution_kinds=("server", "local_agent"),
         )
 
     @classmethod
@@ -514,38 +488,19 @@ class JiraGene(DocumentGene):
                     group="connection", order=0,
                 ),
                 ConfigField(
-                    key="sync_mode", label="Sync Location",
-                    field_type=ConfigFieldType.SELECT, required=False,
-                    choices=[
-                        ConfigOption("cloud", "Cloud"),
-                        ConfigOption("local_agent", "Local sync"),
-                    ],
-                    default="cloud",
-                    help_text=(
-                        "Cloud runs Jira sync from the MemForge service. Local agent runs Jira sync "
-                        "from the machine where the daemon is running, useful for VPN-only Jira."
-                    ),
-                    group="connection", order=1,
-                ),
-                ConfigField(
                     key="auth_mode", label="Authentication Method",
                     field_type=ConfigFieldType.SELECT, required=True,
                     choices=[
-                        ConfigOption(
-                            JIRA_AUTH_MODE_PAT,
-                            "Personal access token",
-                            visible_when=(ConfigCondition("sync_mode", ("cloud",)),),
-                        ),
+                        ConfigOption(JIRA_AUTH_MODE_PAT, "Personal access token"),
                         ConfigOption(JIRA_AUTH_MODE_COOKIE, "Browser session"),
                     ],
                     default=JIRA_AUTH_MODE_PAT,
                     help_text=(
                         "A personal access token, from Jira Data Center or Server, is sent "
-                        "as a bearer token and needs no local daemon. Browser session is "
-                        "for deployments where a personal access token is not available: "
-                        "the local CLI adapter (`memforge adapter auth jira refresh "
-                        "--base-url ...`) captures cookies from your signed-in browser. "
-                        "Local sync always uses a browser session."
+                        "as a bearer token. Browser session is for deployments where a "
+                        "personal access token is not available: the local CLI adapter "
+                        "(`memforge adapter auth jira refresh --base-url ...`) captures "
+                        "cookies from your signed-in browser."
                     ),
                     group="connection", order=2,
                 ),
@@ -632,19 +587,6 @@ class JiraGene(DocumentGene):
         await self.close()
         self._base_url = base_url
         self._auth_mode = mode
-        sync_mode = str(self.config.get("sync_mode") or "cloud").strip().lower()
-        if sync_mode == "local_agent":
-            if has_package_manifest(self.config):
-                self._client = None
-                self._hydrated_issues = {}
-                logger.info("Jira client using local-agent package manifest")
-                return
-            local_documents_dir = self._local_agent_documents_dir()
-            local_documents_dir.mkdir(parents=True, exist_ok=True)
-            self._client = None
-            self._hydrated_issues = {}
-            logger.info("Jira client using local-agent package inbox: %s", local_documents_dir)
-            return
         self._client = ConnectorHttpClient(
             product_name="Jira",
             base_url=base_url,
@@ -674,24 +616,24 @@ class JiraGene(DocumentGene):
         timezone, rounded down to the minute (:func:`_delta_clause`), so the
         first incremental search of a connection also reads ``/myself``.
         """
-        if _read_by_local_agent(self.config):
-            async for item in self._discover_local_agent_packages(since):
-                yield item
-            return
-
         self._hydrated_issues = {}
-        async for item in self._discover_remote_search(
-            since,
+        delta = None
+        if since is not None:
+            profile_zone = await self._jql_profile_zone()
+            delta = _delta_clause(since, profile_zone)
+            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
+        async for issue in self._search_issues(
+            _build_jql(self.config, delta),
             fields=JIRA_SEARCH_FIELDS,
             expand=JIRA_SEARCH_EXPAND,
             max_results=HYDRATED_SEARCH_MAX_RESULTS,
-            cache_hydrated=True,
         ):
-            yield item
+            self._hydrated_issues[str(issue["key"])] = issue
+            yield issue_content_item(issue, self._base_url)
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:
-        return not _read_by_local_agent(config)
+        return True
 
     def filter_summary(self, since: datetime | None) -> str | None:
         jql_filter = str(self.config.get("jql_filter") or "").strip()
@@ -727,27 +669,13 @@ class JiraGene(DocumentGene):
         if len(issues) > 1 or (issue_ref.isdigit() and str(issues[0]["id"]) != issue_ref):
             raise RuntimeError(f"Jira search for issue {issue_ref} returned another issue")
         issue = issues[0]
-        current = _issue_content_item(issue, self._base_url)
+        current = issue_content_item(issue, self._base_url)
         self._hydrated_issues[current.extra["issue_key"]] = issue
         return current
 
-    async def discover_inventory(self) -> AsyncIterator[ContentItem]:
-        """Discover a complete lightweight issue inventory for daemon planning."""
-        if _read_by_local_agent(self.config):
-            raise ValueError("Jira inventory discovery requires direct provider access")
-        self._hydrated_issues = {}
-        async for item in self._discover_remote_search(
-            None,
-            fields=JIRA_INVENTORY_FIELDS,
-            expand=None,
-            max_results=JIRA_INVENTORY_MAX_RESULTS,
-            cache_hydrated=False,
-        ):
-            yield item
-
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
-        """The JQL is listed by an identifier-only search, or by the device's snapshot manifest."""
+        """The JQL is listed by an identifier-only search."""
         return True
 
     async def list_scope(self) -> ScopeListing:
@@ -758,11 +686,6 @@ class JiraGene(DocumentGene):
         ``JIRA_INVENTORY_MAX_RESULTS`` issues. The JQL is a query: an issue it
         no longer matches may still exist (:meth:`confirm_absent`).
         """
-        if _read_by_local_agent(self.config):
-            raise ValueError(
-                "A Jira Source read through the local agent is listed by its device's snapshot manifest, "
-                "not by the server"
-            )
         doc_ids = {
             _issue_doc_id(str(issue["key"]))
             async for issue in self._search_issues(
@@ -773,24 +696,6 @@ class JiraGene(DocumentGene):
             )
         }
         return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset(doc_ids))
-
-    @classmethod
-    def provider_key(cls, item: ContentItem) -> str:
-        """The issue id, as an issue's Unit records it, or the issue key when the item does not record the id."""
-        return _issue_ref(item)
-
-    @classmethod
-    def confirmation_item(cls, document_id: str, provider_key: str) -> ContentItem:
-        """An issue to read by its id or key, answered under ``document_id``."""
-        issue_ref = _jql_issue_ref(provider_key.strip())
-        return ContentItem(
-            item_id=document_id,
-            title=issue_ref,
-            source_url="",
-            last_modified=datetime.fromtimestamp(0, tz=timezone.utc),
-            content_type="application/json",
-            extra={"issue_id": issue_ref} if issue_ref.isdigit() else {"issue_key": issue_ref},
-        )
 
     async def confirm_absent(self, items: Sequence[ContentItem]) -> Mapping[str, AbsenceAnswer]:
         """Search the unlisted issues by id in batches; read each one the search does not return.
@@ -826,33 +731,6 @@ class JiraGene(DocumentGene):
                     )
                 )
         return answers
-
-    async def _discover_remote_search(
-        self,
-        since: datetime | None,
-        *,
-        fields: list[str],
-        expand: list[str] | None,
-        max_results: int,
-        cache_hydrated: bool,
-    ) -> AsyncIterator[ContentItem]:
-        delta = None
-        if since is not None:
-            profile_zone = await self._jql_profile_zone()
-            delta = _delta_clause(since, profile_zone)
-            logger.info("Jira incremental search of %s in profile timezone %s: %s", self.source_id, profile_zone, delta)
-        async for issue in self._search_issues(
-            _build_jql(self.config, delta),
-            fields=fields,
-            expand=expand,
-            max_results=max_results,
-        ):
-            item = _issue_content_item(issue, self._base_url)
-            if cache_hydrated:
-                self._hydrated_issues[str(issue["key"])] = issue
-            else:
-                item.extra["attest_materialized_revision"] = True
-            yield item
 
     async def _jql_profile_zone(self) -> tzinfo:
         """The timezone Jira reads this account's JQL date literals in, read once per connection.
@@ -970,22 +848,7 @@ class JiraGene(DocumentGene):
 
     async def fetch(self, item: ContentItem) -> RawContent:
         """Fetch full issue data with comments and links."""
-        if item.extra.get("package_uri") or item.extra.get("package_path"):
-            body = read_package_body(self, item, source_label="Jira")
-            package = decode_package(body, LOCAL_AGENT_JIRA_PACKAGE_KIND)
-            if package is None:
-                raise ValueError(f"Jira package {item.item_id} is not a {LOCAL_AGENT_JIRA_PACKAGE_KIND} package")
-            return RawContent(
-                item=item,
-                body=body,
-                content_type="application/json",
-                artifacts=source_artifacts_from_package(package),
-            )
-
         key = item.extra.get("issue_key", item.item_id.removeprefix(_ISSUE_DOC_ID_PREFIX))
-        attested = item.extra.get("attest_materialized_revision") is True
-        if attested:
-            await self._hydrate_inventory_issue(item, key)
         hydrated_issue = getattr(self, "_hydrated_issues", {}).get(key)
         if isinstance(hydrated_issue, dict):
             payload = _issue_payload_from_search(hydrated_issue, self.config)
@@ -997,8 +860,6 @@ class JiraGene(DocumentGene):
             if comments_read_apart:
                 await self._fetch_comment_snapshot(key, payload)
             getattr(self, "_hydrated_issues", {}).pop(key, None)
-            if attested and comments_read_apart:
-                await self._attest_materialized_revision(key, str(item.version or ""))
             artifacts = await self._fetch_source_artifacts(payload)
             return RawContent(
                 item=item,
@@ -1119,10 +980,6 @@ class JiraGene(DocumentGene):
     async def open_source_artifact(self, artifact: RawSourceArtifact):
         """Open one Jira attachment without buffering its body."""
 
-        if artifact.locator.get("input_uri"):
-            async with open_packaged_source_artifact(self, artifact) as download:
-                yield download
-            return
         request_path = str(artifact.locator.get("request_path") or "").strip()
         if not request_path:
             raise SourceArtifactContractError("Jira attachment locator is incomplete")
@@ -1186,49 +1043,6 @@ class JiraGene(DocumentGene):
             return "comment", matches[0]
         return "issue_core", f"{issue_id}:core"
 
-    async def _hydrate_inventory_issue(self, item: ContentItem, key: str) -> None:
-        """Read a listed issue in full with a one-issue search in the scope, at the listed revision.
-
-        Jira writes ``updated`` per endpoint: a search can answer it at a
-        coarser precision than an issue read, so a listed revision is
-        compared only with another search.
-        """
-        current = await self.rediscover(item)
-        if current is None or current.extra["issue_key"] != key or current.version != item.version:
-            if current is not None:
-                self._hydrated_issues.pop(current.extra["issue_key"], None)
-            raise RuntimeError(
-                f"Jira issue {key} changed during materialization; retry inventory"
-            )
-
-    async def _attest_materialized_revision(self, key: str, expected_revision: str) -> None:
-        """Search the issue again after its comments are read apart, and require the listed revision."""
-        issues = [
-            issue
-            async for issue in self._search_issues(
-                _single_issue_jql(self.config, key),
-                fields=JIRA_IDENTITY_FIELDS,
-                expand=None,
-                max_results=1,
-                validate_query=False,
-            )
-        ]
-        fields = issues[0].get("fields") if len(issues) == 1 else None
-        current_revision = (
-            str(fields.get("updated") or "").strip()
-            if isinstance(fields, dict)
-            else ""
-        )
-        if (
-            len(issues) != 1
-            or str(issues[0].get("key") or "").strip() != key
-            or not current_revision
-            or current_revision != expected_revision
-        ):
-            raise RuntimeError(
-                f"Jira issue {key} changed during materialization; retry inventory"
-            )
-
     async def _fetch_comment_snapshot(self, key: str, payload: dict) -> None:
         comments_resp = await self._request(
             "GET",
@@ -1277,24 +1091,9 @@ class JiraGene(DocumentGene):
         issue links, subtasks, and comments so the enricher can extract memories
         from the issue payload.
         """
-        package = json.loads(raw.body)
-        data = package
-        package_semantics: dict[str, Any] = {}
-        if package.get("package_kind") == LOCAL_AGENT_JIRA_PACKAGE_KIND:
-            raw_payload = package.get("raw_payload")
-            if not isinstance(raw_payload, dict):
-                raise ValueError("Jira local-agent package is missing raw_payload")
-            data = raw_payload
-            package_semantics = {
-                "source_kind": "jira",
-                "base_url": package.get("base_url"),
-                "issue_key": package.get("issue_key"),
-                "raw_hash": package.get("raw_hash"),
-                "submitted_at": package.get("submitted_at"),
-                "submitted_by": package.get("submitted_by"),
-            }
+        data = json.loads(raw.body)
         fields = data.get("fields", {})
-        key = str(package_semantics.get("issue_key") or raw.item.extra.get("issue_key") or data.get("key") or "")
+        key = str(raw.item.extra.get("issue_key") or data.get("key") or "")
 
         lines = []
 
@@ -1386,7 +1185,6 @@ class JiraGene(DocumentGene):
 
         # Source semantics (structured data for filtering)
         source_semantics = {
-            **package_semantics,
             # The issue's own last-change time; each Observation carries its own
             # narrower time in the projection.
             SOURCE_UPDATED_AT_KEY: source_time_iso(fields.get("updated")),
@@ -1411,32 +1209,3 @@ class JiraGene(DocumentGene):
             markdown_body=markdown_body,
             source_semantics=source_semantics,
         )
-
-    def _local_agent_documents_dir(self) -> Path:
-        configured = str(self.config.get("local_agent_documents_dir") or "").strip()
-        if not configured:
-            raise ValueError("Jira local-agent sync requires a local package inbox")
-        return Path(configured).expanduser()
-
-    async def _discover_local_agent_packages(self, since: datetime | None) -> AsyncIterator[ContentItem]:
-        packages = device_packages(
-            self.config,
-            package_kind=LOCAL_AGENT_JIRA_PACKAGE_KIND,
-            inbox=self._local_agent_documents_dir,
-        )
-        for package in packages:
-            if not package.changed_after(since):
-                continue
-            issue_key = package.text("issue_key").strip()
-            yield ContentItem(
-                item_id=package.text("doc_id", issue_key),
-                title=package.text("title", issue_key),
-                source_url=package.text("source_url"),
-                last_modified=package.last_modified,
-                content_type="application/json",
-                space_or_project=package.text("space_or_project", issue_key.split("-", 1)[0]),
-                version=package.text("version"),
-                author=package.fields.get("submitted_by"),
-                labels=["jira"],
-                extra={**package.locator, "issue_key": issue_key},
-            )

@@ -6,7 +6,7 @@ import type { Source } from "@/api";
 import { errorResponse, type Route } from "@/test/fakeApi";
 import { renderRoutes } from "@/test/renderRoutes";
 import { setupJobRoutes } from "@/test/setupJobs";
-import { makeScopeTransition, makeSource } from "@/test/sourceFixtures";
+import { makeDevice, makeLocalSyncStatus, makeScopeTransition, makeSource } from "@/test/sourceFixtures";
 import { SOURCE_TYPE_FORMS, sourceTypeSchema } from "@/test/sourceTypeForms";
 import { NewSourcePage, SourceSettingsPage } from "./SourceSetupPage";
 
@@ -112,6 +112,7 @@ test("creates a Confluence source with project and schedule", async () => {
     config: { base_url: "https://wiki.example.com", pat: "token-1", spaces: ["PAY"] },
     project_binding: { mode: "fixed", project_key: "PAY" },
     sync_schedule: { enabled: true, interval_minutes: 60 },
+    executor: "server",
   });
   expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(/^\/sources$/);
 });
@@ -160,48 +161,35 @@ test("Check setup lists the first five items", async () => {
     config: { base_url: "https://wiki.example.com", pat: "token-1", spaces: ["PAY"] },
     limit: 5,
     source_id: null,
+    executor: "server",
   });
 });
 
-test("Check setup for a local folder lists the files local sync finds there", async () => {
+test("a new local folder opens its folder picker on the computer chosen in Where it runs", async () => {
   const created: Parameters<typeof setupJobRoutes>[1] = [];
   renderSetup("/sources/new/local_markdown?step=connection", {
     routes: {
       "POST /api/v1/genes/local_markdown/config-check": () => NO_ISSUES,
-      ...setupJobRoutes(
-        {
-          local_markdown_preview_tree: {
-            status: "succeeded",
-            result: {
-              operation: "local_markdown_preview_tree",
-              counts: { included: 12, ignored: 3, too_large: 0, invalid_utf8: 0, unreadable: 0 },
-              items: [
-                { relative_path: "payroll/runbook.md", title: "Payroll runbook" },
-                { relative_path: "notes.md", title: "" },
-              ],
-            },
-          },
-        },
-        created,
-      ),
+      ...setupJobRoutes({ local_markdown_pick_root: { status: "succeeded", result: { operation: "local_markdown_pick_root", root: "/Users/alex/notes" } } }, created),
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice(), makeDevice({ device_id: "dev-desktop", name: "Alex's desktop" })]),
     },
   });
 
-  await userEvent.type(await screen.findByLabelText("Folder Path"), "/Users/me/notes");
-  await next();
-  await userEvent.click(await screen.findByRole("button", { name: "Check setup" }));
+  await userEvent.click(await screen.findByRole("radio", { name: /Alex's desktop/ }));
+  await userEvent.click(await screen.findByRole("button", { name: "Choose folder" }));
 
-  const found = await screen.findByRole("list", { name: "First items found" });
-  expect(within(found).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Payroll runbook", "notes.md"]);
-  expect(screen.getByText("The first 2 items found")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByLabelText("Folder Path")).toHaveValue("/Users/alex/notes"));
   expect(created).toEqual([
     {
       source_id: "",
       source_type: "local_markdown",
-      operation: "local_markdown_preview_tree",
-      payload: { root: "/Users/me/notes", vault_id: "preview", limit: 5 },
+      operation: "local_markdown_pick_root",
+      payload: { title: "Choose folder to sync", initial_directory: null },
+      device_id: "dev-desktop",
     },
   ]);
+  expect(screen.queryByRole("button", { name: "Check setup" })).not.toBeInTheDocument();
 });
 
 test("a pasted Confluence page URL fills the page tree root and switches an unchosen sync scope to page tree", async () => {
@@ -227,7 +215,7 @@ test("a pasted Confluence page URL fills the page tree root and switches an unch
   expect(screen.getByLabelText("Page Tree Root")).toHaveValue("12345");
   expect(screen.getByLabelText("Page Tree Root")).toHaveAccessibleDescription(expect.stringContaining("Filled from the URL"));
   expect(screen.queryByLabelText("Spaces to Sync")).not.toBeInTheDocument();
-  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({ config: { base_url: pageUrl }, source_id: null });
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({ config: { base_url: pageUrl }, source_id: null, executor: "server" });
 });
 
 test("a sync scope the user chose is not overwritten by a derived value", async () => {
@@ -250,11 +238,11 @@ test("a radio change and a switch toggle check the configuration they commit", a
 
   await userEvent.click(await screen.findByRole("radio", { name: "This page tree" }));
   await waitFor(() => expect(checks()).toHaveLength(1));
-  expect(await checks()[0]!.clone().json()).toEqual({ config: { sync_mode: "page_tree" }, source_id: null });
+  expect(await checks()[0]!.clone().json()).toEqual({ config: { sync_mode: "page_tree" }, source_id: null, executor: "server" });
 
   await userEvent.click(screen.getByRole("switch", { name: "Include Child Pages" }));
   await waitFor(() => expect(checks()).toHaveLength(2));
-  expect(await checks()[1]!.clone().json()).toEqual({ config: { sync_mode: "page_tree", include_children: false }, source_id: null });
+  expect(await checks()[1]!.clone().json()).toEqual({ config: { sync_mode: "page_tree", include_children: false }, source_id: null, executor: "server" });
 });
 
 test("an untouched mode field is sent absent", async () => {
@@ -308,6 +296,7 @@ test("a stored Confluence source with a root and a blank sync scope opens on the
   expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toEqual({
     config: { base_url: "https://wiki.example.com", page_tree_root: "12345" },
     source_id: "src-wiki",
+    executor: "server",
   });
 });
 
@@ -428,26 +417,6 @@ test("Wait keeps the edit and does not stop the sync", async () => {
   expect(requestsTo(calls, "PUT", "/api/v1/sources/src-wiki")).toHaveLength(0);
 });
 
-test("fixed-after-create fields are read-only", async () => {
-  const source = makeSource({
-    id: "src-jira",
-    type: "jira",
-    name: "Payroll Jira",
-    config: { base_url: "https://jira.example.com", sync_mode: "local_agent", auth_mode: "browser_cookie", projects: ["PAY"] },
-    execution: { kind: "local_agent", operation: "jira_sync", immutable_config_fields: ["sync_mode"] },
-  });
-  renderSetup("/sources/src-jira/settings?step=connection", { sources: [source] });
-
-  const local = await screen.findByRole("radio", { name: "Local sync" });
-  expect(local).toBeChecked();
-  expect(local).toHaveAttribute("aria-disabled", "true");
-  expect(screen.getByRole("radio", { name: "Cloud" })).toHaveAttribute("aria-disabled", "true");
-  const facts = screen.getByRole("region", { name: "Detected settings" });
-  expect(within(facts).getByText("Sync Location")).toBeInTheDocument();
-  expect(within(facts).getByText("Local sync")).toBeInTheDocument();
-  expect(within(facts).getByText("Fixed when the source was created.")).toBeInTheDocument();
-});
-
 test("a blank secret keeps the stored token", async () => {
   const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
     sources: [makeSource({ config: CONFLUENCE_CONFIG })],
@@ -477,4 +446,337 @@ test("leaving with unsaved changes asks first", async () => {
   await userEvent.click(screen.getByText("Cancel", { selector: "a" }));
   await userEvent.click(within(await screen.findByRole("dialog", { name: "Leave without saving?" })).getByRole("button", { name: "Leave without saving" }));
   expect(await screen.findByRole("status", { name: "Location" })).toHaveTextContent(/^\/sources$/);
+});
+
+/** A Source that runs on the viewer's device, which no device report names yet. */
+function deviceSource(credential: "secret" | "browser_session", overrides: Partial<Source> = {}): Source {
+  return makeSource({
+    config: { base_url: "https://wiki.example.com", sync_mode: "space", spaces: ["PAY"] },
+    connection_status: { state: "action_required", reason: "authentication" },
+    ownership: { ...makeSource().ownership, execution_owner_user_id: "local", viewer_is_execution_owner: true },
+    execution: {
+      kind: "local_agent",
+      operation: "document_acquisition",
+      device: { id: "dev-1", name: "Alex's MacBook", state: "online", not_ready: [], installed_version: "0.2.0b7", required_version: "0.2.0b7", credential },
+    },
+    ...overrides,
+  });
+}
+
+/**
+ * Config-check for a stored device Source, answering as the server does for
+ * the executor the request names: on its device the server holds no token, so
+ * a typed one is refused; on the server the token is required.
+ */
+async function deviceSourceConfigCheck(request: Request) {
+  const { config, executor } = (await request.clone().json()) as { config: Record<string, unknown>; executor?: string };
+  if ((executor ?? "device") === "device") {
+    return config.pat ? { ...NO_ISSUES, issues: [{ key: "pat", message: "The token is stored on the device that runs this source, not on the server." }] } : NO_ISSUES;
+  }
+  return config.pat ? NO_ISSUES : { ...NO_ISSUES, issues: [{ key: "pat", message: "Personal Access Token is required." }] };
+}
+
+async function chooseMyComputer() {
+  await userEvent.click(await screen.findByRole("radio", { name: /My computer/ }));
+}
+
+test("Where it runs on My computer creates the source without its secret once a device is ready", async () => {
+  const { calls } = renderSetup("/sources/new/confluence", {
+    routes: { "POST /api/v1/sources": () => CREATED, "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus() },
+  });
+
+  await userEvent.type(await screen.findByLabelText("Source name"), "Team wiki");
+  await next();
+  expect(screen.getByRole("radio", { name: /Server/ })).toBeChecked();
+  await chooseMyComputer();
+  expect(screen.queryByLabelText("Personal Access Token")).not.toBeInTheDocument();
+  // A single computer is chosen already.
+  const computer = await screen.findByRole("radio", { name: /Alex's MacBook/ });
+  expect(computer).toBeChecked();
+  expect(within(screen.getByRole("region", { name: "Your computers" })).getByText(/Online · MemForge 0.2.0b7/)).toBeInTheDocument();
+  await userEvent.type(screen.getByLabelText("Wiki URL"), "https://wiki.example.com");
+  await next();
+  await userEvent.type(await screen.findByLabelText("Spaces to Sync"), "PAY{Enter}");
+  await userEvent.click(screen.getByRole("button", { name: "Create source" }));
+
+  expect(await bodyOf(calls, "POST", "/api/v1/sources")).toMatchObject({
+    executor: "device",
+    execution_device_id: "dev-1",
+    config: { base_url: "https://wiki.example.com", spaces: ["PAY"] },
+  });
+  const created = (await bodyOf(calls, "POST", "/api/v1/sources")) as { config: Record<string, unknown> };
+  expect(created.config).not.toHaveProperty("pat");
+  expect(requestsTo(calls, "POST", "/api/v1/genes/confluence/preview-discovery")).toHaveLength(0);
+});
+
+test.each([
+  ["no device", [], "Set up MemForge on your computer", "memforge setup"],
+  ["an offline device chosen", [makeDevice({ status: "offline" })], "Start MemForge on that computer", "memforge daemon start"],
+  ["a device that needs an update chosen", [makeDevice({ acquisition_contracts: { confluence: 1 } })], "Update MemForge on that computer", "memforge upgrade"],
+])("Where it runs disables save with %s and shows the step that makes it ready", async (_, devices, step, command) => {
+  renderSetup("/sources/new/confluence?step=connection", {
+    routes: { "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus(devices) },
+  });
+
+  await chooseMyComputer();
+  expect(await screen.findByText(step)).toBeInTheDocument();
+  expect(screen.getByText(command)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Create source" })).toBeDisabled();
+  await userEvent.click(screen.getByRole("radio", { name: /Server/ }));
+  expect(screen.getByRole("button", { name: "Create source" })).toBeEnabled();
+  expect(screen.getByLabelText("Personal Access Token")).toBeInTheDocument();
+});
+
+test("a server source moves to My computer through the executor change", async () => {
+  const source = makeSource({ config: CONFLUENCE_CONFIG });
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus(),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  await chooseMyComputer();
+  expect(await screen.findByRole("radio", { name: /Alex's MacBook/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "device", execution_device_id: "dev-1" });
+  expect(requestsTo(calls, "PUT", "/api/v1/sources/src-wiki")).toHaveLength(0);
+});
+
+test("a device source moves to the server with the secret the form requires", async () => {
+  const source = deviceSource("secret");
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "server", cancelled_jobs: 0 }),
+    },
+  });
+
+  await userEvent.click(await screen.findByRole("radio", { name: /Server/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  expect(await screen.findByText("Personal Access Token is required.")).toBeInTheDocument();
+  expect(requestsTo(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toHaveLength(0);
+
+  await userEvent.type(screen.getByLabelText("Personal Access Token"), "token-2");
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/config-check")).toMatchObject({ source_id: "src-wiki", executor: "server" });
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "server", secrets: { pat: "token-2" } });
+});
+
+test("a device source moving to the server checks its setup through the server with the typed token", async () => {
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [deviceSource("secret")],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "POST /api/v1/genes/confluence/preview-discovery": () => ({ source_type: "confluence", count: 0, items: [], truncated: false }),
+    },
+  });
+
+  await userEvent.click(await screen.findByRole("radio", { name: /Server/ }));
+  await userEvent.type(screen.getByLabelText("Personal Access Token"), "token-2");
+  await next();
+  await userEvent.click(await screen.findByRole("button", { name: "Check setup" }));
+
+  expect(await bodyOf(calls, "POST", "/api/v1/genes/confluence/preview-discovery")).toMatchObject({
+    source_id: "src-wiki",
+    executor: "server",
+    config: { pat: "token-2" },
+  });
+});
+
+test("a device source's token is stored on its computer with a copyable command, never in the form", async () => {
+  renderSetup("/sources/src-wiki/settings?step=connection", { sources: [deviceSource("secret")] });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(within(step).getByText("Sign in required")).toBeInTheDocument();
+  expect(within(step).getByText("memforge source credentials set src-wiki")).toBeInTheDocument();
+  expect(within(step).getByRole("button", { name: "Copy memforge source credentials set src-wiki" })).toBeInTheDocument();
+  expect(screen.queryByLabelText("Personal Access Token")).not.toBeInTheDocument();
+});
+
+test("a device source with a browser session signs in through a credential check on its computer", async () => {
+  const created: Parameters<typeof setupJobRoutes>[1] = [];
+  const source = deviceSource("browser_session", {
+    type: "jira",
+    config: { base_url: "https://jira.example.com", sync_mode: "cloud", auth_mode: "browser_cookie", projects: ["ACME"] },
+  });
+  renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: setupJobRoutes({ credential_check: { status: "succeeded", result: { ok: true } } }, created),
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(screen.queryByRole("region", { name: "Jira browser session" })).not.toBeInTheDocument();
+  await userEvent.click(within(step).getByRole("button", { name: "Sign in" }));
+  await waitFor(() => expect(created).toHaveLength(1));
+  expect(created[0]).toMatchObject({ operation: "credential_check", source_id: "src-wiki", device_id: "dev-1" });
+});
+
+test("a choice of two computers waits for the person to choose one", async () => {
+  renderSetup("/sources/new/confluence?step=connection", {
+    routes: {
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice(), makeDevice({ device_id: "dev-desktop", name: "Alex's desktop" })]),
+    },
+  });
+
+  await chooseMyComputer();
+  expect(await screen.findByText("Choose the computer that runs this source")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Create source" })).toBeDisabled();
+  await userEvent.click(screen.getByRole("radio", { name: /Alex's desktop/ }));
+  expect(screen.queryByText("Choose the computer that runs this source")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Create source" })).toBeEnabled();
+});
+
+test("a device source whose computer is offline moves to another of the person's computers", async () => {
+  const source = deviceSource("secret", {
+    connection_status: { state: "action_required", reason: "authentication" },
+  });
+  source.execution!.device!.state = "offline";
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice({ status: "offline" }), makeDevice({ device_id: "dev-desktop", name: "Alex's desktop" })]),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(within(step).getByText("Alex's MacBook is offline.")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  await userEvent.click(within(step).getByRole("button", { name: "Move" }));
+  // The current computer is chosen, and offline: save waits until another is chosen.
+  expect(await screen.findByRole("radio", { name: /Alex's MacBook/ })).toBeChecked();
+  expect(screen.getByText("Start MemForge on that computer")).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("radio", { name: /Alex's desktop/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({
+    executor: "device",
+    execution_device_id: "dev-desktop",
+  });
+});
+
+test("a device source whose computer is online changes to another of the person's computers", async () => {
+  const source = deviceSource("secret", { connection_status: { state: "ready", reason: null } });
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice(), makeDevice({ device_id: "dev-desktop", name: "Alex's desktop" })]),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(within(step).queryByRole("button", { name: "Move" })).not.toBeInTheDocument();
+  await userEvent.click(within(step).getByRole("button", { name: "Change computer" }));
+  expect(await screen.findByRole("radio", { name: /Alex's MacBook/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("radio", { name: /Alex's desktop/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({
+    executor: "device",
+    execution_device_id: "dev-desktop",
+  });
+});
+
+test("another member takes over a device source by choosing their own computer", async () => {
+  const source = deviceSource("secret", {
+    connection_status: { state: "ready", reason: null },
+    ownership: { ...makeSource().ownership, execution_owner_user_id: "alex", viewer_is_execution_owner: false },
+  });
+  source.execution!.device!.name = null;
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus([makeDevice({ device_id: "dev-sam", name: "Sam's laptop" })]),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(step).toHaveTextContent("Runs on its owner's computer");
+  await userEvent.click(within(step).getByRole("button", { name: "Change computer" }));
+  // Their single computer is chosen already.
+  expect(await screen.findByRole("radio", { name: /Sam's laptop/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "device", execution_device_id: "dev-sam" });
+});
+
+test("a device source without a computer shows Finish setup by choosing one", async () => {
+  const source = deviceSource("secret", { connection_status: { state: "action_required", reason: "configuration" } });
+  source.execution!.device = null;
+  const { calls } = renderSetup("/sources/src-wiki/settings?step=connection", {
+    sources: [source],
+    routes: {
+      "POST /api/v1/genes/confluence/config-check": deviceSourceConfigCheck,
+      "GET /api/cloud/local-agent/status": () => makeLocalSyncStatus(),
+      "PUT /api/v1/sources/src-wiki/executor": () => ({ executor: "device", cancelled_jobs: 0 }),
+    },
+  });
+
+  expect(await screen.findByRole("radio", { name: /My computer/ })).toBeChecked();
+  expect(await screen.findByRole("radio", { name: /Alex's MacBook/ })).toBeChecked();
+  await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+  expect(await bodyOf(calls, "PUT", "/api/v1/sources/src-wiki/executor")).toEqual({ executor: "device", execution_device_id: "dev-1" });
+});
+
+test("a device source whose folder is missing shows Finish setup with the folder and the computer", async () => {
+  const source = makeSource({
+    id: "src-notes",
+    type: "local_markdown",
+    config: { root: "/Users/alex/notes" },
+    connection_status: { state: "action_required", reason: "configuration" },
+    ownership: { ...makeSource().ownership, execution_owner_user_id: "local", viewer_is_execution_owner: true },
+    execution: {
+      kind: "local_agent",
+      operation: "document_acquisition",
+      device: {
+        id: "dev-1",
+        name: "Alex's MacBook",
+        state: "online",
+        not_ready: [{ kind: "location", field: "root", path: "/Users/alex/notes" }],
+        installed_version: "0.2.0b7",
+        required_version: "0.2.0b7",
+        credential: "secret",
+      },
+    },
+  });
+  renderSetup("/sources/src-notes/settings?step=connection", {
+    sources: [source],
+    routes: { "POST /api/v1/genes/local_markdown/config-check": () => NO_ISSUES },
+  });
+
+  const step = await screen.findByRole("region", { name: "Your computer" });
+  expect(within(step).getByText("Finish setup")).toBeInTheDocument();
+  expect(step).toHaveTextContent("The folder /Users/alex/notes is missing on Alex's MacBook.");
+});
+
+test("an offline computer the person no longer uses is removed after they confirm", async () => {
+  const { calls } = renderSetup("/sources/new/confluence?step=connection", {
+    routes: {
+      "GET /api/cloud/local-agent/status": () =>
+        makeLocalSyncStatus([makeDevice(), makeDevice({ device_id: "dev-old", name: "Old laptop", status: "offline" })]),
+      "DELETE /api/cloud/local-agent/devices/dev-old": () => ({ device_id: "dev-old", source_ids: ["src-wiki"] }),
+    },
+  });
+
+  await chooseMyComputer();
+  await userEvent.click(await screen.findByRole("button", { name: "Remove Old laptop" }));
+  expect(screen.getByText(/Sources it runs show Finish setup/)).toBeInTheDocument();
+  expect(requestsTo(calls, "DELETE", "/api/cloud/local-agent/devices/dev-old")).toHaveLength(0);
+  await userEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+  await waitFor(() => expect(requestsTo(calls, "DELETE", "/api/cloud/local-agent/devices/dev-old")).toHaveLength(1));
 });

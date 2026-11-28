@@ -37,8 +37,23 @@ class SourceSyncRunActive(SourceActivityConflict):
         self.run_id = run_id
 
 
+class SourceAcquisitionLeased(SourceActivityConflict):
+    """Raised when a Source change waits for a device that holds the Source's acquisition job.
+
+    ``job_id`` names the leased ``document_acquisition`` job, so that the
+    caller can stop the Source's sync and try again.
+    """
+
+    def __init__(self, message: str, *, job_id: str) -> None:
+        super().__init__(message)
+        self.job_id = job_id
+
+
 SOURCE_SYNC_CANCELLED_BY_USER = "cancelled_by_user"
 """The error a sync run or local-agent job a person stopped fails with."""
+
+SOURCE_SYNC_CANCELLED_BY_SOURCE_CHANGE = "cancelled_by_source_change"
+"""The error a sync run or local-agent job that had not started fails with when its Source changes under it."""
 
 
 class SourceSyncHeartbeat(str, Enum):

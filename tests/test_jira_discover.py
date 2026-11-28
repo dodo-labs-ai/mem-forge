@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from memforge.genes.jira_gene import _issue_content_item
+from memforge.genes.jira_gene import issue_content_item
 
 
 def test_handles_null_optional_fields():
@@ -23,7 +23,7 @@ def test_handles_null_optional_fields():
             "labels": None,
         },
     }
-    item = _issue_content_item(issue, "https://jira.example")
+    item = issue_content_item(issue, "https://jira.example")
     assert item.item_id == "jira-PROJ-1"
     assert item.title == "PROJ-1: Handle orphan data"
     assert item.space_or_project == ""
@@ -49,7 +49,7 @@ def test_maps_populated_fields():
             "labels": ["a", "b"],
         },
     }
-    item = _issue_content_item(issue, "https://jira.example")
+    item = issue_content_item(issue, "https://jira.example")
     assert item.source_url == "https://jira.example/browse/PROJ-2"
     assert item.space_or_project == "PROJ"
     assert item.author == "Jane Doe"
@@ -70,4 +70,4 @@ def test_rejects_offsetless_updated_timestamp():
     }
 
     with pytest.raises(RuntimeError, match="timestamp has no timezone"):
-        _issue_content_item(issue, "https://jira.example")
+        issue_content_item(issue, "https://jira.example")

@@ -8,7 +8,7 @@ so a field a client reads cannot disappear from the response unnoticed.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Request
@@ -17,6 +17,8 @@ from fastapi.testclient import TestClient
 from memforge.config import AppConfig
 from memforge.server.admin_api import create_admin_app
 from memforge.storage.database import Database
+from memforge.local_agent.device_report import DeviceSourceReadiness, NotReadyReason
+from tests.device_report_fixture import DAEMON_DEVICE, DEVICE_ID, connect_device, device_report
 
 SOURCE_KEYS = {
     "id",
@@ -171,14 +173,16 @@ def _confluence(name: str, root: str, *, access_policy: str = "workspace") -> di
 
 
 def _local_jira() -> dict:
+    """A Jira Source acquired on its owner's device."""
     return {
         "type": "jira",
         "name": "Payroll Jira",
         "access_policy": "workspace",
+        "executor": "device",
+        "execution_device_id": DEVICE_ID,
         "config": {
             "base_url": "https://jira.example.test",
             "auth_mode": "browser_cookie",
-            "sync_mode": "local_agent",
             "projects": ["PAY"],
         },
     }
@@ -193,6 +197,7 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
         principal_resolver=_principal,
         workspace_role_resolver=_workspace_role,
     )
+    connect_device(database, "owner-user")
     try:
         with TestClient(app) as client:
             ids = {}
@@ -209,6 +214,14 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
                 created = client.post("/api/v1/sources", json=payload)
                 assert created.status_code == 200, created.text
                 ids[key] = created.json()["id"]
+            # The laptop runs the Jira Source and has no session for it yet.
+            connect_device(
+                database,
+                "owner-user",
+                device_report(
+                    not_ready={ids["jira"]: DeviceSourceReadiness(reasons=(NotReadyReason(kind="credential"),))}
+                ),
+            )
             asyncio.run(
                 database.insert_sync_history(
                     source=ids["history"],
@@ -272,10 +285,12 @@ def test_source_list_rows_carry_exactly_the_contract_fields(tmp_path):
             "created_by_user_id",
             "owner_user_id",
             "execution_owner_user_id",
+            "viewer_is_execution_owner",
             "viewer_role",
             "viewer_relationship",
         }
-        assert set(row["execution"]) == {"kind", "operation", "immutable_config_fields"}
+        execution_keys = {"Payroll Jira": {"device"}}
+        assert set(row["execution"]) == {"kind", "operation"} | execution_keys.get(name, set())
 
     history = rows["History Wiki"]
     assert set(history["sync"]) == HISTORY_SYNC_KEYS
@@ -459,6 +474,8 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
         principal_resolver=_principal,
         workspace_role_resolver=_workspace_role,
     )
+    # The owner's laptop reported a day ago, so it is offline until its daemon leases again.
+    connect_device(database, "owner-user", seen=datetime.now(timezone.utc) - timedelta(days=1))
     try:
         with TestClient(app) as client:
             server_id = client.post("/api/v1/sources", json=_confluence("Server Wiki", "1")).json()["id"]
@@ -469,16 +486,27 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
             local_receipt = client.post(f"/api/v1/sources/{jira_id}/sync")
 
             offline = client.get("/api/cloud/local-agent/status")
+            chats_id = client.post(
+                "/api/v1/sources",
+                json={
+                    "type": "teams",
+                    "name": "Chats",
+                    "access_policy": "workspace",
+                    "config": {"region": "emea", "conversation_ids": ["19:standup@thread.v2"]},
+                },
+            ).json()["id"]
             sync_job = client.post(
-                "/api/cloud/local-agent/jobs",
-                json={"source_id": jira_id, "source_type": "jira", "operation": "jira_sync", "payload": {}},
+                "/api/v1/local-agent/jobs",
+                json={"source_id": chats_id, "source_type": "teams", "operation": "teams_sync", "payload": {}},
             )
             setup_job = client.post(
-                "/api/cloud/local-agent/jobs",
+                "/api/v1/local-agent/jobs",
                 json={"source_type": "teams", "operation": "teams_auth", "payload": {}},
             )
-            current = client.get("/api/cloud/local-agent/jobs/current")
-            leased = client.post("/api/cloud/local-agent/jobs/lease", json={"limit": 5}).json()["jobs"]
+            current = client.get("/api/v1/local-agent/jobs/current")
+            leased = client.post(
+                "/api/cloud/local-agent/jobs/lease", json={"device": DAEMON_DEVICE, "limit": 5}
+            ).json()["jobs"]
             online = client.get("/api/cloud/local-agent/status")
 
             default_preferences = client.get("/api/v1/source-list/preferences")
@@ -506,14 +534,24 @@ def test_sync_receipts_and_local_agent_routes_keep_their_shapes(tmp_path):
     assert setup_job.status_code == 201, setup_job.text
     assert set(setup_job.json()) == {"job_id", "status", "coalesced"}
     assert current.status_code == 200, current.text
-    assert [set(job) for job in current.json()["data"]] == [LOCAL_AGENT_JOB_KEYS]
-    assert current.json()["data"][0]["result"] == {}
+    # Each Source's current job: the Jira Source's, which Sync now queued, and the chats'.
+    assert {job["source_id"] for job in current.json()["data"]} == {jira_id, chats_id}
+    assert all(set(job) == LOCAL_AGENT_JOB_KEYS and job["result"] == {} for job in current.json()["data"])
     assert leased
 
-    assert set(offline.json()) == {"status", "last_seen_at", "checked_at", "stale_after_seconds"}
+    assert set(offline.json()) == {
+        "status",
+        "last_seen_at",
+        "devices",
+        "sources",
+        "server",
+        "checked_at",
+        "stale_after_seconds",
+    }
     assert offline.json()["status"] == "offline"
-    assert offline.json()["last_seen_at"] is None
+    assert offline.json()["last_seen_at"] is not None
     assert online.json()["status"] == "online"
+    assert [device["device_id"] for device in online.json()["devices"]] == [DAEMON_DEVICE["device_id"]]
 
     assert default_preferences.json() == {"sort_mode": "newest"}
     assert saved_preferences.json() == {"sort_mode": "recently_synced"}
@@ -539,10 +577,10 @@ def test_openapi_types_the_sources_page_responses(tmp_path):
     assert response_schema("/api/cloud/local-agent/status", "get", "200") == {
         "$ref": "#/components/schemas/LocalAgentDaemonStatusResponse"
     }
-    assert response_schema("/api/cloud/local-agent/jobs/current", "get", "200") == {
+    assert response_schema("/api/v1/local-agent/jobs/current", "get", "200") == {
         "$ref": "#/components/schemas/LocalAgentJobListResponse"
     }
-    assert response_schema("/api/cloud/local-agent/jobs", "post", "201") == {
+    assert response_schema("/api/v1/local-agent/jobs", "post", "201") == {
         "$ref": "#/components/schemas/LocalAgentJobCreateResponse"
     }
     source = document["components"]["schemas"]["SourceResponse"]

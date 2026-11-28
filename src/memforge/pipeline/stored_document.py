@@ -178,6 +178,13 @@ async def stored_source_item(
     return await _unit_stored_item(db, source_unit_id=unit.id, document_id=document_id)
 
 
+async def stored_unit_input(db: RelationalStore, *, source_id: str, document_id: str) -> SourceUnitInput | None:
+    """The stored input of the Source's current Unit for one Document, ``None`` when it recorded none."""
+
+    unit = await db.find_source_unit_by_document_id(source_id, document_id, current_only=True)
+    return await db.get_source_unit_input(unit.id) if unit is not None else None
+
+
 async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, document_id: str) -> ContentItem:
     unit_input = await db.get_source_unit_input(source_unit_id)
     if unit_input is not None:
@@ -186,6 +193,22 @@ async def _unit_stored_item(db: RelationalStore, *, source_unit_id: str, documen
     if document is None:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.DOCUMENT_MISSING, document_id)
     return document_content_item(document)
+
+
+async def committed_source_item(
+    db: RelationalStore,
+    *,
+    source_id: str,
+    document_id: str,
+) -> ContentItem:
+    """The item that describes one Document whose Unit has committed, to ask its provider for it by id."""
+
+    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
+    return await _unit_stored_item(
+        db,
+        source_unit_id=committed.source_unit_revisions[0].source_unit_id,
+        document_id=document_id,
+    )
 
 
 async def rediscover_source_document(
@@ -197,12 +220,7 @@ async def rediscover_source_document(
 ) -> ContentItem:
     """Ask the provider for the current item of one Document whose Unit is current."""
 
-    committed = await _committed_source_unit(db, source_id=source_id, document_id=document_id)
-    stored_item = await _unit_stored_item(
-        db,
-        source_unit_id=committed.source_unit_revisions[0].source_unit_id,
-        document_id=document_id,
-    )
+    stored_item = await committed_source_item(db, source_id=source_id, document_id=document_id)
     current = await gene.rediscover(stored_item)
     if current is None or current.item_id != document_id:
         raise StoredDocumentUnavailable(StoredDocumentUnavailableReason.PROVIDER_DOCUMENT_MISSING, document_id)
@@ -282,7 +300,6 @@ async def project_stored_input(
                     scope={
                         "configured_scope": dict(projection_scope),
                         "document_id": document_id,
-                        "authoritative_snapshot": False,
                         "source_unit_id": committed_unit.id,
                         "source_unit_provider_key": committed_unit.provider_key,
                     },
@@ -321,6 +338,16 @@ def _stored(document_store: DocumentStore, uri: str | None, media_type: str) -> 
         return bool(uri) and document_store.get_artifact(uri, media_type) is not None
     except FileNotFoundError:
         return False
+
+
+def committed_source_artifacts(committed: SourceProjection, *, document_id: str) -> tuple[StoredSourceArtifact, ...]:
+    """The projection input of every Artifact a Unit's committed revision cites.
+
+    Raises :class:`StoredDocumentUnavailable` for an Artifact the revision
+    cites that cannot be read back.
+    """
+
+    return _committed_artifacts(committed, lambda reason: StoredDocumentUnavailable(reason, document_id))
 
 
 def _committed_artifacts(committed: SourceProjection, unavailable) -> tuple[StoredSourceArtifact, ...]:

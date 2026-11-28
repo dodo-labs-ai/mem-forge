@@ -63,7 +63,6 @@ def test_source_config_rejects_local_clone_paths() -> None:
         GITHUB_REPO.config.validate_input(
             {
                 "repo_url": "https://github.example/org/repo",
-                "connection_mode": "local_push",
                 "repo_path": "/tmp/repo",
             },
             {},

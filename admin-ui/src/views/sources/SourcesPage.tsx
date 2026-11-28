@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "react-router-dom";
 import { Files, Loader2, LockKeyhole, MoreHorizontal, Pause, Pin, Play, Plus, RefreshCw, Search, ShieldCheck, Trash2, X } from "lucide-react";
-import { currentLocalAgentBaseUrl, resourceClient } from "@/api/client";
+import { currentWorkspaceKey, resourceClient } from "@/api/client";
 import { createLocalAgentJob, getCurrentLocalAgentJobs, getLocalAgentJob } from "@/api/localAgentJobs";
 import type {
   GeneMetadata,
@@ -104,7 +104,6 @@ const LOCAL_AGENT_SYNC_POLL_INTERVAL_MS = 2_000;
 const LOCAL_AGENT_WAITING_MESSAGE = "Waiting for local daemon to sync this source.";
 const LOCAL_AGENT_TIMEOUT_MESSAGE =
   "Local daemon did not pick up this job. Start it with `memforge adapter daemon run` and try again.";
-const LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE = "Configure a folder path before syncing this local source.";
 const LOCAL_AGENT_SYNC_FAILED_MESSAGE = "Local daemon could not sync this source.";
 const JIRA_SIGN_IN_FAILED_MESSAGE = "Jira sign-in failed.";
 const SOURCE_EVALUATION_STALE_MS = 60_000;
@@ -114,7 +113,6 @@ function safeSourceErrorMessage(error: unknown): string | null {
   if (
     error.message === LOCAL_AGENT_WAITING_MESSAGE
     || error.message === LOCAL_AGENT_TIMEOUT_MESSAGE
-    || error.message === LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE
     || error.message === LOCAL_AGENT_SYNC_FAILED_MESSAGE
     || error.message.startsWith(`${LOCAL_AGENT_SYNC_FAILED_MESSAGE} `)
     || error.message.startsWith(`${JIRA_SIGN_IN_FAILED_MESSAGE} `)
@@ -140,12 +138,7 @@ async function createLocalAgentSyncJob(
   },
 ): Promise<LocalAgentJobCreateResponse | null> {
   const operation = localAgentSyncOperation(source);
-  if (!operation) {
-    if (source.type === "local_markdown") {
-      throw new Error(LOCAL_AGENT_CONFIGURE_FOLDER_MESSAGE);
-    }
-    return null;
-  }
+  if (!operation) return null;
   const created = await createLocalAgentJob({
     sourceId: source.id,
     sourceType: source.type,
@@ -208,7 +201,7 @@ function awaitingSyncAdmission(
 
 export function SourcesPage() {
   const queryClient = useQueryClient();
-  const workspaceKey = currentLocalAgentBaseUrl();
+  const workspaceKey = currentWorkspaceKey();
   const navigate = useNavigate();
   const location = useLocation();
   const [addOpen, setAddOpen] = useState(false);
@@ -419,11 +412,8 @@ export function SourcesPage() {
       const created = await createLocalAgentJob({
         sourceId: source.id,
         sourceType: source.type,
-        operation: "jira_auth",
-        payload: {
-          base_url: baseUrl,
-          auth_mode: "browser_cookie",
-        },
+        operation: "credential_check",
+        payload: {},
       });
       const status = await pollLocalAgentSyncJob(created.job_id, {});
       if (status.status === "failed") throw new Error(jiraSignInJobErrorMessage(status));

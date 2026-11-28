@@ -5,6 +5,7 @@ import { ActionCard, DetailDrawer, DrawerSection, Notice, PropertyList, StatusBa
 import { Button } from "@/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { canChangeSourceAccess } from "./model/sourceAccess";
+import { sourceAttentionTone } from "./model/sourceAttention";
 import { failedItemsTitle, retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -107,11 +108,11 @@ export function SourceDetailDrawer({
 
       {attention ? (
         <ActionCard
-          tone={attention.reason === "overdue" || attention.reason === "unmapped" ? "warn" : "danger"}
+          tone={sourceAttentionTone(attention.reason)}
           title={attention.title}
           description={attention.detail}
           action={
-            attention.action === "view_details" ? null : (
+            attention.action === null || attention.action === "view_details" ? null : (
               <Button size="sm" disabled={!actions.attentionControl(attention.action, source, attention.actionLabel).enabled} onClick={() => actions.runAttention(attention.action, source)}>
                 {actions.attentionControl(attention.action, source, attention.actionLabel).label}
               </Button>

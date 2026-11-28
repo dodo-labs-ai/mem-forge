@@ -47,6 +47,17 @@ def migrated_database_template(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def own_device_files(tmp_path_factory, monkeypatch):
+    """Keep each test's device identity and credential index out of the real home directory."""
+    from memforge.local_agent import device_credentials, device_identity
+
+    directory = tmp_path_factory.mktemp("device")
+    monkeypatch.setattr(device_identity, "device_identity_path", lambda: directory / "device.json")
+    monkeypatch.setattr(device_credentials, "device_credentials_path", lambda: directory / "device-credentials.json")
+    return directory
+
+
+@pytest.fixture(autouse=True)
 def no_unstored_model_checks():
     """Start each test with no check on record for a binding that is not stored.
 

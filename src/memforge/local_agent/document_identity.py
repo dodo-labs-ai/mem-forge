@@ -1,4 +1,4 @@
-"""Stable document identities for local-agent package adapters."""
+"""Stable Document identities of files a device reads."""
 
 from __future__ import annotations
 
@@ -20,19 +20,6 @@ def build_local_markdown_doc_id(
             "local-md",
             slugify(source_id)[:30],
             slugify(relative_path)[:50] or "doc",
-            digest,
-        ]
-    )
-
-
-def build_jira_doc_id(*, source_id: str, issue_key: str) -> str:
-    identity = "|".join([source_id.strip(), issue_key.strip().upper()])
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    return "-".join(
-        [
-            "jira",
-            slugify(source_id)[:30],
-            slugify(issue_key)[:30] or "issue",
             digest,
         ]
     )

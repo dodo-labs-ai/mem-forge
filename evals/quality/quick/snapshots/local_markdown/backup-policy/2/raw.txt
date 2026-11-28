@@ -1,0 +1,7 @@
+Kestrel backup policy
+
+The backup job kestrel-snapshot copies the queue database every 4 hours, since
+the 2026-10 capacity review.
+Each copy is kept for 30 days in the cold-storage bucket kestrel-archive.
+A restore drill runs on the first Monday of every month; the on-call engineer
+records how long the restore took in the drill log.

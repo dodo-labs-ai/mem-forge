@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
+import { localSyncStatus } from "./support/localSync";
 
 /** The harness page that renders the app in a workspace other people use (see `vite.config.ts`). */
 function sharedWorkspacePath(page: string): string {
@@ -30,7 +31,7 @@ const SOURCE = {
   created_at: "2026-09-01T00:00:00Z",
   project_binding: { mode: "fixed", project_key: "PAY" },
   capabilities: { can_sync: true, can_subscribe: true, can_configure: true, can_delete: true, can_change_access: true },
-  execution: { kind: "server", operation: null, immutable_config_fields: [] },
+  execution: { kind: "server", operation: null },
   enabled_for_me: true,
   pinned_for_me: false,
 };
@@ -54,8 +55,8 @@ const RESPONSES: Record<string, unknown> = {
   "/api/v1/projects": { data: [{ id: "p1", key: "PAY", name: "Payroll", kind: "normal" }], can_manage: true },
   "/api/v1/genes": [{ name: "confluence", display_name: "Confluence" }],
   "/api/v1/source-list/preferences": { sort_mode: "name" },
-  "/api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
-  "/api/cloud/local-agent/jobs/current": { data: [] },
+  "/api/cloud/local-agent/status": localSyncStatus(true),
+  "/api/v1/local-agent/jobs/current": { data: [] },
 };
 
 test("a private source is shared with the workspace and the page follows the change until it is applied", async ({ page }) => {

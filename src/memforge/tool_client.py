@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -16,7 +17,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from memforge.api_target import MemForgeTarget
 from memforge.config import DEFAULT_SEARCH_TOP_K
-from memforge.local_agent.source_contract import LOCAL_PACKAGE_CONTRACT_VERSION
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.sync_progress import normalize_sync_progress_snapshot
 
@@ -198,130 +198,6 @@ class ToolClient:
             body,
         )
 
-    def push_local_markdown_document(
-        self,
-        *,
-        source_id: str,
-        vault_id: str,
-        relative_path: str,
-        markdown_body: str,
-        content_type: str = "text/markdown",
-        title: str | None = None,
-        raw_hash: str | None = None,
-        source_updated_at: str | None = None,
-        sync_snapshot_id: str | None = None,
-        local_agent_job_id: str | None = None,
-        local_agent_attempt_count: int | None = None,
-        submitted_by: str | None = None,
-        submitted_at: str | None = None,
-    ) -> dict[str, Any]:
-        """Push one file's raw text into a configured local repository source.
-
-        ``content_type`` tells the service how to convert ``markdown_body``
-        (the raw file text) during sync: Markdown/text pass through, HTML and
-        JSON are converted server-side. ``source_updated_at`` is the file's
-        own time for this content.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "vault_id": vault_id,
-            "relative_path": relative_path,
-            "markdown_body": markdown_body,
-            "content_type": content_type,
-        }
-        if title is not None:
-            body["title"] = title
-        if raw_hash is not None:
-            body["raw_hash"] = raw_hash
-        if source_updated_at is not None:
-            body["source_updated_at"] = source_updated_at
-        if sync_snapshot_id is not None:
-            body["sync_snapshot_id"] = sync_snapshot_id
-        if local_agent_job_id is not None:
-            body["local_agent_job_id"] = local_agent_job_id
-        if local_agent_attempt_count is not None:
-            body["local_agent_attempt_count"] = local_agent_attempt_count
-        if submitted_by is not None:
-            body["submitted_by"] = submitted_by
-        if submitted_at is not None:
-            body["submitted_at"] = submitted_at
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/packages",
-            body,
-        )
-
-    def push_github_repo_document(
-        self,
-        *,
-        source_id: str,
-        repo_url: str,
-        repo_ref: str,
-        relative_path: str,
-        markdown_body: str,
-        content_type: str = "text/markdown",
-        title: str | None = None,
-        raw_hash: str | None = None,
-        blob_sha: str | None = None,
-        symlink_chain: list[dict[str, str]] | None = None,
-        resolved_relative_path: str | None = None,
-        source_updated_at: str | None = None,
-        sync_snapshot_id: str | None = None,
-        local_agent_job_id: str | None = None,
-        local_agent_attempt_count: int | None = None,
-        artifact_source_unit_key: str | None = None,
-        artifact_input_hashes: list[str] | None = None,
-        submitted_by: str | None = None,
-        submitted_at: str | None = None,
-    ) -> dict[str, Any]:
-        """Push one GitHub repository file into a configured github_repo source.
-
-        ``source_updated_at`` is the file's latest commit time at the collection commit.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "repo_url": repo_url,
-            "repo_ref": repo_ref,
-            "relative_path": relative_path,
-            "markdown_body": markdown_body,
-            "content_type": content_type,
-        }
-        if title is not None:
-            body["title"] = title
-        if raw_hash is not None:
-            body["raw_hash"] = raw_hash
-        if blob_sha is not None:
-            body["blob_sha"] = blob_sha
-        if symlink_chain:
-            body["symlink_chain"] = [dict(item) for item in symlink_chain]
-        if resolved_relative_path is not None:
-            body["resolved_relative_path"] = resolved_relative_path
-        if source_updated_at is not None:
-            body["source_updated_at"] = source_updated_at
-        if sync_snapshot_id is not None:
-            body["sync_snapshot_id"] = sync_snapshot_id
-        if local_agent_job_id is not None:
-            body["local_agent_job_id"] = local_agent_job_id
-        if local_agent_attempt_count is not None:
-            body["local_agent_attempt_count"] = local_agent_attempt_count
-        if artifact_source_unit_key is not None:
-            body["artifact_source_unit_key"] = artifact_source_unit_key
-        if artifact_input_hashes:
-            body["artifact_input_hashes"] = list(artifact_input_hashes)
-        if submitted_by is not None:
-            body["submitted_by"] = submitted_by
-        if submitted_at is not None:
-            body["submitted_at"] = submitted_at
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/packages",
-            body,
-        )
-
     def push_source_artifact(
         self,
         *,
@@ -372,132 +248,108 @@ class ToolClient:
                 "detail": str(exc),
             }
 
-    def prepare_local_source_snapshot(
+    def submit_acquisition_manifest(
         self,
         *,
         source_id: str,
-        items: list[dict[str, str]],
-        coverage: str,
-        sync_snapshot_id: str,
         local_agent_job_id: str,
         local_agent_attempt_count: int,
-        excluded_listings: list[dict[str, Any]] | None = None,
+        manifest: dict[str, Any],
     ) -> dict[str, Any]:
-        """Declare covered membership and request only missing content bodies.
+        """Submit a device run's manifest; the response names what the server run will ask beyond discovery."""
 
-        The request declares the package contract this agent collects under, so
-        the service asks again for retained packages that predate it.
-        ``excluded_listings`` answers the excluded scopes the job carried, each
-        ``{"scope_key", "doc_ids"}`` or ``{"scope_key", "rejection"}``.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "items": items,
-            "coverage": coverage,
-            "sync_snapshot_id": sync_snapshot_id,
-            "local_agent_job_id": local_agent_job_id,
-            "local_agent_attempt_count": local_agent_attempt_count,
-            "package_contract_version": LOCAL_PACKAGE_CONTRACT_VERSION,
-        }
-        if excluded_listings:
-            body["excluded_listings"] = list(excluded_listings)
         return self._resource_json(
             "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/manifest",
-            body,
+            f"/sources/{quote(source_id, safe='')}/acquisition/manifest",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "manifest": manifest,
+            },
         )
 
-    def submit_local_source_confirmations(
+    def upload_acquired_input(
         self,
         *,
         source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        package: dict[str, Any],
+        body: bytes | None,
+    ) -> dict[str, Any]:
+        """Upload one acquired input of a device run, bound to its job attempt, with its body unless held."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/inputs",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "package": package,
+                "body": base64.b64encode(body).decode("ascii") if body is not None else None,
+            },
+        )
+
+    def read_held_acquired_bodies(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        body_sha256s: list[str],
+    ) -> dict[str, Any]:
+        """Ask which of a device run's bodies the Source already holds, each by the hash of its bytes."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/held-bodies",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "body_sha256s": body_sha256s,
+            },
+        )
+
+    def read_acquisition_stored_extras(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
+        item_ids: list[str],
+    ) -> dict[str, Any]:
+        """Read, for a device run's ``fetch``, the ``extra`` the Source stored with each named item."""
+
+        return self._resource_json(
+            "POST",
+            f"/sources/{quote(source_id, safe='')}/acquisition/stored-extras",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "item_ids": item_ids,
+            },
+        )
+
+    def submit_acquisition_answers(
+        self,
+        *,
+        source_id: str,
+        local_agent_job_id: str,
+        local_agent_attempt_count: int,
         manifest_sha256: str,
-        sync_snapshot_id: str,
-        local_agent_job_id: str,
-        local_agent_attempt_count: int,
-        answers: list[dict[str, str]] | None = None,
-        failure_cause: str | None = None,
+        answers: dict[str, Any],
     ) -> dict[str, Any]:
-        """Answer the items a manifest response asked this agent to confirm, bound to that manifest.
+        """Submit a device run's answers to what its manifest response asked."""
 
-        ``answers`` holds one ``{"doc_id", "provider_key", "answer"}`` per item,
-        each answer ``absent``, ``exists`` or ``hidden``. When the agent could
-        not confirm them, it sends ``failure_cause`` instead.
-        """
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "manifest_sha256": manifest_sha256,
-            "sync_snapshot_id": sync_snapshot_id,
-            "local_agent_job_id": local_agent_job_id,
-            "local_agent_attempt_count": local_agent_attempt_count,
-            "answers": list(answers or []),
-        }
-        if failure_cause is not None:
-            body["failure_cause"] = failure_cause
         return self._resource_json(
             "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/manifest/confirmations",
-            body,
-        )
-
-    def push_jira_package(
-        self,
-        *,
-        source_id: str,
-        base_url: str,
-        issue_key: str,
-        raw_payload: dict[str, Any],
-        source_url: str | None = None,
-        title: str | None = None,
-        raw_hash: str | None = None,
-        provider_revision: str | None = None,
-        sync_snapshot_id: str | None = None,
-        local_agent_job_id: str | None = None,
-        local_agent_attempt_count: int | None = None,
-        artifact_source_unit_key: str | None = None,
-        artifact_input_hashes: list[str] | None = None,
-        submitted_by: str | None = None,
-        submitted_at: str | None = None,
-    ) -> dict[str, Any]:
-        """Push one raw Jira issue package into a configured local-agent source."""
-        source_id = source_id.strip()
-        if not source_id:
-            return {"error": "source_id is required"}
-        body: dict[str, Any] = {
-            "base_url": base_url,
-            "issue_key": issue_key,
-            "raw_payload": raw_payload,
-        }
-        if source_url is not None:
-            body["source_url"] = source_url
-        if title is not None:
-            body["title"] = title
-        if raw_hash is not None:
-            body["raw_hash"] = raw_hash
-        if provider_revision is not None:
-            body["provider_revision"] = provider_revision
-        if sync_snapshot_id is not None:
-            body["sync_snapshot_id"] = sync_snapshot_id
-        if local_agent_job_id is not None:
-            body["local_agent_job_id"] = local_agent_job_id
-        if local_agent_attempt_count is not None:
-            body["local_agent_attempt_count"] = local_agent_attempt_count
-        if artifact_source_unit_key is not None:
-            body["artifact_source_unit_key"] = artifact_source_unit_key
-        if artifact_input_hashes:
-            body["artifact_input_hashes"] = list(artifact_input_hashes)
-        if submitted_by is not None:
-            body["submitted_by"] = submitted_by
-        if submitted_at is not None:
-            body["submitted_at"] = submitted_at
-        return self._resource_json(
-            "POST",
-            f"/sources/{quote(source_id, safe='')}/adapter/packages",
-            body,
+            f"/sources/{quote(source_id, safe='')}/acquisition/answers",
+            {
+                "local_agent_job_id": local_agent_job_id,
+                "local_agent_attempt_count": local_agent_attempt_count,
+                "manifest_sha256": manifest_sha256,
+                "answers": answers,
+            },
         )
 
     def conversation_collection_request(
@@ -799,18 +651,20 @@ class ToolClient:
     def lease_local_agent_jobs(
         self,
         *,
+        device: Mapping[str, Any],
         limit: int = 5,
         lease_seconds: int = 60,
         wait_seconds: int = 0,
     ) -> dict[str, Any]:
+        """Lease this device's due jobs; ``device`` is its device report."""
         return self._host_json(
             "POST",
             "/api/cloud/local-agent/jobs/lease",
-            {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
+            {"limit": limit, "lease_seconds": lease_seconds, "wait_seconds": wait_seconds, "device": dict(device)},
         )
 
     def get_local_agent_status(self) -> dict[str, Any]:
-        """Return the authenticated user's server-observed daemon heartbeat."""
+        """Return the authenticated user's devices as the server last heard from each."""
         return self._host_json("GET", "/api/cloud/local-agent/status", None)
 
     def heartbeat_local_agent_job(
@@ -818,12 +672,14 @@ class ToolClient:
         job_id: str,
         *,
         attempt_count: int,
+        device: Mapping[str, Any],
         lease_seconds: int = 60,
         progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "attempt_count": attempt_count,
             "lease_seconds": lease_seconds,
+            "device": dict(device),
         }
         if progress is not None:
             body["progress"] = normalize_sync_progress_snapshot(progress)
@@ -837,12 +693,19 @@ class ToolClient:
         self,
         job_id: str,
         *,
+        device_id: str,
         attempt_count: int,
         status: str,
         result: dict[str, Any],
         error: str | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"status": status, "attempt_count": attempt_count, "result": result}
+        """End the attempt this device, ``device_id``, holds."""
+        body: dict[str, Any] = {
+            "status": status,
+            "attempt_count": attempt_count,
+            "device_id": device_id,
+            "result": result,
+        }
         if error is not None:
             body["error"] = error
         return self._host_json(
@@ -860,6 +723,16 @@ class ToolClient:
 
     def list_jira_origins(self) -> dict[str, Any]:
         return self._resource_json("GET", "/auth/jira-origins", None)
+
+    def upload_browser_session(
+        self, *, provider: str, base_url: str, cookie_header: str, browser: str | None = None
+    ) -> dict[str, Any]:
+        """Store a server Source's browser session of ``provider`` on the server, which checks it."""
+        return self._resource_json(
+            "POST",
+            f"/auth/{quote(provider, safe='')}-session",
+            {"base_url": base_url, "cookie_header": cookie_header, "browser": browser},
+        )
 
     def upload_jira_session(
         self, *, base_url: str, cookie_header: str, browser: str | None = None,

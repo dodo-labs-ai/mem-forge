@@ -6,14 +6,12 @@ export const LOCAL_AGENT_HOST_BASE_URL = "/api/cloud/local-agent";
 
 const STANDALONE_TARGET: WorkspaceApiTarget = Object.freeze({
   resourceBaseUrl: "/api/v1",
-  localAgentBaseUrl: LOCAL_AGENT_HOST_BASE_URL,
   workspaceId: "local",
   shared: false,
 });
 
 export interface WorkspaceApiTarget {
   resourceBaseUrl: string;
-  localAgentBaseUrl: string;
   workspaceId: string | null;
   /**
    * Whether other people use this workspace too. Only then do Sources and
@@ -49,7 +47,6 @@ function normalizeBaseUrl(baseUrl: string): string {
 function normalizeTarget(target: WorkspaceApiTarget): Readonly<WorkspaceApiTarget> {
   return Object.freeze({
     resourceBaseUrl: normalizeBaseUrl(target.resourceBaseUrl),
-    localAgentBaseUrl: normalizeBaseUrl(target.localAgentBaseUrl),
     workspaceId: target.workspaceId?.trim() || null,
     // Only a target that says it has one user hides who can use what.
     shared: target.shared !== false,
@@ -64,7 +61,6 @@ function sameRequests(
   if (left === null || right === null) return left === right;
   return (
     left.resourceBaseUrl === right.resourceBaseUrl &&
-    left.localAgentBaseUrl === right.localAgentBaseUrl &&
     left.workspaceId === right.workspaceId
   );
 }
@@ -104,8 +100,10 @@ export function subscribeWorkspaceTarget(listener: () => void): () => void {
   return () => targetListeners.delete(listener);
 }
 
-export function currentLocalAgentBaseUrl(): string {
-  return currentTarget?.localAgentBaseUrl ?? STANDALONE_TARGET.localAgentBaseUrl;
+/** A key that names the selected workspace, for what the page keeps per workspace. */
+export function currentWorkspaceKey(): string {
+  const target = currentTarget ?? STANDALONE_TARGET;
+  return `${target.resourceBaseUrl}#${target.workspaceId ?? ""}`;
 }
 
 /** Applies the resource client's selected workspace to a same-origin resource link. */

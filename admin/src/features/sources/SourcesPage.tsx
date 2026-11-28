@@ -1,5 +1,5 @@
-import { Files, Plus } from "lucide-react";
-import { useRef, useState } from "react";
+import { Files, Laptop, Plus } from "lucide-react";
+import { useCallback, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useProjects, useSharedWorkspace } from "@/api";
 import { localSyncState, useLocalSyncStatus } from "@/features/local-sync";
@@ -12,6 +12,7 @@ import {
   ErrorNotice,
   FilterBar,
   GroupHeader,
+  Notice,
   PageHeader,
   type DataTableGroup,
 } from "@/patterns";
@@ -28,6 +29,8 @@ import {
   useSources,
   useSourceTypeLabels,
 } from "./api";
+import { deviceUpdateOf, viewerDeviceUpdates, type DeviceUpdate } from "./model/deviceUpdates";
+import { sourceAttentionTone } from "./model/sourceAttention";
 import type { SourceListSortMode } from "./model/sourceListOrganization";
 import type { LocalDaemonReadiness } from "./model/sourceReadiness";
 import {
@@ -39,6 +42,7 @@ import {
 import type { Source } from "./model/types";
 import { sourceColumns } from "./sourceColumns";
 import { SourceTableContext } from "./sourceTableContext";
+import { DeviceUpdateDialog } from "./DeviceUpdateDialog";
 import { FullSyncDialog } from "./FullSyncDialog";
 import { ReReadSourceDialog } from "./ReReadSourceDialog";
 import { SourceAccessChangeDialog } from "./SourceAccessChangeDialog";
@@ -73,6 +77,7 @@ export function SourcesPage() {
   const [pendingReRead, setPendingReRead] = useState<Source | null>(null);
   const [pendingFullSync, setPendingFullSync] = useState<Source | null>(null);
   const [pendingAccessChange, setPendingAccessChange] = useState<Source | null>(null);
+  const [openUpdate, setOpenUpdate] = useState<DeviceUpdate | null>(null);
   const tableRef = useRef<HTMLDivElement>(null);
 
   const daemonState = localSyncState(daemonQuery);
@@ -102,7 +107,16 @@ export function SourcesPage() {
     const row = rows.find((candidate) => candidate.source.id === source.id);
     if (row) setOpenRowKey(row.key);
   }
-  const actions = useSourceActions({ onViewDetails: viewDetails });
+  function updateDevice(source: Source) {
+    setOpenUpdate(deviceUpdateOf(source, sourcesQuery.sources));
+  }
+  const actions = useSourceActions({ onViewDetails: viewDetails, onUpdateDevice: updateDevice });
+  const deviceUpdates = viewerDeviceUpdates(sourcesQuery.sources);
+  const { refetch: refetchSources } = sourcesQuery;
+  const checkDevicesAgain = useCallback(() => void refetchSources(), [refetchSources]);
+  const changeUpdateOpen = useCallback((open: boolean) => {
+    if (!open) setOpenUpdate(null);
+  }, []);
 
   function showAllNeedingAttention() {
     setSearch("");
@@ -145,6 +159,22 @@ export function SourcesPage() {
         />
       ) : null}
 
+      {deviceUpdates.map((update) => (
+        <Notice
+          key={update.deviceId}
+          tone="warn"
+          icon={Laptop}
+          action={
+            <Button size="sm" variant="outline" onClick={() => setOpenUpdate(update)}>
+              Update
+            </Button>
+          }
+        >
+          MemForge on <span className="font-semibold">{update.deviceName}</span> needs an update to sync{" "}
+          {pluralize(update.sources.length, "source")}.
+        </Notice>
+      ))}
+
       {attention.length > 0 ? (
         <section aria-label="Needs you" className="space-y-2">
           <div className="flex items-center justify-between gap-2">
@@ -161,13 +191,15 @@ export function SourcesPage() {
             {attention.slice(0, ATTENTION_CARD_LIMIT).map(({ source, attention: item }) => (
               <ActionCard
                 key={source.id}
-                tone={item.reason === "overdue" || item.reason === "unmapped" ? "warn" : "danger"}
+                tone={sourceAttentionTone(item.reason)}
                 title={source.name}
                 description={item.title}
                 action={
-                  <Button size="sm" variant="outline" disabled={!actions.attentionControl(item.action, source, item.actionLabel).enabled} onClick={() => actions.runAttention(item.action, source)}>
-                    {actions.attentionControl(item.action, source, item.actionLabel).label}
-                  </Button>
+                  item.action === null ? undefined : (
+                    <Button size="sm" variant="outline" disabled={!actions.attentionControl(item.action, source, item.actionLabel).enabled} onClick={() => actions.runAttention(item.action, source)}>
+                      {actions.attentionControl(item.action, source, item.actionLabel).label}
+                    </Button>
+                  )
                 }
               />
             ))}
@@ -292,6 +324,13 @@ export function SourcesPage() {
         onOpenChange={(open) => {
           if (!open) setPendingAccessChange(null);
         }}
+      />
+
+      <DeviceUpdateDialog
+        update={openUpdate}
+        sources={sourcesQuery.sources}
+        onCheckAgain={checkDevicesAgain}
+        onOpenChange={changeUpdateOpen}
       />
     </div>
   );

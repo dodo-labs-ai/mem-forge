@@ -10,8 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memforge.config import AppConfig, SyncConfig
-from memforge.pipeline.collection_family import SnapshotBinding
-from memforge.models import ScopeListingKind, SyncState
+from memforge.models import ScopeListing, ScopeListingKind, SyncState
 from memforge.pipeline.sync import GeneSyncOrchestrator
 from memforge.release import current_release
 from memforge.runtime import SourceSyncWorker, SyncService, failed_item_health, failed_item_retry_for_run
@@ -20,7 +19,6 @@ from memforge.source_derivation import DERIVATION_RELEASE_SUPERSEDED
 from memforge.source_item_failures import FailedItemRetry, RunItemFailure, SourceItemFailure, with_inherited_rename
 from memforge.storage.database import Database
 from tests.test_stored_input_currency import (
-    ISSUES,
     SOURCE_ID,
     SPRINT_HISTORY,
     SYNCED_AT,
@@ -506,7 +504,7 @@ async def test_a_local_agent_job_a_person_requested_keeps_its_intent_when_a_sche
     )
     job = {
         "source_id": "src-teams", "source_type": "teams", "operation": "teams_sync",
-        "created_by_user_id": "dev", "execution_owner_user_id": "dev",
+        "created_by_user_id": "dev", "execution_owner_user_id": "dev", "workspace_id": "default",
     }
     requested, created = await db.enqueue_local_agent_job(
         job_id="laj-requested", payload={"source_config_revision": "rev-a", "retry_failed_items": True}, **job,
@@ -571,9 +569,13 @@ async def test_a_source_that_cannot_ask_for_one_document_retries_the_revision_th
 
 
 class ExistenceListedProvider(BreakableProvider):
-    """A provider whose device manifest is an existence listing: an item it leaves out is gone."""
+    """A provider whose listing is an existence listing: an item it leaves out is gone."""
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
+
+    async def list_scope(self):
+        listing = await super().list_scope()
+        return ScopeListing(kind=ScopeListingKind.EXISTENCE, doc_ids=listing.doc_ids)
 
 
 async def _gone_before_it_committed(db, provider: BreakableProvider):
@@ -588,14 +590,6 @@ async def _gone_before_it_committed(db, provider: BreakableProvider):
     harness.provider.removed.add("PAY-1")
     harness.provider.fetches.clear()
     return harness
-
-
-async def _device_sync(harness):
-    listed = frozenset(doc_id(key) for key in ISSUES if key not in harness.provider.removed)
-    return await harness.orchestrator().sync_gene(
-        gene=harness.provider, source_name="Jira", source_id=SOURCE_ID,
-        failed_item_retry=SCHEDULED, input_snapshot=SnapshotBinding("snapshot-1", listed),
-    )
 
 
 @pytest.mark.asyncio
@@ -628,30 +622,15 @@ async def test_a_server_query_listing_keeps_untried_a_failed_document_it_cannot_
 
 
 @pytest.mark.asyncio
-async def test_a_device_existence_manifest_settles_a_failed_document_it_does_not_list(db):
+async def test_an_existence_listing_settles_a_failed_document_it_does_not_list(db):
     harness = await _gone_before_it_committed(db, ExistenceListedProvider())
 
-    state = await _device_sync(harness)
+    state = await harness.sync(retry=SCHEDULED)
 
     assert state.last_sync_status == "success"
     assert state.absence_check_skipped_reason is None
     assert "PAY-1" not in harness.provider.fetches
     assert await _ledger(db) == {}
-
-
-@pytest.mark.asyncio
-async def test_a_device_query_manifest_keeps_untried_a_failed_document_it_does_not_list(db):
-    harness = await _gone_before_it_committed(db, BreakableProvider())
-
-    state = await _device_sync(harness)
-
-    # Only the device can confirm by identifier whether PAY-1 left the query
-    # or is gone, and it has not.
-    assert state.last_sync_status == "success"
-    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
-    assert state.unlisted_present_count is None
-    assert "PAY-1" not in harness.provider.fetches
-    assert set(await _ledger(db)) == {"PAY-1"}
 
 
 @pytest.mark.asyncio

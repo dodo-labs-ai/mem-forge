@@ -1,4 +1,4 @@
-"""Jira: the issues a JQL selects, read by the server or by the local agent."""
+"""Jira: the issues a JQL selects."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from memforge.source_adapters import jira as adapter
-from memforge.source_types.config import LocalInbox, SourceConfigPolicy, secret_replaced
-from memforge.source_types.descriptor import LocalAgentCollection, SourceTypeDescriptor
+from memforge.source_types.config import SourceConfigPolicy, secret_replaced
+from memforge.source_types.descriptor import SourceTypeDescriptor
 
 _SOURCE_OWNED_COOKIE_FIELDS = (
     "jira_cookie",
@@ -31,27 +31,21 @@ def _canonical_scope(scope: dict[str, object]) -> dict[str, object]:
     return scope
 
 
-def _read_by_local_agent(config: Mapping[str, Any]) -> bool:
-    return str(config.get("sync_mode") or "").strip().lower() == "local_agent"
-
-
 def _complete_config(config: dict[str, Any], source_id: str, existing_config: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Carry the immutable ``sync_mode`` and the authentication method over, and name the method.
+    """Carry the authentication method over, and name the method.
 
-    A blank ``sync_mode`` or ``auth_mode`` keeps the stored one. A new Source
-    without ``auth_mode`` gets the method its sync location uses
-    (:func:`~memforge.genes.jira_gene.jira_auth_mode`), so every stored
-    configuration names its method.
+    A blank ``auth_mode`` keeps the stored one. A new Source without one gets
+    the default method (:func:`~memforge.genes.jira_gene.jira_auth_mode`), so
+    every stored configuration names its method.
     """
 
     from memforge.genes.jira_gene import jira_auth_mode
 
     existing_config = existing_config or {}
-    for key in ("sync_mode", "auth_mode"):
-        if not str(config.get(key) or "").strip():
-            stored = str(existing_config.get(key) or "").strip()
-            if stored:
-                config[key] = stored
+    if not str(config.get("auth_mode") or "").strip():
+        stored = str(existing_config.get("auth_mode") or "").strip()
+        if stored:
+            config["auth_mode"] = stored
     config["auth_mode"] = jira_auth_mode(config)
     return config
 
@@ -75,7 +69,7 @@ def _facts(config: Mapping[str, Any]) -> list[tuple[str, str]]:
     return [("Effective query at sync", _build_jql(scoped, "updated >= '<last sync>'"))]
 
 
-def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, Any]:
+def _store_config(config: dict[str, Any]) -> dict[str, Any]:
     from memforge.genes.jira_gene import JIRA_AUTH_MODE_COOKIE, jira_auth_mode
 
     # Browser sessions belong to the shared auth sessions, never to one Source.
@@ -84,10 +78,6 @@ def _store_config(config: dict[str, Any], local_inbox: LocalInbox) -> dict[str, 
     if jira_auth_mode(config) == JIRA_AUTH_MODE_COOKIE:
         for key in _PAT_FIELDS:
             config.pop(key, None)
-    if _read_by_local_agent(config):
-        config["local_agent_documents_dir"] = local_inbox()
-    else:
-        config.pop("local_agent_documents_dir", None)
     return config
 
 
@@ -114,27 +104,7 @@ DESCRIPTOR = SourceTypeDescriptor(
     evidence_profiles=adapter.CURRENT_OBSERVATION_PROFILES,
     legacy_evidence_profiles=adapter.LEGACY_OBSERVATION_PROFILES,
     record_schemas=adapter.CANONICAL_RECORD_SCHEMAS,
-    local_agent=LocalAgentCollection(
-        operation="jira_sync",
-        job_config_fields=frozenset(
-            {
-                "base_url",
-                "auth_mode",
-                "sync_mode",
-                "projects",
-                "issue_types",
-                "include_comments",
-                "query_mode",
-                "jql",
-                "jql_filter",
-            }
-        ),
-        collects=_read_by_local_agent,
-        immutable_execution_fields=("sync_mode",),
-        package_submitter="memforge.local_adapter:submit_jira_request",
-        replay_adapter="memforge.local_agent.replay_adapter:JiraReplayAdapter",
-        accepts_artifact_inputs=True,
-    ),
+    acquisition_contract=2,
     config=SourceConfigPolicy(
         extra_secret_fields=("jira_cookie",),
         complete=_complete_config,

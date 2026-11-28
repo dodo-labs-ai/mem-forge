@@ -16,10 +16,8 @@ What each family requires:
   abstract-method check above is what refuses a Gene that leaves it out. A
   Gene that can produce a query listing implements ``confirm_absent``; one
   that answers ``rediscovers_documents`` implements ``rediscover``. A
-  document type collected on a device produces exactly one listing kind,
-  which its device snapshot takes; when that kind is query, the Gene also
-  implements ``provider_key`` and ``confirmation_item``, by which the device
-  confirms what its manifest leaves out.
+  document type has no ``local_agent`` collection: it runs on a device
+  through its executor.
 - **Every type's form description** (``config_schema()``) can be read by
   the shared form check and the admin UI: each condition names an earlier
   field in group-then-field order (a panel's condition may also name a field
@@ -50,7 +48,7 @@ from memforge.models import (
     ScopeListingKind,
     comparison_string,
 )
-from memforge.source_types import SourceTypeDescriptor, registered_source_types
+from memforge.source_types import SOURCE_EXECUTOR_DEVICE, SOURCE_EXECUTORS, SourceTypeDescriptor, registered_source_types
 
 __all__ = ["SourceTypeContractError", "validate_registered_source_types", "validate_source_type"]
 
@@ -139,6 +137,20 @@ def _validate_config_schema(name: str, schema: GeneConfigSchema) -> None:
 
 def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[DocumentGene]) -> None:
     name = descriptor.source_type
+    if descriptor.local_agent is not None:
+        raise SourceTypeContractError(f"{name}: a document type runs on a device through its executor, not local_agent")
+    contract = descriptor.acquisition_contract
+    if isinstance(contract, bool) or not isinstance(contract, int) or contract < 1:
+        raise SourceTypeContractError(f"{name}: a document type must declare a positive integer acquisition_contract")
+    if not descriptor.executors or not descriptor.executors <= SOURCE_EXECUTORS:
+        raise SourceTypeContractError(
+            f"{name}: a document type's executors must be a non-empty subset of {sorted(SOURCE_EXECUTORS)}"
+        )
+    config_keys = {field.key for field in gene_cls.config_schema().fields}
+    if unknown := [key for key in descriptor.device_location_fields if key not in config_keys]:
+        raise SourceTypeContractError(f"{name}: device_location_fields names no configuration field: {unknown}")
+    if descriptor.device_location_fields and SOURCE_EXECUTOR_DEVICE not in descriptor.executors:
+        raise SourceTypeContractError(f"{name}: a type with device_location_fields must run on the device")
     kinds = getattr(gene_cls, "listing_kinds", None)
     if not isinstance(kinds, frozenset) or not all(isinstance(kind, ScopeListingKind) for kind in kinds):
         raise SourceTypeContractError(
@@ -154,16 +166,6 @@ def _validate_document_gene(descriptor: SourceTypeDescriptor, gene_cls: type[Doc
         raise SourceTypeContractError(
             f"{name}: {gene_cls.__name__} answers rediscovers_documents, so it must implement rediscover"
         )
-    if descriptor.local_agent is not None and len(kinds) != 1:
-        raise SourceTypeContractError(
-            f"{name}: {gene_cls.__name__} is collected on a device, so it must declare exactly one listing kind"
-        )
-    if descriptor.local_agent is not None and ScopeListingKind.QUERY in kinds:
-        missing = [member for member in ("provider_key", "confirmation_item") if not _overrides(gene_cls, member)]
-        if missing:
-            raise SourceTypeContractError(
-                f"{name}: {gene_cls.__name__} is confirmed on a device, so it must implement {', '.join(missing)}"
-            )
 
 
 def _overrides(gene_cls: type[DocumentGene], member: str) -> bool:
@@ -175,6 +177,8 @@ def _overrides(gene_cls: type[DocumentGene], member: str) -> bool:
 
 def _validate_conversation_type(descriptor: SourceTypeDescriptor) -> None:
     name = descriptor.source_type
+    if descriptor.acquisition_contract is not None:
+        raise SourceTypeContractError(f"{name}: a conversation type has no acquisition_contract")
     reference = descriptor.conversation_provider
     if reference is None:
         raise SourceTypeContractError(f"{name}: a conversation type must name its conversation_provider")

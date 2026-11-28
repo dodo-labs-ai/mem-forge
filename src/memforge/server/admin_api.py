@@ -7,6 +7,8 @@ sources/genes, schedule, model settings, and system health/stats.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
@@ -24,7 +26,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal, cast
+from typing import Annotated, Any, Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -166,7 +168,6 @@ from memforge.models import (
     AbsenceCheckSkippedReason,
     ConfigCondition,
     ConfigGroupPurpose,
-    ScopeListingKind,
     ConfigFieldType,
     Entity,
     Memory,
@@ -178,7 +179,6 @@ from memforge.models import (
     Project,
     RESERVED_PROJECT_KEYS,
     ReviewKind,
-    SourceSyncInput,
     SourceUnitInput,
     SourceExecutionKind,
     UNSORTED_PROJECT_KEY,
@@ -190,7 +190,6 @@ from memforge.models import (
 from memforge.sync_progress import (
     SyncProgressPhase,
     SyncProgressUnit,
-    normalize_sync_progress_snapshot,
 )
 from memforge.source_artifacts import (
     MAX_SOURCE_ARTIFACT_STORAGE_BYTES,
@@ -208,6 +207,7 @@ from memforge.provenance import (
     source_unit_pdf_url,
     source_unit_resource_path,
 )
+from memforge.release import installed_version
 from memforge.retrieval.filters import MemorySourceFilter, MemoryTimeRange
 from memforge.retrieval.intents import RankedRetrievalIntent
 from memforge.runtime import (
@@ -223,7 +223,18 @@ from memforge.runtime import (
 )
 from memforge.pipeline.collection_family import collection_family
 from memforge.pipeline.source_projection_adapters import DEFAULT_SOURCE_PROJECTION_ADAPTER
+from memforge.pipeline.package_migration import PACKAGE_MIGRATION_COMMAND, awaits_package_migration
 from memforge.pipeline.stored_document import reprocess_preview
+from memforge.pipeline.device_acquisition import (
+    AcquisitionNotReady,
+    acquisition_requests,
+    document_acquisition_job_payload,
+    held_acquired_bodies,
+    ready_acquisition,
+    retain_acquired_body,
+    retain_acquired_input,
+    stored_extras,
+)
 from memforge.scheduler import SyncScheduler
 from memforge.server.model_settings_api import (
     ModelHealthResponse,
@@ -241,7 +252,6 @@ from memforge.source_secrets import (
 from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStale,
-    provider_item_key,
 )
 from memforge.source_projection_config import (
     canonical_scope_transition,
@@ -250,13 +260,19 @@ from memforge.source_projection_config import (
     source_access_context,
 )
 from memforge.source_types import (
+    SOURCE_EXECUTOR_DEVICE,
+    SOURCE_EXECUTOR_SERVER,
     LocalAgentCollection,
     SourceConfigPolicy,
-    load_reference,
     source_type_descriptor,
 )
 from memforge.source_types.form import check_config, effective_value
-from memforge.source_activity import SourceActivityConflict, SourceActivityKind, SourceSyncRunActive
+from memforge.source_activity import (
+    SourceAcquisitionLeased,
+    SourceActivityConflict,
+    SourceActivityKind,
+    SourceSyncRunActive,
+)
 from memforge.storage.document_store import LocalDocumentStore
 from memforge.storage.recovery_points import RecoveryPoints, UpgradeError
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -284,38 +300,63 @@ from memforge.source_access_transition import (
     SourceAccessTransitionService,
 )
 from memforge.local_agent.readiness import (
+    DeviceState,
     SourceConnectionReason,
     SourceConnectionState,
     connection_status_from_browser_session,
+    device_source_readiness,
 )
 from memforge.local_agent.setup_results import SETUP_RESULT_MODELS
-from memforge.local_agent.snapshot_manifest import (
-    COMPLETE_SNAPSHOT,
-    SNAPSHOT_MANIFEST_MAX_ITEMS,
-    UPSERT,
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    SnapshotConfirmationAnswer,
-    SnapshotManifestItem,
-    plan_snapshot_manifest,
-    snapshot_manifest_sha256,
+from memforge.local_agent.document_acquisition import (
+    ACQUIRED_BODY_REQUIRED,
+    DOCUMENT_ACQUISITION_OPERATION,
+    REPROCESS_PAYLOAD_FIELD,
+    AcquiredInputPackage,
+    AcquiredListing,
+    AcquisitionAnswers,
+    AcquisitionManifest,
+    AcquisitionManifestTooLarge,
+    acquisition_job_config,
+)
+from memforge.local_agent.device_manifest import (
+    DEVICE_MANIFEST_MAX_ITEMS,
     validate_excluded_listings_for_job,
 )
+from memforge.local_agent.credential_check import (
+    CREDENTIAL_CHECK_OPERATION,
+    credential_check_job_payload,
+    signs_in_with_browser_session,
+)
+from memforge.local_agent.executor_change import move_source_executor
+from memforge.local_agent.broker import OneWorkspace
+from memforge.local_agent.job_store import LocalAgentJobStore
+from memforge.server.local_agent_host_api import (
+    LocalAgentJobResponse,
+    LocalAgentJobStatus,
+    build_local_agent_host_router,
+    shape_local_agent_job,
+)
+from memforge.server.principal import resolve_request_principal
+from memforge.local_agent.device_report import (
+    DEVICE_ID_MAX_CHARS,
+    LocalAgentDevice,
+    declared_acquisition_contracts,
+)
 from memforge.local_agent.source_contract import (
+    ACQUISITION_CONTRACT_CHANGED,
     LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD,
     LOCAL_AGENT_SYNC_OPERATIONS,
+    LocalAgentLease,
     execution_owner_user_id,
     is_local_agent_backed_source,
     local_agent_collection_attempt_id,
-    local_agent_semantic_input_sha256,
-    local_agent_completion_status,
     local_agent_source_config_revision,
     local_agent_sync_job_payload,
     local_agent_sync_operation,
     local_agent_sync_snapshot_id,
-    local_package_confirms_absence,
-    local_package_requires_source_time,
-    validate_local_agent_replay_package,
+    source_executor,
+    source_collection_operation,
+    source_runs_on_device,
 )
 from memforge.storage.adapters.protocols import RelationalStore
 from memforge.storage.admin_memory import MemoryAdminListFilters
@@ -348,14 +389,13 @@ async def _run_source_access_background(
         logger.exception("Background Source access operation failed: %s", operation_id)
 
 
+SELF_HOSTED_WORKSPACE_ID = "local"
+"""The durable run namespace of a self-hosted server, which serves one workspace."""
 SOURCE_ACTIVE_STATUS = "active"
 SOURCE_PAUSED_STATUS = "paused"
-LOCAL_AGENT_STATUS_STALE_SECONDS = 90
+DEVICE_PREVIEW_UNAVAILABLE = "device_preview_unavailable"
 LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES = {
-    "github_repo_preview_tree": "github_repo",
-    "jira_auth": "jira",
     "local_markdown_pick_root": "local_markdown",
-    "local_markdown_preview_tree": "local_markdown",
     "teams_auth": "teams",
     "teams_auth_check": "teams",
     "teams_browse": "teams",
@@ -443,16 +483,6 @@ def _verified_artifact_chunks(
             yield chunk
     if observed_size != expected_size or digest.hexdigest() != expected_sha256:
         raise RuntimeError("Source Artifact integrity mismatch during streaming")
-
-
-def resolve_request_principal(request: Request) -> str:
-    """Resolve the request principal through the app-scoped resolver."""
-    resolver = getattr(request.app.state, "principal_resolver", None)
-    if resolver is None:
-        from memforge.server.principal import resolve_principal
-
-        resolver = resolve_principal
-    return resolver(request)
 
 
 def resolve_request_workspace_role(request: Request) -> str:
@@ -630,58 +660,76 @@ def _require_source_sync_support(source: Mapping[str, Any]) -> None:
         raise HTTPException(status_code=409, detail="source_sync_not_supported")
 
 
+def _job_store(request: Request) -> LocalAgentJobStore:
+    """The deployment's store of local-agent jobs and devices."""
+    return request.app.state.local_agent_jobs
+
+
 async def _require_current_local_agent_lease(
     request: Request,
-    db: Database,
     *,
     source: Mapping[str, Any],
     job_id: str | None,
     attempt_count: int | None,
-) -> None:
+) -> LocalAgentLease:
+    """The Source's job attempt while the caller holds its lease; 409 otherwise.
+
+    The lease's payload carries the Source's current configuration revision.
+    A ``document_acquisition`` attempt is current only while the device that
+    holds it is still the Source's execution device.
+    """
     source_id = str(source.get("id") or "").strip()
     expected_config_revision = local_agent_source_config_revision(source)
     normalized_job_id = str(job_id or "").strip()
     if not normalized_job_id or attempt_count is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
-    validator = getattr(request.app.state, "local_agent_lease_validator", None)
-    job_payload: Mapping[str, Any] = {}
-    if validator is not None:
-        validation = await validator(
-            request,
-            source_id,
-            normalized_job_id,
-            int(attempt_count or 0),
-            expected_config_revision,
-        )
-        valid = bool(validation)
-        if isinstance(validation, Mapping):
-            job_payload = validation
-    else:
-        job = await db.get_local_agent_job(normalized_job_id)
-        if job:
-            job_payload = job.get("payload") or {}
-        leased_until = None
-        if job and job.get("leased_until"):
-            try:
-                leased_until = datetime.fromisoformat(str(job["leased_until"]).replace("Z", "+00:00"))
-            except ValueError:
-                leased_until = None
-        valid = bool(
-            job
-            and job.get("status") == "leased"
-            and job.get("source_id") == source_id
-            and job.get("lease_owner_user_id") == resolve_request_principal(request)
-            and int(job.get("attempt_count") or 0) == attempt_count
-            and (job.get("payload") or {}).get("source_config_revision") == expected_config_revision
-            and leased_until is not None
-            and leased_until > datetime.now(timezone.utc)
-        )
-    if not valid:
+    jobs = _job_store(request)
+    lease = await jobs.current_local_agent_lease(
+        job_id=normalized_job_id,
+        attempt_count=int(attempt_count),
+        source_id=source_id,
+        lease_owner_user_id=resolve_request_principal(request),
+        source_config_revision=expected_config_revision,
+    )
+    if lease is None:
         raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
-    return {
-        **job_payload,
-        "source_config_revision": expected_config_revision,
-    }
+    if lease.payload.get("operation") == DOCUMENT_ACQUISITION_OPERATION:
+        # The job named its device when it was queued; a Source moved since
+        # then no longer runs there, and the attempt's results are not its own.
+        if not source_runs_on_device(source) or source.get("execution_device_id") != lease.device_id:
+            raise HTTPException(status_code=409, detail="local_agent_lease_not_current")
+        await _require_current_acquisition_contract(
+            jobs, source=source, lease=lease, job_id=normalized_job_id, attempt_count=int(attempt_count)
+        )
+    return LocalAgentLease(
+        payload={**lease.payload, "source_config_revision": expected_config_revision},
+        leased_at=lease.leased_at,
+        device_id=lease.device_id,
+        acquisition_contract=lease.acquisition_contract,
+    )
+
+
+async def _require_current_acquisition_contract(
+    jobs: LocalAgentJobStore,
+    *,
+    source: Mapping[str, Any],
+    lease: LocalAgentLease,
+    job_id: str,
+    attempt_count: int,
+) -> None:
+    """Refuse a device run's submission made under an acquisition contract the server no longer has.
+
+    The server interprets only what its own contract for the type describes.
+    A deploy that changed the contract during the attempt queues the job
+    again without counting the attempt, so a device whose contract matches
+    takes it next, and answers 409 ``acquisition_contract_changed``.
+    """
+
+    descriptor = source_type_descriptor(str(source.get("type") or ""))
+    if descriptor is not None and lease.acquisition_contract == descriptor.acquisition_contract:
+        return
+    await jobs.requeue_local_agent_job_uncounted(job_id=job_id, attempt_count=attempt_count)
+    raise HTTPException(status_code=409, detail=ACQUISITION_CONTRACT_CHANGED)
 
 
 async def _filter_visible_ids(db: Database, ids, scope) -> set[str]:
@@ -1750,6 +1798,19 @@ class GeneMetadataResponse(BaseModel):
     auth_method: str
     data_shape: str
     execution_kinds: list[SourceExecutionKind]
+    executors: list[Literal["server", "device"]] | None = Field(
+        description=(
+            "Where a document Source of the type can run, which Configure offers as Where it runs; "
+            "null for a conversation type."
+        ),
+    )
+    device_location_fields: list[str] = Field(
+        default=[],
+        description=(
+            "The configuration fields that name a folder on the Source's execution device, which the folder picker "
+            "of the device chosen in Where it runs fills."
+        ),
+    )
 
 
 class ConfigConditionResponse(BaseModel):
@@ -1784,7 +1845,6 @@ class ConfigFieldResponse(BaseModel):
     widget: str | None = None
     advanced: bool = False
     scope: bool = Field(default=False, description="Changing it changes which items the Source holds.")
-    fixed_after_create: bool = Field(default=False, description="Chooses the executor; a stored Source keeps it.")
     # Deprecated (admin-ui-v1): V1 setup reads bare option values; removed with V1.
     options: list[str] = Field(default=[], deprecated=True, description="The values of `choices`.")
 
@@ -1805,8 +1865,15 @@ class GeneConfigSchemaResponse(BaseModel):
 
 
 class ConfigCheckRequest(BaseModel):
+    """A configuration to check against the executor its save will use.
+
+    ``executor`` is where the Source runs once saved; without it, a stored
+    Source keeps its own executor and a new Source runs on the server.
+    """
+
     config: dict[str, Any]
     source_id: str | None = None
+    executor: Literal["server", "device"] | None = None
 
 
 class ConfigFactResponse(BaseModel):
@@ -1828,8 +1895,15 @@ class ConfigCheckResponse(BaseModel):
 
 
 class DiscoveryPreviewRequest(BaseModel):
+    """A configuration to preview where its save will run it.
+
+    ``executor`` is where the Source runs once saved; without it, a stored
+    Source keeps its own executor and a new Source runs on the server.
+    """
+
     source_id: str | None = None
     config: dict[str, Any]
+    executor: Literal["server", "device"] | None = None
     limit: int = Field(default=50, ge=1, le=200)
 
 
@@ -1914,7 +1988,6 @@ SourceAccessPolicyValue = Literal["private", "workspace"]
 SourceViewerRole = Literal["owner", "workspace_admin", "member", "viewer"]
 SourceSyncRunStatus = Literal["pending", "running", "success", "failed"]
 SourceSyncStatus = Literal["pending", "running", "recovering", "success", "partial", "failed"]
-LocalAgentJobStatus = Literal["queued", "leased", "succeeded", "failed"]
 
 
 class SourceSyncProgressAmountResponse(BaseModel):
@@ -2058,6 +2131,9 @@ class SourceOwnershipResponse(BaseModel):
     created_by_user_id: str | None
     owner_user_id: str
     execution_owner_user_id: str | None
+    viewer_is_execution_owner: bool = Field(
+        description="Whether the viewer is the execution owner, whose device collects a Source collected on a device.",
+    )
     viewer_role: SourceViewerRole
     viewer_relationship: SourceViewerRole
 
@@ -2074,10 +2150,59 @@ class SourceCapabilitiesResponse(BaseModel):
     can_change_access: bool
 
 
+class SourceNotReadyReasonResponse(BaseModel):
+    """What the execution device lacks to run the Source, from its latest report."""
+
+    kind: Literal["credential", "location"] = Field(
+        description=(
+            "credential: no stored value for a secret field, or no browser session; location: the folder of a "
+            "device location field is missing or unreadable on the device."
+        ),
+    )
+    field: str | None = Field(default=None, description="For location: the configuration field naming the folder.")
+    path: str | None = Field(default=None, description="For location: the path the device did not find.")
+
+
+class SourceExecutionDeviceResponse(BaseModel):
+    """The execution device of a device Source, from its latest device report."""
+
+    id: str = Field(description="The device's id, which Where it runs chooses.")
+    name: str | None = Field(
+        description="The device's name; null for a viewer other than the execution owner.",
+    )
+    state: DeviceState = Field(
+        description=(
+            "online: it can take the Source's job; offline: no recent report; update_required: online, "
+            "but its acquisition contract for the type differs from the server's."
+        ),
+    )
+    installed_version: str = Field(description="The MemForge version the device runs.")
+    required_version: str = Field(description="The server's MemForge version, which `memforge upgrade` installs.")
+    credential: Literal["secret", "browser_session"] = Field(
+        description=(
+            "How the Source's credential reaches its device: secret, stored on the device with "
+            "`memforge source credentials set <source-id>`; browser_session, captured from the device's browser by "
+            "a credential_check job."
+        ),
+    )
+    not_ready: list[SourceNotReadyReasonResponse] = Field(
+        description=(
+            "What the device's latest report says it lacks to run the Source; empty when it is ready, not yet "
+            "reported, or the viewer is not the execution owner."
+        ),
+    )
+
+
 class SourceExecutionResponse(BaseModel):
     kind: Literal["server", "local_agent"]
     operation: str | None
-    immutable_config_fields: list[str]
+    device: SourceExecutionDeviceResponse | None = Field(
+        default=None,
+        description=(
+            "The execution device of a Source whose acquisition runs on a device; null while it has none, which "
+            "shows Finish setup until its owner chooses one."
+        ),
+    )
 
 
 class SourceSubscriptionResponse(BaseModel):
@@ -2185,7 +2310,12 @@ class SourceResponse(BaseModel):
     )
     connection_status: SourceConnectionStatusResponse | None = Field(
         default=None,
-        description="Readiness of a browser-session connection; present only for Sources that use one.",
+        description=(
+            "Readiness of the connection: a browser session's on the server, or, for a device Source, its "
+            "execution device's latest report: authentication while a credential is missing, configuration while "
+            "a device location is missing or no execution device is chosen. Absent until the device reports on the "
+            "Source, and for Sources without such a dependency."
+        ),
     )
     ownership: SourceOwnershipResponse
     capabilities: SourceCapabilitiesResponse
@@ -2256,6 +2386,44 @@ class SourceCreatedResponse(BaseModel):
 class SourceUpdatedResponse(BaseModel):
     ok: bool
     id: str
+
+
+class SourceExecutorChangeRequest(BaseModel):
+    """Where a document Source's acquisition runs from now on (ADR 0058)."""
+
+    executor: Literal["server", "device"] = Field(
+        description="server: the server reaches the provider; device: one of the changer's own devices does.",
+    )
+    execution_device_id: str | None = Field(
+        default=None,
+        description=(
+            "The changer's device that runs the Source from now on, from their device reports. Required for "
+            "device, refused for server. Choosing another device moves the Source to it."
+        ),
+    )
+    secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The secret fields of the type's form, which the server holds from now on. Required to move to "
+            "the server, as the form requires them; refused otherwise."
+        ),
+    )
+
+
+class SourceExecutorChangeResponse(BaseModel):
+    """The Source's executor after the change, and the queued sync jobs it cancelled."""
+
+    id: str
+    executor: Literal["server", "device"]
+    execution_owner_user_id: str | None = Field(
+        description="Whose device runs the Source; the person who moved it to the device.",
+    )
+    execution_device_id: str | None = Field(
+        description="The execution owner's device that runs the Source; null for a server Source.",
+    )
+    cancelled_job_ids: list[str] = Field(
+        description="The Source's queued sync jobs, which were planned for the previous executor.",
+    )
 
 
 class SourcePinResponse(BaseModel):
@@ -2389,6 +2557,20 @@ class CreateSourceRequest(BaseModel):
     name: str
     access_policy: Literal["private", "workspace"]
     config: dict
+    executor: Literal["server", "device"] = Field(
+        default="server",
+        description=(
+            "server: the server reaches the provider with the secrets in config; device: one of the creator's own "
+            "devices does, with the credential stored there, so config holds no secret."
+        ),
+    )
+    execution_device_id: str | None = Field(
+        default=None,
+        description=(
+            "The creator's device that runs a device Source, from their device reports. Required for device, "
+            "refused for server."
+        ),
+    )
     project_binding: dict | None = None
     sync_schedule: SourceSyncScheduleRequest | None = None
 
@@ -2503,31 +2685,22 @@ class ImageDocumentsReprocessResponse(BaseModel):
 
 
 class LocalAgentJobCreateRequest(BaseModel):
-    workspace_id: str | None = None
     source_id: str = ""
     source_type: str
     operation: str
     payload: dict[str, Any] = Field(default_factory=dict)
     retry_job_id: str | None = Field(default=None, min_length=1, max_length=255)
-
-
-class LocalAgentJobLeaseRequest(BaseModel):
-    limit: int = Field(default=5, ge=1, le=20)
-    lease_seconds: int = Field(default=60, ge=1, le=3600)
-    wait_seconds: int = Field(default=0, ge=0, le=25)
-
-
-class LocalAgentJobHeartbeatRequest(BaseModel):
-    attempt_count: int = Field(ge=1)
-    lease_seconds: int = Field(default=60, ge=1, le=3600)
-    progress: dict[str, Any] | None = None
-
-
-class LocalAgentJobCompleteRequest(BaseModel):
-    status: Literal["succeeded", "failed"]
-    attempt_count: int = Field(ge=1)
-    result: dict[str, Any] = Field(default_factory=dict)
-    error: str | None = Field(default=None, max_length=2000)
+    device_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=DEVICE_ID_MAX_CHARS,
+        description=(
+            "The requester's device that runs a device-bound setup job: the device chosen in Where it runs, "
+            "whose folder picker picks a device location. Without one, a saved device Source's setup jobs run on "
+            "its execution device. A credential check of a saved device Source runs on its execution device, "
+            "which the request may name but not change."
+        ),
+    )
 
 
 class LocalAgentJobCreateResponse(BaseModel):
@@ -2540,39 +2713,8 @@ class LocalAgentJobCreateResponse(BaseModel):
     )
 
 
-class LocalAgentJobResponse(BaseModel):
-    job_id: str
-    workspace_id: str
-    source_id: str
-    source_type: str
-    operation: str
-    status: LocalAgentJobStatus
-    payload: dict[str, Any]
-    execution_owner_user_id: str
-    result: dict[str, Any] = Field(
-        description=(
-            "The daemon's report: sync progress while the job runs, then its completion result. "
-            "Empty before the first report."
-        ),
-    )
-    last_error: str | None
-    next_attempt_at: str | None
-    leased_until: str | None
-    attempt_count: int
-    created_at: str
-    updated_at: str
-    finished_at: str | None
-
-
 class LocalAgentJobListResponse(BaseModel):
     data: list[LocalAgentJobResponse]
-
-
-class LocalAgentDaemonStatusResponse(BaseModel):
-    status: Literal["online", "offline"]
-    last_seen_at: str | None
-    checked_at: str
-    stale_after_seconds: int
 
 
 class SourceSubscriptionRequest(BaseModel):
@@ -2611,8 +2753,7 @@ class SourceScopeChangeRefusalResponse(BaseModel):
 
     code: str = Field(
         description=(
-            "scope_change_requires_listing, transition_requires_listing, "
-            "source_provider_namespace_immutable or source_execution_mode_immutable."
+            "scope_change_requires_listing, transition_requires_listing or source_provider_namespace_immutable."
         ),
     )
     mode: str | None = Field(default=None, description="The configured mode that cannot list its scope.")
@@ -2710,26 +2851,112 @@ def _source_sync_running_http_error(source_id: str, run_id: str) -> HTTPExceptio
     )
 
 
+def _source_acquisition_leased_http_error(source_id: str, job_id: str) -> HTTPException:
+    """The answer to a Source change that waits for the device that holds the Source's acquisition job."""
+
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": "source_sync_running",
+            "local_agent_job_id": job_id,
+            "message": (
+                "A device is reading this Source for its sync. Stop it with "
+                f"POST /api/v1/sources/{source_id}/sync/stop, wait for it to end, and save again."
+            ),
+        },
+    )
+
+
+def _require_package_migration_done(source: Mapping[str, Any]) -> None:
+    """Refuse to change the configuration or executor of a Source whose stored inputs await the package migration.
+
+    Only the migration moves such a Source: it rewrites the stored inputs
+    to the Gene's form before the Source's configuration leaves the package
+    path, so the Gene continues the stored Units instead of extracting
+    every item again beside them.
+    """
+
+    if awaits_package_migration(source):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "source_awaits_package_migration",
+                "message": (
+                    "This Source is still on its device package path. Run "
+                    f"`{PACKAGE_MIGRATION_COMMAND}` before changing its configuration or where it runs."
+                ),
+            },
+        )
+
+
+def _executor_change_refused(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"code": "executor_change_invalid", "message": message})
+
+
+EXECUTION_DEVICE_INVALID = "execution_device_invalid"
+EXECUTION_DEVICE_REQUIRED_DETAIL = {
+    "code": "execution_device_required",
+    "message": "Choose the device that runs this source in Where it runs first.",
+}
+
+
+async def _chosen_execution_device(
+    jobs: LocalAgentJobStore, *, executor: str, chooser: str, device_id: str | None
+) -> str | None:
+    """The device a device Source is to run on: one of the chooser's own devices, by its id.
+
+    A server Source names none. Answers 400 ``execution_device_invalid``
+    when a device Source names none, a server Source names one, or the
+    chooser has no device with that id.
+    """
+
+    if executor != SOURCE_EXECUTOR_DEVICE:
+        if device_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": EXECUTION_DEVICE_INVALID, "message": "A server source runs on no device."},
+            )
+        return None
+    return await _choosers_device(jobs, chooser=chooser, device_id=device_id)
+
+
+async def _choosers_device(jobs: LocalAgentJobStore, *, chooser: str, device_id: str | None) -> str:
+    """One of the chooser's own devices, by its id; 400 ``execution_device_invalid`` otherwise."""
+
+    if not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": EXECUTION_DEVICE_INVALID, "message": "Choose the device that runs the source."},
+        )
+    if not any(device.report.device_id == device_id for device in await jobs.list_local_agent_devices(chooser)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": EXECUTION_DEVICE_INVALID,
+                "message": "Choose one of your own devices; a device appears once `memforge setup` connects it.",
+            },
+        )
+    return device_id
+
+
 async def _stop_source_sync(
     request: Request,
     db: Database,
     sync_service: SyncService,
     source: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Stop the collection jobs of the Source's local daemon, then its sync run.
+    """Stop the Source's local-agent jobs, then its sync run.
 
-    The jobs go first, so that a job that completes meanwhile hands over a run
+    The jobs are every job a device collects or acquires for the Source:
+    those of a package operation and the ``document_acquisition`` jobs of a
+    document Source the device acquires with its type's Gene, including one
+    waiting to acquire again after its run failed on its acquisition. The
+    jobs go first, so that a job that completes meanwhile hands over a run
     that the run's stop then reaches.
     """
 
     source_id = str(source["id"])
-    job_ids: list[str] = []
-    if local_agent_sync_operation(source["type"], source.get("config")) is not None:
-        stopper = getattr(request.app.state, "local_agent_job_stopper", None)
-        if stopper is not None:
-            job_ids = await stopper(source_id)
-        else:
-            job_ids = await db.stop_local_agent_source_jobs(source_id=source_id)
+    job_ids = await _job_store(request).stop_local_agent_source_jobs(source_id=source_id)
     run = await sync_service.stop_source(source_id)
     if run is not None and run.status == "running":
         outcome = "stopping"
@@ -2749,166 +2976,49 @@ def _source_paused_http_error() -> HTTPException:
     return HTTPException(status_code=400, detail="Source is paused")
 
 
-class LocalSourcePackageRequest(BaseModel):
-    """One raw local-source package pushed by the local daemon/adapter.
+class AcquisitionAttemptRequest(BaseModel):
+    """The ``document_acquisition`` job attempt an upload of a device run belongs to."""
 
-    File-like sources use ``markdown_body`` as raw file text for the declared
-    ``content_type``. Structured sources such as Jira use ``raw_payload`` and
-    defer canonical markdown rendering to the source gene.
-    ``source_updated_at`` is a file-like source's own time for this content
-    (an offset-aware ISO time); structured sources carry their times in
-    ``raw_payload``.
+    local_agent_job_id: str
+    local_agent_attempt_count: int = Field(ge=1)
+
+
+class AcquisitionManifestRequest(AcquisitionAttemptRequest):
+    """A device run's manifest (:class:`~memforge.local_agent.document_acquisition.AcquisitionManifest`)."""
+
+    manifest: dict[str, Any]
+
+
+class AcquiredInputRequest(AcquisitionAttemptRequest):
+    """One acquired input of a device run, bound to its job attempt.
+
+    ``body`` is the base64 of the bytes the package names by ``body_sha256``,
+    or ``None`` when the Source holds them already.
     """
 
-    vault_id: str | None = None
-    relative_path: str | None = None
-    markdown_body: str = ""
-    raw_payload: dict[str, Any] = Field(default_factory=dict)
-    content_type: str = "text/markdown"
-    base_url: str | None = None
-    repo_url: str | None = None
-    repo_ref: str | None = None
-    blob_sha: str | None = None
-    symlink_chain: list[dict[str, str]] = Field(default_factory=list)
-    resolved_relative_path: str | None = None
-    issue_key: str | None = None
-    source_url: str | None = None
-    title: str | None = None
-    raw_hash: str | None = None
-    source_updated_at: str | None = None
-    provider_revision: str | None = None
-    sync_snapshot_id: str | None = None
-    local_agent_job_id: str | None = None
-    local_agent_attempt_count: int | None = Field(default=None, ge=1)
-    artifact_source_unit_key: str | None = None
-    artifact_input_hashes: list[str] = Field(default_factory=list)
-    submitted_by: str | None = None
-    submitted_at: str | None = None
+    package: dict[str, Any]
+    body: str | None = None
 
 
-async def _resolve_local_source_artifact_inputs(
-    db: Database,
-    *,
-    source_id: str,
-    workspace_id: str,
-    input_hashes: list[str],
-    expected_source_unit_key: str,
-) -> list[dict[str, Any]]:
-    """Resolve only attested raw inputs owned by this Source Unit."""
+class HeldAcquiredBodiesRequest(AcquisitionAttemptRequest):
+    """The bodies a device run asks about before it uploads them, each by the hash of its bytes."""
 
-    requested = tuple(dict.fromkeys(str(value).strip() for value in input_hashes if str(value).strip()))
-    if not requested:
-        return []
-    if any(len(value) != 64 for value in requested):
-        raise ValueError("local source Artifact input hash is invalid")
-    inputs = await db.get_source_sync_inputs_by_raw_hashes(
-        source_id=source_id,
-        workspace_id=workspace_id,
-        raw_sha256s=requested,
+    body_sha256s: list[Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]] = Field(
+        max_length=DEVICE_MANIFEST_MAX_ITEMS
     )
-    by_hash = {item.raw_sha256: item for item in inputs}
-    if set(by_hash) != set(requested):
-        raise ValueError("local source Artifact input was not found for this source")
-    resolved: list[dict[str, Any]] = []
-    for input_hash in requested:
-        source_input = by_hash[input_hash]
-        metadata = source_input.metadata.get("local_source_artifact")
-        if not isinstance(metadata, Mapping):
-            raise ValueError("local source Artifact input metadata is invalid")
-        if str(metadata.get("source_unit_key") or "") != expected_source_unit_key:
-            raise ValueError("local source Artifact input belongs to another Source Unit")
-        resolved.append(
-            {
-                "provider_key": str(metadata.get("provider_key") or ""),
-                "parent_observation_type": str(metadata.get("parent_observation_type") or ""),
-                "parent_provider_key": str(metadata.get("parent_provider_key") or ""),
-                "provider_revision": str(metadata.get("provider_revision") or ""),
-                "filename": str(metadata.get("filename") or ""),
-                "media_type": str(metadata.get("media_type") or ""),
-                "size_bytes": int(metadata.get("size_bytes") or 0),
-                "sha256": str(metadata.get("content_sha256") or ""),
-                "uri": source_input.raw_uri,
-            }
-        )
-    return resolved
 
 
-class LocalSourceManifestItemRequest(BaseModel):
-    """One item of a device manifest: the item as the device read it."""
+class AcquisitionStoredExtrasRequest(AcquisitionAttemptRequest):
+    """The items of a device run whose ``fetch`` reads what the Source stored for them."""
 
-    doc_id: str = Field(min_length=1, max_length=512)
-    revision: str = Field(min_length=1, max_length=512)
-    change_kind: Literal["upsert"]
+    item_ids: list[str] = Field(max_length=DEVICE_MANIFEST_MAX_ITEMS)
 
 
-LOCAL_SOURCE_MANIFEST_MAX_ITEMS = SNAPSHOT_MANIFEST_MAX_ITEMS
+class AcquisitionAnswersRequest(AcquisitionAttemptRequest):
+    """A device run's answers to what its manifest response asked, bound to the manifest's digest."""
 
-
-class LocalSourceExcludedListingRequest(BaseModel):
-    """What the device listed in one scope its job's open transition excludes, or that the provider rejected it.
-
-    ``scope_key`` is the key the job named the scope by. A listing holds the
-    Document ids the scope lists, up to the manifest's item bound. A
-    definitive rejection, such as a JQL the provider refuses, gives its cause
-    in ``rejection`` and lists nothing.
-    """
-
-    scope_key: str = Field(min_length=1, max_length=128)
-    doc_ids: list[str] = Field(default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
-    rejection: str | None = Field(default=None, min_length=1, max_length=2_000)
-
-    @model_validator(mode="after")
-    def _listed_or_rejected(self) -> "LocalSourceExcludedListingRequest":
-        if self.rejection is not None and self.doc_ids:
-            raise ValueError("a rejected excluded scope lists nothing")
-        return self
-
-
-class LocalSourceManifestRequest(BaseModel):
-    """One complete local collection, planned against the retained packages.
-
-    A device manifest lists the complete item set of its scope, so it declares
-    ``complete_snapshot`` coverage and every item an ``upsert``.
-    ``package_contract_version`` is the package contract the local agent
-    collects under (``LOCAL_PACKAGE_CONTRACT_VERSION``); an agent that predates
-    the numbered contract sends none. ``excluded_listings`` answers the
-    excluded scopes the job carried, one entry per scope at most.
-    """
-
-    items: list[LocalSourceManifestItemRequest] = Field(max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS)
-    coverage: Literal["complete_snapshot"]
-    sync_snapshot_id: str
-    local_agent_job_id: str
-    local_agent_attempt_count: int = Field(ge=1)
-    package_contract_version: int | None = Field(default=None, ge=1)
-    excluded_listings: list[LocalSourceExcludedListingRequest] = Field(default_factory=list, max_length=100)
-
-
-class LocalSourceConfirmationAnswerRequest(BaseModel):
-    """The device's answer for one item its manifest response asked it to confirm."""
-
-    doc_id: str = Field(min_length=1, max_length=512)
-    provider_key: str = Field(min_length=1, max_length=512)
-    answer: Literal["absent", "exists", "hidden"]
-
-
-class LocalSourceConfirmationsRequest(BaseModel):
-    """A device's answers for the items its query manifest left out, bound to that manifest.
-
-    ``manifest_sha256`` is the digest the manifest response returned, and the
-    job attempt is the one that submitted the manifest. The request answers
-    every item the response named in ``confirm``, or, when the device could
-    not confirm them, gives ``failure_cause`` and no answers.
-    """
-
-    sync_snapshot_id: str
-    local_agent_job_id: str
-    local_agent_attempt_count: int = Field(ge=1)
     manifest_sha256: str = Field(min_length=64, max_length=64)
-    answers: list[LocalSourceConfirmationAnswerRequest] = Field(
-        default_factory=list, max_length=LOCAL_SOURCE_MANIFEST_MAX_ITEMS
-    )
-    failure_cause: str | None = Field(default=None, min_length=1, max_length=2_000)
+    answers: dict[str, Any]
 
 
 CONVERSATION_MANIFEST_MAX_MESSAGES = 200_000
@@ -2958,41 +3068,31 @@ class ConversationBodiesRequest(ConversationCollectionAttemptRequest):
     bodies: list[ConversationBodyRequest] = Field(max_length=2_000)
 
 
-async def _require_ready_snapshot_manifest(
+async def _require_acquisition_lease(
+    request: Request,
     db: Database,
     *,
     source: Mapping[str, Any],
-    source_id: str,
-    workspace_id: str,
-    input_snapshot_id: str,
-    req: Any,
-    lease_payload: Mapping[str, Any],
-) -> None:
-    """Require the document snapshot manifest of this job attempt, materialized and answered.
+    attempt: AcquisitionAttemptRequest,
+) -> tuple[LocalAgentLease, str]:
+    """The current ``document_acquisition`` job attempt of a document Source, and its attempt id.
 
-    Every declared item must be materialized, and every item the manifest
-    asked its device to confirm must be answered.
+    A Source of another family, and a job of another operation, answer 409
+    ``document_acquisition_job_required``.
     """
 
-    manifest_status = await db.get_source_sync_snapshot_manifest_status(
-        source_id=source_id,
-        workspace_id=workspace_id,
-        snapshot_id=input_snapshot_id,
+    lease = await _require_current_local_agent_lease(
+        request,
+        source=source,
+        job_id=attempt.local_agent_job_id,
+        attempt_count=attempt.local_agent_attempt_count,
     )
-    if manifest_status is None:
-        raise HTTPException(status_code=409, detail="source_snapshot_manifest_required")
     if (
-        manifest_status["local_agent_job_id"] != (req.local_agent_job_id if req else None)
-        or manifest_status["local_agent_attempt_count"] != (req.local_agent_attempt_count if req else None)
-        or manifest_status["source_config_revision"] != str(lease_payload["source_config_revision"])
+        not _is_document_source_type(str(source.get("type") or ""))
+        or lease.payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION
     ):
-        raise HTTPException(status_code=409, detail="source_snapshot_manifest_stale")
-    if manifest_status["materialized_count"] != manifest_status["item_count"]:
-        raise HTTPException(status_code=409, detail="source_snapshot_materialization_incomplete")
-    if manifest_status["awaiting_confirmations"]:
-        raise HTTPException(status_code=409, detail="source_snapshot_confirmations_pending")
-    if manifest_status["coverage"] != COMPLETE_SNAPSHOT:
-        raise HTTPException(status_code=409, detail="authoritative_snapshot_coverage_required")
+        raise HTTPException(status_code=409, detail="document_acquisition_job_required")
+    return lease, local_agent_sync_snapshot_id(attempt.local_agent_job_id, attempt.local_agent_attempt_count)
 
 
 def _is_document_source_type(source_type: str) -> bool:
@@ -3000,81 +3100,6 @@ def _is_document_source_type(source_type: str) -> bool:
 
     descriptor = source_type_descriptor(source_type)
     return descriptor is not None and descriptor.family is CollectionFamilyKind.DOCUMENT
-
-
-async def _snapshot_confirm_set(
-    db: Database,
-    *,
-    source: Mapping[str, Any],
-    workspace_id: str,
-    snapshot_id: str,
-    listed_doc_ids: frozenset[str],
-    excluded_listings: Sequence[ExcludedScopeListing],
-    package_contract_version: int | None,
-) -> tuple[SnapshotConfirmation, ...]:
-    """The items a device manifest asks its device to confirm by identifier.
-
-    Only a document Source whose device listing is a query asks, and only an
-    agent that confirms is asked. It asks about every Document with a current
-    Unit the manifest does not list, by the provider's key of the Unit's item
-    (without the incarnation a Unit that came back carries), and every
-    failed Document the manifest does not list that never became a Unit, by
-    the provider key of its stored item. A replay of a stored manifest returns
-    the set the manifest was issued, without asking again. When the manifest
-    lists the excluded scopes of a transition and none was rejected, an item
-    an excluded listing names is not asked about: completing the transition
-    removes it on that listing.
-
-    A set larger than a manifest is issued empty: the run then records
-    ``absence_confirmation_missing`` and removes nothing.
-    """
-
-    source_type = str(source.get("type") or "")
-    descriptor = source_type_descriptor(source_type)
-    if (
-        not local_package_confirms_absence(package_contract_version)
-        or descriptor is None
-        or descriptor.family is not CollectionFamilyKind.DOCUMENT
-    ):
-        return ()
-    gene_cls = cast(type[DocumentGene], descriptor.gene_class())
-    if gene_cls.snapshot_listing_kind() is not ScopeListingKind.QUERY:
-        return ()
-    source_id = str(source["id"])
-    stored = await db.get_source_sync_snapshot_manifest_status(
-        source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
-    )
-    if stored is not None:
-        issued = await db.list_source_sync_snapshot_confirmations(
-            source_id=source_id, workspace_id=workspace_id, snapshot_id=snapshot_id
-        )
-        return tuple(SnapshotConfirmation(item.doc_id, item.provider_key) for item in issued)
-    held = await db.list_current_document_provider_keys(source_id)
-    if excluded_listings and all(listing.rejection is None for listing in excluded_listings):
-        listed_doc_ids = listed_doc_ids.union(*(listing.doc_ids for listing in excluded_listings))
-    unlisted_units = sorted(set(held) - listed_doc_ids)
-    unlisted_failures = sorted(
-        (
-            failure
-            for failure in await db.list_source_item_failures(source_id=source_id)
-            if failure.document_id not in listed_doc_ids and failure.document_id not in held
-        ),
-        key=lambda failure: failure.document_id,
-    )
-    if len(unlisted_units) + len(unlisted_failures) > LOCAL_SOURCE_MANIFEST_MAX_ITEMS:
-        logger.warning(
-            "Source %s has %d unlisted Documents, more than a manifest holds; none is issued for confirmation",
-            source_id,
-            len(unlisted_units) + len(unlisted_failures),
-        )
-        return ()
-    confirm = [SnapshotConfirmation(doc_id, provider_item_key(held[doc_id])) for doc_id in unlisted_units]
-    confirm.extend(
-        SnapshotConfirmation(failure.document_id, gene_cls.provider_key(failure.item))
-        for failure in unlisted_failures
-        if failure.item is not None
-    )
-    return tuple(sorted(confirm, key=lambda item: item.doc_id))
 
 
 @dataclass(frozen=True)
@@ -3214,14 +3239,11 @@ async def _plan_config_change(
     db: Database,
     source: Mapping[str, Any],
     requested: Mapping[str, Any],
-    app_config: AppConfig,
-    *,
-    preview: bool = False,
 ) -> _ConfigChange:
     """Prepare ``requested`` as the Source would store it, and plan the scope change saving it makes.
 
-    Saving and previewing a configuration decide alike; a ``preview``
-    writes nothing, not even the Source's local inbox. A configuration the
+    Saving and previewing a configuration decide alike, and planning writes
+    nothing. A configuration the
     source type rejects answers 400. A change the Source refuses answers
     409: another execution mode or provider namespace, or a scope change it
     cannot apply (:func:`_plan_scope_change`,
@@ -3232,19 +3254,19 @@ async def _plan_config_change(
     source_type = str(source["type"])
     try:
         incoming_config = _complete_source_config(source_type, dict(requested), source_id, source["config"])
-        _validate_source_config(source_type, incoming_config, existing_config=source["config"])
+        _validate_source_config(
+            source_type, incoming_config, existing_config=source["config"], executor=source_executor(source)
+        )
         config = prepare_source_config_for_storage(
             incoming_config,
             existing_config=source["config"],
             secret_fields=_source_secret_fields(source_type),
         )
-        config = _store_source_config(source_type, config, source_id, app_config, create_inbox=not preview)
+        config = _store_source_config(source_type, config)
     except SourceConfigInvalid as exc:
         raise _config_invalid_response(exc) from exc
     except (SecretConfigurationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if is_local_agent_backed_source(source) != is_local_agent_backed_source({"type": source_type, "config": config}):
-        raise HTTPException(status_code=409, detail="source_execution_mode_immutable")
     if _provider_namespace_config(source_type, config) != _provider_namespace_config(source_type, source["config"]):
         raise HTTPException(status_code=409, detail="source_provider_namespace_immutable")
     current_scope = _sync_scope_config(source_type, source["config"])
@@ -3765,6 +3787,22 @@ def _config_policy(source_type: str) -> SourceConfigPolicy:
     return descriptor.config if descriptor is not None else SourceConfigPolicy()
 
 
+def _type_executors(source_type: str) -> list[str] | None:
+    """The executors a document type declares, in a stable order; ``None`` for a conversation type."""
+
+    descriptor = source_type_descriptor(source_type)
+    if descriptor is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
+        return None
+    return sorted(descriptor.executors, key=[SOURCE_EXECUTOR_SERVER, SOURCE_EXECUTOR_DEVICE].index)
+
+
+def _type_device_location_fields(source_type: str) -> list[str]:
+    """The configuration fields of a type that name a folder on the execution device."""
+
+    descriptor = source_type_descriptor(source_type)
+    return list(descriptor.device_location_fields) if descriptor is not None else []
+
+
 def _source_secret_fields(source_type: str) -> tuple[str, ...]:
     fields = set(source_secret_fields(source_type, GENE_REGISTRY))
     fields.update(_config_policy(source_type).extra_secret_fields)
@@ -3797,33 +3835,13 @@ def _complete_source_config(
         raise _unkeyed_refusal(exc) from exc
 
 
-def _store_source_config(
-    source_type: str,
-    config: dict[str, Any],
-    source_id: str,
-    app_config: AppConfig,
-    *,
-    create_inbox: bool = True,
-) -> dict[str, Any]:
-    """Adjust a configuration whose secrets are encrypted before it is stored.
-
-    A configuration that names the Source's local inbox creates it, unless
-    ``create_inbox`` is false, as for a preview that stores nothing.
-    """
+def _store_source_config(source_type: str, config: dict[str, Any]) -> dict[str, Any]:
+    """Adjust a configuration whose secrets are encrypted before it is stored."""
 
     policy = _config_policy(source_type)
     if policy.store is None:
         return config
-
-    def local_inbox() -> str:
-        from memforge.local_adapter import default_local_adapter_inbox
-
-        inbox = default_local_adapter_inbox(app_config, source_id)
-        if create_inbox:
-            inbox.mkdir(parents=True, exist_ok=True)
-        return str(inbox)
-
-    return policy.store(dict(config), local_inbox)
+    return policy.store(dict(config))
 
 
 def _source_credentials_changed(
@@ -3862,8 +3880,13 @@ def _validate_source_config(
     source_type: str,
     config: dict[str, Any],
     existing_config: dict[str, Any] | None = None,
+    *,
+    executor: str = SOURCE_EXECUTOR_SERVER,
 ) -> None:
     """Check a configuration the way a save does, normalizing it in place.
+
+    ``executor`` is where the Source runs: a device Source's secrets are its
+    device's, so the form check neither requires nor accepts them.
 
     The steps run in this order (``SourceConfigPolicy``): the type's
     ``validate_input`` on the configuration as given, the TLS CA bundle check,
@@ -3886,7 +3909,13 @@ def _validate_source_config(
             if callable(normalizer):
                 normalizer(config)
             descriptor = source_type_descriptor(source_type)
-            issues = check_config(gene_cls.config_schema(), config, existing_config, descriptor)
+            issues = check_config(
+                gene_cls.config_schema(),
+                config,
+                existing_config,
+                descriptor,
+                server_holds_secrets=executor == SOURCE_EXECUTOR_SERVER,
+            )
             if issues:
                 raise SourceConfigInvalid(issues)
         _require_secret_origin(source_type, config)
@@ -3948,7 +3977,7 @@ async def _cancel_running_jira_browser_sources_for_origin(
 ) -> None:
     origin = canonical_jira_origin(base_url)
     for source in await db.list_sources():
-        if source.get("type") != "jira":
+        if source.get("type") != "jira" or source_runs_on_device(source):
             continue
         config = source.get("config", {})
         if jira_auth_mode(config) != JIRA_AUTH_MODE_COOKIE:
@@ -4931,82 +4960,6 @@ async def _erase_plaintext_model_keys(db: Database) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _validate_local_source_replay_artifact_identity(
-    *,
-    source_type: str,
-    source_id: str,
-    body: bytes,
-    expected_doc_id: str,
-    expected_version: str,
-    expected_input_sha256: str,
-    expected_package_sha256: str,
-) -> Mapping[str, Any]:
-    """Validate one immutable package and its provider-derived document identity."""
-    from memforge.local_agent.replay_adapter import get_local_source_replay_adapter
-
-    try:
-        package = validate_local_agent_replay_package(
-            source_type,
-            body,
-            expected_doc_id=expected_doc_id,
-            expected_version=expected_version,
-            expected_input_sha256=expected_input_sha256,
-            expected_package_sha256=expected_package_sha256,
-        )
-        derived_doc_id = get_local_source_replay_adapter(source_type).derive_document_id(
-            source_id=source_id,
-            package=package,
-        )
-    except ValueError as exc:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-    if derived_doc_id != expected_doc_id:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
-    return package
-
-
-async def _attest_retained_local_source_input(
-    *,
-    db: Any,
-    artifact_store: DocumentArtifactStore,
-    source_type: str,
-    source_id: str,
-    retained_input: SourceSyncInput,
-) -> tuple[SourceSyncInput, str]:
-    """Validate and attest a legacy retained artifact without trusting a duplicate upload."""
-    metadata = retained_input.metadata
-    manifest_entry = metadata.get("manifest_entry")
-    if not isinstance(manifest_entry, Mapping):
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid")
-    top_level_hash = str(metadata.get("package_sha256") or "").strip()
-    manifest_hash = str(manifest_entry.get("package_sha256") or "").strip()
-    if top_level_hash and manifest_hash and top_level_hash != manifest_hash:
-        raise ValueError(f"source sync input artifact attestation conflict: {retained_input.input_id}")
-    package_hash = top_level_hash or manifest_hash
-    if top_level_hash and manifest_hash:
-        return retained_input, package_hash
-    try:
-        body = artifact_store.read_artifact(retained_input.raw_uri)
-    except Exception as exc:
-        raise ValueError("source_lifecycle_local_replay_artifact_invalid") from exc
-    package_hash = hashlib.sha256(body).hexdigest()
-    expected_doc_id = str(manifest_entry.get("doc_id") or metadata.get("doc_id") or "")
-    _validate_local_source_replay_artifact_identity(
-        source_type=source_type,
-        source_id=source_id,
-        body=body,
-        expected_doc_id=expected_doc_id,
-        expected_version=str(manifest_entry.get("version") or ""),
-        expected_input_sha256=retained_input.raw_sha256,
-        expected_package_sha256=package_hash,
-    )
-    attested = await db.attest_source_sync_input_artifact(
-        source_id=source_id,
-        input_id=retained_input.input_id,
-        package_sha256=package_hash,
-    )
-    return attested, package_hash
-
-
 def create_admin_app(
     db: Database | None = None,
     config: AppConfig | None = None,
@@ -5015,11 +4968,10 @@ def create_admin_app(
     workspace_role_resolver: Callable[[Request], str] | None = None,
     maintenance_operator_resolver: Callable[[Request], bool] | None = None,
     document_store: DocumentArtifactStore | None = None,
-    local_agent_lease_validator: Callable[[Request, str, str, int, str], Awaitable[bool]] | None = None,
-    local_agent_job_enqueuer: Callable[..., Awaitable[tuple[str, bool]]] | None = None,
-    local_agent_job_stopper: Callable[[str], Awaitable[list[str]]] | None = None,
+    local_agent_jobs: LocalAgentJobStore | None = None,
+    serves_daemons: bool = True,
     langfuse_annotation_adapter: object | None = None,
-    workspace_id: str = "local",
+    workspace_id: str = SELF_HOSTED_WORKSPACE_ID,
 ) -> FastAPI:
     """Create and configure the MemForge Admin API FastAPI application.
 
@@ -5029,6 +4981,15 @@ def create_admin_app(
         Connected Database instance for all storage operations.
     config:
         Application configuration (paths, LLM settings, server settings).
+    local_agent_jobs:
+        The store of the workspace's local-agent jobs and devices; ``db``
+        itself when omitted. An app that serves daemons leases them from
+        ``db``, so a store passed with ``serves_daemons`` keeps its jobs
+        there.
+    serves_daemons:
+        Whether this app answers the routes its daemons call
+        (``/api/cloud/local-agent``) from ``db``. A deployment that answers
+        them once in front of several workspace apps passes ``False``.
 
     Returns
     -------
@@ -5083,9 +5044,10 @@ def create_admin_app(
         app.state.principal_resolver = principal_resolver
         app.state.workspace_role_resolver = workspace_role_resolver
         app.state.maintenance_operator_resolver = maintenance_operator_resolver
-        app.state.local_agent_lease_validator = local_agent_lease_validator
-        app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
-        app.state.local_agent_job_stopper = local_agent_job_stopper
+        app.state.local_agent_jobs = local_agent_jobs or app.state.db
+        if serves_daemons:
+            app.state.local_agent_broker = app.state.db
+            app.state.daemon_workspaces = OneWorkspace(workspace_id, app.state.db)
         app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
         app.state.sync_service = SyncService(
             app.state.db,
@@ -5212,9 +5174,11 @@ def create_admin_app(
     app.state.principal_resolver = principal_resolver
     app.state.workspace_role_resolver = workspace_role_resolver
     app.state.maintenance_operator_resolver = maintenance_operator_resolver
-    app.state.local_agent_lease_validator = local_agent_lease_validator
-    app.state.local_agent_job_enqueuer = local_agent_job_enqueuer
-    app.state.local_agent_job_stopper = local_agent_job_stopper
+    # A database the lifespan opens is its own job store, set there.
+    app.state.local_agent_jobs = local_agent_jobs or db
+    if serves_daemons and db is not None:
+        app.state.local_agent_broker = db
+        app.state.daemon_workspaces = OneWorkspace(workspace_id, db)
     app.state.langfuse_annotation_adapter = langfuse_annotation_adapter
 
     @app.middleware("http")
@@ -5403,8 +5367,10 @@ def create_admin_app(
         get_model_settings=get_model_settings,
     )
     projects_router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
+    # The jobs a workspace's Sources queue for a daemon; the daemon's own
+    # routes are the host router's (memforge.server.local_agent_host_api).
     local_agent_router = APIRouter(
-        prefix="/api/cloud/local-agent",
+        prefix="/api/v1/local-agent",
         tags=["local-agent"],
     )
 
@@ -6832,6 +6798,8 @@ def create_admin_app(
                 auth_method=g.auth_method,
                 data_shape=g.data_shape,
                 execution_kinds=list(g.execution_kinds),
+                executors=_type_executors(g.name),
+                device_location_fields=_type_device_location_fields(g.name),
             )
             for g in genes
         ]
@@ -6841,7 +6809,7 @@ def create_admin_app(
         """The form description of a source type, which the admin UI draws without per-type code.
 
         Besides what the Gene declares, each field says whether it is a scope
-        field and whether it is fixed after create, from the type's descriptor.
+        field, from the type's descriptor.
         """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
@@ -6849,7 +6817,6 @@ def create_admin_app(
         schema = GENE_REGISTRY[name].config_schema()
         descriptor = source_type_descriptor(name)
         scope_fields = set(descriptor.scope_fields)
-        fixed_fields = set(descriptor.local_agent.immutable_execution_fields) if descriptor.local_agent else set()
 
         def conditions(items: Iterable[ConfigCondition]) -> list[ConfigConditionResponse]:
             return [ConfigConditionResponse(field=c.field, values=list(c.values)) for c in items]
@@ -6890,7 +6857,6 @@ def create_admin_app(
                     widget=f.widget,
                     advanced=f.advanced,
                     scope=f.key in scope_fields,
-                    fixed_after_create=f.key in fixed_fields,
                     options=[o.value for o in f.choices],
                 )
                 for f in schema.fields
@@ -6915,10 +6881,15 @@ def create_admin_app(
         about the configuration; ``issues`` holds every refusal. With
         ``source_id``, the stored configuration completes the copy as it does
         on update, and the caller needs the access that update needs.
+        ``executor`` is where the save puts the Source, so a stored Source
+        moving between the server and a device is checked against its new
+        executor: a move to the server must carry the secrets the server
+        requires.
         """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
         existing_config: dict[str, Any] | None = None
+        executor = req.executor or SOURCE_EXECUTOR_SERVER
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -6928,13 +6899,14 @@ def create_admin_app(
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Config-check source type does not match the existing source")
             existing_config = existing["config"]
+            executor = req.executor or source_executor(existing)
 
         submitted = copy.deepcopy(req.config)
         config = copy.deepcopy(req.config)
         issues: tuple[FieldIssue, ...] = ()
         try:
             config = _complete_source_config(name, config, req.source_id or "config-check", existing_config)
-            _validate_source_config(name, config, existing_config=existing_config)
+            _validate_source_config(name, config, existing_config=existing_config, executor=executor)
         except SourceConfigInvalid as exc:
             issues = exc.issues
 
@@ -6964,11 +6936,20 @@ def create_admin_app(
         request: Request,
         db: Database = Depends(get_db),
     ):
-        """Preview the documents a source config would discover without saving it."""
+        """Preview the documents a source config would discover without saving it.
+
+        Only the server's own connection can preview. ``executor`` is where
+        the save puts the Source, so a stored device Source moving to the
+        server previews with the configuration the form carries. A
+        configuration that runs on a device answers 409
+        ``device_preview_unavailable``, because the server never reaches a
+        device Source's provider.
+        """
         if name not in GENE_REGISTRY:
             raise HTTPException(status_code=404, detail=f"Gene '{name}' not found")
 
         preview_config = dict(req.config)
+        existing: dict[str, Any] | None = None
         if req.source_id:
             existing = await db.get_source(req.source_id)
             if not existing:
@@ -6977,13 +6958,17 @@ def create_admin_app(
             _require_local_agent_connection_management(request, existing)
             if existing["type"] != name:
                 raise HTTPException(status_code=400, detail="Preview source type does not match the existing source")
+        executor = req.executor or (source_executor(existing) if existing else SOURCE_EXECUTOR_SERVER)
+        if executor == SOURCE_EXECUTOR_DEVICE:
+            raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
+        if existing:
             stored_config = decrypt_source_config_for_runtime(
                 existing["config"],
                 secret_fields=_source_secret_fields(name),
             )
             preview_config = {**stored_config, **preview_config}
         try:
-            preview_config = _complete_snapshot_config(preview_config, existing["config"] if req.source_id else None)
+            preview_config = _complete_snapshot_config(preview_config, existing["config"] if existing else None)
         except SourceConfigInvalid as exc:
             raise _config_invalid_response(exc) from exc
 
@@ -7043,7 +7028,9 @@ def create_admin_app(
         The tree is read with the Source's own client and TLS. A tree GitHub
         truncates is walked folder by folder within
         ``BROWSE_TREE_REQUEST_BUDGET`` requests; a larger repository answers
-        400, and its paths are typed instead.
+        400, and its paths are typed instead. A device Source answers 409
+        ``device_preview_unavailable``, because the server never reaches a
+        device Source's provider.
         """
         gene = None
         try:
@@ -7056,14 +7043,14 @@ def create_admin_app(
                 _require_local_agent_connection_management(request, existing)
                 if existing["type"] != "github_repo":
                     raise ValueError("Repository browse source type does not match the existing source")
+                if source_runs_on_device(existing):
+                    raise HTTPException(status_code=409, detail=DEVICE_PREVIEW_UNAVAILABLE)
                 stored_config = decrypt_source_config_for_runtime(
                     existing["config"],
                     secret_fields=_source_secret_fields("github_repo"),
                 )
                 config = {**stored_config, **config}
             _validate_source_config("github_repo", config)
-            if str(config.get("connection_mode") or "cloud_pull").strip().lower() != "cloud_pull":
-                raise ValueError("GitHub Repository folder browsing is available only for Public internet access")
             gene = cast(GitHubRepoGene, create_gene("github_repo", config, source_id="browse-github-repo"))
             await gene.authenticate()
             github = gene.github_api()
@@ -7118,7 +7105,32 @@ def create_admin_app(
 
         # Attach memory_count and sync status to each source
         jira_auth_service = JiraAuthSessionService(db)
+        viewer_id = resolve_request_principal(request)
+        owner_devices: dict[str, list[LocalAgentDevice]] = {}
+        server_contracts = declared_acquisition_contracts()
+        now = datetime.now(timezone.utc)
         for s in sources:
+            if source_runs_on_device(s):
+                owner = execution_owner_user_id(s) or ""
+                if owner not in owner_devices:
+                    owner_devices[owner] = await _job_store(request).list_local_agent_devices(owner) if owner else []
+                device, connection = device_source_readiness(
+                    source_id=str(s["id"]),
+                    source_type=str(s["type"]),
+                    execution_device_id=s.get("execution_device_id"),
+                    devices=owner_devices[owner],
+                    server_contracts=server_contracts,
+                    server_version=installed_version(),
+                    now=now,
+                    reveal_device=owner == viewer_id,
+                    credential=(
+                        "browser_session"
+                        if signs_in_with_browser_session(str(s["type"]), s.get("config") or {})
+                        else "secret"
+                    ),
+                )
+                s["execution"] = {**s["execution"], "device": device}
+                s["connection_status"] = connection
             original_config = s.get("config", {})
             auth_mode = jira_auth_mode(original_config) if s["type"] == "jira" else None
             if s.get("capabilities", {}).get("can_configure"):
@@ -7135,6 +7147,7 @@ def create_admin_app(
             if (
                 s["type"] == "jira"
                 and auth_mode == JIRA_AUTH_MODE_COOKIE
+                and not source_runs_on_device(s)
                 and s.get("capabilities", {}).get("can_configure_connection")
             ):
                 try:
@@ -8427,16 +8440,35 @@ def create_admin_app(
                 detail=f"Unknown gene type '{req.type}'. Available: {', '.join(sorted(GENE_REGISTRY))}",
             )
 
+        on_device = req.executor == SOURCE_EXECUTOR_DEVICE
+        if on_device:
+            descriptor = source_type_descriptor(req.type)
+            executors = descriptor.executors if descriptor and descriptor.family is CollectionFamilyKind.DOCUMENT else ()
+            if SOURCE_EXECUTOR_DEVICE not in executors:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "executor_invalid",
+                        "message": f"A {req.type} source runs on: {', '.join(sorted(executors)) or 'server'}.",
+                    },
+                )
+        execution_device_id = await _chosen_execution_device(
+            _job_store(request),
+            executor=req.executor,
+            chooser=resolve_request_principal(request),
+            device_id=req.execution_device_id,
+        )
+
         source_id = f"src-{uuid.uuid4().hex[:8]}"
         try:
             incoming_config = _complete_source_config(req.type, req.config, source_id)
-            _validate_source_config(req.type, incoming_config)
+            _validate_source_config(req.type, incoming_config, executor=req.executor)
             source_config = prepare_source_config_for_storage(
                 incoming_config,
                 secret_fields=_source_secret_fields(req.type),
             )
             _validate_source_project_binding(req.project_binding)
-            source_config = _store_source_config(req.type, source_config, source_id, config)
+            source_config = _store_source_config(req.type, source_config)
         except SourceConfigInvalid as exc:
             raise _config_invalid_response(exc) from exc
         except (SecretConfigurationError, ValueError) as exc:
@@ -8453,8 +8485,10 @@ def create_admin_app(
             project_binding=req.project_binding,
             created_by_user_id=creator_user_id,
             execution_owner_user_id=(
-                creator_user_id if is_local_agent_backed_source(source_for_classification) else None
+                creator_user_id if on_device or is_local_agent_backed_source(source_for_classification) else None
             ),
+            executor=req.executor,
+            execution_device_id=execution_device_id,
         )
         if req.sync_schedule is not None:
             await db.set_source_sync_schedule(
@@ -8494,7 +8528,7 @@ def create_admin_app(
         open_transition = await db.get_open_projection_scope_transition(source_id) is not None
         removes = scope_change_removes(str(existing["type"]))
         try:
-            change = await _plan_config_change(db, existing, req.config, config, preview=True)
+            change = await _plan_config_change(db, existing, req.config)
         except HTTPException as exc:
             if exc.status_code != 409:
                 raise
@@ -8505,6 +8539,116 @@ def create_admin_app(
                 "refusal": _scope_change_refusal(exc.detail),
             }
         return {"outcome": _scope_change_outcome(change), "open_transition": open_transition, "removes": removes}
+
+    @source_router.put("/{source_id}/executor", response_model=SourceExecutorChangeResponse)
+    async def change_source_executor(
+        request: Request,
+        source_id: str,
+        req: SourceExecutorChangeRequest,
+        db: Database = Depends(get_db),
+        sync_service: SyncService = Depends(get_sync_service),
+    ):
+        """Change where a document Source's acquisition runs, keeping everything the Source holds.
+
+        The executor is not part of the scope: the change opens no scope
+        transition and keeps the Source's Documents, Units, Memories, cursor,
+        failure ledger and an open transition, so its next run is an
+        ordinary incremental run. The executor must be one the type declares.
+
+        - To ``device``: the server's copies of the Source's secrets are
+          deleted, the person who changes it becomes its execution owner, and
+          ``execution_device_id``, one of their own devices, its execution
+          device, which then holds the credentials.
+        - To another device: the same, so whoever chooses the device becomes
+          the execution owner. The previous device keeps its credentials
+          until its next lease answer no longer names the Source; the new
+          device needs its own.
+        - To ``server``: ``secrets`` must hold what the type's form requires.
+
+        Like a scope change, it cancels the Source's pending run and queued
+        sync jobs, and answers 409 ``source_sync_running`` while a run is
+        running or a device holds the Source's acquisition job.
+        """
+
+        existing = await db.get_source(source_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_management(request, existing)
+        source_type = str(existing["type"])
+        descriptor = source_type_descriptor(source_type)
+        if descriptor is None or descriptor.family is not CollectionFamilyKind.DOCUMENT:
+            raise _executor_change_refused("Only a document source can change where it runs.")
+        if req.executor not in descriptor.executors:
+            raise _executor_change_refused(
+                f"A {source_type} source runs on: {', '.join(sorted(descriptor.executors))}."
+            )
+        _require_package_migration_done(existing)
+        secret_fields = _source_secret_fields(source_type)
+        moving_to_server = req.executor == SOURCE_EXECUTOR_SERVER and source_runs_on_device(existing)
+        if req.secrets and not moving_to_server:
+            raise _executor_change_refused("Secrets are sent only when a source moves to the server.")
+        if unknown := sorted(set(req.secrets) - set(secret_fields)):
+            raise _executor_change_refused(f"Not a secret of a {source_type} source: {', '.join(unknown)}.")
+        chooser = resolve_request_principal(request)
+        device_id = await _chosen_execution_device(
+            _job_store(request), executor=req.executor, chooser=chooser, device_id=req.execution_device_id
+        )
+        unchanged = req.executor == source_executor(existing) and (
+            req.executor == SOURCE_EXECUTOR_SERVER
+            or (existing.get("execution_device_id") == device_id and execution_owner_user_id(existing) == chooser)
+        )
+        if unchanged:
+            return {
+                "id": source_id,
+                "executor": req.executor,
+                "execution_owner_user_id": execution_owner_user_id(existing),
+                "execution_device_id": existing.get("execution_device_id"),
+                "cancelled_job_ids": [],
+            }
+
+        owner_id: str | None = None
+        if req.executor == SOURCE_EXECUTOR_DEVICE:
+            config = acquisition_job_config(source_type, existing["config"])
+            owner_id = chooser
+        else:
+            config = {**existing["config"], **req.secrets}
+            try:
+                _validate_source_config(
+                    source_type, config, existing_config=existing["config"], executor=SOURCE_EXECUTOR_SERVER
+                )
+                config = prepare_source_config_for_storage(
+                    config, existing_config=existing["config"], secret_fields=secret_fields
+                )
+            except SourceConfigInvalid as exc:
+                raise _config_invalid_response(exc) from exc
+            except (SecretConfigurationError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        await sync_service.cancel_source(source_id)
+        try:
+            cancelled = await move_source_executor(
+                db,
+                _job_store(request),
+                source_id,
+                executor=req.executor,
+                config_json=json.dumps(config),
+                execution_owner_user_id=owner_id,
+                execution_device_id=device_id,
+            )
+        except SourceSyncRunActive as exc:
+            raise _source_sync_running_http_error(source_id, exc.run_id) from exc
+        except SourceAcquisitionLeased as exc:
+            raise _source_acquisition_leased_http_error(source_id, exc.job_id) from exc
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Source not found") from exc
+        changed = await db.get_source(source_id)
+        return {
+            "id": source_id,
+            "executor": req.executor,
+            "execution_owner_user_id": execution_owner_user_id(changed or existing),
+            "execution_device_id": (changed or existing).get("execution_device_id"),
+            "cancelled_job_ids": cancelled,
+        }
 
     @source_router.put("/{source_id}", response_model=SourceUpdatedResponse)
     async def update_source(
@@ -8522,11 +8666,12 @@ def create_admin_app(
         _require_source_management(request, existing)
         if req.config is not None:
             _require_local_agent_connection_management(request, existing)
+            _require_package_migration_done(existing)
 
         _validate_source_status(req.status)
         name = req.name or existing["name"]
         if req.config is not None:
-            change = await _plan_config_change(db, existing, req.config, config)
+            change = await _plan_config_change(db, existing, req.config)
         else:
             change = _ConfigChange(
                 config=existing["config"],
@@ -8665,14 +8810,10 @@ def create_admin_app(
 
     async def _enqueue_sync_local_agent_job(
         request: Request,
-        db: Database,
         **job: Any,
     ) -> tuple[str, bool]:
-        enqueuer = getattr(request.app.state, "local_agent_job_enqueuer", None)
         try:
-            if enqueuer is not None:
-                return await enqueuer(**job)
-            return await db.enqueue_local_agent_job(**job)
+            return await _job_store(request).enqueue_local_agent_job(workspace_id=get_workspace_id(request), **job)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -8684,7 +8825,13 @@ def create_admin_app(
         force_full_sync: bool,
         dry_run: bool = False,
     ) -> dict[str, Any] | None:
-        operation = local_agent_sync_operation(source["type"], source.get("config"))
+        """Queue the job that collects the Source on its execution owner's device, or ``None`` for a server Source.
+
+        A device Source's run starts with a ``document_acquisition`` job
+        (ADR 0058); a Source on its type's local-agent path, with that type's
+        operation.
+        """
+        operation = source_collection_operation(source)
         if operation is None:
             return None
         if source.get("status") != "active":
@@ -8695,22 +8842,29 @@ def create_admin_app(
                 status_code=409,
                 detail="local_agent_sync_execution_owner_required",
             )
-        job_id = f"laj-{uuid.uuid4().hex}"
-        payload = await local_agent_sync_job_payload(
-            db,
-            source,
-            {"force_full_sync": force_full_sync, "retry_failed_items": True, **({"dry_run": True} if dry_run else {})},
-        )
+        if operation == DOCUMENT_ACQUISITION_OPERATION and not source.get("execution_device_id"):
+            raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
+        request_payload = {
+            "force_full_sync": force_full_sync,
+            "retry_failed_items": True,
+            **({"dry_run": True} if dry_run else {}),
+        }
+        if operation == DOCUMENT_ACQUISITION_OPERATION:
+            payload = await document_acquisition_job_payload(
+                db, request.app.state.document_store, source, request_payload
+            )
+        else:
+            payload = await local_agent_sync_job_payload(db, source, request_payload)
         job_id, created = await _enqueue_sync_local_agent_job(
             request,
-            db,
-            job_id=job_id,
+            job_id=f"laj-{uuid.uuid4().hex}",
             source_id=source["id"],
             source_type=source["type"],
             operation=operation,
             payload=payload,
             created_by_user_id=resolve_request_principal(request),
             execution_owner_user_id=owner,
+            device_id=source["execution_device_id"] if operation == DOCUMENT_ACQUISITION_OPERATION else None,
         )
         return {
             "ok": True,
@@ -8827,6 +8981,74 @@ def create_admin_app(
         _require_source_sync_support(source)
         return await _stop_source_sync(request, db, sync_service, source)
 
+    async def _process_acquisition(
+        request: Request,
+        db: Database,
+        sync_service: SyncService,
+        source: dict[str, Any],
+        req: SourceSyncRequest | None,
+        workspace_id: str,
+    ) -> dict[str, Any]:
+        """Enqueue the run of one device run's acquisition once it is ready, bound to its attempt."""
+
+        source_id = str(source["id"])
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        if req is None or not req.local_agent_job_id or req.local_agent_attempt_count is None:
+            raise HTTPException(status_code=409, detail="local_agent_lease_context_required")
+        lease, snapshot_id = await _require_acquisition_lease(
+            request,
+            db,
+            source=source,
+            attempt=AcquisitionAttemptRequest(
+                local_agent_job_id=req.local_agent_job_id, local_agent_attempt_count=req.local_agent_attempt_count
+            ),
+        )
+        lease_payload = lease.payload
+        if req.sync_snapshot_id and req.sync_snapshot_id != snapshot_id:
+            raise HTTPException(status_code=409, detail="local agent snapshot does not match the leased job attempt")
+        config_revision = str(lease_payload["source_config_revision"])
+        try:
+            await ready_acquisition(
+                db,
+                source_id=source_id,
+                workspace_id=workspace_id,
+                snapshot_id=snapshot_id,
+                local_agent_job_id=req.local_agent_job_id,
+                local_agent_attempt_count=req.local_agent_attempt_count,
+                source_config_revision=config_revision,
+            )
+        except AcquisitionNotReady as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
+        reprocess = tuple(str(doc_id) for doc_id in lease_payload.get(REPROCESS_PAYLOAD_FIELD) or ())
+        try:
+            if reprocess:
+                run = await sync_service.enqueue_reprocess(
+                    source_id, reprocess, input_snapshot_id=snapshot_id, source_config_revision=config_revision
+                )
+            else:
+                run = await sync_service.enqueue_source(
+                    source_id,
+                    trigger="local_agent",
+                    force_full_sync=bool(lease_payload.get("force_full_sync")),
+                    input_snapshot_id=snapshot_id,
+                    source_config_revision=config_revision,
+                    predecessor_activity_id=req.local_agent_job_id,
+                    retry_failed_items=bool(lease_payload.get("retry_failed_items")),
+                )
+        except SourcePausedError:
+            raise _source_paused_http_error()
+        except (SourceActivityConflict, SourceSyncBoundaryError, SourceSyncUnsupportedError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "source_id": source_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "created_at": run.created_at.isoformat(),
+            "coalesced": run.coalesced,
+        }
+
     @source_router.post("/{source_id}/process", status_code=202)
     async def process_collected_local_source(
         request: Request,
@@ -8836,12 +9058,20 @@ def create_admin_app(
         workspace_id: str = Depends(get_workspace_id),
         sync_service: SyncService = Depends(get_sync_service),
     ):
-        """Enqueue server processing after the owner daemon persisted raw input."""
+        """Enqueue server processing after the owner daemon persisted raw input.
+
+        A document Source the device acquired with its type's own Gene is
+        processed once its attempt is ready (:func:`ready_acquisition`), in
+        a run bound to that attempt; a conversation Source, once its
+        collection attempt is complete.
+        """
         source = await db.get_source(source_id)
         if source is None:
             raise HTTPException(status_code=404, detail="Source not found")
         if local_agent_sync_operation(source["type"], source.get("config")) is None:
-            raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
+            if not _is_document_source_type(str(source.get("type") or "")):
+                raise HTTPException(status_code=400, detail="source_is_not_local_agent_backed")
+            return await _process_acquisition(request, db, sync_service, source, req, workspace_id)
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         current_source = await db.get_source(source_id)
@@ -8859,32 +9089,22 @@ def create_admin_app(
         current_source = await db.get_source(source_id)
         if current_source is None:
             raise HTTPException(status_code=404, detail="Source not found")
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=current_source,
-            job_id=req.local_agent_job_id if req else None,
-            attempt_count=req.local_agent_attempt_count if req else None,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                source=current_source,
+                job_id=req.local_agent_job_id if req else None,
+                attempt_count=req.local_agent_attempt_count if req else None,
+            )
+        ).payload
         if lease_payload.get("dry_run"):
             # A dry run reports its plan; nothing it collected is processed.
             raise HTTPException(status_code=409, detail="dry_run_job_is_not_processed")
-        if _is_conversation_source(current_source):
-            await _require_complete_collection(
-                _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
-                source_id,
-                input_snapshot_id,
-            )
-        else:
-            await _require_ready_snapshot_manifest(
-                db,
-                source=current_source,
-                source_id=source_id,
-                workspace_id=workspace_id,
-                input_snapshot_id=input_snapshot_id,
-                req=req,
-                lease_payload=lease_payload,
-            )
+        await _require_complete_collection(
+            _collection_intake(db, StoredCollections(db, workspace_id=workspace_id)),
+            source_id,
+            input_snapshot_id,
+        )
         try:
             run = await sync_service.enqueue_source(
                 source_id,
@@ -9111,18 +9331,22 @@ def create_admin_app(
         source = await db.get_source(source_id)
         if not source:
             raise HTTPException(status_code=404, detail="Source not found")
-        collection = _local_agent_collection(source.get("type"))
-        if not (collection is not None and collection.accepts_artifact_inputs) and not _is_conversation_source(source):
+        package_inputs = _is_conversation_source(source)
+        if not package_inputs and not _is_document_source_type(str(source.get("type") or "")):
             raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=local_agent_job_id,
-            attempt_count=local_agent_attempt_count,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                source=source,
+                job_id=local_agent_job_id,
+                attempt_count=local_agent_attempt_count,
+            )
+        ).payload
+        if not package_inputs and lease_payload.get("operation") != DOCUMENT_ACQUISITION_OPERATION:
+            # A document Source's device run uploads the artifacts its fetches describe.
+            raise HTTPException(status_code=400, detail="source does not support local Artifact inputs")
         normalized_media_type = normalize_source_artifact_media_type(media_type)
         request_media_type = normalize_source_artifact_media_type(request.headers.get("content-type"))
         if normalized_media_type not in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES:
@@ -9183,169 +9407,6 @@ def create_admin_app(
         finally:
             content.close()
 
-    @source_router.post("/{source_id}/adapter/packages")
-    async def push_local_source_package(
-        source_id: str,
-        req: LocalSourcePackageRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-        config: AppConfig = Depends(get_config),
-        artifact_store: DocumentArtifactStore = Depends(get_document_store),
-        workspace_id: str = Depends(get_workspace_id),
-    ):
-        """Receive one local-source package pushed by the local daemon/adapter.
-
-        The service owns the inbox layout and package format. Local clients
-        send raw file text or structured source payloads; source genes perform
-        canonical markdown normalization during sync.
-        """
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        source_type = source.get("type")
-        collection = _local_agent_collection(source_type)
-        if collection is None or collection.package_submitter is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(f"source {source_id} is type {source_type!r}, not a local adapter source"),
-            )
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
-        if source.get("status") == SOURCE_PAUSED_STATUS:
-            raise HTTPException(status_code=400, detail="Source is paused")
-        try:
-            input_snapshot_id = local_agent_collection_attempt_id(
-                source_type,
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        try:
-            source_artifacts = await _resolve_local_source_artifact_inputs(
-                db,
-                source_id=source_id,
-                workspace_id=workspace_id,
-                input_hashes=req.artifact_input_hashes,
-                expected_source_unit_key=str(req.artifact_source_unit_key or "").strip(),
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        submit_package = load_reference(collection.package_submitter)
-        try:
-            result = await submit_package(
-                req,
-                db=db,
-                workspace_id=workspace_id,
-                config=config,
-                source=source,
-                document_store=artifact_store,
-                sync_snapshot_id=input_snapshot_id,
-                source_artifacts=source_artifacts,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        if result.get("package_uri"):
-            package_uri = str(result["package_uri"])
-
-            async def discard_unretained_package() -> None:
-                await db.enqueue_source_artifact_cleanup_task(
-                    source_id=source_id,
-                    artifact_uri=package_uri,
-                )
-
-            try:
-                current_source = await db.get_source(source_id)
-                if current_source is None:
-                    raise HTTPException(status_code=404, detail="Source not found")
-                await _require_current_local_agent_lease(
-                    request,
-                    db,
-                    source=current_source,
-                    job_id=req.local_agent_job_id,
-                    attempt_count=req.local_agent_attempt_count,
-                )
-                raw_sha256 = local_agent_semantic_input_sha256(
-                    result.get("doc_id"),
-                    result.get("semantic_hash"),
-                )
-                if not raw_sha256:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="local_agent_package_hash_missing",
-                    )
-                manifest_entry = result.get("package_manifest_entry")
-                package_sha256 = str(result.get("package_sha256") or "").strip()
-                if not package_sha256:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="local_agent_package_artifact_hash_missing",
-                    )
-                if isinstance(manifest_entry, dict):
-                    manifest_entry = {
-                        **manifest_entry,
-                        "package_sha256": package_sha256,
-                    }
-                retained_input = await db.create_source_sync_input(
-                    source_id=source_id,
-                    workspace_id=workspace_id,
-                    raw_uri=package_uri,
-                    raw_sha256=raw_sha256,
-                    raw_content_type="application/json",
-                    metadata={
-                        "doc_id": result.get("doc_id"),
-                        "source_type": source_type,
-                        "package_path": result.get("package_path"),
-                        "submitted_at": result.get("submitted_at"),
-                        "submitted_by": req.submitted_by,
-                        "package_sha256": package_sha256,
-                        "manifest_entry": (manifest_entry if isinstance(manifest_entry, dict) else {}),
-                    },
-                    sync_snapshot_id=input_snapshot_id,
-                )
-            except HTTPException:
-                await discard_unretained_package()
-                raise
-            except ValueError as exc:
-                await discard_unretained_package()
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except Exception:
-                await discard_unretained_package()
-                raise
-            if retained_input.raw_uri != package_uri:
-                try:
-                    retained_input, retained_package_hash = await _attest_retained_local_source_input(
-                        db=db,
-                        artifact_store=artifact_store,
-                        source_type=source_type,
-                        source_id=source_id,
-                        retained_input=retained_input,
-                    )
-                except ValueError as exc:
-                    await discard_unretained_package()
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-                except Exception:
-                    await discard_unretained_package()
-                    raise
-                await discard_unretained_package()
-                result["package_uri"] = retained_input.raw_uri
-                result["package_sha256"] = retained_package_hash
-
-        public_result = dict(result)
-        public_result.pop("package_manifest_entry", None)
-        return {**public_result, "sync_started": False}
-
     async def _conversation_upload(
         request: Request,
         db: Database,
@@ -9362,13 +9423,14 @@ def create_admin_app(
         _require_source_sync_execution(request, source)
         _require_source_sync_support(source)
         gene = cast(ConversationGene, _conversation_gene(source))
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=attempt.local_agent_job_id,
-            attempt_count=attempt.local_agent_attempt_count,
-        )
+        lease_payload = (
+            await _require_current_local_agent_lease(
+                request,
+                source=source,
+                job_id=attempt.local_agent_job_id,
+                attempt_count=attempt.local_agent_attempt_count,
+            )
+        ).payload
         collections = StoredCollections(db, workspace_id=workspace_id)
         return _ConversationUpload(
             gene=gene,
@@ -9426,7 +9488,6 @@ def create_admin_app(
         family = collection_family(upload.gene, db=db, doc_store=document_store, source_id=source_id)
         family.prepare(
             collection_attempt=CollectionAttempt(workspace_id, upload.collection_attempt_id),
-            input_snapshot=None,
         )
         transition = await db.get_open_projection_scope_transition(source_id)
         if transition is not None:
@@ -9518,162 +9579,208 @@ def create_admin_app(
 
         raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
 
-    @source_router.post("/{source_id}/adapter/manifest")
-    async def prepare_local_source_manifest(
+    async def _acquisition_source(request: Request, db: Database, source_id: str) -> dict[str, Any]:
+        source = await db.get_source(source_id)
+        if not source:
+            raise HTTPException(status_code=404, detail="Source not found")
+        _require_source_sync_execution(request, source)
+        _require_source_sync_support(source)
+        return source
+
+    @source_router.post("/{source_id}/acquisition/manifest")
+    async def submit_acquisition_manifest(
         source_id: str,
-        req: LocalSourceManifestRequest,
+        req: AcquisitionManifestRequest,
         request: Request,
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        """Reuse unchanged immutable packages in one complete, fenced collection."""
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        if _is_conversation_source(source):
-            # A conversation Source uploads a Collection Manifest; an agent
-            # that sends it document snapshots is told to upgrade.
-            raise HTTPException(status_code=409, detail=LOCAL_AGENT_UPGRADE_REQUIRED)
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        lease_payload = await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
+        """Keep the manifest of one device run and answer what the server run will ask beyond discovery.
+
+        The response's ``requests`` name the unlisted Units to confirm, the
+        failed Documents to rediscover and the failed items to fetch, by the
+        server run's own rules. They are computed when the attempt's manifest
+        is first recorded and returned unchanged on a replay. The attempt's
+        lease time is the run's start for the sync cursor. A manifest
+        above the bound every device manifest has, a listing of a scope the
+        job did not carry, and a reprocess that discovers or lists answer 422.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        lease_payload = lease.payload
+        reprocess = tuple(str(doc_id) for doc_id in lease_payload.get(REPROCESS_PAYLOAD_FIELD) or ())
         try:
-            snapshot_id = local_agent_collection_attempt_id(
-                source.get("type"),
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-            items = [SnapshotManifestItem(doc_id=item.doc_id, revision=item.revision) for item in req.items]
-            manifest_items = [(item.doc_id, item.revision, UPSERT) for item in items]
-            retained_inputs = await db.find_source_sync_input_attestations(
-                source_id=source_id,
-                workspace_id=workspace_id,
-                manifest_items=manifest_items,
-            )
-            plan = plan_snapshot_manifest(
-                items,
-                retained_inputs,
-                require_source_time=local_package_requires_source_time(
-                    source.get("type"),
-                    req.package_contract_version,
-                ),
-            )
-            excluded_listings = tuple(
-                ExcludedScopeListing(
-                    scope_key=listing.scope_key, doc_ids=frozenset(listing.doc_ids), rejection=listing.rejection
-                )
-                for listing in req.excluded_listings
-            )
+            manifest = AcquisitionManifest.from_payload(req.manifest)
+            manifest.check_bound()
+            if reprocess and (manifest.discovered or manifest.listing != AcquiredListing() or manifest.excluded_listings):
+                raise ValueError("a reprocess discovers and lists nothing")
             validate_excluded_listings_for_job(
-                excluded_listings,
+                manifest.excluded_listings,
                 (
                     str(entry.get("scope_key") or "")
                     for entry in lease_payload.get(LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD) or ()
                     if isinstance(entry, Mapping)
                 ),
             )
-            manifest_sha256 = snapshot_manifest_sha256(items, excluded_listings)
-            confirm = await _snapshot_confirm_set(
-                db,
-                source=source,
-                workspace_id=workspace_id,
-                snapshot_id=snapshot_id,
-                listed_doc_ids=frozenset(item.doc_id for item in items),
-                excluded_listings=excluded_listings,
-                package_contract_version=req.package_contract_version,
-            )
-            await db.attach_source_sync_inputs_to_snapshot(
+        except (AcquisitionManifestTooLarge, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        requests = await acquisition_requests(db, source, manifest, reprocess_document_ids=reprocess)
+        try:
+            stored = await db.record_source_acquisition(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 snapshot_id=snapshot_id,
-                memberships=list(plan.reused_memberships),
-                coverage=COMPLETE_SNAPSHOT,
-                manifest_count=len(req.items),
-                manifest_sha256=manifest_sha256,
-                manifest_items=manifest_items,
+                manifest=manifest,
+                requests=requests,
+                started_at=lease.leased_at,
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
                 source_config_revision=str(lease_payload["source_config_revision"]),
-                confirm=confirm,
-                excluded_listings=excluded_listings,
             )
-        except ValueError as exc:
+        except (SourceActivityConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "source_id": source_id,
             "snapshot_id": snapshot_id,
-            "coverage": COMPLETE_SNAPSHOT,
-            "manifest_count": len(req.items),
-            "manifest_sha256": manifest_sha256,
-            "reused_count": len(plan.reused_memberships),
-            "required_doc_ids": list(plan.required_doc_ids),
-            "confirm": [{"doc_id": item.doc_id, "provider_key": item.provider_key} for item in confirm],
+            "manifest_sha256": stored.manifest_sha256,
+            "requests": stored.requests.to_payload(),
         }
 
-    @source_router.post("/{source_id}/adapter/manifest/confirmations")
-    async def submit_local_source_confirmations(
+    @source_router.post("/{source_id}/acquisition/inputs")
+    async def upload_acquired_input(
         source_id: str,
-        req: LocalSourceConfirmationsRequest,
+        req: AcquiredInputRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        artifact_store: DocumentArtifactStore = Depends(get_document_store),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep one acquired input of a device run for its job attempt.
+
+        The device fetches each discovered item before it submits the
+        manifest, so an input belongs to the attempt, not to a manifest
+        digest; the run reads only the inputs of items it asks for. Each
+        artifact body the input names must already be an uploaded input of
+        the Source; an artifact the device could not read names its error
+        instead. The input's own body travels with it unless the Source holds
+        it already; an input naming a body the Source does not hold is
+        answered 409 ``acquired_body_required``, and the device sends it
+        again with its body. The same input uploaded again is kept once.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        _lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
+        try:
+            package = AcquiredInputPackage.from_payload(req.package)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        artifact_hashes = tuple(
+            dict.fromkeys(acquired.input_sha256 for acquired in package.artifacts if acquired.input_sha256 is not None)
+        )
+        if artifact_hashes:
+            held = await db.get_source_sync_inputs_by_raw_hashes(
+                source_id=source_id, workspace_id=workspace_id, raw_sha256s=artifact_hashes
+            )
+            if {held_input.raw_sha256 for held_input in held} != set(artifact_hashes):
+                raise HTTPException(status_code=409, detail="acquired input names an artifact that was not uploaded")
+        if req.body is not None:
+            if package.body_sha256 is None:
+                raise HTTPException(status_code=422, detail="a failed fetch acquired no body")
+            try:
+                body = base64.b64decode(req.body, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="body is not base64") from exc
+            if hashlib.sha256(body).hexdigest() != package.body_sha256:
+                raise HTTPException(status_code=422, detail="body does not match body_sha256")
+            await retain_acquired_body(db, artifact_store, source_id=source_id, workspace_id=workspace_id, body=body)
+        elif package.body_sha256 is not None and not await held_acquired_bodies(
+            db, source_id=source_id, workspace_id=workspace_id, body_sha256s=(package.body_sha256,)
+        ):
+            raise HTTPException(status_code=409, detail=ACQUIRED_BODY_REQUIRED)
+        input_sha256 = await retain_acquired_input(
+            db,
+            artifact_store,
+            source_id=source_id,
+            workspace_id=workspace_id,
+            snapshot_id=snapshot_id,
+            package=package,
+        )
+        return {
+            "source_id": source_id,
+            "snapshot_id": snapshot_id,
+            "doc_id": package.item.item_id,
+            "input_sha256": input_sha256,
+        }
+
+    @source_router.post("/{source_id}/acquisition/held-bodies")
+    async def read_held_acquired_bodies(
+        source_id: str,
+        req: HeldAcquiredBodiesRequest,
         request: Request,
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        """Store a device's answers for the items its manifest response asked it to confirm.
+        """Say which of the named bodies the Source holds, so a device run uploads only the others."""
 
-        The answers bind to the job attempt and the digest of the manifest. An
-        identical replay is accepted; an item the manifest did not ask about,
-        another digest or attempt, and answers that differ from the stored
-        ones are refused with 409.
+        source = await _acquisition_source(request, db, source_id)
+        await _require_acquisition_lease(request, db, source=source, attempt=req)
+        held = await held_acquired_bodies(db, source_id=source_id, workspace_id=workspace_id, body_sha256s=req.body_sha256s)
+        return {"source_id": source_id, "held": sorted(held)}
+
+    @source_router.post("/{source_id}/acquisition/stored-extras")
+    async def read_acquisition_stored_extras(
+        source_id: str,
+        req: AcquisitionStoredExtrasRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+    ):
+        """Give a device run's ``fetch`` the ``stored_extra`` a server run's ``fetch`` reads.
+
+        For each named item whose Document the Source has stored, the
+        ``extra`` recorded with its Unit's stored input, so a Gene that
+        reuses a fact it recorded for an unchanged provider revision does so
+        on the device as on the server.
         """
-        source = await db.get_source(source_id)
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-        _require_source_sync_execution(request, source)
-        _require_source_sync_support(source)
-        await _require_current_local_agent_lease(
-            request,
-            db,
-            source=source,
-            job_id=req.local_agent_job_id,
-            attempt_count=req.local_agent_attempt_count,
-        )
+
+        source = await _acquisition_source(request, db, source_id)
+        await _require_acquisition_lease(request, db, source=source, attempt=req)
+        return {"source_id": source_id, "stored_extras": await stored_extras(db, source_id, req.item_ids)}
+
+    @source_router.post("/{source_id}/acquisition/answers")
+    async def submit_acquisition_answers(
+        source_id: str,
+        req: AcquisitionAnswersRequest,
+        request: Request,
+        db: Database = Depends(get_db),
+        workspace_id: str = Depends(get_workspace_id),
+    ):
+        """Keep a device run's answers to what its manifest response asked.
+
+        The answers must answer exactly what the response asked, bound to the
+        manifest's digest and attempt. An identical replay is accepted;
+        anything else that differs from the stored answers is refused with 409.
+        """
+
+        source = await _acquisition_source(request, db, source_id)
+        _lease, snapshot_id = await _require_acquisition_lease(request, db, source=source, attempt=req)
         try:
-            snapshot_id = local_agent_collection_attempt_id(
-                source.get("type"),
-                req.local_agent_job_id,
-                req.local_agent_attempt_count,
-                req.sync_snapshot_id,
-            )
-            await db.write_source_sync_snapshot_confirmations(
+            answers = AcquisitionAnswers.from_payload(req.answers)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            await db.record_source_acquisition_answers(
                 source_id=source_id,
                 workspace_id=workspace_id,
                 snapshot_id=snapshot_id,
                 manifest_sha256=req.manifest_sha256,
                 local_agent_job_id=req.local_agent_job_id,
                 local_agent_attempt_count=req.local_agent_attempt_count,
-                answers=tuple(
-                    SnapshotConfirmation(
-                        item.doc_id, item.provider_key, SnapshotConfirmationAnswer(item.answer)
-                    )
-                    for item in req.answers
-                ),
-                failure_cause=req.failure_cause,
+                answers=answers,
             )
-        except ValueError as exc:
+        except (SourceActivityConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "source_id": source_id,
-            "snapshot_id": snapshot_id,
-            "answered_count": len(req.answers),
-            "failed": req.failure_cause is not None,
-        }
+        return {"source_id": source_id, "snapshot_id": snapshot_id}
 
     # ===================================================================
     # 4b. Agent Hook Context
@@ -10471,28 +10578,6 @@ def create_admin_app(
                 )
         return _manifest_response("apply", results)
 
-    # -- Include all routers --
-    # Local tool — no auth required. All routers accessible directly.
-    def _shape_local_agent_job(job: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "job_id": job["job_id"],
-            "workspace_id": job["workspace_id"],
-            "source_id": job["source_id"],
-            "source_type": job["source_type"],
-            "operation": job["operation"],
-            "status": job["status"],
-            "payload": job.get("payload") or {},
-            "execution_owner_user_id": job["execution_owner_user_id"],
-            "result": job.get("result") or {},
-            "last_error": job.get("last_error"),
-            "next_attempt_at": job.get("next_attempt_at"),
-            "leased_until": job.get("leased_until"),
-            "attempt_count": int(job.get("attempt_count") or 0),
-            "created_at": job.get("created_at"),
-            "updated_at": job.get("updated_at"),
-            "finished_at": job.get("finished_at"),
-        }
-
     @local_agent_router.post(
         "/jobs",
         status_code=201,
@@ -10510,13 +10595,19 @@ def create_admin_app(
         payload = dict(req.payload)
         if req.retry_job_id is not None and req.operation not in LOCAL_AGENT_SYNC_OPERATIONS:
             raise HTTPException(status_code=400, detail="retry_target_requires_sync_operation")
+        device_id: str | None = None
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
+            if req.device_id is not None:
+                raise HTTPException(status_code=400, detail="local_agent_sync_names_no_device")
             if not source_id:
                 raise HTTPException(status_code=400, detail="local_agent_sync_requires_source_id")
             source = await db.get_source(source_id)
             if source is None:
                 raise HTTPException(status_code=404, detail="local_agent_source_not_found")
             _require_source_discoverability(request, source)
+            if source.get("status") != "active":
+                # Checked here, where the Source is read: the job store may keep jobs elsewhere.
+                raise HTTPException(status_code=409, detail="source_not_active")
             operation = local_agent_sync_operation(source["type"], source.get("config"))
             if operation != req.operation or source["type"] != req.source_type:
                 raise HTTPException(status_code=400, detail="local_agent_operation_source_mismatch")
@@ -10526,6 +10617,14 @@ def create_admin_app(
             if requester != owner:
                 raise HTTPException(status_code=403, detail="local_agent_sync_execution_owner_forbidden")
             payload = await local_agent_sync_job_payload(db, source, payload)
+        elif req.operation == CREDENTIAL_CHECK_OPERATION:
+            source = await _credential_check_source(request, db, source_id, req.source_type)
+            owner = requester
+            payload = credential_check_job_payload(source)
+            if source_runs_on_device(source):
+                device_id = _source_execution_device(source, requester, req.device_id)
+            elif req.device_id is not None:
+                device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
         else:
             expected_type = LOCAL_AGENT_SETUP_OPERATION_SOURCE_TYPES.get(req.operation)
             if expected_type is None:
@@ -10535,16 +10634,27 @@ def create_admin_app(
             if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
                 raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
             owner = requester
+            descriptor = source_type_descriptor(expected_type)
+            if descriptor is not None and descriptor.device_location_fields:
+                saved = await db.get_source(source_id) if source_id else None
+                if source_id and saved is None:
+                    raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+                if saved is not None:
+                    _require_source_discoverability(request, saved)
+                if req.device_id is not None or saved is None or not source_runs_on_device(saved):
+                    # A device location is picked on the device chosen in Where it runs.
+                    device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
+                else:
+                    device_id = _source_execution_device(saved, requester, None)
+            elif req.device_id is not None:
+                device_id = await _choosers_device(_job_store(request), chooser=requester, device_id=req.device_id)
         payload.pop("created_by_user_id", None)
         payload.pop("execution_owner_user_id", None)
         job_id = f"laj-{uuid.uuid4().hex}"
-        workspace_id = (req.workspace_id or current_workspace_id or "default").strip() or "default"
         if req.operation in LOCAL_AGENT_SYNC_OPERATIONS:
             job_id, created = await _enqueue_sync_local_agent_job(
                 request,
-                db,
                 job_id=job_id,
-                workspace_id=workspace_id,
                 source_id=source_id,
                 source_type=req.source_type,
                 operation=req.operation,
@@ -10554,102 +10664,88 @@ def create_admin_app(
                 retry_job_id=req.retry_job_id,
                 trigger="manual",
             )
-            current_job = await db.get_local_agent_job(job_id)
+            current_job = await _job_store(request).get_local_agent_job(job_id)
             return {
                 "job_id": job_id,
                 "status": current_job["status"],
                 "created_at": current_job["created_at"],
                 "coalesced": not created,
             }
-        await db.insert_local_agent_job(
+        await _job_store(request).insert_local_agent_job(
             job_id=job_id,
-            workspace_id=workspace_id,
+            workspace_id=current_workspace_id,
             source_id=source_id,
             source_type=req.source_type,
             operation=req.operation,
             payload=payload,
             created_by_user_id=requester,
             execution_owner_user_id=owner,
+            device_id=device_id,
         )
         return {"job_id": job_id, "status": "queued", "coalesced": False}
 
-    @local_agent_router.post("/jobs/lease")
-    async def lease_local_agent_jobs(
-        req: LocalAgentJobLeaseRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        requester = resolve_request_principal(request)
-        deadline = time.monotonic() + req.wait_seconds
-        while True:
-            jobs = await db.lease_local_agent_jobs(
-                user_id=requester,
-                limit=req.limit,
-                lease_seconds=req.lease_seconds,
+    def _source_execution_device(source: Mapping[str, Any], requester: str, requested: str | None) -> str:
+        """The device a setup job for a saved device Source runs on: its execution device.
+
+        Only the Source's execution owner sets it up there, since a job runs
+        only on a device of its owner (403
+        ``setup_job_execution_owner_forbidden``; another member chooses their
+        own device in Where it runs instead). The request may name the device
+        but not change it (400 ``execution_device_invalid``); 409
+        ``execution_device_required`` while the Source has none.
+        """
+
+        if execution_owner_user_id(source) != requester:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "setup_job_execution_owner_forbidden",
+                    "message": "This source runs on another person's computer; choose your own in Where it runs.",
+                },
             )
-            if jobs or req.wait_seconds <= 0 or time.monotonic() >= deadline:
-                return {"jobs": [_shape_local_agent_job(job) for job in jobs]}
-            if await request.is_disconnected():
-                return {"jobs": []}
-            await asyncio.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+        device_id = source.get("execution_device_id")
+        if not device_id:
+            raise HTTPException(status_code=409, detail=EXECUTION_DEVICE_REQUIRED_DETAIL)
+        if requested is not None and requested != device_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": EXECUTION_DEVICE_INVALID,
+                    "message": "This source's setup runs on its execution device; move it there first.",
+                },
+            )
+        return str(device_id)
 
-    @local_agent_router.post("/jobs/{job_id}/heartbeat")
-    async def heartbeat_local_agent_job(
-        job_id: str,
-        req: LocalAgentJobHeartbeatRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
+    async def _credential_check_source(
+        request: Request, db: Database, source_id: str, source_type: str
+    ) -> dict[str, Any]:
+        """The Source a ``credential_check`` job checks.
+
+        A device Source's credential lives on its execution device, so only
+        its execution owner checks it, and the job runs on that device. A
+        server Source's credential is checked on the server, so a job for one
+        only captures a browser session, which any member who manages the
+        Source may do from their own computer.
+        """
+
         requester = resolve_request_principal(request)
-        try:
-            progress = normalize_sync_progress_snapshot(req.progress) if req.progress is not None else None
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        wrote = await db.heartbeat_local_agent_job(
-            job_id=job_id,
-            user_id=requester,
-            attempt_count=req.attempt_count,
-            lease_seconds=req.lease_seconds,
-            progress=progress,
-        )
-        if not wrote:
-            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-        return {"ok": True, "job_id": job_id, "status": "leased"}
-
-    @local_agent_router.post("/jobs/{job_id}/complete")
-    async def complete_local_agent_job(
-        job_id: str,
-        req: LocalAgentJobCompleteRequest,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        wrote = await db.complete_local_agent_job(
-            job_id=job_id,
-            user_id=resolve_request_principal(request),
-            attempt_count=req.attempt_count,
-            status=req.status,
-            result=req.result,
-            error=req.error,
-            retryable=bool(req.result.get("retryable")),
-        )
-        if not wrote:
-            current = await db.get_local_agent_job(job_id)
-            if (
-                not current
-                or int(current.get("attempt_count") or 0) != req.attempt_count
-                or current.get("execution_owner_user_id") != resolve_request_principal(request)
-            ):
-                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-            status = str(current.get("status") or "")
-            if status not in {"queued", "succeeded", "failed"}:
-                raise HTTPException(status_code=404, detail="local_agent_job_not_found")
+        if not source_id:
+            raise HTTPException(status_code=400, detail="credential_check_requires_source_id")
+        source = await db.get_source(source_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="local_agent_source_not_found")
+        _require_source_discoverability(request, source)
+        if source["type"] != source_type:
+            raise HTTPException(status_code=400, detail="local_agent_operation_source_type_mismatch")
+        if source_runs_on_device(source):
+            if execution_owner_user_id(source) != requester:
+                raise HTTPException(status_code=403, detail="credential_check_execution_owner_forbidden")
         else:
-            status = local_agent_completion_status(
-                req.status,
-                retryable=bool(req.result.get("retryable")),
-                attempt_count=req.attempt_count,
-            )
-        return {"ok": True, "job_id": job_id, "status": status}
+            if not signs_in_with_browser_session(source_type, source.get("config") or {}):
+                raise HTTPException(status_code=400, detail="credential_check_requires_browser_session")
+            if resolve_request_workspace_role(request) not in {"workspace_admin", "member"}:
+                raise HTTPException(status_code=403, detail="local_agent_job_forbidden")
+        return source
 
     @local_agent_router.get("/jobs/current", response_model=LocalAgentJobListResponse)
     async def read_current_local_agent_jobs(
@@ -10657,40 +10753,14 @@ def create_admin_app(
         db: Database = Depends(get_db),
         workspace_id: str = Depends(get_workspace_id),
     ):
-        jobs = await db.list_current_local_agent_jobs(
+        jobs = await _job_store(request).list_current_local_agent_jobs(
             workspace_id=workspace_id,
             user_id=resolve_request_principal(request),
         )
-        return {"data": [_shape_local_agent_job(job) for job in jobs]}
+        return {"data": [shape_local_agent_job(job) for job in jobs]}
 
-    @local_agent_router.get("/jobs/{job_id}")
-    async def read_local_agent_job(
-        job_id: str,
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        job = await db.get_local_agent_job(job_id)
-        requester = resolve_request_principal(request)
-        if job is None or requester not in {job["created_by_user_id"], job["execution_owner_user_id"]}:
-            raise HTTPException(status_code=404, detail="local_agent_job_not_found")
-        return _shape_local_agent_job(job)
-
-    @local_agent_router.get("/status", response_model=LocalAgentDaemonStatusResponse)
-    async def read_local_agent_status(
-        request: Request,
-        db: Database = Depends(get_db),
-    ):
-        now = datetime.now(timezone.utc)
-        last_seen_at = await db.get_local_agent_heartbeat(resolve_request_principal(request))
-        last_seen = datetime.fromisoformat(last_seen_at) if last_seen_at else None
-        online = bool(last_seen and (now - last_seen).total_seconds() <= LOCAL_AGENT_STATUS_STALE_SECONDS)
-        return {
-            "status": "online" if online else "offline",
-            "last_seen_at": last_seen_at,
-            "checked_at": now.isoformat(),
-            "stale_after_seconds": LOCAL_AGENT_STATUS_STALE_SECONDS,
-        }
-
+    # -- Include all routers --
+    # Local tool — no auth required. All routers accessible directly.
     app.include_router(auth_router)
     app.include_router(health_router)
     app.include_router(document_router)
@@ -10708,6 +10778,8 @@ def create_admin_app(
     app.include_router(model_settings_router)
     app.include_router(projects_router)
     app.include_router(local_agent_router)
+    if serves_daemons:
+        app.include_router(build_local_agent_host_router())
 
     return app
 

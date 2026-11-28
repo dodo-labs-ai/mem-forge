@@ -24,10 +24,10 @@ assert.match(
 
 const schemaSourceSetupSource = readFileSync("src/views/sources/SchemaSourceSetup.tsx", "utf8");
 
-assert.match(
+assert.doesNotMatch(
   schemaSourceSetupSource,
   /local_markdown_preview_tree/,
-  "SchemaSourceSetup should preview local_markdown through the local-agent queue",
+  "A local folder is read only on its device, so SchemaSourceSetup offers no preview of it",
 );
 
 assert.match(
@@ -46,11 +46,6 @@ assert.match(
   schemaSourceSetupSource,
   /pollLocalAgentPreviewJob/,
   "SchemaSourceSetup should poll the local-agent preview job",
-);
-assert.doesNotMatch(
-  schemaSourceSetupSource,
-  /sourceType !== "local_markdown"/,
-  "local_markdown preview should be reachable in the source dialog",
 );
 assert.doesNotMatch(
   schemaSourceSetupSource,

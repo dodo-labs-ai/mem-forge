@@ -5,7 +5,7 @@ import { unwrap, useApi } from "@/api";
 import { errorMessage } from "@/lib/errors";
 import { StatusBadge, type Tone } from "@/patterns";
 import { Button } from "@/ui/button";
-import { useJiraSignIn } from "../../useJiraSignIn";
+import { useCredentialCheck } from "../../useCredentialCheck";
 import type { ConfigPanelProps } from "../panels";
 
 const STATUS: Readonly<Record<string, { label: string; tone: Tone }>> = {
@@ -23,11 +23,11 @@ function jiraRefreshCommand(baseUrl: string): string {
 /**
  * The Jira browser session a Source reads through: whether one is stored for
  * the site and whose it is (`GET /auth/jira-session`). An existing Source can
- * renew it in place through local sync (`jira_auth`); either way the copyable
+ * renew it in place through local sync (a `credential_check` job); either way the copyable
  * `memforge adapter auth jira refresh` command captures it from the
  * computer where the person is signed in to Jira.
  */
-export default function JiraSessionPanel({ sourceId, config }: ConfigPanelProps) {
+export default function JiraSessionPanel({ sourceType, sourceId, config }: ConfigPanelProps) {
   const api = useApi();
   const baseUrl = typeof config.base_url === "string" ? config.base_url.trim() : "";
   const session = useQuery({
@@ -36,14 +36,14 @@ export default function JiraSessionPanel({ sourceId, config }: ConfigPanelProps)
     enabled: baseUrl.startsWith("https://"),
     retry: false,
   });
-  const signIn = useJiraSignIn();
+  const signIn = useCredentialCheck();
   const command = jiraRefreshCommand(baseUrl);
   const status = (session.data && STATUS[session.data.status]) ?? MISSING;
   const principal = session.data?.principal_name || session.data?.principal_email || session.data?.principal_id;
 
   function renew() {
     if (!sourceId) return;
-    signIn.mutate({ id: sourceId, config: { base_url: baseUrl } }, { onSettled: () => void session.refetch() });
+    signIn.mutate({ id: sourceId, type: sourceType }, { onSettled: () => void session.refetch() });
   }
 
   function copy() {

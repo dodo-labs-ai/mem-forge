@@ -1,13 +1,12 @@
 /**
- * Where API requests go. The standalone build talks to the local server; the
- * Cloud extension points the target at the workspace the user selected, or at
- * nothing while no workspace is selected.
+ * Where resource requests go. The standalone build talks to the local server;
+ * the Cloud extension points the target at the workspace the user selected, or
+ * at nothing while no workspace is selected. The routes of the user's devices
+ * (`/api/cloud/local-agent`) span every workspace and always go to the host.
  */
 export interface WorkspaceTarget {
   /** Replaces the `/api/v1` prefix of resource routes. */
   resourceBaseUrl: string;
-  /** Replaces the `/api/cloud/local-agent` prefix of local sync routes. */
-  localAgentBaseUrl: string;
   /** Sent as the `workspace_id` query parameter on resource routes. */
   workspaceId: string | null;
   /** Name of the workspace, shown in the browser tab title. */
@@ -21,11 +20,9 @@ export interface WorkspaceTarget {
 }
 
 export const RESOURCE_PREFIX = "/api/v1";
-export const LOCAL_AGENT_PREFIX = "/api/cloud/local-agent";
 
 export const STANDALONE_TARGET: WorkspaceTarget = Object.freeze({
   resourceBaseUrl: RESOURCE_PREFIX,
-  localAgentBaseUrl: LOCAL_AGENT_PREFIX,
   workspaceId: "local",
   shared: false,
 });
@@ -45,7 +42,6 @@ function normalize(target: WorkspaceTarget | null): WorkspaceTarget | null {
     target && {
       ...target,
       resourceBaseUrl: trimTrailingSlash(target.resourceBaseUrl),
-      localAgentBaseUrl: trimTrailingSlash(target.localAgentBaseUrl),
       // Only a target that says it has one user hides who can use what.
       shared: target.shared !== false,
     }
@@ -57,7 +53,6 @@ function sameRequests(a: WorkspaceTarget | null, b: WorkspaceTarget | null): boo
   if (a === null || b === null) return a === b;
   return (
     a.resourceBaseUrl === b.resourceBaseUrl &&
-    a.localAgentBaseUrl === b.localAgentBaseUrl &&
     a.workspaceId === b.workspaceId
   );
 }

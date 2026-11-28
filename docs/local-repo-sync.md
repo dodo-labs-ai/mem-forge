@@ -1,9 +1,10 @@
 # Local repository sync
 
-Local folders and checked-out repositories are configured in the MemForge UI.
-The local daemon reads the selected files and uploads raw packages; the server
-owns conversion, normalization, memory extraction, deduplication, and document
-lifecycle reconciliation.
+A Local Repository Source reads the files of a folder on one of your
+computers, its execution device. The MemForge daemon on that computer walks the
+folder with the Source's include and exclude patterns, reads each file and
+hands what it read to the server; the server owns conversion, normalization,
+memory extraction, deduplication and document lifecycle reconciliation.
 
 ## Setup
 
@@ -12,9 +13,16 @@ lifecycle reconciliation.
    [quickstart](quickstart.md#6-install-the-host-cli) explains the options.
 2. Run `memforge setup` to configure the active API target and install the local
    daemon as a login user service.
-3. In the Sources UI, add a Local Markdown or GitHub Repository source.
-4. Choose the local folder or repository through the source-specific browser.
+3. In the Sources UI, add a Local Repository source. In **Where it runs**,
+   choose the computer that has the folder; with one computer it is chosen
+   already.
+4. Choose the folder with the folder picker, which opens on that computer.
 5. Configure include and exclude patterns, then save the source.
+
+A checked-out GitHub repository can also be read from GitHub itself: add a
+GitHub Repository source and choose **My computer** in **Where it runs** when
+only your computer can reach the repository, then store its token there with
+`memforge source credentials set <source id>`.
 
 When no target is already configured, `memforge setup` prompts for the API URL;
 press Enter to accept the local self-hosted default or enter the hosted URL. The
@@ -45,8 +53,8 @@ and the daemon scopes every later job API call to that stored workspace.
 
 ## Supported file types
 
-The daemon assigns a content type from the file extension and uploads the raw
-text. Conversion happens on the server.
+The daemon assigns a content type from the file extension and hands over the
+file's text. Conversion happens on the server.
 
 | Extension | Content type | Server processing |
 | --- | --- | --- |
@@ -55,42 +63,42 @@ text. Conversion happens on the server.
 | `.json` | `application/json` | converted to fenced JSON markdown |
 | `.html`, `.htm` | `text/html` | converted with `html_to_markdown` |
 
-Files over 1 MB and non-UTF-8 files are skipped. PDF is not part of this local
-text-source contract.
+A file over 1 MB, a file that is not UTF-8 and a file the daemon cannot read
+fail on their own: the run reports them as failed Documents, keeps what each
+one held before, and reads them again on the next run. PDF is not part of this
+local text-source contract.
+
+## What a run reads
+
+Every run walks the whole folder once. The walk lists every file the patterns
+include, by its path relative to the folder; that list is the Source's scope,
+so a file that is deleted, renamed or newly excluded leaves the Source, and a
+renamed folder's files are read under their new paths. A directory matching an
+exclude pattern that ends in `/**`, such as `.git/**`, is not entered.
+
+A missing folder, or a directory inside it that the daemon cannot list, fails
+the run and removes nothing: the Source shows **Finish setup** with the
+folder's path until the folder is back.
+
+Each file's time is its last commit time when it is committed without local
+changes, and its modification time otherwise.
+
+The daemon uploads a file's text only when the server does not already hold
+it for the Source, and the server extracts only files whose content changed,
+so an unchanged folder costs a walk and no extraction.
 
 ## Sync ownership
 
 The UI's Sync action and the source schedule both create durable server-owned
-jobs. The daemon leases those jobs; it has no local profile scheduler or cron
-configuration.
+jobs. Only the Source's execution device leases them; the daemon has no local
+profile scheduler or cron configuration.
 
-Every raw package upload and final processing request carries the leased job id
-and attempt count. The server rejects missing, expired, or superseded lease
-contexts before writing raw input, so an old daemon attempt cannot publish a
-partial snapshot after another daemon has reclaimed the job.
-
-The daemon also enforces that authority while a handler is running. A definitive
-heartbeat or package rejection stops the current attempt at its next progress
-checkpoint; if renewal remains unavailable, the daemon stops itself when the
-last confirmed lease deadline passes. It does not send a stale terminal
-completion. The same durable job can then be reclaimed with a higher attempt
-number and a new attempt-scoped snapshot.
-
-For each complete folder or repository scan, the daemon derives a snapshot id
-from the job id and lease attempt number. Every uploaded package and the final
-processing request use that same attempt-scoped id. The server processes only
-that snapshot, including an explicit empty snapshot, so deleted or newly
-excluded files are reconciled correctly.
-
-If any package upload fails, the daemon does not publish the partial snapshot.
-The same job is retried with a new attempt-scoped snapshot, so membership from a
-partial attempt cannot leak into the retry. Stable document/content identities
-reuse raw inputs and prevent duplicate input generations or memories.
-
-Collection progress reports discovery, content fetching, and Cloud upload as
-separate phases. Large remote repositories therefore continue advancing while
-the daemon reads each selected file instead of leaving the Source row on the
-last discovery count.
+Every upload and the final processing request carry the leased job id and
+attempt count. The server rejects missing, expired or superseded lease
+contexts, so an old daemon attempt cannot publish what it read after another
+attempt has reclaimed the job. A definitive heartbeat or upload rejection
+stops the current attempt at its next progress checkpoint; the same job can
+then be reclaimed with a higher attempt number, which reads the folder again.
 
 ## Scheduling
 
@@ -129,7 +137,8 @@ Rename, pause, rescope, force-resync, schedule, and delete sources in the UI.
 Connection paths and execution ownership remain attached to the saved source,
 while project binding controls where extracted memories land.
 
-The user who creates a local source is its execution owner because the source
-depends on that user's filesystem and browser credentials. Workspace admins can
-rename, bind, schedule, pause, or delete the source, but only the execution
-owner's daemon can configure its connection or run a sync.
+The user whose computer runs a Source is its execution owner, because the
+Source depends on that computer's files and credentials. Workspace admins can
+rename, bind, schedule, pause, or delete the Source, but only its execution
+device runs a sync. Another member takes a Source over by choosing one of their
+own computers in **Where it runs**.

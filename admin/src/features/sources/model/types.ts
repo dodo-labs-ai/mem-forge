@@ -3,6 +3,7 @@ import type { components } from "@/api/schema.gen";
 
 export type { LocalAgentJob, Source, SyncProgressSnapshot, SyncStatus };
 export type SourceConnectionStatus = NonNullable<Source["connection_status"]>;
+export type SourceExecutionDevice = NonNullable<NonNullable<Source["execution"]>["device"]>;
 export type SyncProgressUnit = NonNullable<SyncProgressSnapshot["progress"]>["unit"];
 
 /** One source's online evaluation over the window the Sources page reads. */

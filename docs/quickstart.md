@@ -486,8 +486,9 @@ automatically** and choose a frequency. Scheduled runs use the same backend
 queue and source permissions as a manual sync; an already-running source is
 skipped until the next interval.
 
-To sync a local folder or repository, choose **Add source -> Local Repository**
-and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
+To sync a local folder or repository, choose **Add source -> Local Repository**,
+choose your computer in **Where it runs** and pick the folder. See
+[local-repo-sync.md](local-repo-sync.md).
 
 | Source | What is synced |
 | --- | --- |
@@ -497,7 +498,7 @@ and run the printed CLI command. See [local-repo-sync.md](local-repo-sync.md).
 | GitHub Pages | Rendered documentation pages |
 | Notion | Every page under the root pages and databases you share, database rows included, with their images and PDFs |
 | Microsoft Teams | Channel messages, group chats and direct messages |
-| Local Repository | Markdown, text, JSON and HTML files from a local folder or repo, uploaded by the local daemon |
+| Local Repository | Markdown, text, JSON and HTML files from a folder on one of your computers, read by its local daemon |
 
 ### Confluence
 

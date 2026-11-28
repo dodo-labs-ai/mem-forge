@@ -6,10 +6,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-LocalInbox = Callable[[], str]
-"""Create this Source's local-agent inbox and return its path."""
-
-
 @dataclass(frozen=True)
 class SourceConfigPolicy:
     """The per-type steps the admin API runs on a Source's configuration.
@@ -48,7 +44,7 @@ class SourceConfigPolicy:
     complete: Callable[[dict[str, Any], str, Mapping[str, Any] | None], dict[str, Any]] | None = None
     validate_input: Callable[[dict[str, Any], Mapping[str, Any]], None] | None = None
     validate: Callable[[dict[str, Any], Mapping[str, Any]], None] | None = None
-    store: Callable[[dict[str, Any], LocalInbox], dict[str, Any]] | None = None
+    store: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     public: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     credentials_changed: Callable[[dict[str, Any], Mapping[str, Any]], bool] | None = None
     facts: Callable[[Mapping[str, Any]], list[tuple[str, str]]] | None = None

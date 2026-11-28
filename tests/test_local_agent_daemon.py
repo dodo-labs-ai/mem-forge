@@ -188,40 +188,18 @@ def test_local_adapter_capability_commands_include_teams():
     assert "teams.sync" in status_payload["capabilities"]
 
 
-def test_oss_local_markdown_job_uses_the_unscoped_api_client(monkeypatch):
+def test_an_oss_local_agent_job_uses_the_unscoped_api_client():
     client = ToolClient(
         target=build_target(origin="http://127.0.0.1:8765", edition="oss"),
         api_token=None,
     )
-    observed: dict[str, object] = {}
+    job = {"operation": "teams_sync", "source_id": "src-teams", "workspace_id": "default", "payload": {}}
 
-    def push_profile(*args, **kwargs):
-        observed["client"] = kwargs["client"]
-        return {"source_id": kwargs["source_id"], "sync_started": True}
-
-    monkeypatch.setattr(main, "_push_kb_profile_to_source", push_profile)
-
-    result = main._run_cloud_local_markdown_sync_job(
-        {
-            "job_id": "laj-oss-local-markdown",
-            "attempt_count": 1,
-            "operation": "local_markdown_sync",
-            "source_id": "src-local",
-            "workspace_id": "default",
-            "payload": {
-                "root": "/workspace/notes",
-                "vault_id": "notes",
-            },
-        },
-        client,
+    source_id, unscoped, error = main._local_agent_job_source_client(
+        job, job["payload"], operation=job["operation"], client=client
     )
 
-    assert result == {
-        "operation": "local_markdown_sync",
-        "source_id": "src-local",
-        "sync_started": True,
-    }
-    assert observed["client"] is client
+    assert (source_id, unscoped, error) == ("src-teams", client, None)
 
 
 def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
@@ -230,7 +208,7 @@ def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
         api_token="cloud-token",
     )
     job = {
-        "operation": "local_markdown_sync",
+        "operation": "teams_sync",
         "source_id": "src-local",
         "payload": {},
     }
@@ -245,7 +223,7 @@ def test_cloud_local_agent_job_requires_and_applies_workspace_scope():
     assert source_id == "src-local"
     assert unscoped is client
     assert error == {
-        "operation": "local_markdown_sync",
+        "operation": "teams_sync",
         "source_id": "src-local",
         "error": "workspace_id is required",
     }
@@ -537,63 +515,6 @@ def test_local_agent_forwards_retryable_handler_failure_to_broker(tmp_path):
             "source processing failed to start",
         )
     ]
-
-
-def test_local_agent_marks_github_cli_connection_failure_retryable(monkeypatch, tmp_path):
-    completed: list[tuple[str, int, str, dict, str | None]] = []
-
-    def fail_github_api(command, *args, **kwargs):
-        return main.subprocess.CompletedProcess(
-            command,
-            1,
-            stdout="",
-            stderr=(
-                "error connecting to github.example.com\n"
-                "check your internet connection or https://githubstatus.com"
-            ),
-        )
-
-    monkeypatch.setattr(main.subprocess, "run", fail_github_api)
-    client = ToolClient(
-        target=build_target(origin="http://127.0.0.1:8765", edition="oss"),
-        api_token=None,
-    )
-    runner = LocalAgentRunner(
-        state_store=LocalAgentStateStore(tmp_path / "state.json"),
-        cloud_job_handler=lambda job: main._run_cloud_local_agent_job(job, client),
-        cloud_jobs_provider=lambda: {
-            "jobs": [
-                {
-                    "job_id": "laj-github-vpn",
-                    "operation": "github_repo_sync",
-                    "source_id": "src-github",
-                    "workspace_id": "ws-test",
-                    "attempt_count": 1,
-                    "payload": {
-                        "repo_url": "https://github.example.com/example/repository",
-                        "ref": "main",
-                    },
-                }
-            ]
-        },
-        cloud_job_completer=lambda job_id, attempt_count, status, result, error=None: (
-            completed.append((job_id, attempt_count, status, result, error)) or {"ok": True}
-        ),
-    )
-
-    report = runner.run_once(now=datetime(2026, 8, 18, tzinfo=timezone.utc))
-
-    assert completed == [
-        (
-            "laj-github-vpn",
-            1,
-            "failed",
-            {"retryable": True},
-            "GitHub CLI request failed: error connecting to github.example.com\n"
-            "check your internet connection or https://githubstatus.com",
-        )
-    ]
-    assert report["results"][-1]["error_type"] == "GitHubProviderConnectionError"
 
 
 def test_local_agent_treats_missing_source_run_receipt_as_retryable(tmp_path):

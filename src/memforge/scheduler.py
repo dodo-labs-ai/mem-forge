@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from memforge.genes import source_type_supports_sync
+from memforge.pipeline.device_acquisition import document_acquisition_job_payload
 from memforge.runtime import SyncService
 from memforge.storage.document_store import DocumentStore, LocalDocumentStore
 from memforge.storage.source_cleanup import SourceArtifactCleanupService
@@ -153,7 +154,13 @@ class SyncScheduler:
 
     async def _sync_due_sources(self) -> None:
         try:
-            await self.db.enqueue_due_local_agent_jobs(limit=50)
+            await self.db.enqueue_due_local_agent_jobs(
+                device_acquisition_payload=lambda source: document_acquisition_job_payload(
+                    self.db, self.document_store, source
+                ),
+                limit=50,
+                workspace_id=self.sync_service.workspace_id,
+            )
         except Exception:
             logger.exception("Scheduled local-agent job scan failed")
         try:

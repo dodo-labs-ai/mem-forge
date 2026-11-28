@@ -21,21 +21,14 @@ from memforge.memory.lifecycle_plan import ProjectedLifecycleBlocker, ProjectedL
 from memforge.memory.relation_candidate_retrieval import RelationCandidateRetriever
 from memforge import runtime
 from memforge.genes.jira_gene import JiraQueryRejected
-from memforge.local_agent.document_identity import build_jira_doc_id
-from memforge.local_agent.snapshot_manifest import (
-    ExcludedScopeListing,
-    SnapshotConfirmation,
-    SnapshotConfirmationAnswer,
-)
-from memforge.local_agent.source_contract import LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD, local_agent_sync_job_payload
 from memforge.models import ScopeListing, ScopeListingKind
-from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP, SnapshotBinding
+from memforge.pipeline.collection_family import DEFAULT_INCREMENTAL_SYNC_OVERLAP
 from memforge.source_projection import (
     ProjectionScopeTransition,
     ProjectionScopeTransitionStatus,
     UnitRemovalReason,
 )
-from memforge.source_projection_config import canonical_projection_scope, projection_scope_fingerprint
+from memforge.source_projection_config import canonical_projection_scope
 from memforge.storage.adapters.sqlite import build_sqlite_adapters
 from memforge.storage.database import Database
 from tests.llm_fixture import AdmittingClient
@@ -43,16 +36,12 @@ from tests.memory_store_fixture import OrchestratorMemoryStore
 from tests.test_document_absence import (
     JIRA_CONFIG,
     SOURCE_ID,
-    DeviceJira,
-    DeviceManifest,
     JiraProject,
     Workspace,
     _synced,
 )
 from tests.test_sync_bookkeeping import NoopMemoryEngine, _OrderRecordingMemoryEngine
 
-ABSENT = SnapshotConfirmationAnswer.ABSENT
-EXISTS = SnapshotConfirmationAnswer.EXISTS
 OPENED_AT = datetime(2026, 10, 20, 9, 0, tzinfo=timezone.utc)
 TARGET_CONFIG = {"query_mode": "advanced", "jql": "project = PAY"}
 TRANSITION_ID = "scope-transition-drop-ops"
@@ -632,195 +621,15 @@ async def test_a_document_blocked_by_a_unit_completion_cannot_remove_lists_no_ex
 
 
 @pytest.mark.asyncio
-async def test_a_device_query_transition_stays_open_while_its_manifest_lacks_an_excluded_listing(workspace):
-    project = DeviceJira(existing={0, 1})
-    first = await workspace.sync(project, manifest={0, 1})
-    assert first.last_sync_status == "success"
-    workspace.engine.events.clear()
-    await _change_scope(workspace)
-
-    # The job carried no excluded scope: the previous run had not run yet.
-    project.move_on(existing={0, 1}, in_query={0})
-    await workspace.sync(project, manifest={0}, answers={1: EXISTS})
-    transition = await _transition(workspace)
-
-    assert workspace.tombstoned() == []
-    assert transition.status is ProjectionScopeTransitionStatus.FAILED
-    assert transition.error == "the device has not listed every scope the change excluded"
-
-
-@pytest.mark.asyncio
-async def test_a_device_transition_stays_open_while_one_of_its_excluded_scopes_is_unlisted(workspace):
-    device = await _device_issues_that_left_the_query_before_the_change(workspace)
-    await _superseded(workspace, "superseded-ops", "project = OPS", None)
-    await workspace.db.upsert_source(
-        id=SOURCE_ID,
-        type="jira",
-        name="Jira",
-        config_json=json.dumps(TARGET_CONFIG),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    await workspace.db.create_projection_scope_transition(
-        ProjectionScopeTransition(
-            id=TRANSITION_ID,
-            source_id=SOURCE_ID,
-            previous_scope=canonical_projection_scope("jira", JIRA_CONFIG),
-            target_scope=canonical_projection_scope("jira", TARGET_CONFIG),
-            predecessor_transition_id="superseded-ops",
-            created_at=OPENED_AT.isoformat(),
-        )
-    )
-
-    # The job carried the old JQL and "project = OPS"; the device listed only the first.
-    device.move_on(existing={0, 1, 2, 3}, in_query={0})
-    await workspace.sync(
-        device,
-        manifest={0},
-        answers={1: EXISTS, 2: EXISTS, 3: EXISTS},
-        excluded_listings=(_device_listing(OLD_JQL, 0, 1),),
-    )
-    transition = await _transition(workspace)
-
-    assert workspace.tombstoned() == []
-    assert transition.status is ProjectionScopeTransitionStatus.FAILED
-    assert transition.error == "the device has not listed every scope the change excluded"
-
-
-@pytest.mark.asyncio
-async def test_a_device_transition_blocked_only_by_what_completion_removes_completes_on_the_next_job(workspace):
-    device = DeviceJira(existing={0, 1})
-    await workspace.sync(device, manifest={0, 1})
-    await _change_scope(workspace)
-    engine = _OrderRecordingMemoryEngine(defer=True)
-    engine.deferred_doc_id = "jira-2"
-    engine.blocker_unit_ids = (await workspace.unit_id("jira-1"),)
-    workspace.engine = engine
-
-    # The new JQL drops jira-1, still in Jira, and adds jira-2, whose commit
-    # waits on jira-1's Unit. The job carried no excluded scope yet.
-    device.move_on(existing={0, 1, 2}, in_query={0, 2})
-    await workspace.sync(device, manifest={0, 2}, answers={1: EXISTS})
-    waiting = await _transition(workspace)
-    payload = await local_agent_sync_job_payload(workspace.db, await workspace.db.get_source(SOURCE_ID))
-    engine.events.clear()
-    await workspace.sync(
-        device, manifest={0, 2}, answers={1: EXISTS}, excluded_listings=(_device_listing(OLD_JQL, 0, 1),)
-    )
-
-    # jira-2 is no member, so only the mark tells the next job to carry the scopes.
-    assert waiting.status is ProjectionScopeTransitionStatus.FAILED
-    assert waiting.excluded_scopes_due is True
-    assert "jira-2" not in await _members(workspace)
-    assert [scope["scope_key"] for scope in payload[LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD]] == [
-        _device_listing(OLD_JQL).scope_key
-    ]
-    assert sorted(engine.events) == [("commit", "jira-2"), ("tombstone", "jira-1")]
-    assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
-    completed = await _transition(workspace)
-    assert (completed.status, completed.excluded_scopes_due) == (ProjectionScopeTransitionStatus.APPLIED, False)
-
-
-def _device_listing(jql: str, *numbers: int, rejection: str | None = None) -> ExcludedScopeListing:
-    """What the device listed in the excluded scope of this JQL, by the key its job named it."""
-    return ExcludedScopeListing(
-        scope_key=projection_scope_fingerprint(canonical_projection_scope("jira", {**JIRA_CONFIG, "jql": jql})),
-        doc_ids=frozenset(f"jira-{number}" for number in numbers),
-        rejection=rejection,
-    )
-
-
-async def _device_issues_that_left_the_query_before_the_change(workspace) -> DeviceJira:
-    """jira-0 and jira-1 match the old JQL; jira-2 and jira-3 left it before the change, and still exist."""
-    device = DeviceJira(existing={0, 1, 2, 3})
-    await workspace.sync(device, manifest={0, 1, 2, 3})
-    device.move_on(existing={0, 1, 2, 3}, in_query={0, 1})
-    await workspace.sync(device, manifest={0, 1}, answers={2: EXISTS, 3: EXISTS})
-    assert workspace.tombstoned() == []
-    workspace.engine.events.clear()
-    return device
-
-
-@pytest.mark.asyncio
-async def test_a_device_jql_change_removes_only_what_the_old_query_lists_and_the_new_one_does_not(workspace):
-    device = await _device_issues_that_left_the_query_before_the_change(workspace)
-    await _change_scope(workspace)
-
-    # The new JQL drops jira-1; jira-3 has since been deleted.
-    device.move_on(existing={0, 1, 2}, in_query={0})
-    state = await workspace.sync(
-        device,
-        manifest={0},
-        answers={1: EXISTS, 2: EXISTS, 3: ABSENT},
-        excluded_listings=(_device_listing(OLD_JQL, 0, 1),),
-    )
-
-    assert state.last_sync_status == "success"
-    assert sorted(workspace.tombstoned()) == ["jira-1", "jira-3"]
-    assert await _removal_reason(workspace, "jira-1") == UnitRemovalReason.REMOVED_FROM_SCOPE.value
-    assert await _removal_reason(workspace, "jira-3") == UnitRemovalReason.ABSENT_FROM_SOURCE.value
-    # jira-2 had left the old query before the change and still exists.
-    assert await workspace.held() == {"jira-0", "jira-2"}
-    assert state.unlisted_present_count == 1
-    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "rejection",
-    [
-        "JiraQueryRejected: field 'x' does not exist",
-        "The excluded scope lists 10001 issues, more than the 10000 a manifest holds",
-    ],
-    ids=["jql-rejected", "over-the-manifest-bound"],
-)
-async def test_a_device_jql_change_whose_old_query_cannot_be_listed_completes_with_the_ordinary_rule(
-    workspace, rejection,
-):
-    device = await _device_issues_that_left_the_query_before_the_change(workspace)
-    await _change_scope(workspace)
-
-    device.move_on(existing={0, 1, 2}, in_query={0})
-    state = await workspace.sync(
-        device,
-        manifest={0},
-        answers={1: EXISTS, 2: EXISTS, 3: ABSENT},
-        excluded_listings=(_device_listing(OLD_JQL, rejection=rejection),),
-    )
-
-    # Nothing is removed from scope: only the issue Jira no longer has goes.
-    assert workspace.tombstoned() == ["jira-3"]
-    assert await _removal_reason(workspace, "jira-3") == UnitRemovalReason.ABSENT_FROM_SOURCE.value
-    assert await workspace.held() == {"jira-0", "jira-1", "jira-2"}
-    assert state.unlisted_present_count == 2
-    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
-
-
-@pytest.mark.asyncio
-async def test_a_device_jql_change_without_answers_removes_from_scope_and_records_why(workspace):
-    device = await _device_issues_that_left_the_query_before_the_change(workspace)
-    await _change_scope(workspace)
-
-    # An agent that does not confirm lists the excluded scope but answers nothing.
-    device.move_on(existing={0, 1, 2}, in_query={0})
-    state = await workspace.sync(device, manifest={0}, excluded_listings=(_device_listing(OLD_JQL, 0, 1),))
-
-    assert workspace.tombstoned() == ["jira-1"]
-    assert await workspace.held() == {"jira-0", "jira-2", "jira-3"}
-    assert state.absence_check_skipped_reason == "absence_confirmation_missing"
-    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
-
-
-@pytest.mark.asyncio
-async def test_a_device_manifest_completes_a_transition_and_removes_what_it_does_not_list(workspace):
-    repository = DeviceManifest(existing={0, 1})
-    first = await workspace.sync(repository, manifest={0, 1})
+async def test_an_existence_listing_completes_a_transition_and_removes_what_it_does_not_list(workspace):
+    repository = JiraProject(existing={0, 1}, listing_kind=ScopeListingKind.EXISTENCE)
+    first = await workspace.sync(repository)
     assert first.last_sync_status == "success"
     workspace.engine.events.clear()
     await _change_scope(workspace)
 
     repository.move_on(existing={0, 2})
-    state = await workspace.sync(repository, manifest={0, 2})
+    state = await workspace.sync(repository)
 
     assert state.last_sync_status == "success"
     assert workspace.tombstoned() == ["jira-1"]
@@ -1106,122 +915,3 @@ async def test_a_branch_pinned_transition_stored_before_branch_was_a_scope_field
     assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED
 
 
-class _DeviceIdJira(DeviceJira):
-    """Device Jira whose Documents carry the ids the agent gives them, as ``build_jira_doc_id`` does."""
-
-    def _item(self, number: int):
-        return replace(super()._item(number), item_id=_device_doc(number))
-
-
-def _device_doc(number: int) -> str:
-    return build_jira_doc_id(source_id=SOURCE_ID, issue_key=f"PAY-{number}")
-
-
-async def _device_run(workspace, device: DeviceJira, binding: SnapshotBinding):
-    return await workspace.orchestrator().sync_gene(
-        gene=device, source_name="Jira", source_id=SOURCE_ID, input_snapshot=binding
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_device_jql_change_completes_end_to_end_from_job_to_listing_to_manifest(workspace, monkeypatch):
-    import memforge.genes.jira_gene as jira_gene
-    import memforge.main as main
-
-    device = _DeviceIdJira(existing={0, 1, 2})
-    await _device_run(workspace, device, SnapshotBinding("snap-0", frozenset(map(_device_doc, (0, 1, 2)))))
-    await _change_scope(workspace)
-    # The Source reads Jira through the owner's agent and browser session.
-    await workspace.db.upsert_source(
-        id=SOURCE_ID,
-        type="jira",
-        name="Jira",
-        config_json=json.dumps(
-            {
-                **TARGET_CONFIG,
-                "base_url": "https://jira.example.test",
-                "auth_mode": "browser_cookie",
-                "sync_mode": "local_agent",
-            }
-        ),
-        access_policy="workspace",
-        owner_user_id="dev",
-    )
-    # The new JQL lists PAY-0. The job carried no excluded scope, so the run
-    # that could complete stays open and marks the transition.
-    device.move_on(existing={0, 1, 2}, in_query={0})
-    await _device_run(workspace, device, SnapshotBinding("snap-1", frozenset({_device_doc(0)})))
-    workspace.engine.events.clear()
-
-    # 1. The next job carries the old JQL.
-    payload = await local_agent_sync_job_payload(workspace.db, await workspace.db.get_source(SOURCE_ID))
-
-    # 2. The device lists it with its own session: PAY-0 and PAY-1 match the old JQL.
-    built: list = []
-
-    class OldQuery:
-        def __init__(self, config, source_id):
-            assert config["jql"] == OLD_JQL
-            self.closed = False
-            built.append(self)
-
-        async def close(self):
-            self.closed = True
-
-        async def authenticate(self):
-            return None
-
-        async def list_scope(self):
-            return ScopeListing(kind=ScopeListingKind.QUERY, doc_ids=frozenset({"jira-PAY-0", "jira-PAY-1"}))
-
-    monkeypatch.setattr(jira_gene, "JiraGene", OldQuery)
-    listed = await main._list_excluded_jira_scopes(payload, source_id=SOURCE_ID, jira_cookie="JSESSIONID=local")
-    assert [gene.closed for gene in built] == [True]
-
-    # 3. The manifest stores the listing, and the device answers for PAY-2, which left the query earlier.
-    listings = tuple(
-        ExcludedScopeListing(entry["scope_key"], frozenset(entry["doc_ids"])) for entry in listed
-    )
-    snapshot = {"source_id": SOURCE_ID, "workspace_id": "default", "snapshot_id": "snap-2"}
-    await workspace.db.attach_source_sync_inputs_to_snapshot(
-        **snapshot,
-        memberships=[],
-        coverage="complete_snapshot",
-        manifest_count=1,
-        manifest_sha256="b" * 64,
-        manifest_items=[(_device_doc(0), "r1", "upsert")],
-        local_agent_job_id="laj-2",
-        local_agent_attempt_count=1,
-        source_config_revision="rev-2",
-        confirm=(SnapshotConfirmation(_device_doc(2), "100002"),),
-        excluded_listings=listings,
-    )
-    await workspace.db.write_source_sync_snapshot_confirmations(
-        **snapshot,
-        manifest_sha256="b" * 64,
-        local_agent_job_id="laj-2",
-        local_agent_attempt_count=1,
-        answers=(SnapshotConfirmation(_device_doc(2), "100002", EXISTS),),
-    )
-
-    # 4. The run bound to it completes the transition.
-    state = await _device_run(
-        workspace,
-        device,
-        SnapshotBinding(
-            "snap-2",
-            frozenset({_device_doc(0)}),
-            await workspace.db.list_source_sync_snapshot_confirmations(**snapshot),
-            await workspace.db.list_source_sync_snapshot_excluded_listings(**snapshot),
-        ),
-    )
-
-    assert [entry["scope_key"] for entry in payload[LOCAL_AGENT_EXCLUDED_SCOPES_PAYLOAD_FIELD]] == [
-        _device_listing(OLD_JQL).scope_key
-    ]
-    assert listed == [{"scope_key": _device_listing(OLD_JQL).scope_key, "doc_ids": sorted(map(_device_doc, (0, 1)))}]
-    assert state.last_sync_status == "success"
-    assert workspace.tombstoned() == [_device_doc(1)]
-    assert await _removal_reason(workspace, _device_doc(1)) == UnitRemovalReason.REMOVED_FROM_SCOPE.value
-    assert await workspace.held() == {_device_doc(0), _device_doc(2)}
-    assert (await _transition(workspace)).status is ProjectionScopeTransitionStatus.APPLIED

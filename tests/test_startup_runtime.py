@@ -13,12 +13,20 @@ import pytest
 from fastapi.testclient import TestClient
 from rich.logging import RichHandler
 
+from tests.leased_job_store import LeasedJobStore
 from memforge.config import AppConfig
 from memforge.genes.conversation_gene import CollectionAttempt
+from memforge.local_agent.source_contract import LocalAgentLease
 from memforge.models import Memory, SyncState, Visibility, content_hash
+from memforge.server import admin_api
 from memforge.storage.database import Database
 from tests.test_sync_bookkeeping import _hold_document
 from tests.vector_index_fixture import use_collection_as_index
+
+
+async def _collection_complete(*args, **kwargs) -> None:
+    return None
+
 
 TEST_SOURCE_KEY = "VV4JjZLLr2BcgRnhV90gCnxzchn43M900VQy3dXJI30="
 
@@ -486,11 +494,20 @@ def test_gene_metadata_declares_available_execution_kinds(tmp_path):
     genes = {gene["name"]: gene for gene in response.json()}
     assert genes["confluence"]["execution_kinds"] == ["server"]
     assert genes["github_pages"]["execution_kinds"] == ["server"]
-    assert genes["jira"]["execution_kinds"] == ["server", "local_agent"]
-    assert genes["github_repo"]["execution_kinds"] == ["server", "local_agent"]
+    # Where a document type runs is its executors; no document type keeps a local-agent package path.
+    assert genes["jira"]["execution_kinds"] == ["server"]
+    assert genes["github_repo"]["execution_kinds"] == ["server"]
+    assert genes["local_markdown"]["execution_kinds"] == ["server"]
+    assert genes["jira"]["executors"] == genes["github_repo"]["executors"] == ["server", "device"]
     assert genes["teams"]["execution_kinds"] == ["local_agent"]
-    assert genes["local_markdown"]["execution_kinds"] == ["local_agent"]
     assert "agent_session" not in genes
+    assert genes["confluence"]["executors"] == ["server", "device"]
+    assert genes["notion"]["executors"] == ["server", "device"]
+    assert genes["local_markdown"]["executors"] == ["device"]
+    assert genes["teams"]["executors"] is None
+    # The folder picker of the device chosen in Where it runs fills a device location.
+    assert genes["local_markdown"]["device_location_fields"] == ["root"]
+    assert genes["confluence"]["device_location_fields"] == []
 
 
 def test_gene_execution_kinds_define_ordinary_sync_capability():
@@ -1856,7 +1873,6 @@ async def test_source_provider_namespace_update_is_rejected(db, tmp_path, monkey
 async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path):
     from datetime import datetime, timezone
 
-    from memforge.local_adapter import default_local_adapter_inbox
     from memforge.models import SyncState
     from memforge.server.admin_api import create_admin_app
     from memforge.storage.adapters.context import LOCAL_DEV_USER_ID
@@ -1866,11 +1882,11 @@ async def test_non_secret_source_noop_update_preserves_sync_cursor(db, tmp_path)
     source_config = {
         "root": str(tmp_path / "engineering-notes"),
         "vault_id": "engineering-notes",
-        "documents_dir": str(default_local_adapter_inbox(cfg, source_id)),
     }
     await db.upsert_source(
         id=source_id,
         type="local_markdown",
+        executor="device",
         name="Engineering Notes",
         config_json=json.dumps(source_config),
         created_by_user_id=LOCAL_DEV_USER_ID,
@@ -1949,9 +1965,11 @@ async def test_run_source_sync_leaves_authentication_to_orchestrator(
             failed_item_retry=None,
             collection_attempt=None,
             excluded_scope_gene=None,
+            started_at=None,
         ):
             del (
                 excluded_scope_gene,
+                started_at,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,
@@ -2086,9 +2104,11 @@ async def test_run_source_sync_decrypts_gene_declared_secret_fields(
             failed_item_retry=None,
             collection_attempt=None,
             excluded_scope_gene=None,
+            started_at=None,
         ):
             del (
                 excluded_scope_gene,
+                started_at,
                 failed_item_retry,
                 input_snapshot,
                 reprocess_doc_ids,
@@ -2600,12 +2620,15 @@ async def test_source_scope_update_cancels_active_sync(db, tmp_path, monkeypatch
     fake_sync_service = FakeSyncService()
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
+
+    # The daemon uploaded a complete collection for the attempt.
+    monkeypatch.setattr(admin_api, "_require_complete_collection", _collection_complete)
 
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
@@ -2835,6 +2858,8 @@ async def test_server_sync_routes_translate_atomic_activity_race_to_409(
         raise SourceActivityConflict("source activity started during enqueue")
 
     monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
+    # The daemon uploaded a complete collection for the attempt.
+    monkeypatch.setattr(admin_api, "_require_complete_collection", _collection_complete)
     app = create_admin_app(db=db, config=_config(tmp_path))
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -2860,9 +2885,9 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
     source_id = "src-local-process-atomic-race"
     await db.upsert_source(
         id=source_id,
-        type="local_markdown",
+        type="teams",
         name="Local process atomic conflict",
-        config_json=json.dumps({"root": "/repo", "vault_id": "notes"}),
+        config_json=json.dumps({"conversation_ids": ["19:standup@thread.v2"]}),
         created_by_user_id=LOCAL_DEV_USER_ID,
         execution_owner_user_id=LOCAL_DEV_USER_ID,
         access_policy="workspace",
@@ -2873,25 +2898,17 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
         raise SourceActivityConflict("source activity started during local enqueue")
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
 
     monkeypatch.setattr(db, "enqueue_source_sync_run", lose_enqueue_race)
+    # The daemon uploaded a complete collection for the attempt.
+    monkeypatch.setattr(admin_api, "_require_complete_collection", _collection_complete)
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
-        manifest = client.post(
-            f"/api/v1/sources/{source_id}/adapter/manifest",
-            json={
-                "items": [],
-                "coverage": "complete_snapshot",
-                "sync_snapshot_id": "atomic-race-job:attempt:1",
-                "local_agent_job_id": "atomic-race-job",
-                "local_agent_attempt_count": 1,
-            },
-        )
         response = client.post(
             f"/api/v1/sources/{source_id}/process",
             json={
@@ -2900,7 +2917,6 @@ async def test_local_process_route_translates_atomic_activity_race_to_409(
             },
         )
 
-    assert manifest.status_code == 200
     assert response.status_code == 409
     assert response.json()["detail"] == (
         "source activity started during local enqueue"
@@ -3001,7 +3017,7 @@ async def test_force_resync_preserves_existing_sync_state_until_new_run_succeeds
 
 
 @pytest.mark.asyncio
-async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path):
+async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     from memforge.local_agent.source_contract import local_agent_source_config_revision
@@ -3011,9 +3027,9 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     source_id = "src-local-process"
     await db.upsert_source(
         id=source_id,
-        type="local_markdown",
+        type="teams",
         name="Local process source",
-        config_json=json.dumps({"root": "/repo", "vault_id": "notes"}),
+        config_json=json.dumps({"conversation_ids": ["19:standup@thread.v2"]}),
         created_by_user_id=LOCAL_DEV_USER_ID,
         execution_owner_user_id=LOCAL_DEV_USER_ID,
         access_policy="workspace",
@@ -3066,25 +3082,18 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
     fake_sync_service = FakeSyncService()
 
     async def allow_lease(*args, **kwargs):
-        return True
+        return LocalAgentLease(payload={}, leased_at=datetime.now(timezone.utc))
+
+    # The daemon uploaded a complete collection for the attempt.
+    monkeypatch.setattr(admin_api, "_require_complete_collection", _collection_complete)
 
     app = create_admin_app(
         db=db,
         config=_config(tmp_path),
-        local_agent_lease_validator=allow_lease,
+        local_agent_jobs=LeasedJobStore(db, allow_lease),
     )
     with TestClient(app) as client:
         app.state.sync_service = fake_sync_service
-        manifest = client.post(
-            f"/api/v1/sources/{source_id}/adapter/manifest",
-            json={
-                "items": [],
-                "coverage": "complete_snapshot",
-                "sync_snapshot_id": "test-job:attempt:1",
-                "local_agent_job_id": "test-job",
-                "local_agent_attempt_count": 1,
-            },
-        )
         response = client.post(
             f"/api/v1/sources/{source_id}/process",
             json={
@@ -3094,7 +3103,6 @@ async def test_local_agent_process_endpoint_enqueues_server_processing(db, tmp_p
             },
         )
 
-    assert manifest.status_code == 200
     assert response.status_code == 202
     assert response.json() == {
         "ok": True,
@@ -3139,8 +3147,10 @@ async def test_local_agent_process_endpoint_rejects_server_owned_source(db, tmp_
     with TestClient(app) as client:
         response = client.post(f"/api/v1/sources/{source_id}/process")
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "source_is_not_local_agent_backed"
+    # A document Source is processed only for the device job attempt that acquired it.
+    assert response.status_code == 409
+    assert response.json()["detail"] == "local_agent_lease_context_required"
+    assert await db.get_latest_source_sync_run(source_id=source_id, workspace_id="local") is None
 
 
 @pytest.mark.asyncio

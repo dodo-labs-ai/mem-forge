@@ -89,23 +89,21 @@ suite in ``tests/contracts/test_document_connector_contract.py`` checks the
 behaviour against fakes of the provider; its ``document_fakes`` package says
 how to add a connector's fakes.
 
-Collected on a device
----------------------
+Acquisition and interpretation
+------------------------------
 
-A Source collected on a user's device, such as local markdown, a GitHub
-repository pushed from the internal network, or Jira read through the local
-agent, submits a complete snapshot manifest of its scope. The run reads that
-manifest as the listing, with the Gene's single listing kind, and never calls
-:meth:`DocumentGene.list_scope`. Such a configuration answers ``True`` from
-:meth:`DocumentGene.lists_scope`, and its ``list_scope`` raises.
-
-A query manifest's unlisted items are confirmed on the device, which holds the
-credential. The server names each one by Document id and provider key: the
-key its Source Unit records, or :meth:`DocumentGene.provider_key` of the
-stored item of a failed Document that never became a Unit. The device rebuilds
-each item with :meth:`DocumentGene.confirmation_item`, runs
-:meth:`DocumentGene.confirm_absent` and posts the answers; the run removes only
-the items answered ``absent``.
+The methods that reach the provider are the Gene's *acquisition*:
+``authenticate``, ``discover``, ``list_scope``, ``confirm_absent``,
+``rediscover``, ``fetch``, ``fetch_pdf_material`` and
+``open_source_artifact``. Everything else, ``normalize``, ``render_pdf``,
+``raw_from_stored_input`` and the type's ``project_native`` above all, is
+*interpretation*: it runs on the server and reads only what
+acquisition returned and never reaches the provider. Keep every provider
+request inside an acquisition method, and keep what interpretation needs in
+the item, the raw content or the artifacts ``fetch`` returns. The recorded
+Gene (:mod:`memforge.genes.recorded`) relies on this: it answers acquisition
+from a record of a run that read the provider elsewhere, and inherits
+interpretation.
 """
 
 from __future__ import annotations
@@ -191,9 +189,7 @@ class DocumentGene(Gene):
           pick, such as a GitHub repository tree, yields every item and
           meets the rule trivially.
 
-        Checked by ``test_discover_never_hides_an_item_edited_in_the_cursor_minute``
-        and, for a device-collected configuration, by
-        ``test_a_device_manifest_never_hides_an_item_edited_in_the_cursor_minute``.
+        Checked by ``test_discover_never_hides_an_item_edited_in_the_cursor_minute``.
         """
 
     @classmethod
@@ -208,8 +204,7 @@ class DocumentGene(Gene):
 
         Answer ``True`` only when :meth:`list_scope` either returns a complete
         listing for this configuration or raises; it must never quietly list
-        less. A configuration collected on a device answers ``True``, because
-        its snapshot manifest is the listing. When unsure, answer ``False``:
+        less. When unsure, answer ``False``:
         the Source then removes nothing through a listing.
 
         Checked by ``test_lists_scope_matches_each_fake_configuration``.
@@ -244,14 +239,12 @@ class DocumentGene(Gene):
 
         The listing is complete or it is not returned. Raise when paging is
         incomplete, a result is truncated or the provider fails, and the run
-        then removes nothing. A configuration collected on a device raises,
-        saying that its listing is the snapshot manifest.
+        then removes nothing.
 
         Checked by ``test_a_truncated_listing_raises``,
         ``test_a_failed_listing_raises``,
-        ``test_a_standalone_listing_equals_the_listing_after_discovery``,
-        ``test_a_listing_reuses_the_discovery_walk`` and
-        ``test_a_device_collected_configuration_lists_through_its_manifest``.
+        ``test_a_standalone_listing_equals_the_listing_after_discovery`` and
+        ``test_a_listing_reuses_the_discovery_walk``.
         """
 
     def record_scope_listing(self, kind: ScopeListingKind, doc_ids: set[str] | frozenset[str]) -> None:
@@ -290,46 +283,6 @@ class DocumentGene(Gene):
         """
 
         raise NotImplementedError(f"{type(self).__name__} cannot confirm absence by identifier")
-
-    @classmethod
-    def snapshot_listing_kind(cls) -> ScopeListingKind:
-        """The kind of listing a device's snapshot manifest is: the single kind this Gene declares.
-
-        Startup refuses a device-collected Gene that declares more or fewer
-        kinds, so only a Gene that is never collected on a device raises here.
-        """
-
-        if len(cls.listing_kinds) != 1:
-            raise ValueError(
-                f"{cls.__name__} is listed by a device's snapshot manifest and must declare exactly one listing kind"
-            )
-        return next(iter(cls.listing_kinds))
-
-    @classmethod
-    def provider_key(cls, item: ContentItem) -> str:
-        """The provider's key of an item, as the item's Source Unit records it.
-
-        A device confirms an item its query manifest leaves out by this key,
-        so a Gene whose device listing is a query implements it, together with
-        :meth:`confirmation_item`. For example, Jira answers the issue id, or
-        the issue key when the item does not record the id. A Document that
-        has a Unit is named by the Unit's key; this is asked only for the
-        stored item of a failed Document that never became one.
-        """
-
-        raise NotImplementedError(f"{cls.__name__} does not name its items' provider keys")
-
-    @classmethod
-    def confirmation_item(cls, document_id: str, provider_key: str) -> ContentItem:
-        """The item :meth:`confirm_absent` reads for one Document the server asks a device to confirm.
-
-        ``provider_key`` is the key the server named it by (see
-        :meth:`provider_key`). The item carries only what ``confirm_absent``
-        needs to ask the provider by identifier; ``confirm_absent`` answers it
-        under ``document_id``.
-        """
-
-        raise NotImplementedError(f"{cls.__name__} cannot rebuild an item to confirm on a device")
 
     @classmethod
     def rediscovers_documents(cls, config: Mapping[str, Any]) -> bool:

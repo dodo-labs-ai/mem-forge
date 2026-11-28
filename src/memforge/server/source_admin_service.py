@@ -119,6 +119,7 @@ def source_ownership_and_capabilities(
         "created_by_user_id": source.get("created_by_user_id"),
         "owner_user_id": source_owner_user_id(source),
         "execution_owner_user_id": execution_owner,
+        "viewer_is_execution_owner": can_execute_locally,
         "viewer_role": viewer_role,
         "viewer_relationship": relationship,
     }
@@ -189,10 +190,7 @@ async def list_source_admin_rows(
         )
         row["ownership"] = ownership
         row["capabilities"] = capabilities
-        row["execution"] = source_execution_descriptor(
-            str(row.get("type") or ""),
-            row.get("config"),
-        )
+        row["execution"] = source_execution_descriptor(row)
         enabled_for_me = await reader.is_source_enabled_for_user(source_id, viewer_id)
         row["subscription"] = {"enabled": enabled_for_me}
         row["enabled_for_me"] = enabled_for_me

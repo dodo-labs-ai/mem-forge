@@ -3,6 +3,7 @@ import { formatCount, formatInterval, formatRelative, formatUntil, pluralize } f
 import { StatusBadge } from "@/patterns";
 import { SourceAccessLabel } from "./SourceAccess";
 import { SourceEvaluationChip } from "./SourceEvaluationChip";
+import { sourceAttentionTone } from "./model/sourceAttention";
 import { retryingAfterUpgradeTitle } from "./model/sourceFailedItems";
 import { presentSourceSyncActivity, sourceSyncActivityIsVisible } from "./model/sourceSyncActivity";
 import type { SourceRow } from "./model/sourceRows";
@@ -69,7 +70,7 @@ export function LastSyncCell({ row }: { row: SourceRow }) {
   return (
     <div className="min-w-0 space-y-0.5">
       {attention ? (
-        <StatusBadge tone={attention.reason === "overdue" ? "warn" : "danger"}>
+        <StatusBadge tone={sourceAttentionTone(attention.reason)}>
           {attention.title}
         </StatusBadge>
       ) : live && row.failedItems?.retryingAfterUpgrade ? (

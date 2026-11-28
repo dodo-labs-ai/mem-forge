@@ -15,13 +15,6 @@ from urllib.parse import quote
 import httpx
 
 from memforge.genes.document_gene import DocumentGene
-from memforge.genes.local_adapter_packages import (
-    decode_package,
-    has_package_manifest,
-    open_packaged_source_artifact,
-    read_package_body,
-    source_artifacts_from_package,
-)
 from memforge.genes.local_markdown_gene import _to_markdown
 from memforge.genes.toolkit.config import (
     FieldIssue,
@@ -38,7 +31,6 @@ from memforge.genes.toolkit.github_api import (
     github_rate_limit_wait,
 )
 from memforge.genes.toolkit.http import ConnectorHttpClient
-from memforge.genes.toolkit.local_packages import device_packages
 from memforge.github_repo_utils import (
     DEFAULT_INCLUDE_EXTENSIONS,
     GITHUB_SYMLINK_MODE,
@@ -61,11 +53,9 @@ from memforge.github_repo_utils import (
     validate_github_file_mode,
 )
 from memforge.models import (
-    ConfigCondition,
     ConfigField,
     ConfigFieldType,
     ConfigGroup,
-    ConfigOption,
     ContentItem,
     GeneConfigSchema,
     GeneMetadata,
@@ -90,9 +80,6 @@ _BINARY_FILE_EMPTY_EVIDENCE = "github_binary_file_has_no_text_body"
 
 __all__ = ["GitHubRepoGene", "github_renamed_from"]
 
-CONNECTION_MODE_CLOUD_PULL = "cloud_pull"
-CONNECTION_MODE_LOCAL_PUSH = "local_push"
-GITHUB_REPO_PACKAGE_KIND = "github_repo_document"
 GITHUB_REPO_CONTENT_ROLE = "repository_file"
 GITHUB_REPO_SOURCE_TYPE = "github_repo"
 DEFAULT_MAX_FILES = 500
@@ -153,16 +140,10 @@ class _ScopeTree:
 
 
 class GitHubRepoGene(DocumentGene):
-    """GitHub repository file source.
-
-    The same source type supports two delivery modes:
-    - ``cloud_pull``: MemForge calls the GitHub REST API directly.
-    - ``local_push``: the user's daemon reads the remote repository with its
-      local GitHub session and uploads raw file packages for server processing.
-    """
+    """GitHub repository file source: the files a ref's tree selects, read through the GitHub REST API."""
 
     listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
-    # Opened by ``authenticate`` for cloud pull; a pushed repository is read from its packages.
+    # Opened by ``authenticate``.
     _client: ConnectorHttpClient | None = None
 
     @classmethod
@@ -174,7 +155,6 @@ class GitHubRepoGene(DocumentGene):
             default_sync_interval_minutes=1440,
             auth_method="github_repo",
             data_shape="document",
-            execution_kinds=("server", "local_agent"),
         )
 
     @classmethod
@@ -185,20 +165,6 @@ class GitHubRepoGene(DocumentGene):
                 ConfigGroup(key="scope", label="Files to sync", order=1, purpose="content"),
             ],
             fields=[
-                ConfigField(
-                    key="connection_mode",
-                    label="Repository Access",
-                    field_type=ConfigFieldType.SELECT,
-                    required=True,
-                    choices=[
-                        ConfigOption(CONNECTION_MODE_CLOUD_PULL, "Cloud access"),
-                        ConfigOption(CONNECTION_MODE_LOCAL_PUSH, "Local sync"),
-                    ],
-                    default=CONNECTION_MODE_CLOUD_PULL,
-                    help_text="Use Public internet when MemForge Cloud can reach the repo. Use Internal network / VPN when only your machine can reach it.",
-                    group="connection",
-                    order=0,
-                ),
                 ConfigField(
                     key="repo_url",
                     label="Repository URL",
@@ -214,10 +180,9 @@ class GitHubRepoGene(DocumentGene):
                     label="Personal Access Token",
                     field_type=ConfigFieldType.SECRET,
                     required=False,
-                    help_text="Optional token for private repositories when using cloud pull. Leave blank for public repositories or local push.",
+                    help_text="Optional token for private repositories. Leave blank for public repositories.",
                     group="connection",
                     order=2,
-                    visible_when=(ConfigCondition("connection_mode", (CONNECTION_MODE_CLOUD_PULL,)),),
                 ),
                 ConfigField(
                     key="ref",
@@ -288,14 +253,13 @@ class GitHubRepoGene(DocumentGene):
                 raise SourceConfigInvalid([FieldIssue("repo_url", str(exc))]) from None
             config["repo_url"] = repo_ref.repo_url
             config["base_url"] = repo_ref.origin
-        config["connection_mode"] = _connection_mode(config)
         if not str(config.get("ref") or "").strip():
             config["ref"] = "main"
         config["include_paths"] = normalize_github_scope_paths(list_config(config.get("include_paths")))
         config["exclude_paths"] = normalize_github_scope_paths(list_config(config.get("exclude_paths")))
 
     async def authenticate(self) -> None:
-        """Open the client for cloud pull; a pushed repository needs only its documents directory.
+        """Open the client for the configured repository.
 
         The token is optional: a public repository is read without one. TLS
         trusts ``tls_ca_bundle``, else ``REQUESTS_CA_BUNDLE``, else the
@@ -304,15 +268,6 @@ class GitHubRepoGene(DocumentGene):
         """
         await self.close()
         self._repo_ref = _parse_repo_url(str(self.config.get("repo_url") or ""))
-        self._connection_mode = _connection_mode(self.config)
-        if self._connection_mode == CONNECTION_MODE_LOCAL_PUSH:
-            if has_package_manifest(self.config):
-                return
-            self._documents_dir().mkdir(parents=True, exist_ok=True)
-            return
-        if self._connection_mode != CONNECTION_MODE_CLOUD_PULL:
-            raise ValueError("GitHub Repository Access must be Public internet or Internal network / VPN")
-
         headers = {
             "Accept": "application/vnd.github+json",
             "User-Agent": "memforge-github-repo-source",
@@ -346,7 +301,7 @@ class GitHubRepoGene(DocumentGene):
 
     @classmethod
     def lists_scope(cls, config: Mapping[str, Any]) -> bool:
-        """The tree at the collected commit, or the device's snapshot manifest, holds the whole scope."""
+        """The tree at the collected commit holds the whole scope."""
         return True
 
     async def list_scope(self) -> ScopeListing:
@@ -357,11 +312,6 @@ class GitHubRepoGene(DocumentGene):
         renamed. Discovery reads the same tree on every run, so a run that
         discovered returns that tree's listing.
         """
-        if _connection_mode(self.config) == CONNECTION_MODE_LOCAL_PUSH:
-            raise ValueError(
-                "A GitHub repository pushed from the internal network is listed by its device's snapshot manifest, "
-                "not by the server"
-            )
         if self._discovered_scope is not None:
             return self._discovered_scope
         tree = await self._scope_tree()
@@ -426,11 +376,6 @@ class GitHubRepoGene(DocumentGene):
         }
 
     async def discover(self, since: datetime | None = None) -> AsyncIterator[ContentItem]:
-        if _connection_mode(self.config) == CONNECTION_MODE_LOCAL_PUSH:
-            async for item in self._discover_local_push(since):
-                yield item
-            return
-
         tree = await self._scope_tree()
         repo_ref = tree.repo_ref
         ref = tree.ref
@@ -463,7 +408,7 @@ class GitHubRepoGene(DocumentGene):
             )
             yield ContentItem(
                 item_id=doc_id,
-                title=_title_from_path(path),
+                title=title_from_path(path),
                 source_url=_file_url(repo_ref, ref, path),
                 # Discovery time. The file's source time is its commit time, read in fetch.
                 last_modified=datetime.now(timezone.utc),
@@ -472,7 +417,6 @@ class GitHubRepoGene(DocumentGene):
                 space_or_project=f"{repo_ref.owner}/{repo_ref.repo}",
                 labels=["github_repo"],
                 extra={
-                    "connection_mode": CONNECTION_MODE_CLOUD_PULL,
                     "file_identity_contract": "repository_path",
                     "repo_url": repo_ref.repo_url,
                     "repo_host": repo_ref.host,
@@ -494,13 +438,6 @@ class GitHubRepoGene(DocumentGene):
         self.record_scope_listing(ScopeListingKind.EXISTENCE, self._listed_doc_ids(tree))
 
     async def fetch(self, item: ContentItem) -> RawContent:
-        if item.extra.get("package_uri") or item.extra.get("package_path"):
-            body = read_package_body(self, item, source_label="GitHub repository")
-            package = decode_package(body, GITHUB_REPO_PACKAGE_KIND)
-            if package is None:
-                raise ValueError(f"GitHub repository package {item.item_id} is not a {GITHUB_REPO_PACKAGE_KIND} package")
-            return _package_raw_content(item, body, package, artifacts=source_artifacts_from_package(package))
-
         try:
             validate_github_file_mode(item.extra.get("file_mode"), label=str(item.extra.get("relative_path")))
         except ValueError as exc:
@@ -573,10 +510,6 @@ class GitHubRepoGene(DocumentGene):
     async def open_source_artifact(self, artifact: RawSourceArtifact):
         """Open one immutable Git blob without buffering it in the Gene."""
 
-        if artifact.locator.get("input_uri"):
-            async with open_packaged_source_artifact(self, artifact) as download:
-                yield download
-            return
         blob_url = str(artifact.locator.get("blob_url") or "").strip()
         blob_sha = str(artifact.locator.get("blob_sha") or "").strip()
         if not blob_url or not blob_sha or not blob_url.rstrip("/").endswith(f"/{quote(blob_sha, safe='')}"):
@@ -597,15 +530,12 @@ class GitHubRepoGene(DocumentGene):
             )
 
     def raw_from_stored_input(self, item: ContentItem, body: bytes, content_type: str) -> RawContent:
-        """Rebuild a stored file, a package of one, or a selected binary file.
+        """Rebuild a stored file, or a selected binary file.
 
         A binary file, an image or a PDF, is stored with no text body, as it was
         fetched, and its item names its media type; that is the evidence the
         fetch gave for its empty text. Its bytes come from the committed Artifact.
         """
-        package = decode_package(body, GITHUB_REPO_PACKAGE_KIND)
-        if package is not None:
-            return _package_raw_content(item, body, package)
         if item.content_type in SUPPORTED_SOURCE_ARTIFACT_MEDIA_TYPES and not body.strip():
             return RawContent(
                 item=item,
@@ -617,22 +547,12 @@ class GitHubRepoGene(DocumentGene):
         return super().raw_from_stored_input(item, body, content_type)
 
     async def normalize(self, raw: RawContent) -> NormalizedContent:
-        # A local-push package carries the file and its repository; a
-        # cloud-pull body is the file itself, described by its discovered item.
-        package = decode_package(raw.body, GITHUB_REPO_PACKAGE_KIND)
-        if package is not None:
-            return NormalizedContent(
-                item=raw.item,
-                markdown_body=_package_markdown(package),
-                source_semantics=_semantics_from_package(package),
-            )
-
+        # The body is the file itself, described by its discovered item.
         text = decode_github_text(raw.body, label=str(raw.item.extra.get("relative_path") or raw.item.item_id))
         markdown = _to_markdown(raw.content_type, text)
         semantics = {
             SOURCE_UPDATED_AT_KEY: raw.item.extra.get(LAST_COMMIT_AT_KEY),
             "source_type": GITHUB_REPO_SOURCE_TYPE,
-            "connection_mode": raw.item.extra.get("connection_mode"),
             "repo_url": raw.item.extra.get("repo_url"),
             "repo_identifier": _validated_repo_identifier(str(raw.item.extra.get("repo_url") or "")),
             "repo_host": raw.item.extra.get("repo_host"),
@@ -734,44 +654,6 @@ class GitHubRepoGene(DocumentGene):
                 buffer.write(chunk)
             return buffer.finish()
 
-    async def _discover_local_push(self, since: datetime | None) -> AsyncIterator[ContentItem]:
-        packages = [
-            package
-            for package in device_packages(
-                self.config,
-                package_kind=GITHUB_REPO_PACKAGE_KIND,
-                inbox=self._documents_dir,
-            )
-            if _package_matches_config(package.fields, self.config)
-        ]
-        max_files = int_config(self.config, "max_files", default=DEFAULT_MAX_FILES)
-        if len(packages) > max_files:
-            raise RuntimeError(
-                f"GitHub Repository Internal network / VPN sync matched {len(packages)} files, exceeding max_files={max_files}"
-            )
-        for package in packages:
-            if not package.changed_after(since):
-                continue
-            doc_id = str(package.fields["doc_id"])
-            yield ContentItem(
-                item_id=doc_id,
-                title=package.text("title", doc_id),
-                source_url=package.text("source_url"),
-                last_modified=package.last_modified,
-                content_type=package.text("content_type", "text/markdown"),
-                space_or_project=package.text("space_or_project"),
-                version=package.text("version"),
-                author=package.fields.get("submitted_by"),
-                labels=["github_repo"],
-                extra={**package.locator, "relative_path": package.fields.get("relative_path")},
-            )
-
-    def _documents_dir(self) -> Path:
-        configured = str(self.config.get("documents_dir") or "").strip()
-        if not configured:
-            raise ValueError("GitHub Repository Internal network / VPN source is missing documents_dir")
-        return Path(configured).expanduser()
-
 
 def _parse_repo_url(url: str) -> _RepoRef:
     value = str(url or "").strip()
@@ -790,87 +672,13 @@ def _parse_repo_url(url: str) -> _RepoRef:
     )
 
 
-def _connection_mode(config: dict) -> str:
-    return str(config.get("connection_mode") or CONNECTION_MODE_CLOUD_PULL).strip().lower()
-
-
 def _file_url(ref: _RepoRef, repo_ref: str, relative_path: str) -> str:
     return f"{ref.repo_url}/blob/{quote(repo_ref, safe='')}/{quote(relative_path, safe='/')}"
 
 
-def _title_from_path(relative_path: str) -> str:
+def title_from_path(relative_path: str) -> str:
     filename = relative_path.rstrip("/").rsplit("/", 1)[-1]
     return re.sub(r"\.[^.]+$", "", filename) or filename
-
-
-def _package_matches_config(package: Mapping[str, Any], config: dict) -> bool:
-    configured_repo = str(config.get("repo_url") or "").strip()
-    if configured_repo and str(package.get("repo_url") or "").strip() != _parse_repo_url(configured_repo).repo_url:
-        return False
-    configured_ref = str(config.get("ref") or "main").strip() or "main"
-    if str(package.get("repo_ref") or "").strip() != configured_ref:
-        return False
-    relative_path = str(package.get("relative_path") or "")
-    if not relative_path:
-        return False
-    try:
-        include_paths = github_include_paths(config)
-        exclude_paths = github_exclude_paths(config)
-        normalized_path = normalize_github_relative_path(relative_path)
-    except ValueError:
-        return False
-    if not github_path_in_scope(normalized_path, include_paths, exclude_paths):
-        return False
-    return github_extension_allowed(normalized_path, github_include_extensions(config))
-
-
-def _package_markdown(package: dict) -> str:
-    return _to_markdown(package.get("content_type") or "text/markdown", str(package.get("markdown") or ""))
-
-
-def _package_raw_content(
-    item: ContentItem,
-    body: bytes,
-    package: dict,
-    *,
-    artifacts: tuple[RawSourceArtifact, ...] = (),
-) -> RawContent:
-    """The raw content of one local-push package; the package attests an empty file."""
-
-    authoritative_empty = not _package_markdown(package).strip()
-    return RawContent(
-        item=item,
-        body=body,
-        content_type="application/json",
-        authoritative_empty=authoritative_empty,
-        empty_evidence="github_repo_package_attested_empty_file" if authoritative_empty else None,
-        artifacts=artifacts,
-    )
-
-
-def _semantics_from_package(package: dict) -> dict:
-    semantics = {
-        SOURCE_UPDATED_AT_KEY: package.get(SOURCE_UPDATED_AT_KEY),
-        "source_type": GITHUB_REPO_SOURCE_TYPE,
-        "connection_mode": CONNECTION_MODE_LOCAL_PUSH,
-        "repo_url": package.get("repo_url"),
-        "repo_identifier": _validated_repo_identifier(str(package.get("repo_url") or "")),
-        "repo_host": package.get("repo_host"),
-        "repo_owner": package.get("repo_owner"),
-        "repo_name": package.get("repo_name"),
-        "repo_ref": package.get("repo_ref"),
-        "relative_path": package.get("relative_path"),
-        "blob_sha": package.get("blob_sha"),
-        "content_type": package.get("content_type"),
-        "canonical_url": package.get("source_url"),
-    }
-    if package.get("symlink_chain"):
-        semantics.update({
-            "logical_file_mode": GITHUB_SYMLINK_MODE,
-            "symlink_chain": package.get("symlink_chain"),
-            "resolved_relative_path": package.get("resolved_relative_path"),
-        })
-    return semantics
 
 
 def _validated_repo_identifier(repo_url: str) -> str:

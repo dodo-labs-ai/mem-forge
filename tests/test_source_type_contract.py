@@ -19,10 +19,11 @@ from memforge.genes.contract import (
 )
 from memforge.genes.conversation_gene import ConversationGene
 from memforge.genes.document_gene import DocumentGene
+from memforge.genes.family import CollectionFamilyKind
 from memforge.genes.teams_gene import TeamsGene
 from memforge.genes.teams_provider import TeamsConversationProvider
-from memforge.local_agent.source_contract import LOCAL_AGENT_SYNC_OPERATIONS
-from memforge.genes import github_pages_gene, github_repo_gene, jira_gene
+from memforge.local_agent.source_contract import DOCUMENT_ACQUISITION_OPERATION, LOCAL_AGENT_SYNC_OPERATIONS
+from memforge.genes import github_pages_gene, jira_gene
 from memforge.models import (
     ConfigCondition,
     ConfigField,
@@ -49,6 +50,8 @@ DEVICE = LocalAgentCollection(operation="test_sync", job_config_fields=frozenset
 
 
 def _descriptor(gene, **fields) -> SourceTypeDescriptor:
+    if isinstance(gene, type) and issubclass(gene, DocumentGene):
+        fields.setdefault("acquisition_contract", 1)
     return SourceTypeDescriptor(source_type="test_type", gene=gene, **fields)
 
 
@@ -71,6 +74,37 @@ def test_every_built_in_source_type_meets_its_contract() -> None:
 def test_a_document_gene_with_its_contract_is_accepted() -> None:
     validate_source_type(_descriptor(FakeGene))
     validate_source_type(_descriptor(QueryGene))
+
+
+@pytest.mark.parametrize("contract", [None, 0, -1, True, "1"])
+def test_a_document_type_must_declare_a_positive_acquisition_contract(contract) -> None:
+    _refused(FakeGene, "must declare a positive integer acquisition_contract", acquisition_contract=contract)
+
+
+@pytest.mark.parametrize("executors", [frozenset(), frozenset({"server", "laptop"})], ids=["none", "unknown"])
+def test_a_document_type_declares_executors_from_server_and_device(executors) -> None:
+    _refused(FakeGene, "executors must be a non-empty subset", executors=executors)
+
+
+def test_every_built_in_document_type_declares_an_acquisition_contract() -> None:
+    for descriptor in registered_source_types():
+        if descriptor.family is CollectionFamilyKind.DOCUMENT:
+            assert isinstance(descriptor.acquisition_contract, int), descriptor.source_type
+            assert descriptor.acquisition_contract >= 1, descriptor.source_type
+        else:
+            assert descriptor.acquisition_contract is None, descriptor.source_type
+
+
+def test_a_conversation_type_has_no_acquisition_contract() -> None:
+    teams = source_type_descriptor("teams")
+    assert teams is not None
+    _refused(
+        TeamsGene,
+        "a conversation type has no acquisition_contract",
+        local_agent=teams.local_agent,
+        conversation_provider=teams.conversation_provider,
+        acquisition_contract=1,
+    )
 
 
 def test_a_gene_of_neither_family_is_refused() -> None:
@@ -214,7 +248,7 @@ def test_a_subclass_of_a_built_in_gene_inherits_its_contract() -> None:
     class CustomJira(JiraGene):
         pass
 
-    validate_source_type(_descriptor(CustomJira, local_agent=DEVICE))
+    validate_source_type(_descriptor(CustomJira))
 
 
 def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
@@ -227,39 +261,8 @@ def test_a_gene_missing_its_metadata_is_named_as_unimplemented() -> None:
     )
 
 
-class DeviceQueryGene(QueryGene):
-    @classmethod
-    def provider_key(cls, item):
-        return item.item_id
-
-    @classmethod
-    def confirmation_item(cls, document_id, provider_key):
-        raise NotImplementedError
-
-
-def test_a_device_collected_gene_declares_one_listing_kind() -> None:
-    class Both(DeviceQueryGene):
-        listing_kinds = frozenset({ScopeListingKind.QUERY, ScopeListingKind.EXISTENCE})
-
-    _refused(Both, "exactly one listing kind", local_agent=DEVICE)
-    validate_source_type(_descriptor(DeviceQueryGene, local_agent=DEVICE))
-
-
-def test_a_gene_confirmed_on_a_device_names_and_rebuilds_its_items() -> None:
-    class KeyedOnly(QueryGene):
-        @classmethod
-        def provider_key(cls, item):
-            return item.item_id
-
-    _refused(QueryGene, "must implement provider_key, confirmation_item", local_agent=DEVICE)
-    _refused(KeyedOnly, "must implement confirmation_item", local_agent=DEVICE)
-    # Only a query listed by a device is confirmed there.
-    validate_source_type(_descriptor(QueryGene))
-
-    class Existence(FakeGene):
-        listing_kinds = frozenset({ScopeListingKind.EXISTENCE})
-
-    validate_source_type(_descriptor(Existence, local_agent=DEVICE))
+def test_a_document_type_runs_on_a_device_through_its_executor_not_a_local_agent_collection() -> None:
+    _refused(QueryGene, "runs on a device through its executor", local_agent=DEVICE)
 
 
 def _provider(provider, factory=teams_provider.open_teams_provider) -> ConversationProviderReference:
@@ -371,7 +374,8 @@ import memforge.genes
 
 def test_registry_tables_built_at_import_hold_every_type() -> None:
     assert LOCAL_AGENT_SYNC_OPERATIONS == {
-        d.local_agent.operation for d in registered_source_types() if d.local_agent is not None
+        DOCUMENT_ACQUISITION_OPERATION,
+        *(d.local_agent.operation for d in registered_source_types() if d.local_agent is not None),
     }
     assert "teams_sync" in LOCAL_AGENT_SYNC_OPERATIONS
 
@@ -573,10 +577,8 @@ MODE_READERS = {
     ("confluence", "sync_mode"): lambda config: canonical_projection_scope("confluence", config)["sync_mode"],
     ("github_pages", "auth_mode"): github_pages_gene._auth_mode,
     ("github_pages", "sync_mode"): github_pages_gene.sync_mode_for_config,
-    ("github_repo", "connection_mode"): github_repo_gene._connection_mode,
     ("jira", "auth_mode"): jira_gene._auth_mode,
     ("jira", "query_mode"): lambda config: canonical_projection_scope("jira", config)["query_mode"],
-    ("jira", "sync_mode"): lambda config: "local_agent" if jira_gene._read_by_local_agent(config) else "cloud",
 }
 
 # The least each built-in type needs before its hooks run.

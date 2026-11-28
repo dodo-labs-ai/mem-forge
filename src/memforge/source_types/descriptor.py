@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from memforge.conversations.port import ConversationProvider
     from memforge.genes.base import Gene
     from memforge.genes.family import CollectionFamilyKind
-    from memforge.local_agent.replay_adapter import LocalSourceReplayAdapter
     from memforge.source_adapters.contracts import CanonicalRecordSchema
     from memforge.source_projection import EvidenceRepresentationProfile
 
@@ -35,30 +34,19 @@ def _frozen(mapping: Mapping[Any, Any]) -> Mapping[Any, Any]:
 
 @dataclass(frozen=True)
 class LocalAgentCollection:
-    """How the owner's local agent collects a Source of this type.
+    """How the owner's local agent collects a conversation Source of this type.
 
-    ``collects`` says whether one configuration is collected by the agent; a
-    type such as Jira is collected on the server unless configured otherwise.
-    ``immutable_execution_fields`` choose between the two executors, so a
-    stored Source never changes them. ``package_submitter`` names the
-    function that accepts one package the agent uploads, and
-    ``replay_adapter`` the class that reads it back during sync. A type with
-    ``accepts_artifact_inputs`` takes binary inputs for its packages.
+    ``operation`` is the job the agent runs. ``job_config_fields`` are the
+    configuration fields the job hands the agent, after
+    ``job_config_defaults`` fills what an older configuration leaves out.
+    ``collects`` says whether one configuration is collected by the agent.
+    A document Source runs on a device through its executor instead.
     """
 
     operation: str
     job_config_fields: frozenset[str]
     collects: Callable[[Mapping[str, Any]], bool] = lambda _config: True
-    immutable_execution_fields: tuple[str, ...] = ()
-    package_submitter: str | None = None
-    replay_adapter: str | None = None
-    accepts_artifact_inputs: bool = False
     job_config_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None
-
-    def replay_adapter_instance(self) -> LocalSourceReplayAdapter | None:
-        if self.replay_adapter is None:
-            return None
-        return load_reference(self.replay_adapter)()
 
 
 @dataclass(frozen=True)
@@ -93,6 +81,17 @@ class ConversationProviderReference:
         return self.factory_function()(job_config)
 
 
+SOURCE_EXECUTOR_SERVER = "server"
+"""The executor that reaches a document Source's provider from the server."""
+
+SOURCE_EXECUTOR_DEVICE = "device"
+"""The executor that reaches a document Source's provider from its execution device, one device of its execution
+owner (ADR 0058)."""
+
+SOURCE_EXECUTORS = frozenset({SOURCE_EXECUTOR_SERVER, SOURCE_EXECUTOR_DEVICE})
+"""Every executor a document Source can have; a document type runs on both unless it declares fewer."""
+
+
 @dataclass(frozen=True)
 class SourceTypeDescriptor:
     """Every per-type fact shared sync, projection, configuration and store code reads.
@@ -110,7 +109,19 @@ class SourceTypeDescriptor:
     read under; ``alternative_evidence_profiles`` names the other profiles the
     adapter may choose for one Observation of that type, such as by a file's
     extension. ``exports_pdf`` says the Gene renders a PDF of each Unit, which
-    a Unit's stored input must then hold. ``config`` checks and prepares the
+    a Unit's stored input must then hold. ``acquisition_contract`` is a
+    document type's acquisition contract: an integer that changes whenever
+    what the Gene's acquisition returns changes in a way its interpretation
+    depends on, so a device acquires a type's runs only while its contract
+    equals the server's (ADR 0058). ``executors`` is the set of executors
+    a document type's acquisition can run on, from :data:`SOURCE_EXECUTORS`;
+    a type whose items exist only on the owner's machine declares the device
+    alone. Configure offers the choice from it; a conversation type's
+    collection is its ``local_agent`` and leaves it unread.
+    ``device_location_fields`` are the configuration fields that name a
+    folder on a device Source's execution device: the device is ready for the
+    Source only while each names an existing, readable folder there, and the
+    form picks them with that device's folder picker. ``config`` checks and prepares the
     Source's configuration. ``conversation_provider`` opens a conversation
     type's provider on the device.
     """
@@ -129,6 +140,9 @@ class SourceTypeDescriptor:
     record_schemas: Mapping[tuple[str, int], CanonicalRecordSchema] = field(default_factory=dict)
     local_agent: LocalAgentCollection | None = None
     exports_pdf: bool = False
+    acquisition_contract: int | None = None
+    executors: frozenset[str] = SOURCE_EXECUTORS
+    device_location_fields: tuple[str, ...] = ()
     config: SourceConfigPolicy = field(default_factory=SourceConfigPolicy)
     conversation_provider: ConversationProviderReference | None = None
 

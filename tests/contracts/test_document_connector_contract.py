@@ -8,8 +8,6 @@ and fails it until ``tests/contracts/document_fakes`` has a module for it.
 
 from __future__ import annotations
 
-from datetime import datetime
-from types import SimpleNamespace
 from weakref import WeakValueDictionary
 
 import httpx
@@ -17,16 +15,11 @@ import pytest
 
 from memforge.genes import create_gene
 from memforge.genes.document_gene import DocumentGene
-from memforge.local_agent.source_contract import (
-    local_agent_sync_operation,
-    snapshot_document_ids,
-    source_with_sync_inputs,
-)
+from memforge.local_agent.source_contract import local_agent_sync_operation
 from memforge.models import AbsenceAnswer, ScopeListingKind
 from memforge.source_types import source_type_descriptor
 from tests.contracts.document_fakes import (
     CHANGED_SINCE,
-    IN_THE_CURSOR_MINUTE,
     DocumentConnectorFakes,
     MissingDocumentFakes,
     ProviderListing,
@@ -87,7 +80,6 @@ LISTING_CASES = _cases(lambda _source_type, fakes: fakes.listing_configs)
 WALKING_CASES = _cases(
     lambda _source_type, fakes: [name for name, listing in fakes.listing_configs.items() if listing.walks_scope]
 )
-DEVICE_CASES = _cases(lambda _source_type, fakes: fakes.device_configs)
 REDISCOVER_CASES = _cases(
     lambda source_type, fakes: [
         name
@@ -146,16 +138,13 @@ def test_lists_scope_matches_each_fake_configuration(source_type) -> None:
     fakes = fakes_for(source_type)
     if not gene_cls.listing_kinds:
         # A connector none of whose configurations can list never answers True.
-        assert not fakes.listing_configs and not fakes.device_configs
-    assert fakes.listing_configs or fakes.non_listing_configs or fakes.device_configs
+        assert not fakes.listing_configs
+    assert fakes.listing_configs or fakes.non_listing_configs
     for name, listing in fakes.listing_configs.items():
         assert gene_cls.lists_scope(listing.config) is True, name
         assert local_agent_sync_operation(source_type, listing.config) is None, name
     for name, config in fakes.non_listing_configs.items():
         assert gene_cls.lists_scope(config) is False, name
-    for name, config in fakes.device_configs.items():
-        assert gene_cls.lists_scope(config) is True, name
-        assert local_agent_sync_operation(source_type, config) is not None, name
 
 
 # ---------------------------------------------------------------------------
@@ -236,77 +225,6 @@ async def test_a_failed_listing_raises(source_type, config_name) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Collected on a device: the snapshot manifest is the listing
-# ---------------------------------------------------------------------------
-
-
-def _manifest_inputs(source_type: str, config_name: str) -> list[SimpleNamespace]:
-    """The stored inputs of a device's snapshot manifest, one per entry the fake submits."""
-    fakes = fakes_for(source_type)
-    return [
-        SimpleNamespace(
-            metadata={"manifest_entry": entry},
-            raw_uri=f"artifact://{entry['doc_id']}",
-            raw_sha256=f"input-{generation}",
-            input_generation=generation,
-        )
-        for generation, entry in enumerate(fakes.manifest_entries(fakes.device_configs[config_name]))
-    ]
-
-
-async def _manifest_gene(source_type: str, config_name: str, inputs: list[SimpleNamespace]) -> DocumentGene:
-    """The authenticated Gene of a run bound to the device's snapshot manifest ``inputs``."""
-    config = fakes_for(source_type).device_configs[config_name]
-    projected = source_with_sync_inputs(
-        {"type": source_type, "config": dict(config)}, inputs, input_snapshot_supplied=True
-    )
-    gene = create_gene(source_type, projected["config"], "src-contract")
-    await gene.authenticate()
-    return gene
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
-async def test_a_device_collected_configuration_lists_through_its_manifest(source_type, config_name) -> None:
-    gene_cls = _gene_class(source_type)
-    inputs = _manifest_inputs(source_type, config_name)
-    gene = await _manifest_gene(source_type, config_name, inputs)
-
-    # The run lists through the manifest with the Gene's one kind, never through list_scope.
-    assert len(gene_cls.listing_kinds) == 1
-    with pytest.raises(Exception, match="snapshot manifest"):
-        await gene.list_scope()
-    # A run bound to the snapshot discovers exactly what the manifest lists.
-    discovered = {item.item_id async for item in gene.discover(None)}
-    assert discovered == snapshot_document_ids(inputs)
-    assert discovered
-    # The device read the provider; the server holds no client to release.
-    assert getattr(gene, "_client", None) is None
-    await gene.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("source_type", "config_name"), DEVICE_CASES)
-async def test_a_device_manifest_never_hides_an_item_edited_in_the_cursor_minute(source_type, config_name) -> None:
-    inputs = _manifest_inputs(source_type, config_name)
-    in_the_cursor_minute = [
-        stored
-        for stored in inputs
-        if datetime.fromisoformat(stored.metadata["manifest_entry"]["last_modified"]) == IN_THE_CURSOR_MINUTE
-    ]
-    gene = await _manifest_gene(source_type, config_name, inputs)
-    try:
-        changed = {item.item_id async for item in gene.discover(CHANGED_SINCE)}
-    finally:
-        await gene.close()
-
-    assert in_the_cursor_minute
-    assert snapshot_document_ids(in_the_cursor_minute) <= changed
-    # The manifest's packages are still read incrementally: one changed before the cursor is skipped.
-    assert changed < snapshot_document_ids(inputs)
-
-
-# ---------------------------------------------------------------------------
 # confirm_absent
 # ---------------------------------------------------------------------------
 
@@ -373,7 +291,8 @@ async def test_close_releases_every_client_the_gene_opened(source_type, config_n
     fakes = fakes_for(source_type)
     async with fakes.connect(fakes.listing_configs[config_name].config) as connection:
         await connection.gene.list_scope()
-        assert connection.clients
+        # A Gene that reads a folder on its device opens no client.
+        assert bool(connection.clients) is fakes.opens_clients
         assert not any(client.is_closed for client in connection.clients)
 
         await connection.gene.close()
@@ -390,7 +309,6 @@ async def test_close_before_authenticate_does_nothing(source_type) -> None:
     configs = [
         *(listing.config for listing in fakes.listing_configs.values()),
         *fakes.non_listing_configs.values(),
-        *fakes.device_configs.values(),
     ]
     for config in configs:
         gene = create_gene(source_type, dict(config), "src-contract")

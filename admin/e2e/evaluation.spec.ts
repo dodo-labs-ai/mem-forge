@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { appPath, appUrl } from "./support/appPath";
 import { makeOverview } from "../src/test/evaluationFixtures";
+import { localSyncStatus } from "./support/localSync";
 
 const RESPONSES: Record<string, unknown> = {
   "/api/v1/agent-evaluations/online-overview": makeOverview(),
@@ -10,7 +11,7 @@ const RESPONSES: Record<string, unknown> = {
     { name: "github_repo", display_name: "GitHub Repository" },
     { name: "jira", display_name: "Jira" },
   ],
-  "/api/cloud/local-agent/status": { status: "online", last_seen_at: null, checked_at: "", stale_after_seconds: 60 },
+  "/api/cloud/local-agent/status": localSyncStatus(true),
 };
 
 test("the Evaluation page renders in the shell and scopes to a source", async ({ page }) => {

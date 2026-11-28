@@ -14,7 +14,7 @@ from tests.github_api_fixture import FakeGitHub
 
 REPO_URL = "https://github.example.test/payroll/architecture"
 API = "https://github.example.test/api/v3/repos/payroll/architecture"
-BROWSE_CONFIG = {"connection_mode": "cloud_pull", "repo_url": REPO_URL, "include_extensions": ["md"]}
+BROWSE_CONFIG = {"repo_url": REPO_URL, "include_extensions": ["md"]}
 
 
 def test_github_repo_tree_items_synthesizes_folders_and_files():

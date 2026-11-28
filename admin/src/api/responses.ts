@@ -37,10 +37,8 @@ export type LocalAgentJob = Omit<Schemas["LocalAgentJobResponse"], "result"> & {
  * `last_error`.
  */
 export interface SetupJobResults {
-  github_repo_preview_tree: Schemas["GitHubRepoPreviewTreeResult"];
-  jira_auth: Schemas["JiraAuthResult"];
+  credential_check: Schemas["CredentialCheckResult"];
   local_markdown_pick_root: Schemas["LocalMarkdownPickRootResult"];
-  local_markdown_preview_tree: Schemas["LocalMarkdownPreviewTreeResult"];
   teams_auth: Schemas["TeamsAuthResult"];
   teams_auth_check: Schemas["TeamsAuthCheckResult"];
   teams_browse: Schemas["TeamsBrowseResult"];
