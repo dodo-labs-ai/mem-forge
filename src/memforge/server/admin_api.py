@@ -10605,6 +10605,9 @@ def create_admin_app(
             if source is None:
                 raise HTTPException(status_code=404, detail="local_agent_source_not_found")
             _require_source_discoverability(request, source)
+            if source.get("status") != "active":
+                # Checked here, where the Source is read: the job store may keep jobs elsewhere.
+                raise HTTPException(status_code=409, detail="source_not_active")
             operation = local_agent_sync_operation(source["type"], source.get("config"))
             if operation != req.operation or source["type"] != req.source_type:
                 raise HTTPException(status_code=400, detail="local_agent_operation_source_mismatch")

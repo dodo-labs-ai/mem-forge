@@ -194,3 +194,27 @@ async def test_a_configuration_saved_while_the_scheduler_reads_leaves_the_source
     [row] = await db.db.execute_fetchall("SELECT payload_json FROM local_agent_jobs WHERE source_id = ?", (SOURCE,))
     assert (raced, retried) == (0, 1)
     assert json.loads(row["payload_json"])["conversation_ids"] == OLD_CHATS
+
+
+def test_a_source_that_is_not_active_gets_no_sync_job_from_the_job_route(tmp_path):
+    headers = {"x-test-user": OWNER, "x-test-workspace-role": "member"}
+    database = _ready_database(tmp_path / "paused.db")
+
+    async def pause() -> None:
+        await database.db.execute("UPDATE sources SET status = 'paused' WHERE id = ?", (SOURCE,))
+        await database.db.commit()
+
+    try:
+        asyncio.run(pause())
+        with TestClient(_app(tmp_path, database)) as client:
+            created = client.post(
+                "/api/v1/local-agent/jobs",
+                headers=headers,
+                json={"source_id": SOURCE, "source_type": "teams", "operation": "teams_sync", "payload": {}},
+            )
+        jobs = asyncio.run(database.db.execute_fetchall("SELECT job_id FROM local_agent_jobs"))
+    finally:
+        asyncio.run(database.close())
+
+    assert (created.status_code, created.json()["detail"]) == (409, "source_not_active")
+    assert list(jobs) == []
